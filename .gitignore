@@ -1,0 +1,7 @@
+# Voidseal — exclude private dev artifacts + local-only profiles + regenerated/binary artifacts
+_dev/
+*.local.psd1
+testResults.xml
+*.token
+*.vhdx
+*.iso
