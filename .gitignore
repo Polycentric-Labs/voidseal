@@ -5,3 +5,5 @@ testResults.xml
 *.token
 *.vhdx
 *.iso
+# Private per-repo working memory (Claude Code loads it; never published)
+CLAUDE.local.md
