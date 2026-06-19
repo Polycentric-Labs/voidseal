@@ -134,7 +134,12 @@ consumes it, then it is detached as part of the import-then-seal ritual.
 ## 2a. Disk-mode workload runner
 
 > **This is the `user-data` the seed builder emits for a `WorkloadMode = 'Disk'` profile**
-> (`firefox.psd1`). It replaces the COM1-serial command channel with the **disk-passing model**:
+> (`firefox.psd1`). The canonical emitter is **`New-CidataSeed`** (`scripts/lib/SeedBuilder.ps1`,
+> dot-sourced by `scripts/Invoke-Voidseal.ps1`): it holds this runner as a template, substitutes the
+> profile's `Entrypoint` for `__ENTRYPOINT__`, and writes the `CIDATA` ISO via built-in Windows IMAPI2.
+> The block below is the human-readable mirror of that template (kept in sync; `New-CidataSeed` is the
+> source of truth that actually ships in a seed). It replaces the COM1-serial command channel with the
+> **disk-passing model**:
 > the host creates +
 > host-formats two exFAT data disks (label **`INPUT`**, label **`OUTPUT`**), populates `INPUT`
 > from the profile's `Inputs`, attaches both **before the seal**, then starts the VM. The guest

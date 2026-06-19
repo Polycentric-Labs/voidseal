@@ -59,6 +59,7 @@ $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
 . (Join-Path $script:DeployLibDir 'Sealer.ps1')
 . (Join-Path $script:DeployLibDir 'Runner.ps1')
 . (Join-Path $script:DeployLibDir 'Workload.ps1')
+. (Join-Path $script:DeployLibDir 'SeedBuilder.ps1')
 
 # --------------------------------------------------------------------------
 # Internal: resolve the -Profile argument to a normalized profile hashtable (loader output).
