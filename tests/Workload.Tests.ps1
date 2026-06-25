@@ -6,6 +6,9 @@ BeforeAll {
     # Read-WorkloadResult routes hostile-tier reads to it, so the Workload tests must load it.
     . "$PSScriptRoot\..\scripts\lib\Runner.ps1"
     . "$PSScriptRoot\..\scripts\lib\Workload.ps1"
+    # RC6: New-WorkloadSeedDisk builds the CIDATA seed-disk content via New-CidataUserData /
+    # New-CidataMetaData (SeedBuilder.ps1), so the Workload tests must load it too.
+    . "$PSScriptRoot\..\scripts\lib\SeedBuilder.ps1"
 }
 
 Describe 'New-WorkloadDisks' {
@@ -77,6 +80,81 @@ Describe 'New-WorkloadDisks' {
         @($d.CreatedDisks) | Should -Contain $expectedInput -Because 'teardown (CreatedDisks-authoritative) must be able to clean up the already-created INPUT disk'
         # The INPUT disk really was created+attached (so it genuinely WOULD be an orphan if unrecorded).
         @((& $b.GetVM @{ Name='wlx' }).HardDrives) | Should -Contain $expectedInput
+    }
+}
+
+# ===========================================================================
+#  RC6 — New-WorkloadSeedDisk: deliver the disk-mode cloud-init seed on a CIDATA
+#  DATA DISK that survives the seal (the seal ejects DVDs; a recorded data disk stays).
+# ===========================================================================
+#  RC6 (2026-06-25 live): the seal EJECTS the seed DVD before the guest's ONLY boot, so cloud-init had
+#  no datasource and the runner never ran (10-min timeout). E8 proved cloud-init NoCloud reads
+#  user-data/meta-data off a vfat data disk labelled CIDATA. New-WorkloadSeedDisk creates that disk
+#  (NewOutputVhdx Label='CIDATA', FAT32, small), writes user-data (= New-CidataUserData) + meta-data
+#  (= New-CidataMetaData) at the disk root, attaches it, and RECORDS it on the descriptor (SeedDiskPath
+#  + CreatedDisks) so teardown deletes it and Assert-Sealed accepts it like INPUT/OUTPUT.
+Describe 'New-WorkloadSeedDisk (RC6)' {
+
+    It 'creates a CIDATA-labelled data disk carrying user-data + meta-data, attaches + records it' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='sd'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'sd' -Tier 0
+        $prof = @{ Name='firefox'; WorkloadMode='Disk'; Entrypoint='python3 /mnt/in/x.py --out /mnt/out/result.html' }
+        $d2 = New-WorkloadSeedDisk -Descriptor $d -Profile $prof -StorageRoot 'C:\s\sd' -Backend $b
+
+        $d2.SeedDiskPath | Should -Not -BeNullOrEmpty -Because 'the seed disk path must be recorded on the descriptor'
+        # The disk is host-formatted with the CIDATA label (how cloud-init NoCloud finds the seed).
+        $info = & $b.GetVHDInfo @{ Path=$d2.SeedDiskPath }
+        $info | Should -Not -BeNullOrEmpty
+        $info.Label | Should -Be 'CIDATA' -Because 'cloud-init NoCloud reads the seed off the CIDATA-labelled volume'
+        # The two NoCloud documents are at the disk ROOT.
+        $ud = & $b.ReadVhdxFile @{ Path=$d2.SeedDiskPath; InnerPath='user-data' }
+        $md = & $b.ReadVhdxFile @{ Path=$d2.SeedDiskPath; InnerPath='meta-data' }
+        $ud | Should -Not -BeNullOrEmpty
+        $md | Should -Not -BeNullOrEmpty
+        # user-data is the DISK-MODE runner carrying the entrypoint (cloud-config + the substituted cmd).
+        $ud | Should -Match '#cloud-config' -Because 'user-data must be a cloud-init document'
+        $ud | Should -Match 'organize|result\.html|/mnt/out' -Because 'the disk-mode runner embeds the entrypoint/result path'
+        $md | Should -Match 'instance-id' -Because 'NoCloud meta-data must carry an instance-id'
+    }
+
+    It 'ATTACHES the seed disk to the VM (host-truth: the same .HardDrives Assert-Sealed reads)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='sd2'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'sd2' -Tier 0
+        $prof = @{ Name='x'; WorkloadMode='Disk'; Entrypoint='python3 /mnt/in/x.py --out /mnt/out/result.html' }
+        $d2 = New-WorkloadSeedDisk -Descriptor $d -Profile $prof -StorageRoot 'C:\s\sd2' -Backend $b
+        @((& $b.GetVM @{ Name='sd2' }).HardDrives) | Should -Contain $d2.SeedDiskPath
+    }
+
+    It 'RECORDS the seed disk on CreatedDisks (teardown''s authoritative cleanup set)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='sd3'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'sd3' -Tier 0
+        $prof = @{ Name='x'; WorkloadMode='Disk'; Entrypoint='python3 /mnt/in/x.py --out /mnt/out/result.html' }
+        $d2 = New-WorkloadSeedDisk -Descriptor $d -Profile $prof -StorageRoot 'C:\s\sd3' -Backend $b
+        @($d2.CreatedDisks) | Should -Contain $d2.SeedDiskPath -Because 'the Reaper -DeleteDisks pass must clean up the seed disk'
+    }
+
+    It 'writes user-data with LF line endings (a CRLF in the embedded #!/bin/sh breaks the interpreter)' {
+        # The seed user-data embeds a #!/bin/sh runner; a CRLF there yields /bin/sh\r (bad interpreter).
+        # New-CidataUserData LF-normalizes; the seed-disk write must not reintroduce CR.
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='sdlf'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'sdlf' -Tier 0
+        $prof = @{ Name='x'; WorkloadMode='Disk'; Entrypoint='python3 /mnt/in/x.py --out /mnt/out/result.html' }
+        $d2 = New-WorkloadSeedDisk -Descriptor $d -Profile $prof -StorageRoot 'C:\s\sdlf' -Backend $b
+        $ud = & $b.ReadVhdxFile @{ Path=$d2.SeedDiskPath; InnerPath='user-data' }
+        $ud | Should -Not -Match "`r" -Because 'user-data must be LF-only — a CRLF in the embedded #!/bin/sh runner is a bad-interpreter failure in the guest'
+    }
+
+    It 'fails closed on a blank Disk-mode Entrypoint (the runner has nothing to run)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='sdblank'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'sdblank' -Tier 0
+        $prof = @{ Name='x'; WorkloadMode='Disk'; Entrypoint='' }
+        { New-WorkloadSeedDisk -Descriptor $d -Profile $prof -StorageRoot 'C:\s\sdblank' -Backend $b } |
+            Should -Throw -Because 'a Disk-mode seed needs a non-blank Entrypoint (New-CidataUserData fails closed)'
     }
 }
 

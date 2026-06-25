@@ -317,16 +317,20 @@ function Invoke-Voidseal {
             }
         }
 
-        # --- the cloud-init NoCloud SEED ISO: attach LAST so it occupies the single boot DVD ---
-        # The SeedIso is the BOOT-CONFIG disc cloud-init consumes on the guest's FIRST boot (serial-getty
-        # autologin on ttyS0 = the Runner's command channel, run-user, packages). It is the disc in the
-        # single DVD slot at boot, so it is attached AFTER any StageAssets ISO. DVD-SLOT CAVEAT: the
-        # backend models ONE DVD slot — a StageAssets ISO that must COEXIST with the seed cannot share it
-        # and must be a transfer-VHD for a live coexistence run. Warn when both ISOs are present so the
-        # live run knows the seed took the boot DVD. Add-SandboxSeed is a no-op when no SeedIso is set
-        # (so a profile without one behaves exactly as before). The seed rides the import-only path, so
-        # the seal ejects it and Assert-Sealed verifies it is gone (a still-attached seed fails the gate).
-        if ($hasSeed) {
+        # --- the cloud-init NoCloud SEED: how it is delivered depends on the workload MODE -----
+        # SERIAL mode: the seed is the BOOT-CONFIG DVD cloud-init consumes on the guest's first boot
+        #   (serial-getty autologin on ttyS0 = the Runner's command channel, run-user, packages). It is
+        #   the disc in the single DVD slot at boot, attached AFTER any StageAssets ISO. DVD-SLOT CAVEAT:
+        #   the backend models ONE DVD slot — a StageAssets ISO that must COEXIST with the seed cannot
+        #   share it and must be a transfer-VHD. Warn when both ISOs are present so the live run knows the
+        #   seed took the boot DVD. The seed rides the import-only path, so the seal ejects it and
+        #   Assert-Sealed verifies it is gone.
+        # DISK mode (RC6): the seal EJECTS the seed DVD before the guest's ONLY boot, so a DVD seed never
+        #   survives to the boot cloud-init reads it on. Instead the seed rides a recorded CIDATA DATA
+        #   DISK (New-WorkloadSeedDisk, built below alongside the INPUT/OUTPUT disks) that survives the
+        #   seal. So in disk mode we do NOT call Add-SandboxSeed (the DVD path) and emit NO dual-DVD
+        #   warning — the seed is not a DVD here.
+        if ($workloadMode -ne 'Disk' -and $hasSeed) {
             if ($stageIsoCount -gt 0) {
                 Write-Warning ("Invoke-Voidseal: '$Name' declares BOTH a SeedIso and $stageIsoCount StageAssets ISO(s). " +
                     "The backend has a single DVD slot; the SeedIso takes the boot DVD. A StageAssets ISO that must " +
@@ -335,7 +339,7 @@ function Invoke-Voidseal {
             Add-SandboxSeed -Descriptor $descriptor -SeedIso $seedIso -Backend $Backend
         }
 
-        # --- Disk-mode: create + attach + RECORD the workload data disks BEFORE the seal -------
+        # --- Disk-mode: create + attach + RECORD the workload data disks (+ the CIDATA seed disk) BEFORE the seal ---
         # The INPUT/OUTPUT data disks must be attached AND recorded on the descriptor (InputDiskPath/
         # OutputDiskPath) BEFORE Lock-Sandbox so Assert-Sealed's host-truth scan accepts them as known
         # data disks (an UNRECORDED attached disk fails the seal gate). Use the SAME storage root the
@@ -367,6 +371,23 @@ function Invoke-Voidseal {
             $descriptor = New-WorkloadDisks -Descriptor $descriptor -Profile $resolved `
                 -StorageRoot $diskStorageRoot -Backend $Backend
             $report.Descriptor = $descriptor
+
+            # RC6: the CIDATA seed DATA DISK — built from the resolved profile's Entrypoint (the disk-mode
+            # runner) and recorded on the descriptor (SeedDiskPath + CreatedDisks) so it survives the seal
+            # and is cleaned up at teardown. Only built when there IS an entrypoint to run (the disk-mode
+            # seed carries the workload runner; with no entrypoint there is nothing to seed — the bare
+            # mock fixtures, like a no-entrypoint serial run, skip this). New-CidataUserData fails closed
+            # on a bad entrypoint, so a rejected one aborts here (caught by the outer catch + teardown).
+            if (-not [string]::IsNullOrWhiteSpace($entrypoint)) {
+                # Fold the EFFECTIVE entrypoint (a -Workload.Entrypoint override beats the profile's) onto
+                # $resolved so New-WorkloadSeedDisk -> New-CidataUserData substitutes the right command into
+                # the disk-mode runner. Mirrors the -Workload.Inputs fold above; $resolved is the mutable
+                # clone Resolve-DeployProfile returned.
+                $resolved['Entrypoint'] = $entrypoint
+                $descriptor = New-WorkloadSeedDisk -Descriptor $descriptor -Profile $resolved `
+                    -StorageRoot $diskStorageRoot -Backend $Backend
+                $report.Descriptor = $descriptor
+            }
         }
         $states.Add('STAGED')
 

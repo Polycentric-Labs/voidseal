@@ -480,6 +480,99 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
 }
 
 # ===========================================================================
+#  RC6 — Disk mode delivers the cloud-init seed on a CIDATA DATA DISK that
+#  survives the seal (NOT an ejected DVD), and the disk-mode path emits no dual-DVD warning.
+# ===========================================================================
+#  RC6 (2026-06-25 live): the seal EJECTS the seed DVD before the guest's ONLY boot, so cloud-init had
+#  no datasource and the disk-mode runner never ran. In disk mode the orchestrator must now create the
+#  CIDATA seed DATA DISK (New-WorkloadSeedDisk) instead of attaching the SeedIso DVD (Add-SandboxSeed),
+#  so the seed survives the seal as a recorded data disk. A disk-mode profile that declares a SeedIso
+#  must NOT take the DVD path (and so must NOT emit the dual-DVD warning). Serial mode is UNCHANGED.
+Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk that survives the seal (RC6)' {
+
+    BeforeEach {
+        # A Tier-0 Disk-mode profile WITH an Entrypoint (the disk-mode seed carries the runner, which
+        # needs an entrypoint) AND a SeedIso path (to prove the disk path does NOT attach it as a DVD or
+        # warn). The SeedIso host file need not exist: the disk-mode path builds the seed CONTENT from the
+        # Entrypoint and never reads the SeedIso file.
+        $script:Tier0Seed = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $script:Tier0Seed = @{} + $script:Tier0Seed
+        $script:Tier0Seed['Name']         = 'firefox-seed-test'
+        $script:Tier0Seed['WorkloadMode'] = 'Disk'
+        $script:Tier0Seed['Inputs']       = @{}
+        $script:Tier0Seed['FileSystem']   = 'exFAT'
+        $script:Tier0Seed['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+        $script:Tier0Seed['SeedIso']      = 'C:\sandbox\assets\cidata-seed.iso'   # declared; disk mode must NOT attach it as a DVD
+        Assert-TierProfileValid -Profile $script:Tier0Seed -Context 'TEST Tier-0 Disk-mode seed fixture'
+
+        $script:SeedB = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $script:Art2  = Join-Path $script:TmpRoot ("art-seed-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:Dest2 = Join-Path $script:TmpRoot ("dest-seed-{0}" -f ([guid]::NewGuid().ToString('N')))
+    }
+
+    It 'creates + attaches + records a CIDATA seed data disk carrying user-data + meta-data' {
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Seed `
+            -Name 'sbx-seed-disk' -ArtifactRoot $script:Art2 -Destination $script:Dest2 `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:SeedB
+        $seedPath = $report.Descriptor.SeedDiskPath
+        $seedPath | Should -Not -BeNullOrEmpty -Because 'RC6: disk mode records the CIDATA seed disk on the descriptor'
+        # The seed disk is on CreatedDisks so the Reaper cleans it up.
+        @($report.Descriptor.CreatedDisks) | Should -Contain $seedPath
+        # The seed disk carried both NoCloud documents (proven via the persistent write log — the disk
+        # itself is deleted by teardown). The user-data is the disk-mode runner with the entrypoint.
+        $writes = @($script:SeedB.FakeCallLog | Where-Object { $_.Op -eq 'WriteVhdxFile' -and $_.Path -eq $seedPath })
+        ($writes | Where-Object { $_.InnerPath -eq 'user-data' } | Select-Object -First 1) | Should -Not -BeNullOrEmpty
+        ($writes | Where-Object { $_.InnerPath -eq 'meta-data' } | Select-Object -First 1) | Should -Not -BeNullOrEmpty
+        $ud = ($writes | Where-Object { $_.InnerPath -eq 'user-data' } | Select-Object -First 1).Content
+        $ud | Should -Match '#cloud-config' -Because 'the seed user-data is a cloud-init document'
+        $ud | Should -Match 'organize_bookmarks' -Because 'the disk-mode runner embeds the profile Entrypoint'
+    }
+
+    It 'the seal CERTIFIES with the CIDATA seed disk present and the lifecycle runs INIT...DESTROYED with SealVerdict=$true' {
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Seed `
+            -Name 'sbx-seed-seal' -ArtifactRoot $script:Art2 -Destination $script:Dest2 `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:SeedB
+        $report.SealVerdict | Should -BeTrue -Because 'RC6: the recorded CIDATA seed disk is an EXPECTED disk — the seal must certify with it attached'
+        @($report.States) | Should -Contain 'SEALED'
+        @($report.States) | Should -Contain 'RUNNING'
+        @($report.States) | Should -Contain 'DESTROYED'
+    }
+
+    It 'teardown DELETES the CIDATA seed disk (it is on CreatedDisks)' {
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Seed `
+            -Name 'sbx-seed-teardown' -ArtifactRoot $script:Art2 -Destination $script:Dest2 `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:SeedB
+        $seedPath = $report.Descriptor.SeedDiskPath
+        $seedPath | Should -Not -BeNullOrEmpty
+        (& $script:SeedB.GetVHDInfo @{ Path = $seedPath }) |
+            Should -BeNullOrEmpty -Because 'the Reaper -DeleteDisks pass deletes the CIDATA seed disk (it is recorded on CreatedDisks)'
+    }
+
+    It 'disk mode does NOT attach the SeedIso as a DVD (no SetDvdDrive for the seed)' {
+        # In disk mode the seed rides a DATA DISK, not the DVD slot. Prove no DVD was ever attached.
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Seed `
+            -Name 'sbx-seed-nodvd' -ArtifactRoot $script:Art2 -Destination $script:Dest2 `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:SeedB
+        # SetDvdDrive is not logged by the fake's CallLog, but the descriptor's SeedIso field must NOT be
+        # set by the disk path (Add-SandboxSeed sets it; the disk path must not call Add-SandboxSeed).
+        $seedIsoField = $report.Descriptor.PSObject.Properties['SeedIso']
+        ($null -eq $seedIsoField -or [string]::IsNullOrWhiteSpace([string]$seedIsoField.Value)) |
+            Should -BeTrue -Because 'RC6: the disk path must NOT call Add-SandboxSeed (which records SeedIso for the DVD); the seed is a data disk'
+    }
+
+    It 'disk mode does NOT emit the dual-DVD warning even when a SeedIso is declared (RC6)' {
+        # The dual-DVD warning is a DVD-path concern. In disk mode the seed is a data disk, so even a
+        # profile declaring both a SeedIso and the disk seed must NOT warn about a single DVD slot.
+        Invoke-Voidseal -Tier 0 -Profile $script:Tier0Seed `
+            -Name 'sbx-seed-nowarn' -ArtifactRoot $script:Art2 -Destination $script:Dest2 `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:SeedB `
+            -WarningVariable seedWarnings -WarningAction SilentlyContinue | Out-Null
+        $dualDvd = @($seedWarnings | Where-Object { [string]$_ -match '(?i)single DVD slot|StageAssets ISO that must|SeedIso takes the boot DVD' })
+        @($dualDvd).Count | Should -Be 0 -Because 'RC6: disk mode delivers the seed on a data disk, so the single-DVD-slot warning must not fire'
+    }
+}
+
+# ===========================================================================
 #  Input validation
 # ===========================================================================
 Describe 'Invoke-Voidseal — input validation' {

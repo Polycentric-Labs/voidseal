@@ -395,30 +395,21 @@ never assumes "Off == success".
 ### 4A.1 Preconditions (mostly reuse Milestone-1 groundwork)
 
 - The golden Debian `.vhdx` (non-sparse) at `C:\sandbox\golden\debian-12-cloud.vhdx` — same as §3.
-- The **CIDATA seed ISO** at `C:\sandbox\assets\cidata-seed.iso` — BUT for disk mode it must carry the
-  **disk-mode workload-runner** `user-data` (see `guest-images/debian-12-cloud.md` §2a), not the
-  bare serial-getty seed. The runner mounts `LABEL=INPUT` ro at `/mnt/in` + `LABEL=OUTPUT` rw at
-  `/mnt/out`, runs the entrypoint, writes `result.html` + `result.exitcode`, `umount`s, then
-  `poweroff`s, substituting the firefox profile's `Entrypoint`
-  (`python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html`).
-
-  **Build it with the `New-CidataSeed` builder** (`scripts/lib/SeedBuilder.ps1`, dot-sourced by the
-  orchestrator) — it emits the §2a runner with the entrypoint substituted and writes the ISO with the
-  `CIDATA` volume label via built-in Windows IMAPI2 (no ADK/WSL needed). It selects the runner shape
-  from the profile's `WorkloadMode` (`Disk` → the disk runner; anything else → the serial baseline),
-  and fails closed if the entrypoint contains a single quote or newline (it runs as `sh -c '…'`):
-
-  ```powershell
-  . .\scripts\Invoke-Voidseal.ps1
-  $ff = Import-WorkloadProfile -Path .\profiles\firefox.psd1 -TierProfileDir .\tier-profiles
-  New-CidataSeed -Profile $ff      # -> writes the profile's SeedIso (C:\sandbox\assets\cidata-seed.iso)
-  ```
-
-  Verify the produced ISO before the run (the volume label must be exactly `CIDATA`, and the disk-mode
-  markers must be present — `vmdep-workload`, `LABEL=INPUT`/`OUTPUT`, `result.exitcode`, the substituted
-  entrypoint — with NO leftover `serial-getty`). **Ralph (Tier 1, §4) reuses the same `cidata-seed.iso`
-  path with the SERIAL seed** — regenerate per-profile before each run (`New-CidataSeed` on the ralph
-  profile rebuilds the serial seed; on firefox it rebuilds the disk seed).
+- **The disk-mode seed is built INLINE now — no pre-built ISO to stage** (RC6, 2026-06-25 live). The
+  seal ejects DVDs before the guest's only boot, so a DVD seed never survives to the boot cloud-init
+  reads it on. In disk mode the orchestrator instead builds a recorded **`CIDATA` data disk** at deploy
+  time (`New-WorkloadSeedDisk` → `New-CidataUserData`, the §2a runner with the profile's `Entrypoint`
+  substituted) that survives the seal exactly like the INPUT/OUTPUT disks. **You do not touch the seed
+  for a firefox run** — the profile's `SeedIso` path is ignored in disk mode. The runner mounts
+  `LABEL=INPUT` ro at `/mnt/in` + `LABEL=OUTPUT` rw at `/mnt/out`, runs the entrypoint, writes
+  `result.html` + `result.exitcode`, `umount`s, then `poweroff`s.
+  - (Serial mode — Ralph, Tier 1, §4 — STILL uses a DVD seed ISO via `New-CidataSeed`; that path is
+    unchanged. Only disk mode moved to the inline data-disk seed.)
+- **Automatic checkpoints are disabled at provision** (RC7, 2026-06-25 live): Hyper-V defaults
+  `AutomaticCheckpointsEnabled=ON`, which pins a differencing `.avhdx` per disk so the guest's writes
+  land in the `.avhdx` while the host reads the empty base `.vhdx`. The provisioner now calls
+  `Set-VM -AutomaticCheckpointsEnabled $false` at provision time, so guest writes land on the base disk
+  the host reads. (No operator action — automatic.)
 - The image must already contain **python3** (the runner does NOT apt-install — sealed/offline).
   The Debian genericcloud image has python3; if your organizer needs `lz4`, bake it into the
   golden image at image-prep (the live run is offline).

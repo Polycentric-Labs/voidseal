@@ -104,6 +104,16 @@ function Set-VMComPort {
     [pscustomobject]@{ __Stub = 'SetVMComPort'; VMName = $VMName }
 }
 
+function Set-VM {
+    # RC7: the real backend's SetAutomaticCheckpoints calls Set-VM -AutomaticCheckpointsEnabled. Real
+    # Set-VM with -Passthru emits a VM object; emit a stray object here too so the harness PROVES the
+    # provisioner's `$null = & $Backend.SetAutomaticCheckpoints` suppresses it (the same output-stream-
+    # pollution guard as the other effect-only calls). Without this stub the call would hit the real
+    # Set-VM and the permission wall, breaking the harness — so the stub is required for RC7.
+    [CmdletBinding()] param([string] $Name, [bool] $AutomaticCheckpointsEnabled)
+    [pscustomobject]@{ __Stub = 'SetVM'; VMName = $Name }
+}
+
 function Add-VMHardDiskDrive {
     [CmdletBinding()] param([string] $VMName, [string] $Path)
     # Real Add-VMHardDiskDrive emits a Microsoft.HyperV.PowerShell.HardDiskDrive object.

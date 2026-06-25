@@ -57,7 +57,7 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             # VM lifecycle
             'NewVM', 'GetVM', 'StartVM', 'StopVM', 'RemoveVM'
             # hardware
-            'SetProcessor', 'SetMemory', 'SetFirmware', 'SetComPort', 'GetComPort'
+            'SetProcessor', 'SetMemory', 'SetFirmware', 'SetAutomaticCheckpoints', 'SetComPort', 'GetComPort'
             # guest command delivery (the Runner serial seam)
             'InvokeGuestCommand'
             # host channels (the seal surface)
@@ -154,7 +154,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
         # from the manifest's first identifying key. TestAvailable is arg-less (excluded).
         $primaryKey = @{
             NewVM = 'Name'; GetVM = 'Name'; StartVM = 'Name'; StopVM = 'Name'; RemoveVM = 'Name'
-            SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
+            SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
             InvokeGuestCommand = 'VMName'
             SetHostChannel = 'VMName'; GetHostChannels = 'VMName'
             NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'
@@ -339,6 +339,105 @@ Describe 'Fake backend — hardware (processor / memory / firmware / COM port)' 
 
     It 'GetComPort on a missing VM throws naming the VM (fail closed)' {
         { & $script:B.GetComPort @{ VMName = 'ghost'; Number = 1 } } | Should -Throw -ExpectedMessage '*ghost*'
+    }
+}
+
+# ===========================================================================
+#  FAKE backend — SetAutomaticCheckpoints (RC7: the empty-OUTPUT root cause)
+# ===========================================================================
+#  RC7 (2026-06-25 live): Windows Hyper-V defaults AutomaticCheckpointsEnabled=ON, so each disk gets a
+#  differencing .avhdx at VM start; the guest writes result.html into the .avhdx while the host reads
+#  the BASE .vhdx (the empty pre-write layer) — every host read came back empty. Nothing in the engine
+#  disabled it. SetAutomaticCheckpoints @{ VMName; Enabled } is the new backend method (real = Set-VM
+#  -AutomaticCheckpointsEnabled; fake = flips the recorded flag), called by the Provisioner at provision
+#  time. The fake VM's initial state mirrors Hyper-V's real default (AutomaticCheckpointsEnabled=$true)
+#  so a test can prove the provisioner flips it to $false.
+Describe 'Fake backend — SetAutomaticCheckpoints (RC7)' {
+
+    BeforeEach {
+        $script:B = New-FakeHyperVBackend
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+    }
+
+    It 'a freshly-created fake VM has AutomaticCheckpointsEnabled=$true (mirrors Hyper-V''s real default)' {
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        # The fake must seed the Hyper-V default so the disable is OBSERVABLE (true -> false).
+        $vm.AutomaticCheckpointsEnabled | Should -BeTrue -Because 'Hyper-V enables automatic checkpoints by default; the fake must seed that so the disable is testable'
+    }
+
+    It 'SetAutomaticCheckpoints Enabled=$false flips the recorded flag to $false' {
+        & $script:B.SetAutomaticCheckpoints @{ VMName = 'vm1'; Enabled = $false }
+        (& $script:B.GetVM @{ Name = 'vm1' }).AutomaticCheckpointsEnabled |
+            Should -BeFalse -Because 'disabling automatic checkpoints must be host-visible on the VM record'
+    }
+
+    It 'SetAutomaticCheckpoints Enabled=$true round-trips back to $true' {
+        & $script:B.SetAutomaticCheckpoints @{ VMName = 'vm1'; Enabled = $false }
+        (& $script:B.GetVM @{ Name = 'vm1' }).AutomaticCheckpointsEnabled | Should -BeFalse
+        & $script:B.SetAutomaticCheckpoints @{ VMName = 'vm1'; Enabled = $true }
+        (& $script:B.GetVM @{ Name = 'vm1' }).AutomaticCheckpointsEnabled | Should -BeTrue
+    }
+
+    It 'SetAutomaticCheckpoints on a missing VM throws naming the VM (fail closed)' {
+        { & $script:B.SetAutomaticCheckpoints @{ VMName = 'ghost'; Enabled = $false } } |
+            Should -Throw -ExpectedMessage '*ghost*'
+    }
+
+    It 'the manifest documents SetAutomaticCheckpoints with VMName + Enabled arg keys' {
+        $m = Get-HyperVBackendMethodManifest
+        $m.Keys | Should -Contain 'SetAutomaticCheckpoints'
+        @($m['SetAutomaticCheckpoints']) | Should -Contain 'VMName'
+        @($m['SetAutomaticCheckpoints']) | Should -Contain 'Enabled'
+    }
+
+    It 'both backends expose SetAutomaticCheckpoints as a scriptblock (interface parity)' {
+        (New-RealHyperVBackend)['SetAutomaticCheckpoints'] | Should -BeOfType [scriptblock]
+        (New-FakeHyperVBackend)['SetAutomaticCheckpoints'] | Should -BeOfType [scriptblock]
+    }
+}
+
+# ===========================================================================
+#  REAL backend — SetAutomaticCheckpoints calls Set-VM -AutomaticCheckpointsEnabled (AST-pinned)
+# ===========================================================================
+#  The real backend's closures resolve their Hyper-V cmdlets against the session captured at
+#  .GetNewClosure() time, not the test scope, so an in-process Mock can't intercept (see the file
+#  header). We PIN the real SetAutomaticCheckpoints STRUCTURALLY via the AST — the same technique used
+#  for the GetDvdDrives / GetComPort guards above: the real method must call Set-VM with the
+#  -AutomaticCheckpointsEnabled parameter, and must route through the $InvokeOp fail-closed wrapper.
+Describe 'Real backend — SetAutomaticCheckpoints uses Set-VM -AutomaticCheckpointsEnabled (RC7; AST-pinned)' {
+
+    BeforeAll {
+        $tokens = $null; $parseErrors = $null
+        $script:LibAst5 = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:LibPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0 -Because 'the backend lib must parse cleanly to be analyzed'
+
+        $script:RealFn5 = $script:LibAst5.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $n.Name -eq 'New-RealHyperVBackend'
+        }, $true) | Select-Object -First 1
+        $script:RealFn5 | Should -Not -BeNullOrEmpty
+
+        # Locate the `$b.SetAutomaticCheckpoints = { ... }` assignment in the real factory.
+        $script:RealAcAssign = $script:RealFn5.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                      $n.Left.Extent.Text -eq '$b.SetAutomaticCheckpoints'
+        }, $true) | Select-Object -First 1
+    }
+
+    It 'the real factory defines SetAutomaticCheckpoints' {
+        $script:RealAcAssign | Should -Not -BeNullOrEmpty -Because 'the real backend must implement SetAutomaticCheckpoints'
+    }
+
+    It 'the REAL SetAutomaticCheckpoints calls Set-VM with -AutomaticCheckpointsEnabled' {
+        $body = $script:RealAcAssign.Right.Extent.Text
+        $body | Should -Match 'Set-VM' -Because 'disabling automatic checkpoints is Set-VM -AutomaticCheckpointsEnabled <bool>'
+        $body | Should -Match 'AutomaticCheckpointsEnabled' -Because 'the method must set the AutomaticCheckpointsEnabled property'
+    }
+
+    It 'the REAL SetAutomaticCheckpoints routes through the fail-closed $InvokeOp wrapper' {
+        $body = $script:RealAcAssign.Right.Extent.Text
+        $body | Should -Match '\$InvokeOp' -Because 'every real backend op routes through $InvokeOp so an availability/permission error becomes the single clear fail-closed message'
     }
 }
 

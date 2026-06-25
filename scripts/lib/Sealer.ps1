@@ -602,9 +602,9 @@ function Lock-Sandbox {
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.
       * Tier >= 2 STRUCTURAL invariant-6 check: the only hard disks that may be attached are the
         recorded system disk and the descriptor's RECORDED workload data disks (InputDiskPath/
-        OutputDiskPath — attached before the seal, expected to remain); ANY other attached volume is
-        treated as a residual secret/transfer volume and refused (catches an attached secret volume
-        even if its path isn't secret-shaped). An UNRECORDED data disk is still refused, so this is
+        OutputDiskPath, plus the RC6 CIDATA SeedDiskPath — all attached before the seal, expected to
+        remain); ANY other attached volume is treated as a residual secret/transfer volume and refused
+        (catches an attached secret volume even if its path isn't secret-shaped). An UNRECORDED data disk is still refused, so this is
         the AUTHORITATIVE no-net guarantee (Tier-3 scope per SCHEMA invariant-6).
       * ANY tier BEST-EFFORT backstop: an attached disk that is NOT an EXPECTED disk (recorded
         system disk + the descriptor's CreatedDisks/DiskPaths + the recorded data disks) is
@@ -702,6 +702,14 @@ function Assert-Sealed {
     # HashSet so they are compared exactly like the system/created disks (case-folding Windows paths).
     $inputDisk  = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'InputDiskPath')
     $outputDisk = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'OutputDiskPath')
+    # RC6: the disk-mode cloud-init seed rides a recorded CIDATA DATA DISK (SeedDiskPath) instead of an
+    # ejected DVD — the seal ejects DVDs, so the seed would never survive to the guest's only boot. The
+    # seed disk is attached BEFORE the seal and recorded on the descriptor, so it is EXPECTED to remain
+    # attached through the seal exactly like INPUT/OUTPUT — NOT a residual. It joins the recorded-data-
+    # disk set (Tier>=2 structural rule (c)) and the expected set (all-tier backstop (d)) below. As with
+    # input/output, an UNRECORDED disk is still refused, and a secret-SHAPED SeedDiskPath is still caught
+    # by the secret check (b) BEFORE these allowances — recording cannot launder a secret.
+    $seedDisk   = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'SeedDiskPath')
     # HARDENING 2 (path canonicalization): the set-membership compares below (the structural rule (c)
     # and the all-tier backstop (d)) test a host-truth attached path against these recorded sets with
     # an exact OrdinalIgnoreCase string compare. A recorded path and the attached path that differ
@@ -713,13 +721,15 @@ function Assert-Sealed {
     # This does NOT weaken the gate: an UNRECORDED disk's canonical form is still absent from the set,
     # so it is still refused (a genuinely-different path canonicalizes to a genuinely-different string).
     $expectedDisks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($e in (@($systemDisk) + $createdDisks + $diskPaths + @($inputDisk) + @($outputDisk))) {
+    foreach ($e in (@($systemDisk) + $createdDisks + $diskPaths + @($inputDisk) + @($outputDisk) + @($seedDisk))) {
         if (-not [string]::IsNullOrWhiteSpace([string]$e)) { [void]$expectedDisks.Add((Get-CanonicalDiskPath ([string]$e))) }
     }
     # The recorded data disks, as a set, used by the Tier>=2 STRUCTURAL rule (c) to allow them too
     # (they are expected, not residual). Same OrdinalIgnoreCase + canonicalization as the expected set.
+    # RC6: the CIDATA seed disk (SeedDiskPath) is a recorded data disk too — it must be allowed by the
+    # Tier>=2 structural rule alongside INPUT/OUTPUT (an UNRECORDED disk is still refused; see (c)).
     $recordedDataDisks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($e in (@($inputDisk) + @($outputDisk))) {
+    foreach ($e in (@($inputDisk) + @($outputDisk) + @($seedDisk))) {
         if (-not [string]::IsNullOrWhiteSpace([string]$e)) { [void]$recordedDataDisks.Add((Get-CanonicalDiskPath ([string]$e))) }
     }
     # The system disk in canonical form, for the structural rule (c)'s system-disk compare.
@@ -761,8 +771,9 @@ function Assert-Sealed {
         }
 
         # (c) Tier >= 2 STRUCTURAL check: the only attached disks may be the recorded system disk
-        # and the descriptor's RECORDED workload data disks (InputDiskPath/OutputDiskPath). ANY
-        # other attached volume is a residual secret/transfer disk — refuse (this is the invariant-6
+        # and the descriptor's RECORDED workload data disks (InputDiskPath/OutputDiskPath + the RC6
+        # CIDATA SeedDiskPath). ANY other attached volume is a residual secret/transfer disk — refuse
+        # (this is the invariant-6
         # "attached secret volume" guard that does not rely on the path being secret-shaped or
         # recorded as import media). The data disks are attached before the seal and are recorded
         # on the descriptor, so they are EXPECTED here too — but an UNRECORDED disk is still refused,

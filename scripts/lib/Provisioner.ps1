@@ -54,12 +54,14 @@
         provision rollback (above) deletes any vSwitch the provision created so a failed
         provision leaves no orphaned switch. Real backend = Remove-VMSwitch -Force (guarded by
         a Get so it's idempotent); fake = drops its in-memory record. (Also usable by the Sealer.)
-    KNOWN BACKEND GAP (NOT worked around — flagged):
-      * No method to toggle `Set-VM -AutomaticCheckpointsEnabled $false`. Automatic checkpoints
-        are undesirable for a disposable sandbox (they pin a differencing AVHDX and leak state
-        across runs). Provisioning records the INTENT on the descriptor
-        (`AutomaticCheckpointsEnabled = $false`) so the Sealer/Runner can honor it once the
-        backend grows a `SetVM`/`SetAutomaticCheckpoints` method.
+    AUTOMATIC CHECKPOINTS (RC7 — gap CLOSED 2026-06-25):
+      * Hyper-V defaults `AutomaticCheckpointsEnabled=ON`, which pins a differencing AVHDX per disk at
+        VM start: the guest writes its result into the .avhdx while the host reads the empty BASE .vhdx,
+        so every result read came back empty (a disposable sandbox also does not want checkpoints leaking
+        state across runs). The backend now has `SetAutomaticCheckpoints @{ VMName; Enabled }` (real =
+        `Set-VM -AutomaticCheckpointsEnabled`; fake flips the recorded flag), and provisioning CALLS it
+        (Enabled=$false) right after NewVM — the descriptor's `AutomaticCheckpointsEnabled=$false` field
+        now reflects the ACTUALLY-APPLIED posture, not just recorded intent.
 #>
 
 Set-StrictMode -Version Latest
@@ -213,6 +215,7 @@ function New-SandboxDescriptor {
         [string[]] $CreatedDisks = @(),            # disks THIS provision created (Remove -DeleteDisks targets these)
         [string]   $InputDiskPath  = $null,        # optional host-side INPUT disk handed to the guest
         [string]   $OutputDiskPath = $null,        # optional host-side OUTPUT disk collected from the guest
+        [string]   $SeedDiskPath   = $null,        # optional host-side CIDATA seed data disk (RC6: disk-mode cloud-init seed that survives the seal)
         [long]     $MemoryStartupBytes = 0,
         [int]      $ProcessorCount = 0,
         [bool]     $NestedVirt = $false,
@@ -234,12 +237,14 @@ function New-SandboxDescriptor {
         CreatedDisks                 = @($CreatedDisks)
         InputDiskPath                = $InputDiskPath
         OutputDiskPath               = $OutputDiskPath
+        SeedDiskPath                 = $SeedDiskPath
         MemoryStartupBytes           = $MemoryStartupBytes
         ProcessorCount               = $ProcessorCount
         NestedVirt                   = $NestedVirt
         State                        = $State
-        # Recorded INTENT — see the file header's "KNOWN BACKEND GAP". The backend has
-        # no method to actually set this yet; the descriptor preserves the desired posture.
+        # The applied automatic-checkpoints posture (RC7 — see the file header). New-SandboxVM now
+        # calls the backend's SetAutomaticCheckpoints (Enabled=$false) at provision time, so this field
+        # records the state actually applied to the VM, not just intent.
         AutomaticCheckpointsEnabled  = $AutomaticCheckpointsEnabled
     }
 }
@@ -383,6 +388,16 @@ function New-SandboxVM {
         $null = & $Backend.NewVM @{ Name = $Name; Generation = $generation; MemoryStartupBytes = $memoryBytes; Path = $storageRoot; NoVHD = $true }
         $vmCreated = $true
 
+        # --- 2a. disable automatic checkpoints (RC7) ----------------------
+        # RC7 (2026-06-25 live): Hyper-V defaults AutomaticCheckpointsEnabled=ON, so each disk gets a
+        # differencing .avhdx at VM start and the guest's writes land in the .avhdx while the host reads
+        # the empty BASE .vhdx (every result read came back empty). The descriptor has long RECORDED the
+        # intent (AutomaticCheckpointsEnabled=$false) but no backend method applied it; now it does. A
+        # disposable sandbox never wants automatic checkpoints (they pin a differencing AVHDX and leak
+        # state across runs), so this is unconditionally $false — the same value the descriptor records.
+        $autoCheckpoints = $false
+        $null = & $Backend.SetAutomaticCheckpoints @{ VMName = $Name; Enabled = $autoCheckpoints }
+
         # --- 3. memory (fixed startup; dynamic disabled for a deterministic sandbox) ---
         $null = & $Backend.SetMemory @{ VMName = $Name; StartupBytes = $memoryBytes; DynamicMemoryEnabled = $false }
 
@@ -449,7 +464,7 @@ function New-SandboxVM {
             -ProcessorCount     $cpuCount `
             -NestedVirt         $nestedVirt `
             -State              $state `
-            -AutomaticCheckpointsEnabled $false
+            -AutomaticCheckpointsEnabled $autoCheckpoints
 
         # BELT-AND-BRACES (a real-backend bug found during live debugging): guarantee this function emits EXACTLY the
         # descriptor and nothing else. If a future edit reintroduces an uncaptured backend emission

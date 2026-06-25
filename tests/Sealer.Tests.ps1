@@ -717,6 +717,83 @@ Describe 'Assert-Sealed — accepts RECORDED workload data disks, still rejects 
             Should -Not -Throw -Because 'a recorded data disk given in a non-canonical-but-equivalent form must be matched after canonicalization (availability: it is the SAME disk)'
         Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
     }
+
+    # --- RC6: the CIDATA seed DATA DISK is a recorded, expected disk that survives the seal ---
+    #     The seal ejects DVDs, so the disk-mode cloud-init seed rides a recorded CIDATA data disk
+    #     instead. Assert-Sealed must ACCEPT a disk recorded on SeedDiskPath exactly like INPUT/OUTPUT
+    #     (at every tier, including the Tier>=2 structural rule), WITHOUT weakening the unrecorded-disk
+    #     refusal or letting a secret-shaped seed path launder past the secret check.
+    It 'ACCEPTS a recorded CIDATA SEED data disk attached to a Tier-0 sealed VM (RC6)' {
+        $t0 = $script:Tier1.Clone()
+        $t0['Tier']        = 0
+        $t0['Description'] = 'TEST FIXTURE — Tier 0 (recorded-seed-disk RC6).'
+        Assert-TierProfileValid -Profile $t0 -Context 'TEST Tier-0 seed-disk fixture'
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $t0 -Name 'sbx-g4seed0' -Backend $b
+        Lock-Sandbox -Descriptor $d -Backend $b
+        $seedDisk = Join-Path (Get-SandboxStorageRoot -Name 'sbx-g4seed0') 'sbx-g4seed0-cidata.vhdx'
+        & $b.NewOutputVhdx @{ Path = $seedDisk; Label = 'CIDATA'; FileSystem = 'FAT32'; SizeBytes = 64MB }
+        & $b.AddHardDiskDrive @{ VMName = 'sbx-g4seed0'; Path = $seedDisk }
+        $d.SeedDiskPath = $seedDisk   # RECORDED -> expected, not residual
+        (Test-IsSecretPath -Path $seedDisk) | Should -BeFalse -Because 'precondition: the CIDATA seed disk is not secret-shaped'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Not -Throw -Because 'a data disk recorded on the descriptor (SeedDiskPath) is an EXPECTED disk that survives the seal — the gate must certify'
+        Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
+    }
+
+    It 'ACCEPTS a recorded CIDATA SEED data disk on a Tier-2 sealed VM (structural rule allows it too) (RC6)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier2 -Name 'sbx-g4seed2'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        $seedDisk = Join-Path (Get-SandboxStorageRoot -Name 'sbx-g4seed2') 'sbx-g4seed2-cidata.vhdx'
+        & $b.NewOutputVhdx @{ Path = $seedDisk; Label = 'CIDATA'; FileSystem = 'FAT32'; SizeBytes = 64MB }
+        & $b.AddHardDiskDrive @{ VMName = 'sbx-g4seed2'; Path = $seedDisk }
+        $d.SeedDiskPath = $seedDisk
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Not -Throw -Because 'the recorded SeedDiskPath is an EXPECTED data disk at Tier-2 too — the structural rule must allow it'
+        Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
+    }
+
+    It 'still REFUSES an UNRECORDED extra disk even alongside a recorded CIDATA seed disk (RC6 regression guard)' {
+        # Recording the seed disk must NOT open the door to an arbitrary residual at any tier.
+        $t0 = $script:Tier1.Clone()
+        $t0['Tier']        = 0
+        $t0['Description'] = 'TEST FIXTURE — Tier 0 (seed-disk + unrecorded residual RC6).'
+        Assert-TierProfileValid -Profile $t0 -Context 'TEST Tier-0 seed+residual fixture'
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $t0 -Name 'sbx-g4seedrogue0' -Backend $b
+        Lock-Sandbox -Descriptor $d -Backend $b
+        $seedDisk = Join-Path (Get-SandboxStorageRoot -Name 'sbx-g4seedrogue0') 'sbx-g4seedrogue0-cidata.vhdx'
+        & $b.NewOutputVhdx @{ Path = $seedDisk; Label = 'CIDATA'; FileSystem = 'FAT32'; SizeBytes = 64MB }
+        & $b.AddHardDiskDrive @{ VMName = 'sbx-g4seedrogue0'; Path = $seedDisk }
+        $d.SeedDiskPath = $seedDisk   # one recorded seed disk is fine...
+        # ...but an UNRECORDED extra disk must still be refused.
+        $rogue = Join-Path (Get-SandboxStorageRoot -Name 'sbx-g4seedrogue0') 'rogue.vhdx'
+        & $b.NewVHD @{ Path = $rogue; SizeBytes = 64MB; Dynamic = $true }
+        & $b.AddHardDiskDrive @{ VMName = 'sbx-g4seedrogue0'; Path = $rogue }
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*unexpected*' -Because 'an UNRECORDED attached disk is still a residual — accepting the recorded seed disk must not weaken this'
+    }
+
+    It 'Assert-Sealed REFUSES a secret-shaped path recorded as SeedDiskPath (recording cannot launder a secret) (RC6)' {
+        $t0 = $script:Tier1.Clone()
+        $t0['Tier']        = 0
+        $t0['Description'] = 'TEST FIXTURE — Tier 0 (secret-laundering-via-SeedDiskPath RC6).'
+        Assert-TierProfileValid -Profile $t0 -Context 'TEST Tier-0 secret-seed fixture'
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $t0 -Name 'sbx-g4secseed0' -Backend $b
+        Lock-Sandbox -Descriptor $d -Backend $b
+        # A SECRET-SHAPED disk path (leaf '.env.vhdx' matches Test-IsSecretPath), attached AND recorded
+        # as the descriptor's SeedDiskPath. The recording must NOT bypass the secret-shape check (b),
+        # which runs BEFORE the recorded-disk allowance (c)/(d) in the same loop iteration.
+        $secretSeed = Join-Path (Get-SandboxStorageRoot -Name 'sbx-g4secseed0') '.env.vhdx'
+        & $b.NewVHD @{ Path = $secretSeed; SizeBytes = 64MB; Dynamic = $true }
+        & $b.AddHardDiskDrive @{ VMName = 'sbx-g4secseed0'; Path = $secretSeed }
+        $d.SeedDiskPath = $secretSeed   # RECORDED — must still NOT bypass the secret check
+        (Test-IsSecretPath -Path $secretSeed) | Should -BeTrue -Because 'precondition: the recorded SeedDiskPath is genuinely secret-shaped'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*secret*' -Because 'a secret-shaped path recorded as SeedDiskPath must STILL be refused — recording a disk cannot launder a secret'
+    }
 }
 
 # ===========================================================================

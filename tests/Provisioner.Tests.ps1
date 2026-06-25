@@ -165,6 +165,31 @@ Describe 'New-SandboxVM — firmware defaults the Linux Secure Boot template (RC
 }
 
 # ===========================================================================
+#  New-SandboxVM — RC7: disables automatic checkpoints at provision time
+# ===========================================================================
+Describe 'New-SandboxVM — disables automatic checkpoints (RC7)' {
+    # RC7 (2026-06-25 live): Hyper-V defaults AutomaticCheckpointsEnabled=ON, so each disk gets a
+    # differencing .avhdx at VM start and the guest's writes land in the .avhdx while the host reads
+    # the empty BASE .vhdx. The descriptor has long RECORDED the intent (AutomaticCheckpointsEnabled
+    # =$false) but nothing applied it. New-SandboxVM must now call the backend's SetAutomaticCheckpoints
+    # at provision time so the VM record reads automatic checkpoints OFF.
+
+    It 'turns AutomaticCheckpointsEnabled OFF on the provisioned VM (was ON by Hyper-V default)' {
+        $b = New-FakeHyperVBackend
+        # Sanity: the fake seeds the Hyper-V default (ON) on NewVM, so a flip to OFF is observable.
+        $null = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ac' -Backend $b
+        (& $b.GetVM @{ Name = 'sbx-ac' }).AutomaticCheckpointsEnabled |
+            Should -BeFalse -Because 'RC7: the provisioner must disable automatic checkpoints so the host reads the base .vhdx, not an empty .avhdx layer'
+    }
+
+    It 'the descriptor still records AutomaticCheckpointsEnabled=$false (intent matches the applied state)' {
+        $b = New-FakeHyperVBackend
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ac2' -Backend $b
+        $desc.AutomaticCheckpointsEnabled | Should -BeFalse -Because 'the descriptor records the desired (now actually-applied) posture'
+    }
+}
+
+# ===========================================================================
 #  New-SandboxVM — the returned sandbox descriptor (consumed by the Sealer/Runner/Reaper)
 # ===========================================================================
 Describe 'New-SandboxVM — returns a sandbox descriptor the Sealer/Runner/Reaper consume' {

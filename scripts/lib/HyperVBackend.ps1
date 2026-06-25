@@ -98,6 +98,14 @@ function Get-HyperVBackendMethodManifest {
         SetProcessor         = @('VMName', 'Count', 'ExposeVirtualizationExtensions')
         SetMemory            = @('VMName', 'StartupBytes', 'DynamicMemoryEnabled', 'MinimumBytes', 'MaximumBytes')
         SetFirmware          = @('VMName', 'EnableSecureBoot', 'SecureBootTemplate', 'BootOrder')
+        # RC7 (2026-06-25 live): disable Hyper-V's automatic checkpoints. Hyper-V defaults
+        # AutomaticCheckpointsEnabled=ON, so each disk gets a differencing .avhdx at VM start; the guest
+        # writes its result into the .avhdx while the host reads the BASE .vhdx (the empty pre-write
+        # layer) -> every host read came back empty. The Provisioner calls this at provision time to turn
+        # automatic checkpoints OFF for a disposable sandbox. REAL = Set-VM -AutomaticCheckpointsEnabled
+        # <bool>; FAKE = flips the recorded AutomaticCheckpointsEnabled flag on the VM record. Added per
+        # the SetFirmware/RemoveVHD addendum precedent (manifest + both factories + parity/drift tests).
+        SetAutomaticCheckpoints = @('VMName', 'Enabled')           # Set-VM -AutomaticCheckpointsEnabled
         SetComPort           = @('VMName', 'Number', 'Path')        # COM1 named-pipe (Linux mgmt channel)
         # Host-TRUTH read of a VM's COM port (the Runner's COM1 serial command channel). Returns
         # @{ Number; Path } for the requested port, or $null when no port / an empty path. Backs
@@ -561,6 +569,20 @@ function New-RealHyperVBackend {
             # fails closed with a clear restart-vmms/reboot-host message instead of a raw cmdlet error.
             # The helper only retries that specific enumeration error; any other failure rethrows at once.
             & $FirmwareRetry -Operation { Set-VMFirmware @p }
+        }
+    }.GetNewClosure()
+
+    # RC7: turn Hyper-V's automatic checkpoints OFF (or on). Hyper-V defaults
+    # AutomaticCheckpointsEnabled=ON, which pins a differencing .avhdx per disk at VM start so the host
+    # reads the empty BASE .vhdx instead of the guest's writes. The Provisioner calls this at provision
+    # time with Enabled=$false. Effect-only; route through $InvokeOp like the rest of the real backend.
+    # Hoist $P reads into locals BEFORE $InvokeOp (see NewVHD note).
+    $b.SetAutomaticCheckpoints = {
+        param([System.Collections.IDictionary] $P)
+        $vm      = & $AssertArg $P 'VMName' 'SetAutomaticCheckpoints'
+        $enabled = [bool](& $GetArg $P 'Enabled' $false)
+        & $InvokeOp {
+            $null = Set-VM -Name $vm -AutomaticCheckpointsEnabled $enabled -ErrorAction Stop
         }
     }.GetNewClosure()
 
@@ -1307,6 +1329,9 @@ function New-FakeHyperVBackend {
             ExposeVirtualizationExtensions = $false
             SecureBootEnabled              = $false
             SecureBootTemplate             = $null
+            # RC7: seed Hyper-V's REAL default (automatic checkpoints ON) so SetAutomaticCheckpoints's
+            # flip to $false is OBSERVABLE — a test can assert New-SandboxVM turns it off.
+            AutomaticCheckpointsEnabled    = $true
             ComPorts                       = @{}                                       # number -> pipe path
             GuestCommands                  = [System.Collections.Generic.List[object]]::new()  # commands delivered over the COM1 serial seam (Runner)
             HardDrives                     = [System.Collections.Generic.List[object]]::new()
@@ -1415,6 +1440,15 @@ function New-FakeHyperVBackend {
         $vm = & $requireVM (& $GetArg $P 'VMName') 'SetFirmware'
         $sb = & $GetArg $P 'EnableSecureBoot'; if ($null -ne $sb) { $vm.SecureBootEnabled = [bool]$sb }
         $tmpl = & $GetArg $P 'SecureBootTemplate'; if ($null -ne $tmpl) { $vm.SecureBootTemplate = $tmpl }
+    }.GetNewClosure()
+
+    # RC7: the fake's analogue of Set-VM -AutomaticCheckpointsEnabled — flip the recorded flag on the VM
+    # record. Mirrors the real backend (which calls Set-VM); the fake models the resulting host-truth
+    # state so a test can assert New-SandboxVM turns automatic checkpoints off (true -> false).
+    $b.SetAutomaticCheckpoints = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $requireVM (& $GetArg $P 'VMName') 'SetAutomaticCheckpoints'
+        $vm.AutomaticCheckpointsEnabled = [bool](& $GetArg $P 'Enabled' $false)
     }.GetNewClosure()
 
     $b.SetComPort = {

@@ -103,6 +103,100 @@ function New-WorkloadDisks {
 
 <#
 .SYNOPSIS
+    Voidseal — RC6: deliver the disk-mode cloud-init NoCloud seed on a CIDATA DATA DISK that survives
+    the seal (the seal ejects DVDs; a recorded data disk stays attached through it).
+
+.DESCRIPTION
+    RC6 (2026-06-25 live): the seal EJECTS the seed DVD before the guest's ONLY boot, so cloud-init had
+    no datasource and the disk-mode runner never ran (the sealed deploy timed out). E8 proved cloud-init
+    NoCloud reads `user-data` + `meta-data` off a vfat DATA DISK labelled `CIDATA`. So in disk mode the
+    seed must ride a recorded data disk, NOT an ejected DVD.
+
+        New-WorkloadSeedDisk -Descriptor <descriptor> -Profile <hashtable> -StorageRoot <dir> [-Backend]
+
+    Creates a small CIDATA-labelled data disk (NewOutputVhdx, FAT32 — a vfat cloud-init reads), writes
+    `user-data` (= New-CidataUserData -Profile <resolved>, the disk-mode runner with the Entrypoint
+    substituted) and `meta-data` (= New-CidataMetaData) at the disk ROOT (WriteVhdxFile), ATTACHES it
+    (AddHardDiskDrive), and RECORDS it on the descriptor (a SeedDiskPath field AND a deduped append to
+    CreatedDisks) BEFORE the seal — exactly like the INPUT/OUTPUT data disks — so:
+      * teardown (Remove-Sandbox -DeleteDisks, CreatedDisks-authoritative) deletes it, and
+      * Assert-Sealed ACCEPTS it as an EXPECTED disk (it adds the recorded SeedDiskPath to its
+        expected/data-disk sets) instead of refusing it as a residual.
+
+    LINE ENDINGS: New-CidataUserData LF-normalizes its output (the embedded `#!/bin/sh` runner needs LF
+    — a CRLF yields a `/bin/sh\r` bad-interpreter failure). The host write goes through the backend's
+    WriteVhdxFile, which writes the content STRING verbatim (Set-Content -NoNewline -Encoding utf8
+    preserves LF + adds no BOM — verified on this host). We LF-normalize once more here as belt-and-
+    braces so the seed disk's user-data is LF-only regardless of any future content-source change.
+
+    FAIL-CLOSED: New-CidataUserData refuses a blank/single-quote/multi-line Disk-mode Entrypoint, so a
+    bad entrypoint throws here BEFORE any disk is created — the same gate the SeedBuilder applies.
+
+    EVERYTHING touches Hyper-V / the host disk through the backend; effect-only calls go through
+    `$null = & $Backend.X @{...}` (output-stream-pollution discipline). Returns the mutated descriptor.
+    Dot-source AFTER HyperVBackend.ps1 + Provisioner.ps1 + SeedBuilder.ps1 (function resolution is at
+    call time, so the dot-source ORDER among the libs does not matter for the runtime call).
+.PARAMETER Descriptor
+    The sandbox descriptor (consumed + mutated: SeedDiskPath + CreatedDisks).
+.PARAMETER Profile
+    The resolved profile (must declare WorkloadMode='Disk' + a non-blank Entrypoint).
+.PARAMETER StorageRoot
+    The host-side storage dir the seed disk lands in (beside the INPUT/OUTPUT data disks).
+.PARAMETER Backend
+    The Hyper-V backend. Defaults to the real one; tests inject the fake.
+#>
+function New-WorkloadSeedDisk {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] $Descriptor,
+        [Parameter(Mandatory)] [hashtable] $Profile,
+        [Parameter(Mandatory)] [string] $StorageRoot,
+        [hashtable] $Backend = (New-RealHyperVBackend)
+    )
+    $name     = [string]$Descriptor.Name
+    $seedPath = Join-Path $StorageRoot ("{0}-cidata.vhdx" -f $name)
+
+    # Build the NoCloud documents FIRST. New-CidataUserData fails closed on a bad Disk-mode Entrypoint
+    # (blank / single-quote / multi-line) BEFORE we create any disk — so a rejected entrypoint produces
+    # no seed disk. Both documents are LF-normalized (the user-data embeds a #!/bin/sh runner; a CRLF
+    # there is a guest bad-interpreter failure). Belt-and-braces re-normalize so the on-disk seed is
+    # LF-only regardless of the content source.
+    $userData = ConvertTo-LfText -Text ([string](New-CidataUserData -Profile $Profile))
+    $metaData = ConvertTo-LfText -Text ([string](New-CidataMetaData))
+
+    # CIDATA disk: create -> RECORD (field + CreatedDisks) -> populate -> attach. The record happens
+    # right after CREATE (before populate/attach) so even a populate/attach throw leaves the disk
+    # recorded for teardown (the same incremental-record invariant New-WorkloadDisks uses). FAT32 is a
+    # vfat cloud-init reads; the CIDATA label is how NoCloud finds the seed. ~64MB is ample for two
+    # tiny text files. Effect-only backend calls are suppressed ($null = ...) so a real-backend
+    # emission can't leak into this function's return stream.
+    $null = & $Backend.NewOutputVhdx @{ Path = $seedPath; Label = 'CIDATA'; FileSystem = 'FAT32'; SizeBytes = 64MB }
+    # Record the seed disk on the descriptor BEFORE populate/attach (orphan-window fix) AND so
+    # Assert-Sealed accepts it as an EXPECTED disk. SeedDiskPath is its own field (audit / the seal+gate
+    # know it by name; New-SandboxDescriptor declares it, so a direct assignment is StrictMode-safe) and
+    # it joins CreatedDisks (teardown's authoritative cleanup set), deduped.
+    $Descriptor.SeedDiskPath = $seedPath
+    $set = [System.Collections.Generic.List[string]]::new()
+    foreach ($cd in @($Descriptor.CreatedDisks)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$cd)) { $set.Add([string]$cd) }
+    }
+    if ($set -notcontains $seedPath) { $set.Add($seedPath) }
+    $Descriptor.CreatedDisks = $set.ToArray()
+
+    # Write the two NoCloud documents at the disk ROOT (cloud-init NoCloud expects user-data + meta-data
+    # at the volume root). WriteVhdxFile writes the content verbatim (LF preserved, no BOM).
+    $null = & $Backend.WriteVhdxFile @{ Path = $seedPath; InnerPath = 'user-data'; Content = $userData }
+    $null = & $Backend.WriteVhdxFile @{ Path = $seedPath; InnerPath = 'meta-data'; Content = $metaData }
+
+    # Attach the seed disk to the VM BEFORE the seal so the seal's host-truth scan records it.
+    $null = & $Backend.AddHardDiskDrive @{ VMName = $name; Path = $seedPath }
+
+    return $Descriptor
+}
+
+<#
+.SYNOPSIS
     Voidseal — wait for a sandbox workload to finish (disk-passing workload).
 
 .DESCRIPTION
