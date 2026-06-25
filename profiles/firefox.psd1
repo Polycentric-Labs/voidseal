@@ -129,16 +129,11 @@
         'C:\sandbox\firefox-organizer-out'  = '/work/out'
     }
 
-    # ------------------------------------------------------------------
-    # StageAssets (SUPERSEDED for Disk mode — SERIAL/CONTAINER-ERA, kept for shape/history).
-    # In the Disk model the organizer script is NOT staged as an ISO to /opt/organizer; it rides
-    # the INPUT data disk (Inputs/InputFiles -> /mnt/in/organize_bookmarks.py). Retained only as
-    # documentation of the pre-Disk staging mechanism + as a loader secret-screen regression guard.
-    # The KEY is the host source the Importer attached; the VALUE documents it. Not secret-shaped.
-    # ------------------------------------------------------------------
-    StageAssets = @{
-        'C:\sandbox\assets\firefox-organizer.iso' = 'organize_bookmarks.py + helpers (reads a places.sqlite COPY + mozlz4 backups, emits <!DOCTYPE NETSCAPE-Bookmark-file-1> HTML). [SUPERSEDED by the INPUT data disk for Disk mode — the script now rides /mnt/in.]'
-    }
+    # StageAssets: REMOVED 2026-06-25 (post-live-acceptance tidy). In Disk mode the organizer rides the
+    # INPUT data disk (Inputs -> /mnt/in/organize_bookmarks.py), so the superseded firefox-organizer.iso
+    # DVD was being imported-then-ejected-by-the-seal for nothing. The loader's secret-screen regression
+    # coverage lives in the ProfileLoader tests (synthetic profiles), not in a profile carrying a
+    # placeholder StageAssets. Pre-Disk staging history is in git.
 
     # ------------------------------------------------------------------
     # SeedIso — STILL APPLIES in Disk mode. The cloud-init NoCloud CIDATA seed is attached

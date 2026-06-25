@@ -8,10 +8,11 @@ description: >
   "deploy a sandboxed / airgapped VM", "run this in a throwaway VM", "sandbox this
   agent loop / plugin / untrusted code", or invokes /voidseal. Two v1 workload
   profiles ship: `ralph` (Tier-1 net-restricted Claude Code agent loop) and `firefox`
-  (Tier-0 bookmark organizer on a profile COPY). Tier 0 (container, net-OK) + Tier 1
-  (net-restricted VM) are fully exercised; Tier 2 (disposable no-net) + Tier 3
-  (airgapped detonation) are scaffolded/harness-only this round — NO live malware or
-  plugin detonation. Live runs require an ELEVATED session (Hyper-V Administrators).
+  (Tier-0 bookmark organizer on a profile COPY). Tier 0 is live-proven on real Hyper-V
+  (firefox disk-mode round-trip); Tier 1 (net-restricted VM) is mock-green with its live
+  run pending; Tier 2 (disposable no-net) + Tier 3 (airgapped detonation) are
+  scaffolded/harness-only this round — NO live malware or plugin detonation. Live runs
+  require an ELEVATED session (Hyper-V Administrators).
 ---
 
 # voidseal — risk-tiered sandbox VM provisioning
@@ -29,15 +30,18 @@ INIT -> PROVISIONED -> STAGED -> SEALED -> RUNNING -> CAPTURED -> EXTRACTED -> D
 assume the agent/code inside is a prompt-injectable insider; make the blast radius
 structurally small. Isolation strength is matched to the task's risk via the **tier axis**.
 
-> **Status (v1):** core engine + the Tier 0/1 Hyper-V provisioning paths built + tested —
-> the whole module is **mock-backed and green** (all tests run against the fake Hyper-V
-> backend; the first real elevated run is the live smoke test (operator-run, elevated) — see [Testing](#testing) and
-> [Elevation requirement](#elevation-requirement)). Tier 0's **container substrate is not
-> yet built** (v1 provisions Tier 0 via the Hyper-V path; the Docker / `docker sbx` /
-> sandbox-runtime substrate is a planned future addition). Tier 2/3 are **scaffolded code
-> paths validated with benign inputs only** — no untrusted plugin or malware is run until
-> you explicitly green-light verified isolation. Credential-injecting host-Envoy is
-> **deferred to Phase-1B** (v1 egress is a credential-FREE FQDN/nftables allowlist).
+> **Status (v1):** core engine + the Tier 0/1 Hyper-V provisioning paths built + tested. The whole
+> module is **mock-backed green (485 tests)**, AND the **Tier-0 `firefox` disk-mode round-trip is now
+> LIVE-PROVEN on real Hyper-V** (2026-06-25 — Milestone 3: provision → host-verified seal gate →
+> disk-passing workload → host-read result → clean teardown, end to end; the first live run drove out
+> 7 real `fake≠real` host/Hyper-V gaps, all since fixed). The **Tier-1 `ralph` live run is still
+> pending** (mock-green; not yet exercised on metal — and serial-mode seed delivery needs the same
+> seal-survival treatment disk mode got). Tier 0's **container substrate is not yet built** (v1
+> provisions Tier 0 via the Hyper-V path; the Docker / `docker sbx` / sandbox-runtime substrate is a
+> planned future addition). Tier 2/3 are **scaffolded code paths validated with benign inputs only** —
+> no untrusted plugin or malware is run until you explicitly green-light verified isolation.
+> Credential-injecting host-Envoy is **deferred to Phase-1B** (v1 egress is a credential-FREE
+> FQDN/nftables allowlist).
 
 ## The tier model
 
