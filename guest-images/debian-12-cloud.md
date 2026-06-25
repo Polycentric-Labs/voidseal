@@ -137,9 +137,14 @@ consumes it, then it is detached as part of the import-then-seal ritual.
 > (`firefox.psd1`). The canonical emitter is **`New-CidataSeed`** (`scripts/lib/SeedBuilder.ps1`,
 > dot-sourced by `scripts/Invoke-Voidseal.ps1`): it holds this runner as a template, substitutes the
 > profile's `Entrypoint` for `__ENTRYPOINT__`, and writes the `CIDATA` ISO via built-in Windows IMAPI2.
-> The block below is the human-readable mirror of that template (kept in sync; `New-CidataSeed` is the
-> source of truth that actually ships in a seed). It replaces the COM1-serial command channel with the
-> **disk-passing model**.
+> The block below is the human-readable mirror of that template
+> (`SeedBuilder.ps1`'s `$script:CidataDiskRunnerTemplate` is the source of truth that actually ships in a
+> seed). It replaces the COM1-serial command channel with the **disk-passing model**: the host creates +
+> host-formats two exFAT data disks (label **`INPUT`**, label **`OUTPUT`**), populates `INPUT`
+> from the profile's `Inputs`, attaches both **before the seal**, then starts the VM. The guest
+> mounts them by LABEL, runs the workload, writes its result + an exit-code sentinel to `OUTPUT`,
+> flushes (`umount`), and **self-powers-off**. The host polls `State == Off`, detaches, reads, and
+> classifies (`Wait-WorkloadComplete` → `Read-WorkloadResult` in `scripts/lib/Workload.ps1`).
 >
 > **Live-acceptance updates (2026-06-24 — see `_dev/2026-06-24-live-acceptance-findings.md`):** the
 > shipped runner now also (RC2) **creates the non-root `sandbox` user** via a cloud-config `users:` block
@@ -147,14 +152,8 @@ consumes it, then it is detached as part of the import-then-seal ritual.
 > to a plain `mount LABEL=…`** (the live cloud kernel failed the uid/gid mount where a plain mount
 > worked), tracking whether OUTPUT mounted sandbox-owned so it only runs the entrypoint as `sandbox` when
 > that user can actually write; and (RC3) **masks `systemd-networkd-wait-online.service`** in `bootcmd`
-> (network is disabled, so its ~47 s wait was pure dead time). The mount/run sequence below is otherwise
-> unchanged; consult `SeedBuilder.ps1` for the exact current shell.
-> the host creates +
-> host-formats two exFAT data disks (label **`INPUT`**, label **`OUTPUT`**), populates `INPUT`
-> from the profile's `Inputs`, attaches both **before the seal**, then starts the VM. The guest
-> mounts them by LABEL, runs the workload, writes its result + an exit-code sentinel to `OUTPUT`,
-> flushes (`umount`), and **self-powers-off**. The host polls `State == Off`, detaches, reads, and
-> classifies (`Wait-WorkloadComplete` → `Read-WorkloadResult` in `scripts/lib/Workload.ps1`).
+> (network is disabled, so its ~47 s wait was pure dead time). The block below is a **verbatim** mirror
+> of the shipped template as of that update.
 
 ### The contract this runner MUST match (engine defaults — do NOT drift)
 
@@ -193,60 +192,77 @@ path, never a hang.
 ```yaml
 #cloud-config
 network: {config: disabled}
-# NO package_update / packages / apt — sealed guest, no network. The image already
-# contains the workload's runtime (e.g. python3). The workload + its inputs arrive on
-# the INPUT data disk; results go to the OUTPUT data disk; the guest self-powers-off.
+# Voidseal disk-mode workload seed. NO apt / no network — sealed, offline guest. The image already
+# contains the runtime (e.g. python3). The workload + its inputs arrive on the INPUT data disk;
+# results go to the OUTPUT data disk; the guest self-powers-off and the host reads the result.
+
+# RC2 (2026-06-24 live): the golden image has NO 'sandbox' user and the disk seed never created one,
+# so `runuser -u sandbox` / the uid/gid mount options had no user to own the volumes (SBX_UID fell
+# back to 0). Create the non-root sandbox user here, identically to the serial baseline.
+users:
+  - name: sandbox
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    lock_passwd: true          # no password login anywhere; this is a sealed offline guest
+
+# RC3 (2026-06-24 live): network is {config: disabled} for this sealed offline guest, yet
+# systemd-networkd-wait-online.service still blocked ~47s of every boot for a network that never
+# comes up — pure dead time. Mask it EARLY (bootcmd runs before systemd brings the unit up) so the
+# wait never happens. Network stays disabled; this only removes the pointless wait.
+bootcmd:
+  - [ systemctl, mask, --now, systemd-networkd-wait-online.service ]
 
 write_files:
   - path: /usr/local/sbin/vmdep-workload
     permissions: '0755'
     content: |
       #!/bin/sh
-      # Voidseal disk-mode workload runner. Mounts the host-pre-formatted exFAT data disks by
-      # LABEL, runs the workload AS A NON-ROOT USER, writes result + exit-code sentinel to the OUTPUT
-      # disk, flushes (umount), and powers off. The host reads result.html + result.exitcode. The
-      # runner itself is root (mount/umount/poweroff need it); only the workload entrypoint drops to
-      # the unprivileged 'sandbox' user (created in the image build, §2 above).
+      # Voidseal disk-mode workload runner: mount the host-pre-formatted exFAT data disks by LABEL,
+      # run the workload as the non-root 'sandbox' user (when the volume is sandbox-owned), write
+      # result + an exit-code sentinel to the OUTPUT disk, flush (umount), and power off. The host
+      # reads result.html + result.exitcode.
       set +e
-      # Resolve the unprivileged run-user. If it's missing (misconfigured image), uid/gid fall back
-      # to 0 and the entrypoint runs as root below (degraded, but the run still completes) — a missing
-      # user must not silently fail the run.
       SBX_UID=$(id -u sandbox 2>/dev/null || echo 0)
       SBX_GID=$(id -g sandbox 2>/dev/null || echo 0)
       modprobe exfat 2>/dev/null   # host-pre-formatted exFAT; in-kernel since 5.7. No mkfs in guest.
       mkdir -p /mnt/in /mnt/out
-      # The INPUT/OUTPUT SCSI data disks are not in fstab, so nothing ordered this unit after they were
-      # enumerated; settle udev so mount-by-LABEL resolves /dev/disk/by-label reliably on first boot.
+      # The INPUT/OUTPUT SCSI data disks are not in fstab; settle udev so mount-by-LABEL resolves.
       udevadm settle 2>/dev/null
-      # exFAT is not POSIX — file ownership comes from the uid=/gid= mount options. Own both volumes by
-      # the sandbox user so the non-root entrypoint can read /mnt/in and write /mnt/out. (root still
-      # writes the sentinel below regardless — root bypasses the ownership check.)
-      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in   2>/dev/null
-      mount -o    uid=$SBX_UID,gid=$SBX_GID LABEL=OUTPUT /mnt/out  2>/dev/null
-      # If OUTPUT didn't mount there's nowhere to write the sentinel -> power off so the host stops
-      # waiting (it classifies Failed: no sentinel). The `exit` is LOAD-BEARING: systemd `poweroff` is
-      # ASYNCHRONOUS and returns 0, so WITHOUT it the script would keep running against an unmounted
-      # /mnt/out and write into the live rootfs during the shutdown window (undefined behavior).
+      # RC4 (2026-06-24 live): the uid=/gid= mount options give the non-root entrypoint ownership of the
+      # exFAT (non-POSIX) volume, BUT on the live cloud kernel that mount FAILED where a PLAIN mount
+      # worked (the serial probe proved `mount LABEL=OUTPUT /mnt/out` succeeds). So mount ROBUSTLY: try
+      # the uid/gid mount first, and FALL BACK to a plain mount on failure — OUTPUT must always mount so
+      # the result + sentinel can be written. Track whether the sandbox-owned (uid/gid) OUTPUT mount won;
+      # only then is it safe to run the entrypoint as the non-root sandbox user (else it can't write).
+      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in  2>/dev/null || mount LABEL=INPUT  /mnt/in  2>/dev/null
+      # OUTPUT: try the sandbox-owning uid/gid mount; record whether IT won (so we only run the
+      # entrypoint as the non-root user when it can actually write), then fall back to a plain mount.
+      OUT_SANDBOX_OWNED=0
+      if mount -o uid=$SBX_UID,gid=$SBX_GID LABEL=OUTPUT /mnt/out 2>/dev/null; then OUT_SANDBOX_OWNED=1; fi
+      mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out 2>/dev/null
+      # No OUTPUT -> nowhere to write the sentinel -> poweroff (host classifies Failed: no sentinel).
+      # The `exit` is LOAD-BEARING: systemd poweroff is async + returns 0, so without it the script
+      # would run on against an unmounted /mnt/out and write into the live rootfs during shutdown.
       if ! mountpoint -q /mnt/out; then poweroff; exit 0; fi
-      # If INPUT didn't mount, the workload can't read its inputs (the entrypoint itself lives on
-      # /mnt/in). Record a clear non-zero sentinel on OUTPUT so the host classifies Failed with a
-      # determinate exit code, flush, and power off.
+      # No INPUT -> the entrypoint (which lives on /mnt/in) can't run; record a determinate non-zero
+      # sentinel so the host classifies Failed with a definite code, flush, power off.
       if ! mountpoint -q /mnt/in; then printf '%s' 70 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
-      # --- run the workload ONCE, as the unprivileged sandbox user (the seed builder substitutes
-      # __ENTRYPOINT__ from the profile). The entrypoint MUST write its own result to
-      # /mnt/out/result.html (the firefox organizer does, via --out /mnt/out/result.html). The runner
-      # does NOT redirect stdout into result.html: capturing stdout there WHILE the script also opens
-      # it via --out is a double-write (undefined order; can 0-byte or corrupt the required Netscape-
-      # HTML). stdout/stderr go to SEPARATE logs for diagnosis (the host ignores them). NOTE: the
-      # entrypoint is run via `sh -c '<entrypoint>'`, so it must not contain a single quote. ---
-      if id -u sandbox >/dev/null 2>&1; then
+      # Run the workload ONCE. Prefer the unprivileged 'sandbox' user, but ONLY when OUTPUT is
+      # sandbox-OWNED (the uid/gid mount won) AND the user exists — otherwise a non-root run could not
+      # write to a root-owned plain-mounted /mnt/out. Fall back to root in every other case (v1: the VM
+      # boundary is the containment, not the in-guest user — see the live-acceptance findings RC4).
+      # The entrypoint writes its OWN result to /mnt/out/result.html (firefox: --out). stdout/stderr
+      # go to SEPARATE logs (the host ignores them) — never redirected into result.html (a double-
+      # write with the entrypoint's own --out can 0-byte/corrupt the required Netscape-HTML).
+      # NOTE: run via sh -c '<entrypoint>', so the entrypoint must contain no single quote.
+      if [ "$OUT_SANDBOX_OWNED" = "1" ] && id -u sandbox >/dev/null 2>&1; then
         runuser -u sandbox -- /bin/sh -c '__ENTRYPOINT__' > /mnt/out/stdout.log 2> /mnt/out/stderr.txt
       else
-        # No 'sandbox' user in the image — degrade to a root run (prior behavior) rather than failing.
         /bin/sh -c '__ENTRYPOINT__' > /mnt/out/stdout.log 2> /mnt/out/stderr.txt
       fi
       rc=$?
-      # --- write the sentinel LAST, after the result is on disk (root; bypasses the exFAT uid owner) ---
+      # Sentinel LAST (root; bypasses the exFAT uid owner) — its presence means the result is on disk.
       printf '%s' "$rc" > /mnt/out/result.exitcode
       sync
       umount /mnt/out
@@ -269,11 +285,9 @@ write_files:
 
 runcmd:
   - [ systemctl, daemon-reload ]
-  # --no-block is LOAD-BEARING. runcmd runs inside cloud-final.service; a BLOCKING `systemctl start`
-  # of this oneshot would make cloud-final WAIT for the unit's ExecStart — which ends in `poweroff`,
-  # SIGTERM-ing the very cloud-final that is blocked on it and racing the script's own sync/umount
-  # against the systemd shutdown sweep (a truncated/empty result.html risk). --no-block lets the unit
-  # run INDEPENDENTLY so poweroff is its own last act, not one cloud-final is synchronously blocked on.
+  # --no-block is LOAD-BEARING: a blocking start would make cloud-final WAIT on a oneshot that ends
+  # in poweroff (SIGTERM-ing the very cloud-final blocked on it, racing the result flush). --no-block
+  # lets the unit run independently so poweroff is its own last act.
   - [ systemctl, start, --no-block, vmdep-workload.service ]
 ```
 
@@ -284,21 +298,30 @@ runcmd:
    exFAT unavailability the `OUTPUT` mount fails, no sentinel is ever written, and the host classifies
    `Failed` with a clear reason (the design's FAT32 fallback is a one-knob switch on the host
    `FileSystem` default + this not needing any guest change since both are in-kernel).
-2. `mount -o ro,uid=…,gid=… LABEL=INPUT /mnt/in` — INPUT is mounted **read-only** and **owned by the
-   `sandbox` user** (exFAT is non-POSIX, so ownership is a mount option). The workload never writes its
-   inputs; it reads a copy and emits a fresh result.
-3. `mount -o uid=…,gid=… LABEL=OUTPUT /mnt/out` — OUTPUT is mounted **read-write**, also owned by
-   `sandbox` so the non-root entrypoint can write to it. If it did not mount there is nowhere to write
-   the sentinel, so the runner powers off immediately **and `exit`s** (systemd `poweroff` is async and
-   returns 0 — without the `exit` the script would run on against an unmounted `/mnt/out`); the host
-   (correctly) classifies `Failed` (no sentinel) rather than hanging. A failed **INPUT** mount writes a
-   determinate non-zero sentinel (the entrypoint can't run) then powers off.
-4. Run the workload **exactly once, as the unprivileged `sandbox` user** (`runuser -u sandbox -- sh -c
-   '__ENTRYPOINT__'`; falls back to a root run only if the image has no `sandbox` user). The entrypoint
-   **writes its own** result to `/mnt/out/result.html` (firefox: `--out /mnt/out/result.html`); the
-   runner captures stdout/stderr to **separate** `/mnt/out/stdout.log` + `/mnt/out/stderr.txt` (the host
-   ignores them) — it does **NOT** redirect stdout into `result.html`, which would double-write the file
-   the entrypoint already owns and could 0-byte/corrupt the required Netscape-HTML.
+2. `mount -o ro,uid=…,gid=… LABEL=INPUT /mnt/in || mount LABEL=INPUT /mnt/in` — INPUT is mounted
+   **read-only**, *preferring* the `sandbox`-owning `uid=/gid=` form (exFAT is non-POSIX, so ownership is
+   a mount option) but **falling back to a plain mount** if the uid/gid form fails on the live kernel
+   (RC4). The workload never writes its inputs; it reads a copy and emits a fresh result.
+3. OUTPUT mounts **robustly** (RC4): the runner first tries the `sandbox`-owning
+   `mount -o uid=…,gid=… LABEL=OUTPUT /mnt/out` and records whether **that** form won
+   (`OUT_SANDBOX_OWNED=1`), then `mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out` **falls back to a
+   plain mount** so OUTPUT mounts even where the live cloud kernel rejects the uid/gid options. OUTPUT
+   must always mount — it is the only place the result + sentinel can be written. If it did not mount at
+   all there is nowhere to write the sentinel, so the runner powers off immediately **and `exit`s**
+   (systemd `poweroff` is async and returns 0 — without the `exit` the script would run on against an
+   unmounted `/mnt/out`); the host (correctly) classifies `Failed` (no sentinel) rather than hanging. A
+   failed **INPUT** mount writes a determinate non-zero sentinel (the entrypoint can't run) then powers
+   off.
+4. Run the workload **exactly once**. The runner runs the entrypoint as the unprivileged `sandbox` user
+   (`runuser -u sandbox -- sh -c '__ENTRYPOINT__'`) **only when OUTPUT mounted sandbox-owned AND that
+   user exists** (`[ "$OUT_SANDBOX_OWNED" = "1" ] && id -u sandbox`); in every other case — including the
+   plain-mount fallback, where `/mnt/out` is root-owned and a non-root run could not write to it — it
+   **falls back to a root run** (v1: the VM boundary is the containment, not the in-guest user — see RC4).
+   The entrypoint **writes its own** result to `/mnt/out/result.html` (firefox: `--out
+   /mnt/out/result.html`); the runner captures stdout/stderr to **separate** `/mnt/out/stdout.log` +
+   `/mnt/out/stderr.txt` (the host ignores them) — it does **NOT** redirect stdout into `result.html`,
+   which would double-write the file the entrypoint already owns and could 0-byte/corrupt the required
+   Netscape-HTML.
 5. **Write the sentinel LAST**: `printf '%s' "$rc" > /mnt/out/result.exitcode` (as root — bypasses the
    exFAT uid owner). Writing it after the result guarantees that a present sentinel means the result is
    already on disk. `sync` flushes.

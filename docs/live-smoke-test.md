@@ -434,6 +434,15 @@ never assumes "Off == success".
   tunable — without it the first boot adds a 2–5 min datasource-probe delay (the host
   `-WorkloadTimeoutSeconds` default 600 still bounds it, so it's not a blocker).
 
+> **Gotcha — Hyper-V Secure Boot template enumeration can wedge under churn (RC5, 2026-06-24 live).**
+> After ~10 rapid VM create/destroy cycles, `Set-VMFirmware -SecureBootTemplate <any>` began failing
+> (`'… matches none of the secure boot templates'`) for **every** template — and crucially
+> **`Restart-Service vmms` did NOT clear it; only a host reboot did.** The real backend's `SetFirmware`
+> now **retries** the transient enumeration error and, if it persists, **throws a clear "restart vmms /
+> reboot the host" message** rather than half-provisioning. If a live run dies at provision time with
+> that error, **reboot the host** and re-run — it is a host-side Hyper-V state bug surfaced by repeated
+> acceptance cycles, **not** a Voidseal containment failure.
+
 ### 4A.2 The organizer script must be /mnt/in ⇄ /mnt/out aligned (one-time check)
 
 The host source `C:\sandbox\organizer-src\organize_bookmarks.py` must **read its `--profile`
@@ -538,8 +547,8 @@ the **first time** on real hardware here — if something snags, it's most likel
 
 1. **Host disk format** — `New-VHD`+`Mount-VHD`+`Initialize-Disk -GPT`+`New-Partition`+`Format-Volume -exFAT`+`Dismount` (the `NewOutputVhdx` real path; has a Get-Disk settle-retry).
 2. **Native host read** — `Mount-VHD` (read-**write**, see note) + drive-letter assign + read + `Dismount` (the `ReadVhdxFile` real path). NOTE: `ReadVhdxFile` deliberately mounts the OUTPUT disk read-write, not read-only — a read-only mount on Windows often won't auto-assign a drive letter and `Add-PartitionAccessPath -AssignDriveLetter` can throw against a write-protected volume, which would make this *first* read spuriously report `result read failed`. RW is safe (the OUTPUT disk is the deployer's own host-formatted volume, detached from the powered-off guest; Tier ≥ 2 untrusted output never reaches here — it quarantines first). If a read *still* fails after this, suspect the guest didn't write `result.html`/`result.exitcode` (item 3), not the mount.
-3. **The guest cloud-init runner** — does the seed's `vmdep-workload` unit actually run, mount the exFAT disks by LABEL, run the entrypoint **as the non-root `sandbox` user**, write `result.html` (via the entrypoint's `--out`) + the `result.exitcode` sentinel, and self-poweroff? (First live exercise.) The runner is started **`--no-block`** so its `poweroff` doesn't race `cloud-final`, and `exit`s after a mount-failure `poweroff` (so it never runs against an unmounted `/mnt/out`). If the run fails, mount the OUTPUT disk read-only on the host and read `/stdout.log` + `/stderr.txt`.
-4. **exFAT mount in the guest** — the in-kernel `exfat` module auto-loading on `mount LABEL=OUTPUT` (Debian 6.1 kernel; the runner `modprobe`s it), **with `uid=/gid=` options** so the non-root `sandbox` user can read `/mnt/in` and write `/mnt/out`. If exFAT is somehow unavailable, switch the firefox profile to `FileSystem='FAT32'` (one knob; ≤4 GiB/file, fine here).
+3. **The guest cloud-init runner** — does the seed's `vmdep-workload` unit actually run, mount the exFAT disks by LABEL, run the entrypoint **as the non-root `sandbox` user when OUTPUT mounted sandbox-owned (else root — RC4)**, write `result.html` (via the entrypoint's `--out`) + the `result.exitcode` sentinel, and self-poweroff? (First live exercise.) The runner is started **`--no-block`** so its `poweroff` doesn't race `cloud-final`, and `exit`s after a mount-failure `poweroff` (so it never runs against an unmounted `/mnt/out`). If the run fails, mount the OUTPUT disk read-only on the host and read `/stdout.log` + `/stderr.txt`.
+4. **exFAT mount in the guest** — the in-kernel `exfat` module auto-loading on `mount LABEL=OUTPUT` (Debian 6.1 kernel; the runner `modprobe`s it), **preferring the `uid=/gid=` options** so the non-root `sandbox` user can read `/mnt/in` and write `/mnt/out` but **falling back to a plain mount** if the uid/gid form fails on the live kernel (RC4 — OUTPUT must always mount). If exFAT is somehow unavailable, switch the firefox profile to `FileSystem='FAT32'` (one knob; ≤4 GiB/file, fine here).
 5. **Detach timing** — `RemoveHardDiskDrive` against the now-Off VM. A transient detach throw is **caught**: the run is reported `Failed` (reason names the *detach* → host-side, not a guest bug) and the host **skips the read** rather than read a possibly-still-attached disk; teardown still removes the VM. Never a corruption-read, never a lifecycle abort.
 6. **Host drive-letter assignment** — `Add-PartitionAccessPath -AssignDriveLetter` on a freshly-mounted exFAT volume (the `$script:SbResolveVolumeLetter` path used by Write/ReadVhdxFile). Now settle-retried (Get-Disk **and** Get-Partition) and the assigned letter is validated `^[A-Za-z]$`; a still-blank letter throws a clear named error rather than building a `\0:\` path.
 
@@ -684,7 +693,7 @@ any gap-related friction observed).
 - [ ] `SealVerdict=$true`; Netscape-HTML extracted; VM destroyed; `Error=$null` — §3.4
 
 **Milestone 3 — Firefox Tier-0 REAL workload (disk mode) — the real round-trip**
-- [ ] CIDATA seed carries the **disk-mode workload-runner** user-data (not the bare serial seed); the golden image has the non-root **`sandbox`** user — §4A.1 / debian-12-cloud.md §2
+- [ ] CIDATA seed carries the **disk-mode workload-runner** user-data (not the bare serial seed); the seed's `users:` block **creates** the non-root **`sandbox`** user (RC2 — the golden image no longer needs one baked) — §4A.1 / debian-12-cloud.md §2a
 - [ ] `ds=nocloud` baked into guest GRUB; python3 (+ any organizer deps) in the golden image — §4A.1
 - [ ] **★ HARD GATE:** host-side organizer pre-test passes — writes `result.html` via `--out` (non-empty), first line is exactly `<!DOCTYPE NETSCAPE-Bookmark-file-1>`, dedup applied (<4 `<A>`) — §4A.2
 - [ ] `-Workload.Inputs` populated from the host organizer + sample; live `Invoke-Voidseal -Tier 0 -Profile firefox -Workload @{WorkloadMode='Disk';Inputs=...}` run — §4A.3
