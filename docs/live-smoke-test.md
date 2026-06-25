@@ -422,14 +422,14 @@ never assumes "Off == success".
 - The image must already contain **python3** (the runner does NOT apt-install — sealed/offline).
   The Debian genericcloud image has python3; if your organizer needs `lz4`, bake it into the
   golden image at image-prep (the live run is offline).
-- **The image must have a non-root `sandbox` user** (debian-12-cloud.md §2 creates it) — the runner
-  runs the entrypoint as `sandbox`, falling back to root only if it's absent.
-- **Confirm the exfat kernel module loads in the golden image** before the run — the Debian *cloud*
-  kernel can be driver-trimmed. Boot the golden image once (or chroot) and run
-  `modprobe exfat && lsmod | grep exfat`. If it's absent, either install `exfatprogs`/enable the
-  module at image-prep, **or** switch the firefox profile to `FileSystem='FAT32'` (one host-side knob;
-  both drivers are in-kernel — no guest change needed). exFAT-unavailable otherwise degrades to a
-  clean host-classified `Failed` (no sentinel), not a hang.
+- **The `sandbox` user is created by the seed now** (RC2, 2026-06-24 live): the disk-mode seed's
+  cloud-config `users:` block creates the non-root `sandbox` user, so the golden image does **not** need
+  one baked in. The runner runs the entrypoint as `sandbox` when the OUTPUT volume mounted sandbox-owned,
+  else as root.
+- **Data-disk mount is robust now** (RC4, 2026-06-24 live): the runner tries the `uid=/gid=` mount and
+  **falls back to a plain `mount LABEL=…`** if it fails, so OUTPUT/INPUT always mount regardless of the
+  filesystem driver. On the live Debian *cloud* kernel `exfat` loaded fine — but FAT32 remains a
+  one-knob fallback (`FileSystem='FAT32'` in the profile) if a future image is exfat-trimmed.
 - **`ds=nocloud`** on the guest kernel cmdline (GRUB, baked at image-prep) is a boot-speed
   tunable — without it the first boot adds a 2–5 min datasource-probe delay (the host
   `-WorkloadTimeoutSeconds` default 600 still bounds it, so it's not a blocker).

@@ -9,6 +9,10 @@
     EgressAllowlist = @()                          # default offline; the only Tier-0 net step is an opt-in dead-link check (escalates to Tier 1)
     Credentials     = 'None'
     GuestImage      = 'debian-12-slim'             # container base
+    # RC1 (2026-06-24 live): Tier-0 today provisions a real Debian Gen2 VM (the container substrate is
+    # still aspirational), so it MUST carry the Linux Secure Boot template — an omitted/Windows-default
+    # template makes Hyper-V reject Debian's MS-UEFI-CA-signed shim/grub and the guest never boots.
+    SecureBootTemplate = 'MicrosoftUEFICertificateAuthority'   # verified for Debian Gen2 (matches tier1)
     Memory          = '2GB'
     Cpu             = 2
     HostChannels    = @{ Clipboard = $false; Shares = 'ReadOnlyInput'; GuestServices = $false }

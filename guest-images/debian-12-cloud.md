@@ -139,7 +139,16 @@ consumes it, then it is detached as part of the import-then-seal ritual.
 > profile's `Entrypoint` for `__ENTRYPOINT__`, and writes the `CIDATA` ISO via built-in Windows IMAPI2.
 > The block below is the human-readable mirror of that template (kept in sync; `New-CidataSeed` is the
 > source of truth that actually ships in a seed). It replaces the COM1-serial command channel with the
-> **disk-passing model**:
+> **disk-passing model**.
+>
+> **Live-acceptance updates (2026-06-24 — see `_dev/2026-06-24-live-acceptance-findings.md`):** the
+> shipped runner now also (RC2) **creates the non-root `sandbox` user** via a cloud-config `users:` block
+> (the golden image has none); (RC4) **mounts robustly** — tries the `uid=/gid=` mount then **falls back
+> to a plain `mount LABEL=…`** (the live cloud kernel failed the uid/gid mount where a plain mount
+> worked), tracking whether OUTPUT mounted sandbox-owned so it only runs the entrypoint as `sandbox` when
+> that user can actually write; and (RC3) **masks `systemd-networkd-wait-online.service`** in `bootcmd`
+> (network is disabled, so its ~47 s wait was pure dead time). The mount/run sequence below is otherwise
+> unchanged; consult `SeedBuilder.ps1` for the exact current shell.
 > the host creates +
 > host-formats two exFAT data disks (label **`INPUT`**, label **`OUTPUT`**), populates `INPUT`
 > from the profile's `Inputs`, attaches both **before the seal**, then starts the VM. The guest

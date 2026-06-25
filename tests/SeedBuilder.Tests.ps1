@@ -109,6 +109,29 @@ Describe 'New-CidataUserData — disk-mode runner' {
         New-CidataUserData -Profile $script:DiskProfile | Should -BeLike '*network: {config: disabled}*'
     }
 
+    It 'RC2: creates the non-root sandbox user (the golden image has none; the disk seed must)' {
+        $ud = New-CidataUserData -Profile $script:DiskProfile
+        $ud | Should -BeLike '*name: sandbox*' -Because 'RC2: the disk-mode seed must create the sandbox user so runuser -u sandbox works'
+        $ud | Should -BeLike '*lock_passwd: true*' -Because 'the sandbox user must have no password login (matches the serial baseline)'
+    }
+
+    It 'RC4: OUTPUT mount is ROBUST — falls back to a plain mount when the uid/gid mount fails' {
+        $ud = New-CidataUserData -Profile $script:DiskProfile
+        # The serial probe proved a plain `mount LABEL=OUTPUT /mnt/out` works where `mount -o uid=,gid=`
+        # failed; the runner must try uid/gid first then fall back to plain mount.
+        $ud | Should -BeLike '*|| mount LABEL=OUTPUT*' -Because 'RC4: a uid/gid OUTPUT mount must fall back to a plain mount so OUTPUT always mounts'
+    }
+
+    It 'RC4: INPUT mount also has a plain-mount fallback' {
+        New-CidataUserData -Profile $script:DiskProfile | Should -BeLike '*|| mount LABEL=INPUT*' -Because 'RC4: the read-only INPUT mount must also fall back to a plain mount'
+    }
+
+    It 'RC3: masks systemd-networkd-wait-online (network is disabled — the ~47s wait is dead time)' {
+        $ud = New-CidataUserData -Profile $script:DiskProfile
+        $ud | Should -BeLike '*systemd-networkd-wait-online*' -Because 'RC3: the runner must reference the wait-online service to disable/mask it'
+        $ud | Should -Match '(?i)mask' -Because 'RC3: the boot delay is removed by masking systemd-networkd-wait-online.service'
+    }
+
     It 'substitutes the profile Entrypoint for __ENTRYPOINT__ (and leaves no token behind)' {
         $ud = New-CidataUserData -Profile $script:DiskProfile
         $ud | Should -BeLike "*$($script:FfEntrypoint)*" -Because 'the runner runs the profile entrypoint'

@@ -1238,6 +1238,69 @@ Describe 'Real backend — fails closed with a clear, actionable message' {
 }
 
 # ===========================================================================
+#  REAL backend — SetFirmware Secure Boot template-enumeration retry (RC5)
+# ===========================================================================
+#  RC5 (2026-06-24 live): after ~10 rapid create/destroy cycles, Hyper-V's vmms wedged its Secure
+#  Boot template enumeration — `Set-VMFirmware -SecureBootTemplate <any>` failed
+#  "... matches none of the secure boot templates ..." for EVERY template, and a `Restart-Service
+#  vmms` did NOT clear it (needed a host reboot). The real SetFirmware must (a) RETRY the transient
+#  enumeration error a few times with a short sleep, and (b) if it still fails, throw a CLEAR
+#  actionable error naming the remediation (restart vmms / reboot the host) rather than leave a
+#  half-provisioned VM behind.
+#
+#  The retry/clear-error logic is factored into the shared helper scriptblock
+#  $script:SbInvokeFirmwareWithRetry so it is UNIT-testable in-process (drive it with a scriptblock
+#  that throws the enumeration error N times) WITHOUT a live Hyper-V or the out-of-process harness —
+#  exactly the path the real SetFirmware uses. The FAKE SetFirmware does not use it (it just records),
+#  so fake≠real parity is unaffected (manifest + arg shape unchanged).
+Describe 'Real backend — SetFirmware retries the transient Secure Boot template-enumeration wedge (RC5)' {
+
+    It 'exposes the shared firmware-retry helper scriptblock' {
+        $script:SbInvokeFirmwareWithRetry | Should -BeOfType [scriptblock] -Because 'the real SetFirmware factors its retry through this shared helper so it is unit-testable'
+    }
+
+    It 'SUCCEEDS without retry when the operation succeeds first try' {
+        $calls = 0
+        $op = { $script:fwCalls++ }
+        $script:fwCalls = 0
+        # MaxAttempts/DelayMs kept tiny so the test is instant.
+        { & $script:SbInvokeFirmwareWithRetry -Operation { $script:fwCalls++ } -MaxAttempts 4 -DelayMilliseconds 1 } | Should -Not -Throw
+        $script:fwCalls | Should -Be 1 -Because 'a first-try success must not retry'
+    }
+
+    It 'RETRIES the transient "matches none of the secure boot templates" error and then succeeds' {
+        $script:fwCalls = 0
+        $op = {
+            $script:fwCalls++
+            if ($script:fwCalls -lt 3) { throw "'MicrosoftUEFICertificateAuthority' matches none of the secure boot templates known to the host." }
+            # third attempt succeeds
+        }
+        { & $script:SbInvokeFirmwareWithRetry -Operation $op -MaxAttempts 4 -DelayMilliseconds 1 } | Should -Not -Throw
+        $script:fwCalls | Should -Be 3 -Because 'it must keep retrying the transient enumeration error until it succeeds'
+    }
+
+    It 'after exhausting retries on the enumeration error, throws an ACTIONABLE message (restart vmms / reboot host)' {
+        $script:fwCalls = 0
+        $op = { $script:fwCalls++; throw "'MicrosoftWindows' matches none of the secure boot templates known to the host." }
+        $msg = $null
+        try { & $script:SbInvokeFirmwareWithRetry -Operation $op -MaxAttempts 3 -DelayMilliseconds 1 } catch { $msg = $_.Exception.Message }
+        $script:fwCalls | Should -Be 3 -Because 'all attempts must be spent before failing'
+        $msg | Should -Not -BeNullOrEmpty
+        $msg | Should -Match '(?i)secure boot template' -Because 'the message must name the failing condition'
+        $msg | Should -Match '(?i)vmms'   -Because 'the operator remediation is to restart the vmms service'
+        $msg | Should -Match '(?i)reboot' -Because 'and, if that does not help, reboot the host'
+    }
+
+    It 'does NOT retry an UNRELATED error — it rethrows immediately (no masking real failures)' {
+        $script:fwCalls = 0
+        $op = { $script:fwCalls++; throw 'some other firmware failure (not the enumeration wedge)' }
+        { & $script:SbInvokeFirmwareWithRetry -Operation $op -MaxAttempts 5 -DelayMilliseconds 1 } |
+            Should -Throw -ExpectedMessage '*some other firmware failure*'
+        $script:fwCalls | Should -Be 1 -Because 'an unrelated error is not transient; retrying would only waste time and hide the real cause'
+    }
+}
+
+# ===========================================================================
 #  REAL backend — builds the right cmdlet params (out-of-process capture)
 # ===========================================================================
 #  THE BEHAVIORAL REGRESSION TEST FOR A REAL-BACKEND BUG FOUND DURING LIVE DEBUGGING.

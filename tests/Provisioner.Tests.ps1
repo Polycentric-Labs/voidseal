@@ -118,6 +118,53 @@ Describe 'New-SandboxVM — provisions a Tier-1 VM from tier1.psd1 (via the fake
 }
 
 # ===========================================================================
+#  New-SandboxVM — RC1: the firmware step DEFAULTS the Linux Secure Boot template
+# ===========================================================================
+Describe 'New-SandboxVM — firmware defaults the Linux Secure Boot template (RC1)' {
+    # Voidseal only provisions Linux (Debian) Gen2 guests. A profile that OMITS SecureBootTemplate must
+    # NOT fall through to Hyper-V's MicrosoftWindows default (which rejects Debian's MS-UEFI-CA bootloader
+    # → the guest never boots). The provisioner defaults the template to MicrosoftUEFICertificateAuthority,
+    # and the descriptor records the EFFECTIVE (defaulted) template.
+
+    It 'calls SetFirmware with MicrosoftUEFICertificateAuthority even when the profile OMITS a template' {
+        $b   = New-FakeHyperVBackend
+        # A VM-tier profile (so the Hyper-V path runs) that declares NO SecureBootTemplate.
+        $prof = $script:Tier1.Clone()
+        $prof.Remove('SecureBootTemplate')
+        $null = New-SandboxVM -Profile $prof -Name 'sbx-nosbt' -Backend $b
+        $vm = & $b.GetVM @{ Name = 'sbx-nosbt' }
+        $vm.SecureBootEnabled  | Should -BeTrue
+        $vm.SecureBootTemplate | Should -Be 'MicrosoftUEFICertificateAuthority' -Because 'RC1: an omitted template must default to the Linux CA, not the Windows default'
+    }
+
+    It 'calls SetFirmware with the Linux default when the profile BLANK-sets a template' {
+        $b   = New-FakeHyperVBackend
+        $prof = $script:Tier1.Clone()
+        $prof['SecureBootTemplate'] = ''
+        $null = New-SandboxVM -Profile $prof -Name 'sbx-blanksbt' -Backend $b
+        (& $b.GetVM @{ Name = 'sbx-blanksbt' }).SecureBootTemplate |
+            Should -Be 'MicrosoftUEFICertificateAuthority' -Because 'RC1: a blank template is treated as omitted and defaults to the Linux CA'
+    }
+
+    It 'the descriptor records the EFFECTIVE (defaulted) template when the profile omits one' {
+        $b   = New-FakeHyperVBackend
+        $prof = $script:Tier1.Clone()
+        $prof.Remove('SecureBootTemplate')
+        $desc = New-SandboxVM -Profile $prof -Name 'sbx-effsbt' -Backend $b
+        $desc.SecureBootTemplate | Should -Be 'MicrosoftUEFICertificateAuthority' -Because 'RC1: the descriptor must reflect the template actually applied, not $null'
+    }
+
+    It 'still honors an explicit non-default template from the profile' {
+        $b   = New-FakeHyperVBackend
+        $prof = $script:Tier1.Clone()
+        $prof['SecureBootTemplate'] = 'OpenSourceShieldedVM'
+        $null = New-SandboxVM -Profile $prof -Name 'sbx-explsbt' -Backend $b
+        (& $b.GetVM @{ Name = 'sbx-explsbt' }).SecureBootTemplate |
+            Should -Be 'OpenSourceShieldedVM' -Because 'an explicitly-declared template must win over the default'
+    }
+}
+
+# ===========================================================================
 #  New-SandboxVM — the returned sandbox descriptor (consumed by the Sealer/Runner/Reaper)
 # ===========================================================================
 Describe 'New-SandboxVM — returns a sandbox descriptor the Sealer/Runner/Reaper consume' {

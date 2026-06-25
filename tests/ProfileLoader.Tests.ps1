@@ -133,6 +133,9 @@ Describe 'Import-TierProfile — real example profiles' {
         $p.HostChannels        | Should -BeOfType [System.Collections.IDictionary]
         $p.HostChannels.Shares | Should -Be 'ReadOnlyInput'   # string on a container tier is allowed
         $p.ContainsKey('ManagementChannel') | Should -BeFalse # container tier has no mgmt channel
+        # RC1: Tier-0 today provisions a real Debian Gen2 VM, so it MUST carry the Linux Secure Boot
+        # template (an omitted/Windows-default template rejects Debian's MS-UEFI-CA-signed bootloader).
+        $p.SecureBootTemplate  | Should -Be 'MicrosoftUEFICertificateAuthority' -Because 'RC1: a Linux Gen2 guest needs the MS-UEFI-CA template, not the Windows default'
     }
 
     It 'loads tier1.psd1 without error and returns the expected normalized shape' {
@@ -244,6 +247,12 @@ Describe 'SecureBootTemplate enum gate (optional; validated when present)' {
         # Regression guard: the shipped tier1 profile sets a valid SecureBootTemplate and must keep loading.
         { Import-TierProfile -Path $script:Tier1Path } | Should -Not -Throw
         (Import-TierProfile -Path $script:Tier1Path).SecureBootTemplate | Should -Be 'MicrosoftUEFICertificateAuthority'
+    }
+
+    It 'tier0.psd1 (which sets MicrosoftUEFICertificateAuthority for its Linux Gen2 guest) still loads' {
+        # RC1 regression guard: tier0 now also declares the Linux Secure Boot template and must load through the enum gate.
+        { Import-TierProfile -Path $script:Tier0Path } | Should -Not -Throw
+        (Import-TierProfile -Path $script:Tier0Path).SecureBootTemplate | Should -Be 'MicrosoftUEFICertificateAuthority'
     }
 }
 

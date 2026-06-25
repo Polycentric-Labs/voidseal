@@ -252,6 +252,56 @@ $script:SbIsElevated = {
     catch { return $false }
 }
 
+# SHARED real-backend helper (RC5): run a Set-VMFirmware operation with bounded retry on the
+# transient Secure-Boot-template enumeration wedge, then a CLEAR actionable failure if it persists.
+#
+# RC5 (2026-06-24 live): after ~10 rapid create/destroy cycles Hyper-V's vmms wedged its Secure Boot
+# template enumeration — `Set-VMFirmware -SecureBootTemplate <any>` failed
+#   "... matches none of the secure boot templates known to the host ..."
+# for EVERY template (even MicrosoftWindows), and `Restart-Service vmms` did NOT clear it (needed a
+# host reboot). The symptom is transient WMI churn, NOT a wrong template, so a few retries with a short
+# sleep often ride it out. If it still fails we throw a clear remediation message rather than leave a
+# half-provisioned VM (the differencing system disk + VM already exist by the firmware step).
+#
+# ONLY the enumeration error is retried; any OTHER error rethrows immediately (retrying a genuine
+# failure would only waste time and mask the real cause). Factored out as a shared scriptblock so the
+# real SetFirmware uses it AND it is unit-testable in-process (drive -Operation with a stub that throws
+# the enumeration error N times) without a live Hyper-V. The FAKE SetFirmware does not use it.
+$script:SbInvokeFirmwareWithRetry = {
+    param(
+        [Parameter(Mandatory)] [scriptblock] $Operation,
+        [int] $MaxAttempts = 4,
+        [int] $DelayMilliseconds = 750
+    )
+    # The transient-wedge signature (case-insensitive substring of the real Hyper-V message).
+    $enumWedge = '*matches none of the secure boot templates*'
+    if ($MaxAttempts -lt 1) { $MaxAttempts = 1 }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            return (& $Operation)
+        }
+        catch {
+            $caught = $_
+            $message = if ($caught -and $caught.Exception) { [string]$caught.Exception.Message } else { [string]$caught }
+            # Not the transient wedge -> a real failure; rethrow unchanged (do NOT retry).
+            if ($message -notlike $enumWedge) { throw }
+            # The transient wedge: retry until attempts are exhausted, then fail closed with remediation.
+            if ($attempt -ge $MaxAttempts) {
+                throw ("HyperVBackend.SetFirmware: Set-VMFirmware -SecureBootTemplate kept failing with a " +
+                       "Secure Boot template-enumeration error after $MaxAttempts attempts " +
+                       "(`"$message`"). This is a known transient Hyper-V vmms wedge under rapid " +
+                       "create/destroy churn. Remediation: `Restart-Service vmms`; if that does not clear " +
+                       "it, REBOOT the host (a vmms restart is often insufficient). The half-provisioned VM " +
+                       "should be torn down before retrying. Failing closed.")
+            }
+            if ($DelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $DelayMilliseconds }
+            # loop and retry
+        }
+    }
+}
+
 # Validate a NewOutputVhdx FileSystem + Label EARLY and IDENTICALLY in BOTH factories
 # (the fake≠real divergence guard). A bad FileSystem (e.g. 'ext4') or an over-length Label
 # is recorded VERBATIM by the fake (test green) yet FAILS live on Format-Volume — so both
@@ -358,6 +408,7 @@ function New-RealHyperVBackend {
     $IsElevated    = $script:SbIsElevated
     $ValidateFmt   = $script:SbValidateVhdxFormat
     $ResolveVol    = $script:SbResolveVolumeLetter
+    $FirmwareRetry = $script:SbInvokeFirmwareWithRetry   # RC5: Secure-Boot template-enumeration retry
     $unavailPrefix = $script:HyperVUnavailablePrefix
 
     # Run a real Hyper-V op; convert an availability/permission failure into the single
@@ -505,7 +556,11 @@ function New-RealHyperVBackend {
             if ($null -ne $sb)   { $p.EnableSecureBoot = ([bool]$sb ? 'On' : 'Off') }
             if ($null -ne $tmpl) { $p.SecureBootTemplate = $tmpl }
             if ($null -ne $bo)   { $p.BootOrder = $bo }
-            Set-VMFirmware @p
+            # RC5: route through the bounded retry so a transient Secure-Boot template-enumeration wedge
+            # (vmms WMI hiccup under rapid create/destroy churn) is ridden out, and a persistent one
+            # fails closed with a clear restart-vmms/reboot-host message instead of a raw cmdlet error.
+            # The helper only retries that specific enumeration error; any other failure rethrows at once.
+            & $FirmwareRetry -Operation { Set-VMFirmware @p }
         }
     }.GetNewClosure()
 

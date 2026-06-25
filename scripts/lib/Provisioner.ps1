@@ -391,9 +391,14 @@ function New-SandboxVM {
         if ($nestedVirt) { $procArgs.ExposeVirtualizationExtensions = $true }
         $null = & $Backend.SetProcessor $procArgs
 
-        # --- 5. firmware: SecureBoot ON with the profile's template -------
-        $fwArgs = @{ VMName = $Name; EnableSecureBoot = $true }
-        if (-not [string]::IsNullOrWhiteSpace($secureTmpl)) { $fwArgs.SecureBootTemplate = $secureTmpl }
+        # --- 5. firmware: SecureBoot ON with the EFFECTIVE Secure Boot template -------
+        # RC1 (2026-06-24 live): Voidseal only provisions Linux (Debian) Gen2 guests. If a profile OMITS
+        # (or blank-sets) SecureBootTemplate, we MUST NOT fall through to Hyper-V's MicrosoftWindows
+        # default — that template rejects Debian's MS-UEFI-CA-signed shim/grub and the guest never boots
+        # (it sits "Running" at firmware until the idle timeout force-stops it). So default the template
+        # to the Linux CA here, and record the EFFECTIVE (defaulted) template on the descriptor.
+        if ([string]::IsNullOrWhiteSpace($secureTmpl)) { $secureTmpl = 'MicrosoftUEFICertificateAuthority' }
+        $fwArgs = @{ VMName = $Name; EnableSecureBoot = $true; SecureBootTemplate = $secureTmpl }
         $null = & $Backend.SetFirmware $fwArgs
 
         # --- 6. COM1 named pipe — the Linux management channel ------------
