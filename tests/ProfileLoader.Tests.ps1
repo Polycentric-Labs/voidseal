@@ -596,4 +596,17 @@ Describe 'Processor profile (Network=None) + DepsSpec/ScreenConfig' {
         $p = script:New-ProcBase; $p.ScreenConfig=@{categories=@('financial')}
         (Resolve-ScreenConfig -Profile $p).mode | Should -Be 'aggressive'
     }
+    It 'returns categories as an ARRAY even for a single-element categories (no unroll)' {
+        $p = @{ ScreenConfig = @{ mode='aggressive'; categories=@('financial') } }
+        $r = Resolve-ScreenConfig -Profile $p
+        ($r.categories -is [array]) | Should -BeTrue
+        @($r.categories).Count      | Should -Be 1
+        @($r.categories)[0]         | Should -Be 'financial'
+    }
+    It 'defaults BOTH mode and categories when ScreenConfig is absent entirely' {
+        $r = Resolve-ScreenConfig -Profile @{}
+        $r.mode                | Should -Be 'aggressive'
+        ($r.categories -is [array]) | Should -BeTrue
+        @($r.categories).Count | Should -Be 0
+    }
 }

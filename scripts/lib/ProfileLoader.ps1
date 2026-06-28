@@ -364,6 +364,12 @@ function Resolve-ScreenConfig {
     if (-not $src.ContainsKey('categories') -or ($null -eq $src['categories'])) {
         $src['categories'] = @()
     }
+    # Explicit array contract (StrictMode .Count safety): the RETURN always exposes
+    # 'categories' as an array regardless of input shape. A hashtable value-copy already
+    # preserves a 1-element array (it does NOT unroll like a function return), so this is
+    # a harmless re-wrap today — it locks the contract against a future refactor that DID
+    # introduce unrolling (single-element unrolling is the repo's documented #1 bug class).
+    $src['categories'] = @($src['categories'])
 
     return $src
 }
