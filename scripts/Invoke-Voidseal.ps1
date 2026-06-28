@@ -399,9 +399,10 @@ function Invoke-Voidseal {
             }
 
             # --- PROCESSOR: attach + RECORD the DEPS disk BEFORE the seal -------------------------
-            # A processor profile (Network='None') runs against a pre-built, read-only DEPENDENCY disk
-            # (deps.vhdx — Phase 2 builds it; the path is supplied via -Workload.DepsDiskPath or the
-            # resolved profile's DepsDiskPath). Like the INPUT/OUTPUT/SeedDisk data disks, it must be
+            # A processor profile (Network='None') runs against a pre-built, read-only DEPENDENCY disk.
+            # PHASE-1 ONLY: the deps.vhdx is a fixture supplied via -Workload.DepsDiskPath (or the resolved
+            # profile's DepsDiskPath); PHASE-2 (real): the builder produces deps.vhdx and hands its path in.
+            # Like the INPUT/OUTPUT/SeedDisk data disks, it must be
             # ATTACHED and RECORDED (DepsDiskPath) on the descriptor BEFORE Lock-Sandbox so Assert-Sealed's
             # host-truth scan ACCEPTS it as an expected disk — an UNRECORDED extra attached disk fails the
             # seal gate as a residual. We attach via the existing AddHardDiskDrive (no read-only attach:
@@ -488,10 +489,15 @@ function Invoke-Voidseal {
             # --- POST-DETACH SENSITIVITY GATE (processor workloads) -------------------
             # The screener ran IN-GUEST (offline) and wrote verdicts.json + candidates onto the OUTPUT disk's
             # staging/. Now that OUTPUT is detached, the HOST partitions: only auto-certified-SAFE artifacts are
-            # released. PHASE-1 (mock): the host-readable staging dir + verdicts path are injected via -Workload
+            # released. PHASE-1 ONLY: the host-readable staging dir + verdicts path are injected via -Workload
             # (GateStagingDir/GateVerdictsPath). PHASE-2 (real): derive them by host-mounting the detached OUTPUT
             # VHDX. The host re-validates the consumed verdicts (traversal+completeness+exact-SAFE) — D1.
-            if ($resolved['Network'] -eq 'None' -and $resolved.ContainsKey('ScreenConfig')) {
+            # $detachOk GUARD: the gate must run ONLY after a SUCCESSFUL data-disk detach. In Phase-2 the staging
+            # dir is derived from the DETACHED OUTPUT VHDX, so a failed detach means we must NOT read a disk that
+            # may still be attached to a (possibly live) guest — exactly the read-after-detach discipline the
+            # OUTPUT read above follows. In the mock the detach succeeds ($detachOk=$true), so the processor path
+            # still runs the gate. (Defense-in-depth today; load-bearing once Phase-2 derives staging from OUTPUT.)
+            if ($detachOk -and $resolved['Network'] -eq 'None' -and $resolved.ContainsKey('ScreenConfig')) {
                 $gateStaging  = [string](Get-WorkloadField -Workload $Workload -Name 'GateStagingDir')
                 $gateVerdicts = [string](Get-WorkloadField -Workload $Workload -Name 'GateVerdictsPath')
                 if (-not [string]::IsNullOrWhiteSpace($gateStaging) -and -not [string]::IsNullOrWhiteSpace($gateVerdicts)) {
@@ -508,7 +514,11 @@ function Invoke-Voidseal {
                     }
                     catch {
                         # A gate failure is fail-closed like the seal gate: record + let the finally teardown run.
-                        $report.Error = "Sensitivity gate failed: $($_.Exception.Message)"
+                        # APPEND (do not clobber): a detach/read failure above may have already set $report.Error;
+                        # preserve it and chain the gate error so neither failure is lost in the report.
+                        $gateErr = "Sensitivity gate failed: $($_.Exception.Message)"
+                        if ([string]::IsNullOrWhiteSpace([string]$report.Error)) { $report.Error = $gateErr }
+                        else { $report.Error = "$($report.Error) | $gateErr" }
                         Write-Warning "Invoke-Voidseal: '$Name' sensitivity gate failed: $($_.Exception.Message)"
                     }
                 }
