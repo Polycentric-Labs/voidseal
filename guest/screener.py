@@ -5,7 +5,7 @@ import argparse, json, re, pathlib
 
 SENSITIVE = [
     (re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'), 'aws_key'),
-    (re.compile(r'(?i)\b(secret|api[_-]?key|password|token)\s*[=:]\s*\S+'), 'credential'),
+    (re.compile(r'(?i)(?<![A-Za-z])(secret|api[_-]?key|password|token)(?![A-Za-z])\s*[=:]\s*\S+'), 'credential'),
     (re.compile(r'(?i)\b(routing|account)\b.*\b\d{6,}\b'), 'financial'),
     (re.compile(r'(?i)\b(diagnosis|prescription|rx|icd-?10)\b'), 'health'),
     (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), 'ssn'),
@@ -27,6 +27,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--in', dest='inp', required=True)
     ap.add_argument('--out', required=True)
+    # NOTE: per-file verdicts are MODE-INDEPENDENT today; --mode is consumed by the GATE's
+    # release/hold partition policy (SensitivityGate.ps1, a later task), not by the screener.
     ap.add_argument('--mode', choices=['aggressive','moderate'], default='aggressive')
     a = ap.parse_args()
     verdicts = []
@@ -41,6 +43,8 @@ def main():
             v = 'SAFE'
         else:
             v = 'UNCERTAIN'   # fail-closed: never SAFE-by-omission
+        # assumes a FLAT input dir (the gate's staging is flat by design); if nested inputs are
+        # ever screened, switch p.name to a path relative to --in to avoid same-name collisions.
         verdicts.append({'name': p.name, 'verdict': v, 'detectors': hits})
     pathlib.Path(a.out).write_text(json.dumps(verdicts, indent=1), encoding='utf-8')
 
