@@ -981,23 +981,23 @@ Describe 'Assert-Sealed — processor (Network=None) checks' {
         # omits it), so we add it via Set-DescriptorField after provisioning — exactly the
         # same pattern test fixtures use for SeedDiskPath / InputDiskPath / etc.
         $script:NewSealedProcessor = {
-        param([string] $Name = 'sbx-proc')
-        $t0 = $script:Tier1.Clone()
-        $t0['Tier']        = 0
-        $t0['Description'] = 'TEST FIXTURE — Tier 0 processor (Network=None).'
-        Assert-TierProfileValid -Profile $t0 -Context "TEST processor fixture '$Name'"
-        $b = New-FakeHyperVBackend
-        $d = New-SandboxVM -Profile $t0 -Name $Name -Backend $b
-        # Mark the descriptor as a processor (no-NIC intent).
-        Set-DescriptorField -Descriptor $d -Name 'Network' -Value 'None'
-        # Remove the NIC the provisioner wired (processor VMs have no NIC by contract;
-        # Lock-Sandbox does not strip the NIC for Tier<2, so we do it here in the fixture
-        # to represent a correctly-configured processor VM before sealing).
-        $null = & $b.RemoveNetworkAdapter @{ VMName = $Name }
-        # Seal: eject media + turn off channels + mark State=Sealed (no NIC removal by
-        # Lock-Sandbox for Tier-0, but the NIC was already removed above).
-        Lock-Sandbox -Descriptor $d -Backend $b
-        return @{ Backend = $b; Desc = $d }
+            param([string] $Name = 'sbx-proc')
+            $t0 = $script:Tier1.Clone()
+            $t0['Tier']        = 0
+            $t0['Description'] = 'TEST FIXTURE — Tier 0 processor (Network=None).'
+            Assert-TierProfileValid -Profile $t0 -Context "TEST processor fixture '$Name'"
+            $b = New-FakeHyperVBackend
+            $d = New-SandboxVM -Profile $t0 -Name $Name -Backend $b
+            # Mark the descriptor as a processor (no-NIC intent).
+            Set-DescriptorField -Descriptor $d -Name 'Network' -Value 'None'
+            # Remove the NIC the provisioner wired (processor VMs have no NIC by contract;
+            # Lock-Sandbox does not strip the NIC for Tier<2, so we do it here in the fixture
+            # to represent a correctly-configured processor VM before sealing).
+            $null = & $b.RemoveNetworkAdapter @{ VMName = $Name }
+            # Seal: eject media + turn off channels + mark State=Sealed (no NIC removal by
+            # Lock-Sandbox for Tier-0, but the NIC was already removed above).
+            Lock-Sandbox -Descriptor $d -Backend $b
+            return @{ Backend = $b; Desc = $d }
         }
     }
 
@@ -1059,10 +1059,11 @@ Describe 'Assert-Sealed — processor (Network=None) checks' {
             Should -Throw -ExpectedMessage '*secret*' -Because 'a secret-shaped path recorded as DepsDiskPath must STILL be refused — recording a disk cannot launder a secret (the secret check runs before the recorded-disk allowance)'
     }
 
-    It 'a non-processor Tier-0 VM with a NIC is NOT failed by the processor check (regression guard)' {
+    It 'a non-processor Tier-1 VM with a NIC is NOT failed by the processor check (regression guard)' {
         # The processor check fires ONLY when Network='None' is on the descriptor. A normal
-        # Tier-0/1 descriptor (no Network field, or Network != 'None') with a NIC must certify
+        # non-processor VM (no Network field, or Network != 'None') with a NIC must certify
         # exactly as before — the new guard must NOT add behavior for any other descriptor.
+        # This fixture is a standard Tier-1 VM (profile $script:Tier1), which legitimately keeps its NIC.
         $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-nonproc'
         $b = $sb.Backend; $d = $sb.Desc
         Import-SandboxAsset -Descriptor $d -Source $script:IsoSrc -As Iso -Backend $b

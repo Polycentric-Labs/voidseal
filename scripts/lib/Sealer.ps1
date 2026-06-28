@@ -664,16 +664,20 @@ function Assert-Sealed {
     # --- Tier >= 2 OR processor (Network='None'): NO NIC (host-verified; guest view irrelevant) ---
     # A processor (Network='None') is structurally no-NIC at any tier — exactly the same
     # guarantee as Tier>=2. We reuse the same GetNetworkAdapter call (D2: no new method)
-    # and branch the error message so the reason is unambiguous in the operator log.
+    # and branch the error message so the reason is unambiguous in the operator log: the
+    # PROCESSOR message fires for ANY processor tier (the no-NIC guarantee comes from
+    # Network='None', not the tier integer — so a Tier>=2 processor still gets the processor
+    # reason, never the generic one), and the generic Tier>=2 message is reserved for a
+    # NON-processor Tier>=2 VM (whose no-NIC guarantee comes purely from its tier).
     # Read the collection DIRECTLY (the backend preserves array semantics; never re-wrap).
     if ($tier -ge 2 -or $isProcessor) {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
         if ($nics.Count -ne 0) {
-            if ($isProcessor -and $tier -lt 2) {
-                # Processor case: the no-NIC guarantee comes from Network='None', not the tier.
+            if ($isProcessor) {
+                # Processor case (any tier): the no-NIC guarantee comes from Network='None'.
                 throw ("Assert-Sealed: REFUSING to certify processor VM '$vmName' SEALED — $($nics.Count) " +
                        "network adapter(s) still attached. A processor (Network='None') MUST have NO NIC " +
-                       "(structurally no-net even at Tier-$tier). Fail closed.")
+                       "(no live egress route — structurally no-net at Tier-$tier). Fail closed.")
             }
             throw ("Assert-Sealed: REFUSING to certify Tier-$tier VM '$vmName' SEALED — $($nics.Count) network " +
                    "adapter(s) still attached. A Tier>=2 VM MUST have NO NIC (no live egress route). Fail closed.")
