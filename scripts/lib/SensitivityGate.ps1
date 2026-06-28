@@ -5,12 +5,18 @@
 .DESCRIPTION
     Dot-source this file to get:
 
+        # Run mode: execute the screener in-process and partition.
         Invoke-SensitivityGate -StagingDir <path> -OutputDir <path> [-Mode aggressive|moderate]
                                -ScreenerPath <path>
 
+        # Consume mode: partition from a pre-existing verdicts file (in-guest-screen → host-partition).
+        Invoke-SensitivityGate -StagingDir <path> -OutputDir <path> [-Mode aggressive|moderate]
+                               -VerdictsPath <path>
+
     THE JOB:
       Run the offline Python screener (`guest/screener.py`) against a STAGING directory of
-      candidate artifacts, then PARTITION them into two output buckets:
+      candidate artifacts (Run mode), OR consume a verdicts.json produced in-guest (Consume mode),
+      then PARTITION them into two output buckets:
 
           <OutputDir>/released/   — ONLY files the screener marked exactly 'SAFE'
           <OutputDir>/held/       — EVERYTHING else (SENSITIVE, UNCERTAIN, or any unknown verdict)
@@ -23,18 +29,25 @@
       partition logic ever produces a violation — defence in depth against future code changes.
 
     FAIL-CLOSED ON ERROR:
-      A non-zero screener exit code or a missing verdicts file means the screen did not
-      complete. In that case we THROW and release NOTHING — an inability to screen is never
-      a pass (same design principle as Assert-Sealed refusing to certify if the host cannot
-      be queried).
+      Run mode: a non-zero screener exit code or a missing verdicts file means the screen did
+      not complete → THROW, release nothing.
+      Consume mode: a missing -VerdictsPath file → THROW, release nothing.
+      In BOTH modes the file passes through the SAME traversal guard, completeness guard,
+      exact-SAFE partition, and invariant re-assertion — the host does NOT trust the in-guest
+      file any more than a locally-run screener file. (Architecture decision D1.)
 
-    -Mode is passed through to the screener (aggressive|moderate). The partition decision
-    itself is mode-independent: only exact 'SAFE' releases. The 'moderate' review-queue
-    refinement (UNCERTAIN → held-for-human-review sub-bucket) is deferred to a later task.
+    -Mode is passed through to the screener (Run mode only). The partition decision itself is
+    mode-independent: only exact 'SAFE' releases. The 'moderate' review-queue refinement
+    (UNCERTAIN → held-for-human-review sub-bucket) is deferred to a later task.
 
     INJECTION: -ScreenerPath is explicit so tests can point at the real script without
     hard-coding a relative path, and error tests can point at a nonexistent path to exercise
     the fail-closed branch without any mocking infrastructure.
+
+    CONSUME MODE (production path): the in-guest screener runs offline against personal data,
+    writes a verdicts.json to the OUTPUT disk, and the host consumes that file via -VerdictsPath.
+    The consumed file is copied into the run's manifest/ dir as an audit record, then goes
+    through the identical host-side guards as a screener-produced file.
 
     Pure host-side orchestration: no Hyper-V calls. This module is intentionally thin —
     it delegates ALL content classification to the screener process.
@@ -46,12 +59,21 @@ function Invoke-SensitivityGate {
 <#
 .SYNOPSIS
     Run the offline screener over $StagingDir and partition artifacts into released/held.
+    Or consume a pre-existing verdicts file (in-guest-screen → host-partition production path).
 
 .DESCRIPTION
-    Orchestrates the three-phase gate:
+    Orchestrates the three-phase gate in one of two input modes:
+
+    Run mode (-ScreenerPath):
       1. Run screener.py → emit a per-file verdicts JSON.
       2. Partition: copy SAFE files to <OutputDir>/released/, everything else to /held/.
       3. Assert released ⊆ SAFE (belt-and-braces re-check before writing the manifest).
+
+    Consume mode (-VerdictsPath):
+      1. Copy the supplied verdicts file into the run's manifest/ dir (audit record).
+      2. Partition using the IDENTICAL traversal guard, completeness guard, exact-SAFE
+         partition, and invariant re-assertion as Run mode — the host does NOT trust the
+         in-guest-produced file any more than a locally-run screener file (D1).
 
     Throws on any screener failure, missing verdicts file, or invariant violation.
     Returns a [pscustomobject] with .Released, .Held, .ManifestPath for callers that need
@@ -64,22 +86,29 @@ function Invoke-SensitivityGate {
     Root output dir. Subdirs released/, held/, and manifest/ are created here.
 
 .PARAMETER Mode
-    Screener mode passed through to screener.py. 'aggressive' (default) is fail-closed.
-    The partition decision itself is mode-independent: only exact 'SAFE' releases.
+    Screener mode passed through to screener.py (Run mode only). 'aggressive' (default) is
+    fail-closed. The partition decision itself is mode-independent: only exact 'SAFE' releases.
 
 .PARAMETER ScreenerPath
-    Absolute path to screener.py. Explicit to keep test injection clean.
+    (Run mode) Absolute path to screener.py. Explicit to keep test injection clean.
+
+.PARAMETER VerdictsPath
+    (Consume mode) Absolute path to a verdicts.json produced in-guest. The file is copied
+    into the run's manifest/ dir as an audit record, then goes through the identical
+    host-side guards as a screener-produced file (traversal guard, completeness guard,
+    exact-SAFE partition, invariant re-assertion). Fail-closed: throws if the file is absent.
 
 .OUTPUTS
     [pscustomobject] @{ Released=[array]; Held=[array]; ManifestPath=[string] }
     where Released/Held are arrays of the screener's verdict objects ({name,verdict,detectors}).
 #>
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName='Run')]
     param(
         [Parameter(Mandatory)] [string] $StagingDir,
         [Parameter(Mandatory)] [string] $OutputDir,
         [ValidateSet('aggressive','moderate')] [string] $Mode = 'aggressive',
-        [Parameter(Mandatory)] [string] $ScreenerPath
+        [Parameter(Mandatory, ParameterSetName='Run')]     [string] $ScreenerPath,
+        [Parameter(Mandatory, ParameterSetName='Consume')] [string] $VerdictsPath
     )
 
     # Create output subdirs unconditionally — fail-closed means these exist even when we throw
@@ -93,23 +122,37 @@ function Invoke-SensitivityGate {
 
     $vjson = Join-Path $man 'verdicts.json'
 
-    # Phase 1: run the screener.
-    # Capture stdout+stderr together so we can surface the diagnostic in the throw message.
-    # The screener writes its JSON to --out $vjson directly; we are not parsing stdout.
-    # FAIL CLOSED: any non-zero exit means classification is incomplete => throw, release nothing.
-    # NOTE: the python executable ('python' on the host, 'python3' in-guest) and the gate's
-    # production runtime location (host vs in-guest) are wired in Phase 1 — out of scope here.
-    $screenerOutput = & python $ScreenerPath --in $StagingDir --out $vjson --mode $Mode 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        # $screenerOutput can be $null/empty (a screener that exits non-zero silently). Coerce to a
-        # human-readable placeholder so the diagnostic never renders a bare 'Output: '.
-        $so = if ([string]::IsNullOrWhiteSpace([string]$screenerOutput)) { '(no output)' } else { [string]$screenerOutput }
-        throw ("Invoke-SensitivityGate: screener failed (exit $LASTEXITCODE) — fail closed, " +
-               "nothing released. Output: $so")
-    }
-    if (-not (Test-Path -LiteralPath $vjson)) {
-        throw ("Invoke-SensitivityGate: screener exited 0 but produced no verdicts file at " +
-               "'$vjson' — fail closed, nothing released.")
+    # Phase 1: produce (or acquire) the verdicts file.
+    # Both paths lead to $vjson existing in the manifest dir before the shared parse/partition.
+    if ($PSCmdlet.ParameterSetName -eq 'Run') {
+        # Run mode: execute the screener and capture its output.
+        # Capture stdout+stderr together so we can surface the diagnostic in the throw message.
+        # The screener writes its JSON to --out $vjson directly; we are not parsing stdout.
+        # FAIL CLOSED: any non-zero exit means classification is incomplete => throw, release nothing.
+        # NOTE: the python executable ('python' on the host, 'python3' in-guest) and the gate's
+        # production runtime location (host vs in-guest) are wired in Phase 1 — out of scope here.
+        $screenerOutput = & python $ScreenerPath --in $StagingDir --out $vjson --mode $Mode 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            # $screenerOutput can be $null/empty (a screener that exits non-zero silently). Coerce to a
+            # human-readable placeholder so the diagnostic never renders a bare 'Output: '.
+            $so = if ([string]::IsNullOrWhiteSpace([string]$screenerOutput)) { '(no output)' } else { [string]$screenerOutput }
+            throw ("Invoke-SensitivityGate: screener failed (exit $LASTEXITCODE) — fail closed, " +
+                   "nothing released. Output: $so")
+        }
+        if (-not (Test-Path -LiteralPath $vjson)) {
+            throw ("Invoke-SensitivityGate: screener exited 0 but produced no verdicts file at " +
+                   "'$vjson' — fail closed, nothing released.")
+        }
+    } else {
+        # Consume mode: the verdicts file was produced in-guest; the host ingests it here.
+        # FAIL CLOSED: if the file is absent, there is nothing to partition against => throw.
+        if (-not (Test-Path -LiteralPath $VerdictsPath)) {
+            throw ("Invoke-SensitivityGate: verdicts file not found at '$VerdictsPath' — " +
+                   "fail closed, nothing released.")
+        }
+        # Copy the consumed file into the manifest dir so the run's audit record is self-contained.
+        # -ErrorAction Stop: a failed copy is a hard failure, not a swallowed error.
+        Copy-Item -LiteralPath $VerdictsPath -Destination $vjson -ErrorAction Stop
     }
 
     # Phase 2: partition.

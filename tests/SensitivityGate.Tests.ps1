@@ -113,6 +113,120 @@ pathlib.Path(a.out).write_text(json.dumps([{"name": "a.txt", "verdict": "SAFE", 
   }
 }
 
+Describe 'Invoke-SensitivityGate -VerdictsPath (consume mode)' {
+  BeforeAll {
+    . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"
+
+    # Helper: create a verdicts array that matches what the real screener produces for
+    # the messy-drive fixture (7 files, verdicts as documented in acceptance tests).
+    $script:messyVerdicts = @(
+      [pscustomobject]@{ name = 'creds.txt';             verdict = 'SENSITIVE';  detectors = @('credential-pattern') }
+      [pscustomobject]@{ name = 'finance-statement.txt'; verdict = 'SENSITIVE';  detectors = @('financial-keyword') }
+      [pscustomobject]@{ name = 'health-note.txt';       verdict = 'SENSITIVE';  detectors = @('health-keyword') }
+      [pscustomobject]@{ name = 'prose-essay.txt';       verdict = 'SAFE';       detectors = @() }
+      [pscustomobject]@{ name = 'prose-letter.md';       verdict = 'SAFE';       detectors = @() }
+      [pscustomobject]@{ name = 'spreadsheet-dump.csv';  verdict = 'UNCERTAIN';  detectors = @('non-prose') }
+      [pscustomobject]@{ name = 'prose-with-token.md';   verdict = 'SENSITIVE';  detectors = @('token-pattern') }
+    )
+  }
+
+  It 'produces the same partition as Run mode (released=SAFE only, held=everything else)' {
+    # Arrange — copy messy-drive into a staging dir; hand the pre-written verdicts.json to the gate.
+    $staging = Join-Path $TestDrive 'consume-staging'
+    New-Item -ItemType Directory -Path $staging -Force | Out-Null
+    Copy-Item "$PSScriptRoot/fixtures/messy-drive/*" $staging
+
+    $vfile = Join-Path $TestDrive 'consume-verdicts.json'
+    $script:messyVerdicts | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+
+    $output = Join-Path $TestDrive 'consume-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $staging -OutputDir $output -VerdictsPath $vfile
+
+    # Partition assertions: exactly the two SAFE prose files released.
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') | ForEach-Object { $_.Name })
+    $helNames = @(Get-ChildItem (Join-Path $output 'held')     | ForEach-Object { $_.Name })
+
+    $relNames | Should -Contain 'prose-essay.txt'
+    $relNames | Should -Contain 'prose-letter.md'
+    $relNames | Should -Not -Contain 'creds.txt'
+    $relNames | Should -Not -Contain 'finance-statement.txt'
+    $relNames | Should -Not -Contain 'health-note.txt'
+    $relNames | Should -Not -Contain 'spreadsheet-dump.csv'
+    $relNames | Should -Not -Contain 'prose-with-token.md'
+
+    $helNames | Should -Contain 'creds.txt'
+    $helNames | Should -Contain 'finance-statement.txt'
+    $helNames | Should -Contain 'health-note.txt'
+    $helNames | Should -Contain 'spreadsheet-dump.csv'
+    $helNames | Should -Contain 'prose-with-token.md'
+
+    # Every Released entry must carry exactly verdict='SAFE'.
+    @($r.Released).Count | Should -BeGreaterThan 0
+    $r.Released | ForEach-Object { $_.verdict | Should -Be 'SAFE' }
+  }
+
+  It 'host re-validates consumed file — traversal name still throws; evil.txt NOT released' {
+    # Arrange — an "evil.txt" placed OUTSIDE staging; a crafted verdicts.json marks it SAFE with
+    # a traversal name.  The host traversal guard must catch this EVEN on a consumed file.
+    $evil = Join-Path $TestDrive 'evil.txt'
+    Set-Content -LiteralPath $evil -Value 'EXTERNAL-SECRET'
+
+    $staging = Join-Path $TestDrive 'traversal-staging'
+    New-Item -ItemType Directory -Path $staging -Force | Out-Null
+    # staging is empty — the traversal guard runs before any copy.
+
+    $vfile = Join-Path $TestDrive 'traversal-verdicts.json'
+    @( [pscustomobject]@{ name = '../evil.txt'; verdict = 'SAFE'; detectors = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+
+    $output = Join-Path $TestDrive 'traversal-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    { Invoke-SensitivityGate -StagingDir $staging -OutputDir $output -VerdictsPath $vfile } |
+      Should -Throw
+
+    # evil.txt must NOT appear in released/ — the traversal guard fired before any copy.
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue |
+                  ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain 'evil.txt'
+  }
+
+  It 'completeness guard runs on the consumed file — unvouched staged file throws' {
+    # A staging dir with two files; the consumed verdicts only cover one.
+    # The completeness guard must catch the gap and throw, releasing nothing.
+    $staging = Join-Path $TestDrive 'completeness-staging'
+    New-Item -ItemType Directory -Path $staging -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $staging 'a.txt') -Value 'alpha'
+    Set-Content -LiteralPath (Join-Path $staging 'b.txt') -Value 'bravo'   # no verdict for this one
+
+    $vfile = Join-Path $TestDrive 'completeness-verdicts.json'
+    @( [pscustomobject]@{ name = 'a.txt'; verdict = 'SAFE'; detectors = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+
+    $output = Join-Path $TestDrive 'completeness-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    { Invoke-SensitivityGate -StagingDir $staging -OutputDir $output -VerdictsPath $vfile } |
+      Should -Throw
+  }
+
+  It 'missing -VerdictsPath file fails closed — throws before any copy' {
+    $staging = Join-Path $TestDrive 'missing-vp-staging'
+    New-Item -ItemType Directory -Path $staging -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $staging 'x.txt') -Value 'data'
+
+    $output = Join-Path $TestDrive 'missing-vp-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $nonExistent = Join-Path $TestDrive 'does-not-exist-verdicts.json'
+
+    { Invoke-SensitivityGate -StagingDir $staging -OutputDir $output -VerdictsPath $nonExistent } |
+      Should -Throw
+  }
+}
+
 Describe 'screener.py Presidio+spaCy upgrade (regex/crude fallback, strictly tighter)' {
   BeforeAll {
     $script:screener = "$PSScriptRoot/../guest/screener.py"
