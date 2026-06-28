@@ -573,6 +573,127 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
 }
 
 # ===========================================================================
+#  Task 1.4 — processor (gate) wiring: Invoke-Voidseal attaches+records the DEPS
+#  disk BEFORE the seal (so Assert-Sealed accepts it) and wires the POST-DETACH
+#  Sensitivity Gate (processor workloads only). The gate runs HOST-SIDE after the
+#  OUTPUT disk is detached, partitioning the in-guest screener's candidates into
+#  Released (auto-certified SAFE) vs Held (everything else), and stamps GateRan
+#  on the descriptor + Released/Held/SensitivityReport on the report.
+# ===========================================================================
+Describe 'Invoke-Voidseal — processor (gate) wiring' {
+
+    BeforeEach {
+        # A Tier-0 PROCESSOR profile: Network='None' (structurally no-NIC; Tier-0 Container substrate
+        # wires no NIC, so it seals clean) + a ScreenConfig (mode='aggressive') that routes the post-
+        # detach gate, + WorkloadMode='Disk' (a processor IS a Disk-mode workload) + an Entrypoint (so
+        # the disk-mode CIDATA seed disk is built, exactly like the RC6 path). EgressMode/EgressAllowlist
+        # MUST be 'None'/@() for a Network='None' profile (the loader's processor rule).
+        $script:Proc = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $script:Proc = @{} + $script:Proc                    # mutable copy
+        $script:Proc['Name']            = 'firefox-proc-test'
+        $script:Proc['WorkloadMode']    = 'Disk'
+        $script:Proc['Inputs']          = @{}
+        $script:Proc['FileSystem']      = 'exFAT'
+        $script:Proc['Network']         = 'None'             # processor: structurally no-NIC
+        $script:Proc['EgressMode']      = 'None'             # processor rule: Network=None => EgressMode=None
+        $script:Proc['EgressAllowlist'] = @()                # processor rule: empty allowlist
+        $script:Proc['ScreenConfig']    = @{ mode = 'aggressive' }   # routes the post-detach gate
+        $script:Proc['Entrypoint']      = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+        Assert-TierProfileValid -Profile $script:Proc -Context 'TEST Tier-0 processor fixture'
+
+        # SimulateSelfPowerOff: the guest self-powers-off before the first poll, so Wait-WorkloadComplete
+        # reads the happy (Off, not-timed-out) branch and the detach+read+gate path runs.
+        $script:ProcB = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $script:ProcArt  = Join-Path $script:TmpRoot ("art-proc-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:ProcDest = Join-Path $script:TmpRoot ("dest-proc-{0}" -f ([guid]::NewGuid().ToString('N')))
+
+        # The HOST-readable gate inputs the orchestrator consumes via -Workload (Phase-1 mock injection;
+        # Phase-2 derives these from host-mounting the detached OUTPUT VHDX). The staging dir is a real
+        # temp dir with the messy-drive fixture copied in; the verdicts.json is hand-written to cover all
+        # seven staged files (the gate's completeness guard refuses an unaccounted staged file).
+        $script:GateStaging = Join-Path $script:TmpRoot ("gate-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:GateStaging -Force | Out-Null
+        Copy-Item (Join-Path $script:SkillRoot 'tests/fixtures/messy-drive/*') $script:GateStaging
+
+        $script:GateVerdicts = Join-Path $script:TmpRoot ("gate-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        @(
+            [pscustomobject]@{ name = 'creds.txt';             verdict = 'SENSITIVE'; detectors = @('credential-pattern') }
+            [pscustomobject]@{ name = 'finance-statement.txt'; verdict = 'SENSITIVE'; detectors = @('financial-keyword') }
+            [pscustomobject]@{ name = 'health-note.txt';       verdict = 'SENSITIVE'; detectors = @('health-keyword') }
+            [pscustomobject]@{ name = 'prose-essay.txt';       verdict = 'SAFE';      detectors = @() }
+            [pscustomobject]@{ name = 'prose-letter.md';       verdict = 'SAFE';      detectors = @() }
+            [pscustomobject]@{ name = 'spreadsheet-dump.csv';  verdict = 'UNCERTAIN'; detectors = @('non-prose') }
+            [pscustomobject]@{ name = 'prose-with-token.md';   verdict = 'SENSITIVE'; detectors = @('token-pattern') }
+        ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:GateVerdicts -Encoding utf8
+
+        # A mock DEPS disk: a pre-existing VHDX the builder would have produced (Phase 2). The fake's
+        # AddHardDiskDrive requires the VHD to exist in its state (real Add-VMHardDiskDrive requires the
+        # file), so we create it on the backend with NewVHD first — mirroring how a real deps.vhdx exists
+        # on disk before the orchestrator attaches it.
+        $script:DepsDisk = Join-Path $script:TmpRoot ("deps-{0}.vhdx" -f ([guid]::NewGuid().ToString('N')))
+        & $script:ProcB.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+    }
+
+    It 'a processor deploy attaches+records the DEPS disk (seal accepts it), runs the gate, and stamps GateRan + Released/Held/SensitivityReport' {
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{
+                WorkloadMode    = 'Disk'
+                DepsDiskPath    = $script:DepsDisk
+                GateStagingDir  = $script:GateStaging
+                GateVerdictsPath= $script:GateVerdicts
+            } `
+            -Name 'sbx-proc-gate' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:ProcB
+
+        # The DEPS disk was attached + RECORDED before the seal, so Assert-Sealed accepted it (an
+        # UNRECORDED extra attached disk would have FAILED the seal as a residual) — the deploy SEALED.
+        $report.SealVerdict | Should -BeTrue -Because 'the recorded DepsDiskPath is an EXPECTED disk; the seal must certify with it attached'
+        @($report.States)   | Should -Contain 'SEALED'
+        $report.Descriptor.DepsDiskPath | Should -Be $script:DepsDisk -Because 'the orchestrator records the attached DEPS disk on the descriptor so the seal accepts it'
+
+        # The post-detach gate ran (processor + ScreenConfig present). Released holds the two SAFE prose
+        # files; Held holds creds.txt (+ the other non-SAFE files); GateRan is stamped on the descriptor.
+        $relNames = @($report.Released | ForEach-Object { $_.name })
+        $helNames = @($report.Held     | ForEach-Object { $_.name })
+        $relNames | Should -Contain 'prose-essay.txt' -Because 'a SAFE prose file is released'
+        $relNames | Should -Contain 'prose-letter.md' -Because 'a SAFE prose file is released'
+        $relNames | Should -Not -Contain 'creds.txt'  -Because 'a SENSITIVE credential file is NEVER released'
+        $helNames | Should -Contain 'creds.txt'       -Because 'the credential file is held'
+        $report.SensitivityReport | Should -Not -BeNullOrEmpty -Because 'the gate records the manifest path on the report'
+        Test-Path -LiteralPath $report.SensitivityReport | Should -BeTrue -Because 'sensitivity-report.json exists on disk'
+        (Split-Path -Leaf $report.SensitivityReport) | Should -Be 'sensitivity-report.json'
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'a processor deploy that ran the gate stamps GateRan on the descriptor'
+    }
+
+    It 'a NON-processor Disk-mode deploy does NOT run the gate (Released stays $null; GateRan not set)' {
+        # Reuse the established Tier-0 NON-processor Disk-mode fixture (no Network='None', no ScreenConfig).
+        $nonProc = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $nonProc = @{} + $nonProc
+        $nonProc['Name']         = 'firefox-nonproc-test'
+        $nonProc['WorkloadMode'] = 'Disk'
+        $nonProc['Inputs']       = @{}
+        $nonProc['FileSystem']   = 'exFAT'
+        Assert-TierProfileValid -Profile $nonProc -Context 'TEST Tier-0 non-processor Disk-mode fixture'
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $report = Invoke-Voidseal -Tier 0 -Profile $nonProc `
+            -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'result.html'; SentinelInnerName = 'result.exitcode' } `
+            -Name 'sbx-nonproc' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        @($report.States)         | Should -Contain 'SEALED' -Because 'a non-processor Disk-mode deploy still seals + runs'
+        $report.Released          | Should -BeNullOrEmpty -Because 'the gate did not run on a non-processor deploy'
+        $report.Held              | Should -BeNullOrEmpty -Because 'the gate did not run on a non-processor deploy'
+        $report.SensitivityReport | Should -BeNullOrEmpty -Because 'no gate => no sensitivity report'
+        # GateRan must NOT be set on the descriptor (the gate never ran). A descriptor without the field,
+        # or one whose field is falsey/absent, both satisfy "GateRan is not set".
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) |
+            Should -BeTrue -Because 'GateRan is never stamped when the gate did not run'
+    }
+}
+
+# ===========================================================================
 #  Input validation
 # ===========================================================================
 Describe 'Invoke-Voidseal — input validation' {

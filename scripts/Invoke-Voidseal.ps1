@@ -60,6 +60,7 @@ $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
 . (Join-Path $script:DeployLibDir 'Runner.ps1')
 . (Join-Path $script:DeployLibDir 'Workload.ps1')
 . (Join-Path $script:DeployLibDir 'SeedBuilder.ps1')
+. (Join-Path $script:DeployLibDir 'SensitivityGate.ps1')
 
 # --------------------------------------------------------------------------
 # Internal: resolve the -Profile argument to a normalized profile hashtable (loader output).
@@ -289,6 +290,14 @@ function Invoke-Voidseal {
         TeardownStatus    = '(not run)'
         Error             = $null
         Descriptor        = $null
+        # Processor-workload Sensitivity Gate outputs (set only when the post-detach gate runs — see
+        # the Disk-mode RUNNING block). Released/Held are arrays of the screener's per-file verdict
+        # objects (auto-certified-SAFE vs held-for-review); SensitivityReport is the host path to the
+        # gate's sensitivity-report.json. They stay $null for a non-processor deploy (the gate did not
+        # run). GateRan (the boolean fact that the gate executed) lives on the DESCRIPTOR, not here.
+        Released          = $null
+        Held              = $null
+        SensitivityReport = $null
     }
 
     $descriptor = $null
@@ -388,6 +397,24 @@ function Invoke-Voidseal {
                     -StorageRoot $diskStorageRoot -Backend $Backend
                 $report.Descriptor = $descriptor
             }
+
+            # --- PROCESSOR: attach + RECORD the DEPS disk BEFORE the seal -------------------------
+            # A processor profile (Network='None') runs against a pre-built, read-only DEPENDENCY disk
+            # (deps.vhdx — Phase 2 builds it; the path is supplied via -Workload.DepsDiskPath or the
+            # resolved profile's DepsDiskPath). Like the INPUT/OUTPUT/SeedDisk data disks, it must be
+            # ATTACHED and RECORDED (DepsDiskPath) on the descriptor BEFORE Lock-Sandbox so Assert-Sealed's
+            # host-truth scan ACCEPTS it as an expected disk — an UNRECORDED extra attached disk fails the
+            # seal gate as a residual. We attach via the existing AddHardDiskDrive (no read-only attach:
+            # Hyper-V cannot host-enforce a read-only VHDX — D3). The DEPS disk is the BUILDER's pre-
+            # existing file, so it is NOT added to CreatedDisks (we did not create it; teardown's
+            # Remove-Sandbox detaches it by removing the VM, but the deps.vhdx FILE is left on disk).
+            $depsDiskPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
+            if ([string]::IsNullOrWhiteSpace($depsDiskPath) -and $resolved.ContainsKey('DepsDiskPath')) { $depsDiskPath = [string]$resolved['DepsDiskPath'] }
+            if ($resolved['Network'] -eq 'None' -and -not [string]::IsNullOrWhiteSpace($depsDiskPath)) {
+                $null = & $Backend.AddHardDiskDrive @{ VMName = $Name; Path = $depsDiskPath }   # existing method; no read-only attach (D3)
+                Set-DescriptorField -Descriptor $descriptor -Name 'DepsDiskPath' -Value $depsDiskPath
+                $report.Descriptor = $descriptor
+            }
         }
         $states.Add('STAGED')
 
@@ -457,6 +484,35 @@ function Invoke-Voidseal {
                 $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = 'boot/workload timed out' }
             }
             # (detach failed -> RunResult already set above; EXTRACTED intentionally not reached)
+
+            # --- POST-DETACH SENSITIVITY GATE (processor workloads) -------------------
+            # The screener ran IN-GUEST (offline) and wrote verdicts.json + candidates onto the OUTPUT disk's
+            # staging/. Now that OUTPUT is detached, the HOST partitions: only auto-certified-SAFE artifacts are
+            # released. PHASE-1 (mock): the host-readable staging dir + verdicts path are injected via -Workload
+            # (GateStagingDir/GateVerdictsPath). PHASE-2 (real): derive them by host-mounting the detached OUTPUT
+            # VHDX. The host re-validates the consumed verdicts (traversal+completeness+exact-SAFE) — D1.
+            if ($resolved['Network'] -eq 'None' -and $resolved.ContainsKey('ScreenConfig')) {
+                $gateStaging  = [string](Get-WorkloadField -Workload $Workload -Name 'GateStagingDir')
+                $gateVerdicts = [string](Get-WorkloadField -Workload $Workload -Name 'GateVerdictsPath')
+                if (-not [string]::IsNullOrWhiteSpace($gateStaging) -and -not [string]::IsNullOrWhiteSpace($gateVerdicts)) {
+                    try {
+                        $gateOut = Join-Path $Destination 'gate'
+                        $screenCfg = Resolve-ScreenConfig -Profile $resolved
+                        $gateResult = Invoke-SensitivityGate -StagingDir $gateStaging -OutputDir $gateOut `
+                                        -Mode $screenCfg.mode -VerdictsPath $gateVerdicts
+                        Set-DescriptorField -Descriptor $descriptor -Name 'GateRan' -Value $true
+                        $report.Descriptor        = $descriptor
+                        $report.Released          = $gateResult.Released
+                        $report.Held              = $gateResult.Held
+                        $report.SensitivityReport = $gateResult.ManifestPath
+                    }
+                    catch {
+                        # A gate failure is fail-closed like the seal gate: record + let the finally teardown run.
+                        $report.Error = "Sensitivity gate failed: $($_.Exception.Message)"
+                        Write-Warning "Invoke-Voidseal: '$Name' sensitivity gate failed: $($_.Exception.Message)"
+                    }
+                }
+            }
         }
         else {
             # SERIAL MODE (default): RUNNING/CAPTURED/EXTRACTED only when there is an entrypoint to deliver.
