@@ -304,6 +304,20 @@ function Assert-TierProfileValid {
             throw "Invariant 5 (Linux management): '$Context' GuestImage='$($Profile['GuestImage'])' is Linux but ManagementChannel='$($Profile['ManagementChannel'])'; a Linux guest MUST use ManagementChannel='Com1Serial' (PSDirect is Windows-guest-only)."
         }
     }
+
+    # --- processor rule: Network='None' => EgressMode='None' + empty allowlist ------
+    # A structurally no-NIC processor profile (Network='None') cannot simultaneously
+    # request egress — there is no network interface to route traffic through. Enforced
+    # as a fail-closed consistency check to catch accidental copy-paste from network-
+    # capable profiles (the same mis-copy class that produced fake≠real divergences).
+    if ($Profile['Network'] -eq 'None') {
+        if ($Profile['EgressMode'] -ne 'None') {
+            throw "Processor rule (Network=None): '$Context' sets Network='None' (no NIC) but EgressMode='$($Profile['EgressMode'])'; a no-network processor profile MUST set EgressMode='None'."
+        }
+        if ($allowlist.Count -ne 0) {
+            throw "Processor rule (Network=None): '$Context' sets Network='None' (no NIC) but EgressAllowlist has $($allowlist.Count) entr$(if($allowlist.Count -eq 1){'y'}else{'ies'}); a no-network processor profile MUST have an empty EgressAllowlist (@())."
+        }
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -317,6 +331,41 @@ function ConvertTo-StringArray {
     param([AllowNull()] $Value)
     if ($null -eq $Value) { return @() }
     return @($Value)
+}
+
+<#
+.SYNOPSIS
+    Returns the profile's ScreenConfig hashtable with missing defaults applied.
+.DESCRIPTION
+    Processor profiles carry an optional ScreenConfig key. When mode is absent
+    or empty, defaults to 'aggressive'. When categories is absent, defaults to
+    an empty array. StrictMode-safe: guards every key access with ContainsKey.
+.PARAMETER Profile
+    The (merged) profile hashtable.
+.OUTPUTS
+    [hashtable] with at least keys 'mode' and 'categories'.
+#>
+function Resolve-ScreenConfig {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([Parameter(Mandatory)] [hashtable] $Profile)
+
+    # Start from the profile's ScreenConfig when present; otherwise an empty table.
+    $src = @{}
+    if ($Profile.ContainsKey('ScreenConfig') -and ($null -ne $Profile['ScreenConfig']) -and
+        ($Profile['ScreenConfig'] -is [System.Collections.IDictionary])) {
+        foreach ($k in $Profile['ScreenConfig'].Keys) { $src[$k] = $Profile['ScreenConfig'][$k] }
+    }
+
+    # Apply defaults: mode defaults to 'aggressive'; categories defaults to @().
+    if (-not $src.ContainsKey('mode') -or [string]::IsNullOrWhiteSpace([string]$src['mode'])) {
+        $src['mode'] = 'aggressive'
+    }
+    if (-not $src.ContainsKey('categories') -or ($null -eq $src['categories'])) {
+        $src['categories'] = @()
+    }
+
+    return $src
 }
 
 # --------------------------------------------------------------------------
@@ -457,8 +506,12 @@ function Import-WorkloadProfile {
     # and Inputs / FileSystem / InputLabel / OutputLabel configure the INPUT/OUTPUT data disks that
     # New-WorkloadDisks creates. Without layering these, a 'Disk' workload profile (firefox.psd1)
     # would lose its mode + data-disk config in the merge and silently fall back to Serial.
+    # DepsSpec / ScreenConfig / DepsDiskPath are processor-profile keys: DepsSpec carries the
+    # dependency set the builder stages; ScreenConfig carries gate mode + categories;
+    # DepsDiskPath carries the pre-built deps disk path (optional, resolved at runtime).
     foreach ($layerKey in @('Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
-                            'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel')) {
+                            'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
+                            'DepsSpec', 'ScreenConfig', 'DepsDiskPath')) {
         if ($raw.ContainsKey($layerKey)) {
             $merged[$layerKey] = $raw[$layerKey]
         }

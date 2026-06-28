@@ -567,3 +567,33 @@ Describe 'Import-WorkloadProfile — merge + re-validation' {
             Should -Throw -ExpectedMessage '*Egress*'
     }
 }
+
+Describe 'Processor profile (Network=None) + DepsSpec/ScreenConfig' {
+    BeforeAll {
+        . "$PSScriptRoot/../scripts/lib/ProfileLoader.ps1"
+        # New-ProcBase defined in BeforeAll so It blocks can find it (Pester 5 scoping).
+        function script:New-ProcBase {
+            @{ Tier=0; Description='p'; Substrate='HyperV-Gen2'; Network='None'; EgressMode='None';
+               EgressAllowlist=@(); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
+               HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
+               Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
+               Controls=@(); ManagementChannel='Com1Serial' }
+        }
+    }
+    It 'accepts a processor profile with Network=None + DepsSpec + ScreenConfig' {
+        $p = script:New-ProcBase; $p.DepsSpec=@{packages=@('tika')}; $p.ScreenConfig=@{mode='aggressive';categories=@('financial')}
+        { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Not -Throw
+    }
+    It 'REFUSES a Network=None profile that declares egress (EgressMode != None)' {
+        $p = script:New-ProcBase; $p.EgressMode='NftablesAllowlist'
+        { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Throw
+    }
+    It 'REFUSES a Network=None profile with a non-empty EgressAllowlist' {
+        $p = script:New-ProcBase; $p.EgressAllowlist=@('pypi.org')
+        { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Throw
+    }
+    It 'defaults a processor ScreenConfig mode to aggressive when omitted' {
+        $p = script:New-ProcBase; $p.ScreenConfig=@{categories=@('financial')}
+        (Resolve-ScreenConfig -Profile $p).mode | Should -Be 'aggressive'
+    }
+}
