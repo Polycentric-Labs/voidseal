@@ -24,14 +24,16 @@ SENSITIVE = [
     (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), 'email'),
 ]
 
-# Lazy Presidio (PII NER). On ANY failure -> None (dep-free fallback). Adds hits only (stricter).
+# Conditional Presidio init: constructed at import if installed, else None (regex floor stands).
+# Adds hits only (stricter) -> only moves a verdict toward SENSITIVE, never toward SAFE.
 try:
     from presidio_analyzer import AnalyzerEngine
     _ANALYZER = AnalyzerEngine()
 except Exception:
     _ANALYZER = None
 
-# Lazy spaCy POS model. On ANY failure -> None (crude-heuristic fallback). Tightens is_prose only.
+# Conditional spaCy init: model loaded at import if available, else None (crude floor stands).
+# Tightens is_prose only (can demote a crude-True to non-prose, never the reverse).
 try:
     import spacy
     _NLP = spacy.load('en_core_web_sm')
@@ -68,7 +70,7 @@ def is_prose(t):
         tokens = [tok for tok in doc if tok.is_alpha]
         if not tokens:
             return False
-        verb_ratio = sum(1 for tok in doc if tok.pos_ in ('VERB','AUX')) / max(len(tokens),1)
+        verb_ratio = sum(1 for tok in tokens if tok.pos_ in ('VERB','AUX')) / max(len(tokens),1)
         return verb_ratio >= 0.05         # conservative; only DEMOTES a crude-true to non-prose
     except Exception:
         return True                       # spaCy failure -> keep the crude verdict (do NOT loosen)

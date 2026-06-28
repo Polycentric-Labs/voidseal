@@ -107,9 +107,12 @@ Describe 'screener.py Presidio+spaCy upgrade (regex/crude fallback, strictly tig
     Set-Content -LiteralPath (Join-Path $script:din 'email-doc.txt') -Value @'
 I wanted to follow up on our wonderful conversation from last week about the community garden project. It was truly inspiring to see so many neighbors come together for a shared cause. If you have any further questions or would simply like to continue the discussion, please feel free to reach me at jane.doe@example.com whenever it is convenient for you. I look forward to hearing your thoughts and to working alongside everyone again very soon.
 '@
-    # name-doc: prose with a clear PERSON name (Presidio NER target).
+    # Presidio fixture: clean prose (passes the crude floor -> SAFE dep-free) whose ONLY sensitive
+    # feature is a private person name -> Presidio NER is the only stage that can demote it off SAFE.
+    # Tests the high-risk SAFE->SENSITIVE path (a doc that WOULD be released without Presidio).
+    # Fictional private name (not a public figure, which Presidio can deny-list / low-score).
     Set-Content -LiteralPath (Join-Path $script:din 'name-doc.txt') -Value @'
-The keynote was delivered by Barack Obama, who spoke at length about civic participation and the importance of local engagement. The audience listened intently as the speaker walked through several stories drawn from years of public service, and the room responded warmly to each reflection offered throughout the long and memorable afternoon session.
+The afternoon review ran far longer than anyone had expected that day. Margaret Osei opened with a brief summary of the quarter and then handed the floor over to the rest of the group for comment. Questions came quickly, and the discussion soon wandered into territory that no one in the room had planned for at all. By the time the long session finally ended and the room emptied out, the early enthusiasm had given way to a quiet and thoughtful sort of fatigue.
 '@
     # list-like: crude-prose-but-verb-poor -> passes the crude floor so the spaCy POS refinement is
     # the only stage that can demote it (otherwise this dep-gated test wouldn't exercise spaCy).
@@ -131,7 +134,7 @@ The weathered oak desk. A faded velvet armchair. The brass reading lamp. A small
     $md = @(Get-Content $mdOut -Raw | ConvertFrom-Json)
     (@($md | Where-Object { $_.name -eq 'spreadsheet-dump.csv' })[0]).verdict | Should -Not -Be 'SAFE'
   }
-  It 'marks a PII person-name document SENSITIVE (Presidio NER)' {
+  It 'marks a clean-prose doc with a private person name SENSITIVE (Presidio NER, SAFE->SENSITIVE path)' {
     if (-not $script:hasPresidio) { Set-ItResult -Skipped -Because 'Presidio not staged in this environment (live-run only)'; return }
     (@($script:V | Where-Object { $_.name -eq 'name-doc.txt' })[0]).verdict | Should -Be 'SENSITIVE'
   }
