@@ -63,7 +63,7 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             # host channels (the seal surface)
             'SetHostChannel', 'GetHostChannels'
             # disk
-            'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
+            'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'ReadVhdxRawRegion', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
             # switch / network
             'NewSwitch', 'GetSwitch', 'RemoveSwitch', 'ConnectNetworkAdapter', 'RemoveNetworkAdapter', 'GetNetworkAdapter'
             # checkpoint
@@ -104,6 +104,12 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
         $m['NewOutputVhdx'] | Should -Contain 'Label'
         $m['NewOutputVhdx'] | Should -Contain 'FileSystem'
         $m['NewOutputVhdx'] | Should -Contain 'SizeBytes'
+    }
+
+    It 'manifest documents ReadVhdxRawRegion with Path + Offset + Length' {
+        $m = Get-HyperVBackendMethodManifest
+        $m.Contains('ReadVhdxRawRegion') | Should -BeTrue
+        $m['ReadVhdxRawRegion'] | Should -Be @('Path','Offset','Length')
     }
 }
 
@@ -157,7 +163,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
             InvokeGuestCommand = 'VMName'
             SetHostChannel = 'VMName'; GetHostChannels = 'VMName'
-            NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'
+            NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; ReadVhdxRawRegion = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'
             AddHardDiskDrive = 'VMName'; RemoveHardDiskDrive = 'VMName'; SetDvdDrive = 'VMName'; RemoveDvdDrive = 'VMName'; GetDvdDrives = 'VMName'
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
@@ -1516,5 +1522,51 @@ Describe 'Real backend — builds the right cmdlet params (out-of-process; live-
         $cap.Count       | Should -Be 2
         $cap.ExposeGiven | Should -BeTrue
         $cap.Expose      | Should -BeTrue
+    }
+}
+
+# ===========================================================================
+#  ReadVhdxRawRegion — user-space raw read (fake axes + real never-mounts)
+# ===========================================================================
+Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-mounts)' {
+    BeforeEach {
+        $script:fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16))
+        & $script:fake.NewVM @{ Name = 'p1'; Generation = 2 }
+        & $script:fake.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $false }   # the RC7 fix
+        & $script:fake.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $script:fake.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+    }
+    It 'AXIS 1: reading a STILL-ATTACHED disk throws (file-lock / detach ordering)' {
+        & $script:fake.StartVM @{ Name = 'p1' }
+        { & $script:fake.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 } } |
+            Should -Throw -ExpectedMessage '*still attached*'
+    }
+    It 'AXIS 1+3: after detach + SelfPowerOff, returns the recorded outbox bytes; CallLog proves detach precedes read' {
+        & $script:fake.StartVM @{ Name = 'p1' }
+        & $script:fake.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $script:fake.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 }
+        ,$bytes | Should -BeOfType ([byte[]])
+        ($bytes -join ',') | Should -Be ((1..16) -join ',')
+    }
+    It 'AXIS 2: checkpoints ON (RC7 trap) -> base raw-read returns ALL ZEROS (outbox stuck in .avhdx child)' {
+        & $script:fake.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $true }
+        & $script:fake.StartVM @{ Name = 'p1' }
+        & $script:fake.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $script:fake.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 }
+        (@($bytes | Where-Object { $_ -ne 0 })).Count | Should -Be 0
+    }
+    It 'AXIS 4: an over-read past the written payload is zero-padded, never an error (FIXED-disk tail)' {
+        & $script:fake.StartVM @{ Name = 'p1' }
+        & $script:fake.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $script:fake.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 32 }
+        $bytes.Length | Should -Be 32
+        (@($bytes[16..31] | Where-Object { $_ -ne 0 })).Count | Should -Be 0
+    }
+    It 'SECURITY: the REAL ReadVhdxRawRegion NEVER references Mount-VHD / Add-VMHardDiskDrive (user-space only)' {
+        $real = New-RealHyperVBackend
+        $body = $real.ReadVhdxRawRegion.ToString()
+        $body | Should -Not -Match 'Mount-VHD'
+        $body | Should -Not -Match 'Add-VMHardDiskDrive'
+        $body | Should -Match 'qemu-img'   # pin the user-space mechanism
     }
 }

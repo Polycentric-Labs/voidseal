@@ -153,6 +153,15 @@ function Get-HyperVBackendMethodManifest {
         NewOutputVhdx        = @('Path', 'Label', 'FileSystem', 'SizeBytes')  # create + host-format a data VHDX
         WriteVhdxFile        = @('Path', 'InnerPath', 'Content')   # host writes one file onto a VHDX (rw)
         ReadVhdxFile         = @('Path', 'InnerPath')              # host reads one file from a VHDX (ro) -> string or $null
+        # Read a raw byte range from a FIXED VHDX's payload in USER-SPACE (qemu-img convert -O raw +
+        # file-slice). NEVER Mount-VHD / Add-VMHardDiskDrive — host attach kernel-parses attacker FS
+        # bytes (Pass-5). The host reads the in-guest "outbox" (guest/outbox.py) off the DETACHED OUTPUT
+        # disk through THIS method; the Sensitivity Gate consumes the parsed verdicts. REAL = qemu-img
+        # convert -f vhdx -O raw then FileStream seek/read; FAKE = return the recorded outbox-region
+        # bytes, modeling detach/file-lock ordering + the .avhdx child-layer trap (RC7) + a zero-padded
+        # FIXED-disk tail. Added per the GetDvdDrives/ReadVhdxFile addendum precedent (manifest + both
+        # factories + parity/drift tests). Interface: -> [byte[]] of length Length.
+        ReadVhdxRawRegion    = @('Path', 'Offset', 'Length')   # user-space raw read (NEVER Mount-VHD)
         GetVHDInfo           = @('Path')                            # -> @{ Path; SizeBytes; Differencing; ParentPath; Label; FileSystem } or $null
         RemoveVHD            = @('Path')                            # delete a DETACHED .vhdx file (the Reaper's explicit cleanup)
         AddHardDiskDrive     = @('VMName', 'Path')
@@ -941,6 +950,54 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
+    # Read a raw byte range from a FIXED VHDX's payload WITHOUT attaching/mounting it. qemu-img does the
+    # VHDX -> logical-block translation (so a logical Offset == the byte offset in the flat raw output);
+    # we then seek/read the requested slice. NEVER Mount-VHD: even -ReadOnly host-attach runs partmgr.sys
+    # + FS-recognizer parses on attacker bytes (Pass-5, verified). REQUIRES the VHDX DETACHED + the VM Off
+    # (qemu-img cannot open a Hyper-V-locked file) — the orchestrator's $detachOk guard enforces that.
+    # LIVE-ONLY-UNPROVEN until Phase 6 (the mock never runs this); re-resolve the exact qemu-img
+    # invocation at fire. Fails closed with a clear message if qemu-img is absent or the file is locked.
+    # Hoist every $P read into locals BEFORE $InvokeOp (see NewVHD note).
+    $b.ReadVhdxRawRegion = {
+        param([System.Collections.IDictionary] $P)
+        $path   = & $AssertArg $P 'Path'   'ReadVhdxRawRegion'
+        $offset = [int64](& $AssertArg $P 'Offset' 'ReadVhdxRawRegion')
+        $length = [int64](& $AssertArg $P 'Length' 'ReadVhdxRawRegion')
+        & $InvokeOp {
+            if ($offset -lt 0 -or $length -lt 0) { throw "ReadVhdxRawRegion: Offset/Length must be non-negative (got Offset=$offset, Length=$length)." }
+            $qemu = Get-Command qemu-img -ErrorAction SilentlyContinue
+            if ($null -eq $qemu) {
+                throw "ReadVhdxRawRegion: qemu-img not found on PATH. The user-space OUTPUT read needs qemu-img (host attach of an untrusted guest disk is FORBIDDEN — host attach kernel-parses attacker bytes; Pass-5). Install qemu-img and retry. Failing closed."
+            }
+            $tmpRaw = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "voidseal-outbox-$([System.IO.Path]::GetRandomFileName()).raw")
+            try {
+                # -f vhdx pins the input format (never auto-probe an attacker-influenced header into a
+                # surprising driver); -O raw flattens to logical-block order. '--' ends option parsing.
+                & $qemu.Source convert -f vhdx -O raw -- $path $tmpRaw 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "ReadVhdxRawRegion: qemu-img convert failed (exit $LASTEXITCODE) for '$path' — the VHDX may still be attached/locked (detach first) or be malformed. Failing closed."
+                }
+                $fsr = [System.IO.File]::OpenRead($tmpRaw)
+                try {
+                    $buf = [byte[]]::new($length)   # zero-initialized: an over-read past EOF keeps the zero tail (honest FIXED-disk)
+                    if ($offset -lt $fsr.Length) {
+                        $null  = $fsr.Seek($offset, [System.IO.SeekOrigin]::Begin)
+                        $avail = [int][Math]::Min($length, $fsr.Length - $offset)
+                        $read  = 0
+                        while ($read -lt $avail) {
+                            $n = $fsr.Read($buf, $read, $avail - $read)
+                            if ($n -le 0) { break }
+                            $read += $n
+                        }
+                    }
+                    return ,$buf   # unary comma: return the byte[] as ONE array (PS unrolls a bare array)
+                }
+                finally { $fsr.Dispose() }
+            }
+            finally { Remove-Item -LiteralPath $tmpRaw -Force -ErrorAction SilentlyContinue }
+        }
+    }.GetNewClosure()
+
     $b.GetVHDInfo = {
         param([System.Collections.IDictionary] $P)
         $path = & $AssertArg $P 'Path' 'GetVHDInfo'
@@ -1244,6 +1301,7 @@ function New-FakeHyperVBackend {
         [switch] $SimulateSelfPowerOff,
         [switch] $SimulateSecondNewOutputVhdxError,
         [hashtable] $SimulateWorkloadOutput,
+        [byte[]] $SimulateOutboxBlob,
         [switch] $SimulateDetachError
     )
 
@@ -1273,6 +1331,7 @@ function New-FakeHyperVBackend {
     # Captured by the StartVM closure: the inner files the guest "writes" to the OUTPUT disk on boot,
     # so a positive Success-path e2e can reach Read-WorkloadResult -> Success -> EXTRACTED. $null = none.
     $workloadOutput    = $SimulateWorkloadOutput
+    $outboxBlob = $SimulateOutboxBlob   # raw bytes the guest "wrote" to the OUTPUT disk's outbox region
     # Captured by the RemoveHardDiskDrive closure: model a transient detach failure so the orchestrator's
     # detach try/catch (Failed run, host read skipped — NOT a lifecycle abort) is unit-testable.
     $detachThrows      = $SimulateDetachError.IsPresent
@@ -1395,6 +1454,29 @@ function New-FakeHyperVBackend {
                 if (-not $state.VHDs[$outDisk].ContainsKey('Files')) { $state.VHDs[$outDisk]['Files'] = @{} }
                 foreach ($inner in @($workloadOutput.Keys)) {
                     $state.VHDs[$outDisk]['Files'][[string]$inner] = [string]$workloadOutput[$inner]
+                }
+            }
+        }
+        # SimulateOutboxBlob (paired with SimulateSelfPowerOff): model the guest packing guest/outbox.py
+        # and dd-ing it onto the OUTPUT disk's RAW region at boot, then powering off (write-flush axis).
+        # The .avhdx identity trap (RC7): if AutomaticCheckpointsEnabled is ON, the guest's writes land
+        # in a per-disk .avhdx CHILD layer that a host BASE raw-read does NOT expose — model that by
+        # stashing the blob where ReadVhdxRawRegion can't see it (OutboxChildLayer), so the base read
+        # returns zeros and the gate releases nothing. Checkpoints OFF (the provisioner's RC7 fix) -> the
+        # base OutboxRegion is host-readable.
+        if ($null -ne $outboxBlob) {
+            $outDisk = $null
+            foreach ($hd in @($vm.HardDrives)) {
+                if ($state.VHDs.ContainsKey([string]$hd)) {
+                    $rec = $state.VHDs[[string]$hd]
+                    if ($rec.Contains('Label') -and [string]$rec['Label'] -eq 'OUTPUT') { $outDisk = [string]$hd }
+                }
+            }
+            if ($null -ne $outDisk) {
+                if ([bool]$vm['AutomaticCheckpointsEnabled']) {
+                    $state.VHDs[$outDisk]['OutboxChildLayer'] = [byte[]]$outboxBlob   # base raw-read can't see it (RC7)
+                } else {
+                    $state.VHDs[$outDisk]['OutboxRegion'] = [byte[]]$outboxBlob        # base raw-read sees it
                 }
             }
         }
@@ -1607,6 +1689,37 @@ function New-FakeHyperVBackend {
             return $state.VHDs[$path]['Files'][$inner]
         }
         return $null
+    }.GetNewClosure()
+
+    # USER-SPACE raw region read (fake): return the recorded outbox-region bytes, modeling the FOUR live
+    # divergence axes honestly (D-A) so the mock cannot pass where the live qemu-img read would fail.
+    $b.ReadVhdxRawRegion = {
+        param([System.Collections.IDictionary] $P)
+        $path   = & $AssertArg $P 'Path'   'ReadVhdxRawRegion'
+        $offset = [int64](& $AssertArg $P 'Offset' 'ReadVhdxRawRegion')
+        $length = [int64](& $AssertArg $P 'Length' 'ReadVhdxRawRegion')
+        if (-not $state.VHDs.ContainsKey($path)) { throw "ReadVhdxRawRegion: VHD '$path' does not exist." }
+        if ($offset -lt 0 -or $length -lt 0) { throw "ReadVhdxRawRegion: Offset/Length must be non-negative (got Offset=$offset, Length=$length)." }
+        # AXIS 1 — detach/file-lock ordering: qemu-img cannot open a Hyper-V-locked VHDX, so a raw read of
+        # a STILL-ATTACHED disk must fail exactly as the live open would. Throw if any VM still holds it.
+        foreach ($vmRec in $state.VMs.Values) {
+            if (@($vmRec.HardDrives) -contains $path) {
+                throw "ReadVhdxRawRegion: VHD '$path' is still attached to VM '$($vmRec.Name)' (locked); detach before the host raw read. Failing closed."
+            }
+        }
+        # Log so a test can prove DETACH (RemoveHardDiskDrive) precedes the read (survives RemoveVM).
+        $state.CallLog.Add(@{ Op = 'ReadVhdxRawRegion'; Path = $path; Offset = $offset; Length = $length })
+        $rec = $state.VHDs[$path]
+        # AXIS 2 — .avhdx identity trap (RC7): only the BASE OutboxRegion is host-readable; a blob stuck in
+        # the checkpoint child layer reads as zeros.
+        $region = if ($rec.ContainsKey('OutboxRegion')) { [byte[]]$rec['OutboxRegion'] } else { [byte[]]::new(0) }
+        # AXIS 4 — honest FIXED-disk tail: full-size disk, an over-read past the written payload is zeros.
+        $buf = [byte[]]::new($length)
+        if ($offset -lt $region.Length) {
+            $avail = [int][Math]::Min($length, [int64]$region.Length - $offset)
+            if ($avail -gt 0) { [System.Array]::Copy($region, [int]$offset, $buf, 0, $avail) }
+        }
+        return ,$buf
     }.GetNewClosure()
 
     $b.GetVHDInfo = {
