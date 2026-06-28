@@ -639,6 +639,11 @@ function Assert-Sealed {
         throw "Assert-Sealed: descriptor has no VM Name; cannot verify a seal."
     }
     $tier = [int](Get-DescriptorField -Descriptor $Descriptor -Name 'Tier' -Default 0)
+    # A processor profile carries Network='None' on the descriptor. It is structurally
+    # no-NIC — the same guarantee as Tier>=2 — even when the tier integer is 0 or 1.
+    # Read it once and propagate to the NIC check and error messaging below.
+    $network     = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'Network')
+    $isProcessor = ($network -eq 'None')
 
     # --- FAIL CLOSED: if the host can't be queried, do NOT certify --------
     # An inability to perform the host-side check is never a pass — that is the whole point of
@@ -656,11 +661,20 @@ function Assert-Sealed {
         throw "Assert-Sealed: REFUSING to certify — no VM named '$vmName' exists on the host. Fail closed."
     }
 
-    # --- Tier >= 2: NO NIC (host-verified; the guest's view is irrelevant) ----
+    # --- Tier >= 2 OR processor (Network='None'): NO NIC (host-verified; guest view irrelevant) ---
+    # A processor (Network='None') is structurally no-NIC at any tier — exactly the same
+    # guarantee as Tier>=2. We reuse the same GetNetworkAdapter call (D2: no new method)
+    # and branch the error message so the reason is unambiguous in the operator log.
     # Read the collection DIRECTLY (the backend preserves array semantics; never re-wrap).
-    if ($tier -ge 2) {
+    if ($tier -ge 2 -or $isProcessor) {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
         if ($nics.Count -ne 0) {
+            if ($isProcessor -and $tier -lt 2) {
+                # Processor case: the no-NIC guarantee comes from Network='None', not the tier.
+                throw ("Assert-Sealed: REFUSING to certify processor VM '$vmName' SEALED — $($nics.Count) " +
+                       "network adapter(s) still attached. A processor (Network='None') MUST have NO NIC " +
+                       "(structurally no-net even at Tier-$tier). Fail closed.")
+            }
             throw ("Assert-Sealed: REFUSING to certify Tier-$tier VM '$vmName' SEALED — $($nics.Count) network " +
                    "adapter(s) still attached. A Tier>=2 VM MUST have NO NIC (no live egress route). Fail closed.")
         }
@@ -710,6 +724,18 @@ function Assert-Sealed {
     # input/output, an UNRECORDED disk is still refused, and a secret-SHAPED SeedDiskPath is still caught
     # by the secret check (b) BEFORE these allowances — recording cannot launder a secret.
     $seedDisk   = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'SeedDiskPath')
+    # Task 1.3: the processor-profile DEPS disk (DepsDiskPath) is a pre-provisioned dependency
+    # payload attached BEFORE the seal and recorded on the descriptor. It is EXPECTED to remain
+    # attached through the seal exactly like INPUT/OUTPUT/SeedDiskPath — NOT a residual. It joins
+    # both the expected set (all-tier backstop (d)) and the recorded-data-disk set (Tier>=2
+    # structural rule (c)). The secret check (b) still runs FIRST so a secret-SHAPED DepsDiskPath
+    # is caught before these allowances — recording cannot launder a secret. An UNRECORDED attached
+    # disk is still refused; the no-net structural guarantee is intact.
+    # NOTE: Hyper-V cannot host-enforce a read-only VHDX (no -ReadOnly on Add-VMHardDiskDrive and
+    # host-file-read-only is undefined), so there is NO read-only check and NO new backend method.
+    # The DEPS disk is attached normally; the recorded DepsDiskPath is simply ACCEPTED (not refused
+    # as a residual), exactly like INPUT/OUTPUT. (D3 correction — 2026-06-28.)
+    $depsDisk   = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'DepsDiskPath')
     # HARDENING 2 (path canonicalization): the set-membership compares below (the structural rule (c)
     # and the all-tier backstop (d)) test a host-truth attached path against these recorded sets with
     # an exact OrdinalIgnoreCase string compare. A recorded path and the attached path that differ
@@ -721,15 +747,17 @@ function Assert-Sealed {
     # This does NOT weaken the gate: an UNRECORDED disk's canonical form is still absent from the set,
     # so it is still refused (a genuinely-different path canonicalizes to a genuinely-different string).
     $expectedDisks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($e in (@($systemDisk) + $createdDisks + $diskPaths + @($inputDisk) + @($outputDisk) + @($seedDisk))) {
+    foreach ($e in (@($systemDisk) + $createdDisks + $diskPaths + @($inputDisk) + @($outputDisk) + @($seedDisk) + @($depsDisk))) {
         if (-not [string]::IsNullOrWhiteSpace([string]$e)) { [void]$expectedDisks.Add((Get-CanonicalDiskPath ([string]$e))) }
     }
     # The recorded data disks, as a set, used by the Tier>=2 STRUCTURAL rule (c) to allow them too
     # (they are expected, not residual). Same OrdinalIgnoreCase + canonicalization as the expected set.
     # RC6: the CIDATA seed disk (SeedDiskPath) is a recorded data disk too — it must be allowed by the
     # Tier>=2 structural rule alongside INPUT/OUTPUT (an UNRECORDED disk is still refused; see (c)).
+    # Task 1.3: the DEPS disk (DepsDiskPath) joins the same recorded-data-disk set for the structural
+    # rule, mirroring the SeedDiskPath addition (an UNRECORDED disk is still refused by rule (c)).
     $recordedDataDisks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($e in (@($inputDisk) + @($outputDisk) + @($seedDisk))) {
+    foreach ($e in (@($inputDisk) + @($outputDisk) + @($seedDisk) + @($depsDisk))) {
         if (-not [string]::IsNullOrWhiteSpace([string]$e)) { [void]$recordedDataDisks.Add((Get-CanonicalDiskPath ([string]$e))) }
     }
     # The system disk in canonical form, for the structural rule (c)'s system-disk compare.

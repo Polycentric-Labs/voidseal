@@ -964,3 +964,117 @@ Describe 'Import-SandboxAsset / Lock-Sandbox / Assert-Sealed — input validatio
             Should -Throw -ExpectedMessage '*Descriptor is null*'
     }
 }
+
+# ===========================================================================
+#  Assert-Sealed — processor (Network=None) checks
+#  Task 1.3: a Tier-0 processor profile (Network='None') is structurally no-NIC
+#  like Tier>=2 — the seal gate MUST enforce NIC absence even though the tier
+#  integer does not reach the Tier>=2 threshold. The recorded DepsDiskPath is an
+#  expected disk (attached before seal, survives it), never a residual.
+# ===========================================================================
+Describe 'Assert-Sealed — processor (Network=None) checks' {
+
+    BeforeAll {
+        # Helper: build a sealed Tier-0 descriptor marked as a processor (Network='None'),
+        # with the NIC removed and all channels off. Returns @{ Backend; Desc }.
+        # The descriptor does NOT carry Network in the standard shape (New-SandboxDescriptor
+        # omits it), so we add it via Set-DescriptorField after provisioning — exactly the
+        # same pattern test fixtures use for SeedDiskPath / InputDiskPath / etc.
+        $script:NewSealedProcessor = {
+        param([string] $Name = 'sbx-proc')
+        $t0 = $script:Tier1.Clone()
+        $t0['Tier']        = 0
+        $t0['Description'] = 'TEST FIXTURE — Tier 0 processor (Network=None).'
+        Assert-TierProfileValid -Profile $t0 -Context "TEST processor fixture '$Name'"
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $t0 -Name $Name -Backend $b
+        # Mark the descriptor as a processor (no-NIC intent).
+        Set-DescriptorField -Descriptor $d -Name 'Network' -Value 'None'
+        # Remove the NIC the provisioner wired (processor VMs have no NIC by contract;
+        # Lock-Sandbox does not strip the NIC for Tier<2, so we do it here in the fixture
+        # to represent a correctly-configured processor VM before sealing).
+        $null = & $b.RemoveNetworkAdapter @{ VMName = $Name }
+        # Seal: eject media + turn off channels + mark State=Sealed (no NIC removal by
+        # Lock-Sandbox for Tier-0, but the NIC was already removed above).
+        Lock-Sandbox -Descriptor $d -Backend $b
+        return @{ Backend = $b; Desc = $d }
+        }
+    }
+
+    It 'processor with a NIC still attached FAILS the seal gate (0-NIC processor check)' {
+        # A Tier-0 descriptor with Network='None' and a NIC still attached must be REFUSED —
+        # the processor check must fire regardless of the tier integer (Tier<2 but Network='None').
+        # Build the VM, mark it as a processor, and seal WITHOUT removing the NIC first.
+        $t0 = $script:Tier1.Clone()
+        $t0['Tier']        = 0
+        $t0['Description'] = 'TEST FIXTURE — Tier 0 processor (NIC-still-attached).'
+        Assert-TierProfileValid -Profile $t0 -Context 'TEST processor NIC fixture'
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $t0 -Name 'sbx-proc-nic' -Backend $b
+        Set-DescriptorField -Descriptor $d -Name 'Network' -Value 'None'
+        # Seal WITHOUT removing the NIC — this is the error condition.
+        Lock-Sandbox -Descriptor $d -Backend $b
+        # Precondition: the NIC is still present (Lock-Sandbox does not strip at Tier<2).
+        (& $b.GetNetworkAdapter @{ VMName = 'sbx-proc-nic' }).Count |
+            Should -Be 1 -Because 'precondition: the NIC was not removed (Tier<2 + Network=None misconfiguration)'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*network adapter*' -Because 'a processor (Network=None) with ANY NIC MUST fail the seal gate — it is structurally no-NIC like Tier>=2'
+    }
+
+    It 'processor with recorded DepsDiskPath PASSES; an unrecorded extra disk FAILS' {
+        # Phase A — a correctly-sealed processor with a recorded DEPS disk PASSES.
+        $r = & $script:NewSealedProcessor -Name 'sbx-proc-deps'
+        $b = $r.Backend; $d = $r.Desc
+        # Attach + record a DEPS disk (the expected, pre-provisioned dependency payload).
+        $depsDisk = Join-Path (Get-SandboxStorageRoot -Name 'sbx-proc-deps') 'sbx-proc-deps-deps.vhdx'
+        & $b.NewOutputVhdx @{ Path = $depsDisk; Label = 'DEPS'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+        & $b.AddHardDiskDrive @{ VMName = 'sbx-proc-deps'; Path = $depsDisk }
+        Set-DescriptorField -Descriptor $d -Name 'DepsDiskPath' -Value $depsDisk   # RECORDED -> expected
+        (Test-IsSecretPath -Path $depsDisk) | Should -BeFalse -Because 'precondition: the DEPS disk is not secret-shaped'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Not -Throw -Because 'a recorded DepsDiskPath is an EXPECTED disk (not a residual); the gate must certify'
+        Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
+
+        # Phase B — an UNRECORDED extra disk alongside the recorded DEPS disk FAILS.
+        $rogue = Join-Path (Get-SandboxStorageRoot -Name 'sbx-proc-deps') 'rogue.vhdx'
+        & $b.NewVHD @{ Path = $rogue; SizeBytes = 64MB; Dynamic = $true }
+        & $b.AddHardDiskDrive @{ VMName = 'sbx-proc-deps'; Path = $rogue }
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*unexpected*' -Because 'an UNRECORDED extra disk must still be refused — accepting the recorded DEPS disk must not open the door to residual volumes'
+    }
+
+    It 'a secret-shaped DepsDiskPath is still REFUSED (recording cannot launder a secret)' {
+        # Even a disk recorded as DepsDiskPath must be refused if it is secret-shaped — the
+        # secret check (branch b) runs BEFORE the recorded-disk allowance (branches c/d) in
+        # the same attached-disk loop iteration. This locks the ordering against refactors.
+        $r = & $script:NewSealedProcessor -Name 'sbx-proc-sec'
+        $b = $r.Backend; $d = $r.Desc
+        # A secret-shaped path (leaf 'id_rsa' matches Test-IsSecretPath), attached AND recorded.
+        $secretDeps = Join-Path (Get-SandboxStorageRoot -Name 'sbx-proc-sec') 'id_rsa.vhdx'
+        & $b.NewVHD @{ Path = $secretDeps; SizeBytes = 64MB; Dynamic = $true }
+        & $b.AddHardDiskDrive @{ VMName = 'sbx-proc-sec'; Path = $secretDeps }
+        Set-DescriptorField -Descriptor $d -Name 'DepsDiskPath' -Value $secretDeps   # RECORDED — must still be refused
+        (Test-IsSecretPath -Path $secretDeps) | Should -BeTrue -Because 'precondition: the recorded DepsDiskPath is genuinely secret-shaped'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*secret*' -Because 'a secret-shaped path recorded as DepsDiskPath must STILL be refused — recording a disk cannot launder a secret (the secret check runs before the recorded-disk allowance)'
+    }
+
+    It 'a non-processor Tier-0 VM with a NIC is NOT failed by the processor check (regression guard)' {
+        # The processor check fires ONLY when Network='None' is on the descriptor. A normal
+        # Tier-0/1 descriptor (no Network field, or Network != 'None') with a NIC must certify
+        # exactly as before — the new guard must NOT add behavior for any other descriptor.
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-nonproc'
+        $b = $sb.Backend; $d = $sb.Desc
+        Import-SandboxAsset -Descriptor $d -Source $script:IsoSrc -As Iso -Backend $b
+        Lock-Sandbox -Descriptor $d -Backend $b
+        # Precondition: the descriptor carries NO Network='None' marker — it is a normal Tier-1 VM.
+        [string](Get-DescriptorField -Descriptor $d -Name 'Network') |
+            Should -BeNullOrEmpty -Because 'precondition: a standard Tier-1 descriptor has no Network=None marker'
+        # Precondition: the NIC is still present (Tier-1 keeps it).
+        (& $b.GetNetworkAdapter @{ VMName = 'sbx-nonproc' }).Count |
+            Should -Be 1 -Because 'precondition: Tier-1 keeps its NIC'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Not -Throw -Because 'a standard Tier-1 VM with a NIC and no Network=None marker must NOT be failed by the processor check'
+        Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
+    }
+}
