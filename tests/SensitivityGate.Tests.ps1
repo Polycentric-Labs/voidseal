@@ -57,6 +57,7 @@ Describe 'Invoke-SensitivityGate partition' {
     $relNames  | Should -Contain 'prose-letter.md'
     @($script:r.Released).Count | Should -BeGreaterThan 0  # the prose files
     $script:r.Released | ForEach-Object { $_.verdict | Should -Be 'SAFE' }  # released ⊆ SAFE
+    @($script:r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'creds.txt'  # SENSITIVE never in .Released
   }
   It 'writes a sensitivity manifest with released/held + reasons' {
     Test-Path (Join-Path $script:out 'manifest/sensitivity-report.json') | Should -BeTrue
@@ -89,6 +90,26 @@ pathlib.Path(a.out).write_text(json.dumps([{"name": "../evil.txt", "verdict": "S
     # (StrictMode-safe: '@().Name' on an empty array throws under Set-StrictMode -Version Latest).
     $relNames3 = @(Get-ChildItem (Join-Path $out3 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
     $relNames3 | Should -Not -Contain 'evil.txt'
+  }
+  It 'fails closed when a staged file has no screener verdict (incomplete screen)' {
+    $st = Join-Path $TestDrive 'staging-incomplete'; New-Item -ItemType Directory -Path $st -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $st 'a.txt') -Value 'alpha'
+    Set-Content -LiteralPath (Join-Path $st 'b.txt') -Value 'bravo'   # this one gets NO verdict
+    $o = Join-Path $TestDrive 'out-incomplete'; New-Item -ItemType Directory -Path $o -Force | Out-Null
+    $stub = Join-Path $TestDrive 'stub-partial.py'
+    @'
+import argparse, json, pathlib
+ap = argparse.ArgumentParser(); ap.add_argument('--in', dest='inp'); ap.add_argument('--out'); ap.add_argument('--mode')
+a = ap.parse_args()
+pathlib.Path(a.out).write_text(json.dumps([{"name": "a.txt", "verdict": "SAFE", "detectors": []}]))
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+    { Invoke-SensitivityGate -StagingDir $st -OutputDir $o -Mode aggressive -ScreenerPath $stub } | Should -Throw
+  }
+  It 'manifest content reflects the partition (released=SAFE, held includes sensitive, total counted)' {
+    $report = Get-Content (Join-Path $script:out 'manifest/sensitivity-report.json') -Raw | ConvertFrom-Json
+    @($report.released | ForEach-Object { $_.verdict } | Where-Object { $_ -ne 'SAFE' }).Count | Should -Be 0
+    @($report.held | ForEach-Object { $_.name }) | Should -Contain 'creds.txt'
+    $report.total | Should -Be 7
   }
 }
 

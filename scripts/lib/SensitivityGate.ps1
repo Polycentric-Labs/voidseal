@@ -131,6 +131,19 @@ function Invoke-SensitivityGate {
         }
     }
 
+    # Fail-closed completeness: the screener must have produced a verdict for EVERY file in staging.
+    # A staged file with no verdict would otherwise be silently dropped (neither released nor held) —
+    # the gate must not trust the screener's completeness. Compare top-level basenames (flat-staging
+    # design, consistent with the screener's p.name + the traversal guard). OrdinalIgnoreCase to match
+    # Windows path semantics. An unaccounted staged file => REFUSE.
+    $verdictNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($v in $verdicts) { [void]$verdictNames.Add([string]$v.name) }
+    foreach ($f in @(Get-ChildItem -LiteralPath $StagingDir -File)) {
+        if (-not $verdictNames.Contains($f.Name)) {
+            throw "Invoke-SensitivityGate: staged file '$($f.Name)' has no screener verdict — the screen is incomplete. Fail closed, refusing the partition."
+        }
+    }
+
     $rel = [System.Collections.Generic.List[object]]::new()
     $hel = [System.Collections.Generic.List[object]]::new()
 
@@ -138,11 +151,15 @@ function Invoke-SensitivityGate {
         $src = Join-Path $StagingDir $v.name
         # The ONE releasable verdict is the exact string 'SAFE'.
         # SENSITIVE, UNCERTAIN, and any future/unknown verdict → HELD (fail-closed).
+        # -ErrorAction Stop makes a failed copy THROW rather than emit a swallowed non-terminating
+        # error: without it, a missing source file would let $rel.Add/$hel.Add run anyway, so
+        # .Released / the manifest would CLAIM a release that never hit disk. Fail closed — record a
+        # release/hold only AFTER the copy is confirmed.
         if ($v.verdict -eq 'SAFE') {
-            Copy-Item -LiteralPath $src -Destination $released
+            Copy-Item -LiteralPath $src -Destination $released -ErrorAction Stop
             $rel.Add($v)
         } else {
-            Copy-Item -LiteralPath $src -Destination $held
+            Copy-Item -LiteralPath $src -Destination $held -ErrorAction Stop
             $hel.Add($v)
         }
     }
