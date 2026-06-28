@@ -13,6 +13,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The Sensitivity-Gate tests shell out to `python guest/screener.py`, so the
+      # runner needs Python on PATH. (Phase 0 introduced the first Python to the repo.)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Install Pester 5
         shell: pwsh
         run: |
