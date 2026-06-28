@@ -42,3 +42,16 @@ def test_truncated_blob_is_rejected():
 def test_oversize_count_is_rejected():
     with pytest.raises(outbox.OutboxError):
         outbox.pack_outbox([(f"f{i}.txt", b"x") for i in range(outbox.MAX_ENTRIES + 1)])
+
+def test_write_from_dir_and_read_and_verify(tmp_path):
+    staging = tmp_path / "staging"; staging.mkdir()
+    (staging / "a.txt").write_bytes(b"hello")
+    (staging / "b.txt").write_bytes(b"world")
+    verdicts = tmp_path / "verdicts.json"
+    verdicts.write_text('[{"name":"a.txt","verdict":"SAFE","detectors":[]}]')
+    out = tmp_path / "outbox.bin"
+    outbox.write_outbox_from_dir(str(staging), str(verdicts), str(out))
+    vobj, cands = outbox.read_and_verify(out.read_bytes(),
+                                         allowed_names={"verdicts.json", "a.txt", "b.txt"})
+    assert vobj == [{"name": "a.txt", "verdict": "SAFE", "detectors": []}]
+    assert cands == {"a.txt": b"hello", "b.txt": b"world"}
