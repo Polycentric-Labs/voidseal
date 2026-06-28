@@ -5,5 +5,8 @@ testResults.xml
 *.token
 *.vhdx
 *.iso
+# Python bytecode cache (guest/ screener + workloads are executed during tests)
+__pycache__/
+*.pyc
 # Private per-repo working memory (Claude Code loads it; never published)
 CLAUDE.local.md
