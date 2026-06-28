@@ -91,3 +91,50 @@ pathlib.Path(a.out).write_text(json.dumps([{"name": "../evil.txt", "verdict": "S
     $relNames3 | Should -Not -Contain 'evil.txt'
   }
 }
+
+Describe 'screener.py Presidio+spaCy upgrade (regex/crude fallback, strictly tighter)' {
+  BeforeAll {
+    $script:screener = "$PSScriptRoot/../guest/screener.py"
+    $script:hasPresidio = $false
+    & python -c "import presidio_analyzer" 2>$null
+    if ($LASTEXITCODE -eq 0) { $script:hasPresidio = $true }
+    $script:hasSpacy = $false
+    & python -c "import spacy; spacy.load('en_core_web_sm')" 2>$null
+    if ($LASTEXITCODE -eq 0) { $script:hasSpacy = $true }
+
+    $script:din = Join-Path $TestDrive 'pii-in'; New-Item -ItemType Directory -Path $script:din -Force | Out-Null
+    # email-doc: clean PROSE that contains ONE email -> without the email regex it'd be SAFE; with it, SENSITIVE.
+    Set-Content -LiteralPath (Join-Path $script:din 'email-doc.txt') -Value @'
+I wanted to follow up on our wonderful conversation from last week about the community garden project. It was truly inspiring to see so many neighbors come together for a shared cause. If you have any further questions or would simply like to continue the discussion, please feel free to reach me at jane.doe@example.com whenever it is convenient for you. I look forward to hearing your thoughts and to working alongside everyone again very soon.
+'@
+    # name-doc: prose with a clear PERSON name (Presidio NER target).
+    Set-Content -LiteralPath (Join-Path $script:din 'name-doc.txt') -Value @'
+The keynote was delivered by Barack Obama, who spoke at length about civic participation and the importance of local engagement. The audience listened intently as the speaker walked through several stories drawn from years of public service, and the room responded warmly to each reflection offered throughout the long and memorable afternoon session.
+'@
+    # numbered-list: NON-narrative list that the crude heuristic may call SAFE but spaCy should reject.
+    Set-Content -LiteralPath (Join-Path $script:din 'numbered-list.txt') -Value @'
+1. Widget. 2. Gadget. 3. Sprocket. 4. Flange. 5. Bracket. 6. Coupler. 7. Bearing. 8. Washer. 9. Gasket. 10. Bolt. 11. Nut. 12. Pin. 13. Clip. 14. Rivet. 15. Spacer. 16. Shim. 17. Dowel. 18. Stud. 19. Ferrule. 20. Grommet. 21. Bushing. 22. Collar. 23. Sleeve. 24. Cap. 25. Plug.
+'@
+    $script:vout = Join-Path $TestDrive 'pii-verdicts.json'
+    & python $script:screener --in $script:din --out $script:vout --mode aggressive
+    $script:V = @(Get-Content $script:vout -Raw | ConvertFrom-Json)
+  }
+  It 'always (dep-free regex) marks a document containing an email SENSITIVE' {
+    (@($script:V | Where-Object { $_.name -eq 'email-doc.txt' })[0]).verdict | Should -Be 'SENSITIVE'
+  }
+  It 'fail-closed preserved: the upgrade never promotes the UNCERTAIN csv to SAFE' {
+    # re-screen the messy-drive fixture; spreadsheet-dump.csv must remain non-SAFE regardless of deps.
+    $mdOut = Join-Path $TestDrive 'md-verdicts.json'
+    & python $script:screener --in (Join-Path $PSScriptRoot 'fixtures/messy-drive') --out $mdOut --mode aggressive
+    $md = @(Get-Content $mdOut -Raw | ConvertFrom-Json)
+    (@($md | Where-Object { $_.name -eq 'spreadsheet-dump.csv' })[0]).verdict | Should -Not -Be 'SAFE'
+  }
+  It 'marks a PII person-name document SENSITIVE (Presidio NER)' {
+    if (-not $script:hasPresidio) { Set-ItResult -Skipped -Because 'Presidio not staged in this environment (live-run only)'; return }
+    (@($script:V | Where-Object { $_.name -eq 'name-doc.txt' })[0]).verdict | Should -Be 'SENSITIVE'
+  }
+  It 'does NOT classify a numbered list as SAFE prose (spaCy POS refinement)' {
+    if (-not $script:hasSpacy) { Set-ItResult -Skipped -Because 'spaCy/en_core_web_sm not staged (live-run only)'; return }
+    (@($script:V | Where-Object { $_.name -eq 'numbered-list.txt' })[0]).verdict | Should -Not -Be 'SAFE'
+  }
+}
