@@ -111,9 +111,11 @@ I wanted to follow up on our wonderful conversation from last week about the com
     Set-Content -LiteralPath (Join-Path $script:din 'name-doc.txt') -Value @'
 The keynote was delivered by Barack Obama, who spoke at length about civic participation and the importance of local engagement. The audience listened intently as the speaker walked through several stories drawn from years of public service, and the room responded warmly to each reflection offered throughout the long and memorable afternoon session.
 '@
-    # numbered-list: NON-narrative list that the crude heuristic may call SAFE but spaCy should reject.
-    Set-Content -LiteralPath (Join-Path $script:din 'numbered-list.txt') -Value @'
-1. Widget. 2. Gadget. 3. Sprocket. 4. Flange. 5. Bracket. 6. Coupler. 7. Bearing. 8. Washer. 9. Gasket. 10. Bolt. 11. Nut. 12. Pin. 13. Clip. 14. Rivet. 15. Spacer. 16. Shim. 17. Dowel. 18. Stud. 19. Ferrule. 20. Grommet. 21. Bushing. 22. Collar. 23. Sleeve. 24. Cap. 25. Plug.
+    # list-like: crude-prose-but-verb-poor -> passes the crude floor so the spaCy POS refinement is
+    # the only stage that can demote it (otherwise this dep-gated test wouldn't exercise spaCy).
+    # NO digits/numbering (digits lower the alpha ratio); noun phrases only (verb_ratio ~ 0 -> demote).
+    Set-Content -LiteralPath (Join-Path $script:din 'list-like.txt') -Value @'
+The weathered oak desk. A faded velvet armchair. The brass reading lamp. A small ceramic vase. The wooden coat rack. A worn leather satchel. The cast iron kettle. A folded woolen blanket. The polished silver tray. A chipped porcelain teacup. The dusty glass decanter. A frayed cotton rug. The tarnished copper pot. A cracked marble statue. The faded canvas tent. A rusty garden trowel. The chipped enamel basin. A tattered paper map. The smooth river stone. A bent willow basket. The hollow bamboo flute. A speckled robin egg. The gnarled apple branch. A pale autumn leaf.
 '@
     $script:vout = Join-Path $TestDrive 'pii-verdicts.json'
     & python $script:screener --in $script:din --out $script:vout --mode aggressive
@@ -133,8 +135,8 @@ The keynote was delivered by Barack Obama, who spoke at length about civic parti
     if (-not $script:hasPresidio) { Set-ItResult -Skipped -Because 'Presidio not staged in this environment (live-run only)'; return }
     (@($script:V | Where-Object { $_.name -eq 'name-doc.txt' })[0]).verdict | Should -Be 'SENSITIVE'
   }
-  It 'does NOT classify a numbered list as SAFE prose (spaCy POS refinement)' {
+  It 'does NOT classify a list-like noun-phrase passage as SAFE prose (spaCy POS refinement)' {
     if (-not $script:hasSpacy) { Set-ItResult -Skipped -Because 'spaCy/en_core_web_sm not staged (live-run only)'; return }
-    (@($script:V | Where-Object { $_.name -eq 'numbered-list.txt' })[0]).verdict | Should -Not -Be 'SAFE'
+    (@($script:V | Where-Object { $_.name -eq 'list-like.txt' })[0]).verdict | Should -Not -Be 'SAFE'
   }
 }
