@@ -28,3 +28,39 @@ Describe 'screener.py verdicts' {
   }
   AfterAll { if ($script:out) { Remove-Item -Recurse -Force $script:out -ErrorAction SilentlyContinue } }
 }
+
+Describe 'Invoke-SensitivityGate partition' {
+  BeforeAll {
+    . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"
+    $script:screener = "$PSScriptRoot/../guest/screener.py"
+    $script:staging = Join-Path $TestDrive 'staging'
+    New-Item -ItemType Directory -Path $script:staging -Force | Out-Null
+    Copy-Item "$PSScriptRoot/fixtures/messy-drive/*" $script:staging
+    $script:out = Join-Path $TestDrive 'out'
+    New-Item -ItemType Directory -Path $script:out -Force | Out-Null
+    $script:r = Invoke-SensitivityGate -StagingDir $script:staging -OutputDir $script:out `
+                  -Mode aggressive -ScreenerPath $script:screener
+  }
+  It 'releases ONLY SAFE; everything else held (released subset of SAFE)' {
+    $relNames = @((Get-ChildItem (Join-Path $script:out 'released')).Name)
+    $heldNames = @((Get-ChildItem (Join-Path $script:out 'held')).Name)
+    $relNames  | Should -Not -Contain 'creds.txt'
+    $relNames  | Should -Not -Contain 'finance-statement.txt'
+    $heldNames | Should -Contain 'creds.txt'
+    $heldNames | Should -Contain 'spreadsheet-dump.csv'   # UNCERTAIN is held too (fail-closed)
+    @($script:r.Released).Count | Should -BeGreaterThan 0  # the prose files
+    $script:r.Released | ForEach-Object { $_.verdict | Should -Be 'SAFE' }  # released ⊆ SAFE
+  }
+  It 'writes a sensitivity manifest with released/held + reasons' {
+    Test-Path (Join-Path $script:out 'manifest/sensitivity-report.json') | Should -BeTrue
+  }
+  It 'fails closed when the screener errors (throws; releases nothing)' {
+    $staging2 = Join-Path $TestDrive 'staging2'; New-Item -ItemType Directory -Path $staging2 -Force | Out-Null
+    Copy-Item "$PSScriptRoot/fixtures/messy-drive/prose-essay.txt" $staging2
+    $out2 = Join-Path $TestDrive 'out2'; New-Item -ItemType Directory -Path $out2 -Force | Out-Null
+    { Invoke-SensitivityGate -StagingDir $staging2 -OutputDir $out2 -Mode aggressive `
+        -ScreenerPath "$PSScriptRoot/../guest/does-not-exist.py" } | Should -Throw
+    # nothing must have been released
+    @(Get-ChildItem (Join-Path $out2 'released') -ErrorAction SilentlyContinue).Count | Should -Be 0
+  }
+}
