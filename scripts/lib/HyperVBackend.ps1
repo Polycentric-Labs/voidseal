@@ -157,10 +157,19 @@ function Get-HyperVBackendMethodManifest {
         # file-slice). NEVER Mount-VHD / Add-VMHardDiskDrive — host attach kernel-parses attacker FS
         # bytes (Pass-5). The host reads the in-guest "outbox" (guest/outbox.py) off the DETACHED OUTPUT
         # disk through THIS method; the Sensitivity Gate consumes the parsed verdicts. REAL = qemu-img
-        # convert -f vhdx -O raw then FileStream seek/read; FAKE = return the recorded outbox-region
-        # bytes, modeling detach/file-lock ordering + the .avhdx child-layer trap (RC7) + a zero-padded
+        # convert -f vhdx -O raw then FileStream seek/read (with an RC8 detach-settle-lag lock-retry +
+        # qemu stderr-in-throw); FAKE = return the recorded outbox-region bytes, modeling detach/file-lock
+        # ordering + the .avhdx child-layer trap (RC7) + the SelfPowerOff write-flush gate + a zero-padded
         # FIXED-disk tail. Added per the GetDvdDrives/ReadVhdxFile addendum precedent (manifest + both
         # factories + parity/drift tests). Interface: -> [byte[]] of length Length.
+        #
+        # DISK MODEL CAVEAT (MUST-FIX 3): the FAKE models a ZERO-INITIALIZED raw disk with the outbox at
+        # disk byte OFFSET 0. The REAL OUTPUT disk is NOT guaranteed zero outside the outbox region this
+        # phase — it may be an NTFS-formatted disk with a boot sector / MFT at low offsets until the
+        # dedicated FIXED raw outbox disk lands (Phase 2/4). THEREFORE the consumer MUST SELF-DELIMIT: the
+        # outbox is length-prefixed (header carries entry_count + payload_total_len), so the seam reads the
+        # 24-byte header then EXACTLY 24 + entry_count*104 + payload_total_len bytes from offset 0 and never
+        # reads arbitrary / low offsets expecting zeros.
         ReadVhdxRawRegion    = @('Path', 'Offset', 'Length')   # user-space raw read (NEVER Mount-VHD)
         GetVHDInfo           = @('Path')                            # -> @{ Path; SizeBytes; Differencing; ParentPath; Label; FileSystem } or $null
         RemoveVHD            = @('Path')                            # delete a DETACHED .vhdx file (the Reaper's explicit cleanup)
@@ -319,6 +328,64 @@ $script:SbInvokeFirmwareWithRetry = {
     }
 }
 
+# SHARED real-backend helper (RC8): run an operation with bounded retry on a transient FILE-LOCK / sharing-
+# violation, then a CLEAR fail-closed failure if the lock persists. Mirrors SbInvokeFirmwareWithRetry.
+#
+# RC8 (detach settle-lag): `Remove-VMHardDiskDrive` / `Stop-VM` returning does NOT guarantee the Hyper-V
+# worker-process handle on the `.vhdx` has been released — a sub-second lag can make ReadVhdxRawRegion's
+# qemu-img `convert` first open hit a sharing violation, spuriously failing a SUCCESSFUL run. The symptom
+# is a transient handle-release lag, NOT a real failure, so a few retries with a short sleep ride it out.
+# If the lock PERSISTS we fail closed with a clear message rather than return garbage / hang.
+#
+# ONLY a lock-class error is retried (case-insensitive substring match of any of the well-known Windows /
+# qemu sharing-violation phrasings); any OTHER error (e.g. a malformed image) rethrows IMMEDIATELY (retrying
+# a genuine failure would only waste time and mask the real cause). Factored out as a shared scriptblock so
+# the real ReadVhdxRawRegion uses it AND it is unit-testable in-process (drive -Operation with a stub that
+# throws a lock-class error N times then returns a sentinel) without a live VM. The FAKE does not use it —
+# it models the same bounded tolerance via -SimulateDetachSettleLag; the two budgets share the SAME default
+# MaxAttempts (5) so they agree (see the fake ReadVhdxRawRegion + its -SimulateDetachSettleLag tests).
+$script:SbInvokeWithLockRetry = {
+    param(
+        [Parameter(Mandatory)] [scriptblock] $Operation,
+        [int] $MaxAttempts = 5,
+        [int] $DelayMilliseconds = 400
+    )
+    # Lock-class signatures (case-insensitive). These are the Windows + qemu-img phrasings for a file that
+    # is still open by another handle (the unreleased Hyper-V worker-process handle, here).
+    $lockPatterns = @(
+        'sharing violation',
+        'used by another process',
+        'being used by another',
+        'Failed to get shared lock',
+        'Permission denied'
+    )
+    if ($MaxAttempts -lt 1) { $MaxAttempts = 1 }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            return (& $Operation)
+        }
+        catch {
+            $caught = $_
+            $message = if ($caught -and $caught.Exception) { [string]$caught.Exception.Message } else { [string]$caught }
+            $isLock = $false
+            foreach ($pat in $lockPatterns) { if ($message -match ('(?i)' + [regex]::Escape($pat))) { $isLock = $true; break } }
+            # Not a lock-class error -> a real failure (e.g. malformed image); rethrow unchanged (do NOT retry).
+            if (-not $isLock) { throw }
+            # A lock-class error: retry until attempts are exhausted, then fail closed with remediation.
+            if ($attempt -ge $MaxAttempts) {
+                throw ("ReadVhdxRawRegion: the VHDX is still locked after $MaxAttempts attempts " +
+                       "(`"$message`"). The VHDX handle may not have been released after detach " +
+                       "(a sub-second Hyper-V worker-process settle-lag that did not clear). " +
+                       "Ensure the disk is detached and the VM is Off, then retry. Failing closed.")
+            }
+            if ($DelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $DelayMilliseconds }
+            # loop and retry
+        }
+    }
+}
+
 # Validate a NewOutputVhdx FileSystem + Label EARLY and IDENTICALLY in BOTH factories
 # (the fake≠real divergence guard). A bad FileSystem (e.g. 'ext4') or an over-length Label
 # is recorded VERBATIM by the fake (test green) yet FAILS live on Format-Volume — so both
@@ -426,6 +493,7 @@ function New-RealHyperVBackend {
     $ValidateFmt   = $script:SbValidateVhdxFormat
     $ResolveVol    = $script:SbResolveVolumeLetter
     $FirmwareRetry = $script:SbInvokeFirmwareWithRetry   # RC5: Secure-Boot template-enumeration retry
+    $LockRetry     = $script:SbInvokeWithLockRetry       # RC8: detach settle-lag sharing-violation retry
     $unavailPrefix = $script:HyperVUnavailablePrefix
 
     # Run a real Hyper-V op; convert an availability/permission failure into the single
@@ -964,18 +1032,42 @@ function New-RealHyperVBackend {
         $offset = [int64](& $AssertArg $P 'Offset' 'ReadVhdxRawRegion')
         $length = [int64](& $AssertArg $P 'Length' 'ReadVhdxRawRegion')
         & $InvokeOp {
+            # Bounds FIRST (matches the fake's check-order). Non-negative, then the 2GB single-read ceiling:
+            # [byte[]]::new($length) + [int][Math]::Min(...) only accept Int32, so a >2GB value would throw an
+            # opaque CLR exception — guard with a clear fail-closed message instead (M-d). The outbox MAX_TOTAL
+            # is 64MiB so this is a clean message, not a real limit.
             if ($offset -lt 0 -or $length -lt 0) { throw "ReadVhdxRawRegion: Offset/Length must be non-negative (got Offset=$offset, Length=$length)." }
+            if ($length -gt [int]::MaxValue -or $offset -gt [int]::MaxValue) {
+                throw "ReadVhdxRawRegion: Offset/Length exceeds the supported 2GB single-read limit ($offset/$length) — failing closed."
+            }
             $qemu = Get-Command qemu-img -ErrorAction SilentlyContinue
             if ($null -eq $qemu) {
                 throw "ReadVhdxRawRegion: qemu-img not found on PATH. The user-space OUTPUT read needs qemu-img (host attach of an untrusted guest disk is FORBIDDEN — host attach kernel-parses attacker bytes; Pass-5). Install qemu-img and retry. Failing closed."
             }
             $tmpRaw = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "voidseal-outbox-$([System.IO.Path]::GetRandomFileName()).raw")
             try {
-                # -f vhdx pins the input format (never auto-probe an attacker-influenced header into a
-                # surprising driver); -O raw flattens to logical-block order. '--' ends option parsing.
-                & $qemu.Source convert -f vhdx -O raw -- $path $tmpRaw 2>&1 | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    throw "ReadVhdxRawRegion: qemu-img convert failed (exit $LASTEXITCODE) for '$path' — the VHDX may still be attached/locked (detach first) or be malformed. Failing closed."
+                # RC8 (detach settle-lag): Remove-VMHardDiskDrive/Stop-VM returning does NOT guarantee the
+                # Hyper-V worker-process handle on the .vhdx is released — qemu-img's first open can hit a
+                # transient sharing violation and spuriously fail a SUCCESSFUL run. Route the convert through
+                # the shared lock-retry helper: a LOCK-CLASS error rides out (the handle is releasing), a real
+                # failure (e.g. malformed image) rethrows at once, and a persistent lock fails closed clearly.
+                # qemu-img is a NATIVE exe (non-zero $LASTEXITCODE, not a thrown error), so the Operation block
+                # converts a non-zero exit INTO a throw that INCLUDES the trimmed qemu output — that also
+                # surfaces qemu's stderr (M-a) AND lets the helper's pattern match classify lock vs malformed.
+                & $LockRetry -Operation {
+                    # -f vhdx pins the input format (never auto-probe an attacker-influenced header into a
+                    # surprising driver); -O raw flattens to logical-block order. '--' ends option parsing.
+                    $out = & $qemu.Source convert -f vhdx -O raw -- $path $tmpRaw 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        $detail = ([string]($out -join "`n")).Trim()
+                        throw "ReadVhdxRawRegion: qemu-img convert failed (exit $LASTEXITCODE) for '$path' — the VHDX may still be attached/locked (detach first) or be malformed. qemu-img output: $detail"
+                    }
+                }
+                # M-a post-convert sanity: a successful (exit 0) convert must have produced a non-empty raw
+                # image. A missing / zero-byte $tmpRaw indicates a silently-failed convert — fail closed
+                # rather than read zeros and report a false-empty outbox.
+                if (-not (Test-Path -LiteralPath $tmpRaw) -or ((Get-Item -LiteralPath $tmpRaw).Length -le 0)) {
+                    throw "ReadVhdxRawRegion: qemu-img convert reported success but produced no raw output for '$path' — failing closed."
                 }
                 $fsr = [System.IO.File]::OpenRead($tmpRaw)
                 try {
@@ -1302,6 +1394,7 @@ function New-FakeHyperVBackend {
         [switch] $SimulateSecondNewOutputVhdxError,
         [hashtable] $SimulateWorkloadOutput,
         [byte[]] $SimulateOutboxBlob,
+        [int] $SimulateDetachSettleLag = 0,
         [switch] $SimulateDetachError
     )
 
@@ -1332,6 +1425,12 @@ function New-FakeHyperVBackend {
     # so a positive Success-path e2e can reach Read-WorkloadResult -> Success -> EXTRACTED. $null = none.
     $workloadOutput    = $SimulateWorkloadOutput
     $outboxBlob = $SimulateOutboxBlob   # raw bytes the guest "wrote" to the OUTPUT disk's outbox region
+    # Captured by the ReadVhdxRawRegion closure: model the RC8 detach settle-lag — qemu-img's first open can
+    # hit a transient sharing violation while the Hyper-V worker-process handle is still releasing. A lag
+    # WITHIN the read's internal retry budget (matches the real SbInvokeWithLockRetry MaxAttempts default of
+    # 5) rides out and returns the bytes; a lag EXCEEDING it fails closed with the same lock message the real
+    # helper throws. 0 (default) = no lag (the instantaneous-detach model the suite used before).
+    $detachSettleLag = $SimulateDetachSettleLag
     # Captured by the RemoveHardDiskDrive closure: model a transient detach failure so the orchestrator's
     # detach try/catch (Failed run, host read skipped — NOT a lifecycle abort) is unit-testable.
     $detachThrows      = $SimulateDetachError.IsPresent
@@ -1357,6 +1456,20 @@ function New-FakeHyperVBackend {
             throw "HyperVBackend(fake).${Method}: no such VM '$Name'."
         }
         return $state.VMs[$Name]
+    }.GetNewClosure()
+
+    # Helper (M-b): find the OUTPUT-labelled VHD path attached to a VM record, or $null. New-WorkloadDisks
+    # labels the output disk 'OUTPUT'; both StartVM write-back blocks (SimulateWorkloadOutput AND
+    # SimulateOutboxBlob) need this same discovery, so it lives here once instead of drifting in two copies.
+    $findOutputDisk = {
+        param($vm)
+        foreach ($hd in @($vm.HardDrives)) {
+            if ($state.VHDs.ContainsKey([string]$hd)) {
+                $rec = $state.VHDs[[string]$hd]
+                if ($rec.Contains('Label') -and [string]$rec['Label'] -eq 'OUTPUT') { return [string]$hd }
+            }
+        }
+        return $null
     }.GetNewClosure()
 
     $b = @{}
@@ -1443,13 +1556,7 @@ function New-FakeHyperVBackend {
         # through the same Files table the host's ReadVhdxFile later reads — so Read-WorkloadResult sees
         # a real sentinel/result and can classify Success, letting the EXTRACTED happy path run e2e.
         if ($null -ne $workloadOutput -and $workloadOutput.Count -gt 0) {
-            $outDisk = $null
-            foreach ($hd in @($vm.HardDrives)) {
-                if ($state.VHDs.ContainsKey([string]$hd)) {
-                    $rec = $state.VHDs[[string]$hd]
-                    if ($rec.Contains('Label') -and [string]$rec['Label'] -eq 'OUTPUT') { $outDisk = [string]$hd }
-                }
-            }
+            $outDisk = & $findOutputDisk $vm
             if ($null -ne $outDisk) {
                 if (-not $state.VHDs[$outDisk].ContainsKey('Files')) { $state.VHDs[$outDisk]['Files'] = @{} }
                 foreach ($inner in @($workloadOutput.Keys)) {
@@ -1459,19 +1566,17 @@ function New-FakeHyperVBackend {
         }
         # SimulateOutboxBlob (paired with SimulateSelfPowerOff): model the guest packing guest/outbox.py
         # and dd-ing it onto the OUTPUT disk's RAW region at boot, then powering off (write-flush axis).
+        # WRITE-FLUSH GATE (MUST-FIX 2): the outbox exists ONLY after a CLEAN self-power-off — a guest that
+        # never powers off (timeout path) leaves the RAW region UNFLUSHED, so a host read sees zeros. Gating
+        # on $selfPowerOff stops a future timeout-path e2e from going mock-green while a live unflushed disk
+        # reads zeros (the canonical mock-green/live-empty trap). So: NO clean power-off -> no recorded blob.
         # The .avhdx identity trap (RC7): if AutomaticCheckpointsEnabled is ON, the guest's writes land
         # in a per-disk .avhdx CHILD layer that a host BASE raw-read does NOT expose — model that by
         # stashing the blob where ReadVhdxRawRegion can't see it (OutboxChildLayer), so the base read
         # returns zeros and the gate releases nothing. Checkpoints OFF (the provisioner's RC7 fix) -> the
         # base OutboxRegion is host-readable.
-        if ($null -ne $outboxBlob) {
-            $outDisk = $null
-            foreach ($hd in @($vm.HardDrives)) {
-                if ($state.VHDs.ContainsKey([string]$hd)) {
-                    $rec = $state.VHDs[[string]$hd]
-                    if ($rec.Contains('Label') -and [string]$rec['Label'] -eq 'OUTPUT') { $outDisk = [string]$hd }
-                }
-            }
+        if ($null -ne $outboxBlob -and $selfPowerOff) {
+            $outDisk = & $findOutputDisk $vm
             if ($null -ne $outDisk) {
                 if ([bool]$vm['AutomaticCheckpointsEnabled']) {
                     $state.VHDs[$outDisk]['OutboxChildLayer'] = [byte[]]$outboxBlob   # base raw-read can't see it (RC7)
@@ -1691,15 +1796,34 @@ function New-FakeHyperVBackend {
         return $null
     }.GetNewClosure()
 
-    # USER-SPACE raw region read (fake): return the recorded outbox-region bytes, modeling the FOUR live
+    # USER-SPACE raw region read (fake): return the recorded outbox-region bytes, modeling the live
     # divergence axes honestly (D-A) so the mock cannot pass where the live qemu-img read would fail.
+    #
+    # ZERO-DISK MODEL + REAL-DISK CAVEAT + SELF-DELIMITING CONTRACT (MUST-FIX 3):
+    #   (a) The fake models a ZERO-INITIALIZED raw disk with the outbox at disk byte OFFSET 0 — every byte
+    #       outside the recorded OutboxRegion reads as zero (AXIS 4, the zero-padded FIXED-disk tail).
+    #   (b) The REAL OUTPUT disk is NOT guaranteed zero outside the outbox region THIS phase: the live read
+    #       target is the EXISTING NTFS-formatted output disk (D-B), whose low offsets carry a boot sector /
+    #       MFT / prior-run residue, NOT zeros — until the dedicated FIXED raw outbox disk lands (Phase 2/4).
+    #   (c) THEREFORE the consumer MUST SELF-DELIMIT — the outbox is length-prefixed (its header carries
+    #       entry_count + payload_total_len), so the seam reads the 24-byte header then EXACTLY
+    #       24 + entry_count*104 + payload_total_len bytes from offset 0 and NEVER reads arbitrary / low
+    #       offsets expecting zeros. The zero-pad tail below stays — it correctly models the FUTURE FIXED
+    #       raw disk; a future seam test must NOT lean on it for the present NTFS-formatted disk.
     $b.ReadVhdxRawRegion = {
         param([System.Collections.IDictionary] $P)
         $path   = & $AssertArg $P 'Path'   'ReadVhdxRawRegion'
         $offset = [int64](& $AssertArg $P 'Offset' 'ReadVhdxRawRegion')
         $length = [int64](& $AssertArg $P 'Length' 'ReadVhdxRawRegion')
-        if (-not $state.VHDs.ContainsKey($path)) { throw "ReadVhdxRawRegion: VHD '$path' does not exist." }
+        # M-c: bounds FIRST (matches the real impl's bounds-before-existence order) so a double-fault input
+        # (missing path AND a negative offset) reports the bounds problem first.
         if ($offset -lt 0 -or $length -lt 0) { throw "ReadVhdxRawRegion: Offset/Length must be non-negative (got Offset=$offset, Length=$length)." }
+        # M-d: the same 2GB single-read ceiling the real impl guards — [byte[]]::new($length) / [int][Math]::Min
+        # only accept Int32, so a >2GB value throws an opaque CLR exception. Fail closed with a clear message.
+        if ($length -gt [int]::MaxValue -or $offset -gt [int]::MaxValue) {
+            throw "ReadVhdxRawRegion: Offset/Length exceeds the supported 2GB single-read limit ($offset/$length) — failing closed."
+        }
+        if (-not $state.VHDs.ContainsKey($path)) { throw "ReadVhdxRawRegion: VHD '$path' does not exist." }
         # AXIS 1 — detach/file-lock ordering: qemu-img cannot open a Hyper-V-locked VHDX, so a raw read of
         # a STILL-ATTACHED disk must fail exactly as the live open would. Throw if any VM still holds it.
         foreach ($vmRec in $state.VMs.Values) {
@@ -1707,9 +1831,24 @@ function New-FakeHyperVBackend {
                 throw "ReadVhdxRawRegion: VHD '$path' is still attached to VM '$($vmRec.Name)' (locked); detach before the host raw read. Failing closed."
             }
         }
+        $rec = $state.VHDs[$path]
+        # RC8 (MUST-FIX 1, FAKE) — model the detach SETTLE-LAG the real read tolerates via its internal
+        # lock-retry. Seed a per-disk countdown from -SimulateDetachSettleLag on the FIRST read, then "retry
+        # it away" up to a budget that MATCHES the real SbInvokeWithLockRetry MaxAttempts default (5): a lag
+        # WITHIN budget decrements to 0 and proceeds (the method tolerates it, returning the bytes); a lag
+        # EXCEEDING the budget throws the SAME fail-closed lock message the real helper throws.
+        $LOCK_RETRY_BUDGET = 5   # shared with $script:SbInvokeWithLockRetry's MaxAttempts default
+        if (-not $rec.ContainsKey('_settleRemaining')) { $rec['_settleRemaining'] = [int]$detachSettleLag }
+        $attempts = 0
+        while ([int]$rec['_settleRemaining'] -gt 0) {
+            if ($attempts -ge $LOCK_RETRY_BUDGET) {
+                throw "ReadVhdxRawRegion: the VHDX '$path' is still locked after $LOCK_RETRY_BUDGET attempts — the VHDX handle may not have been released after detach (settle-lag did not clear). Failing closed."
+            }
+            $rec['_settleRemaining'] = [int]$rec['_settleRemaining'] - 1
+            $attempts++
+        }
         # Log so a test can prove DETACH (RemoveHardDiskDrive) precedes the read (survives RemoveVM).
         $state.CallLog.Add(@{ Op = 'ReadVhdxRawRegion'; Path = $path; Offset = $offset; Length = $length })
-        $rec = $state.VHDs[$path]
         # AXIS 2 — .avhdx identity trap (RC7): only the BASE OutboxRegion is host-readable; a blob stuck in
         # the checkpoint child layer reads as zeros.
         $region = if ($rec.ContainsKey('OutboxRegion')) { [byte[]]$rec['OutboxRegion'] } else { [byte[]]::new(0) }

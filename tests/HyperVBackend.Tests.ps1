@@ -1406,6 +1406,64 @@ Describe 'Real backend — SetFirmware retries the transient Secure Boot templat
 }
 
 # ===========================================================================
+#  REAL backend — ReadVhdxRawRegion rides out a transient detach SETTLE-LAG lock (RC8/MUST-FIX 1)
+# ===========================================================================
+#  Mirror of the SbInvokeFirmwareWithRetry pattern. The real ReadVhdxRawRegion's qemu-img convert can
+#  hit a sub-second SHARING VIOLATION when Remove-VMHardDiskDrive / Stop-VM has returned but the Hyper-V
+#  worker-process handle on the .vhdx has not yet been released (a fresh RC8 — a SUCCESSFUL run that
+#  spuriously fails on the first open). The convert is wrapped in the shared $script:SbInvokeWithLockRetry
+#  helper: a LOCK-CLASS error is retried (the handle is releasing), any OTHER error rethrows immediately,
+#  and exhaustion fails closed with a clear "...still locked after N attempts..." message. Factored out so
+#  it is UNIT-testable in-process (drive it with a stub Operation that throws a lock-class error N times
+#  then returns a sentinel) WITHOUT a live VM — exactly the path the real ReadVhdxRawRegion uses. The FAKE
+#  models the same bounded tolerance via -SimulateDetachSettleLag (see the fake-axes Describe below); the
+#  two budgets share the SAME default MaxAttempts (5) so they agree.
+Describe 'Real backend — ReadVhdxRawRegion rides out a transient detach settle-lag lock (RC8; lock-retry helper)' {
+
+    It 'exposes the shared lock-retry helper scriptblock' {
+        $script:SbInvokeWithLockRetry | Should -BeOfType [scriptblock] -Because 'the real ReadVhdxRawRegion factors its convert retry through this shared helper so it is unit-testable'
+    }
+
+    It 'SUCCEEDS without retry when the operation succeeds first try' {
+        $script:lockCalls = 0
+        { & $script:SbInvokeWithLockRetry -Operation { $script:lockCalls++; 'OK' } -MaxAttempts 5 -DelayMilliseconds 1 } | Should -Not -Throw
+        $script:lockCalls | Should -Be 1 -Because 'a first-try success must not retry'
+    }
+
+    It 'RETRIES a lock-class error (sharing violation) N times then returns the sentinel for N < MaxAttempts' {
+        $script:lockCalls = 0
+        $op = {
+            $script:lockCalls++
+            if ($script:lockCalls -lt 3) { throw 'qemu-img: Could not open: The process cannot access the file because it is being used by another process.' }
+            'SENTINEL'   # third attempt succeeds
+        }
+        $result = & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 5 -DelayMilliseconds 1
+        $script:lockCalls | Should -Be 3 -Because 'it must keep retrying the transient lock until the handle releases'
+        $result | Should -Be 'SENTINEL' -Because 'a lag WITHIN budget must return the operation result'
+    }
+
+    It 'after exhausting retries on a lock-class error (N >= MaxAttempts), throws a fail-closed message naming the unreleased handle' {
+        $script:lockCalls = 0
+        $op = { $script:lockCalls++; throw 'sharing violation' }
+        $msg = $null
+        try { & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 3 -DelayMilliseconds 1 } catch { $msg = $_.Exception.Message }
+        $script:lockCalls | Should -Be 3 -Because 'all attempts must be spent before failing closed'
+        $msg | Should -Not -BeNullOrEmpty
+        $msg | Should -Match '(?i)still locked' -Because 'the message must name the persistent-lock condition'
+        $msg | Should -Match '(?i)(handle|released|detach)' -Because 'the remediation is that the VHDX handle was not released after detach'
+        $msg | Should -Match '(?i)failing closed' -Because 'an unresolved lock fails closed, never silently'
+    }
+
+    It 'does NOT retry an UNRELATED error — it rethrows immediately (no masking malformed-image failures)' {
+        $script:lockCalls = 0
+        $op = { $script:lockCalls++; throw 'qemu-img: error while reading sector: Invalid argument (a malformed image, not a lock)' }
+        { & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 5 -DelayMilliseconds 1 } |
+            Should -Throw -ExpectedMessage '*malformed image*'
+        $script:lockCalls | Should -Be 1 -Because 'a malformed-image error is not transient; retrying would mask the real cause'
+    }
+}
+
+# ===========================================================================
 #  REAL backend — builds the right cmdlet params (out-of-process capture)
 # ===========================================================================
 #  THE BEHAVIORAL REGRESSION TEST FOR A REAL-BACKEND BUG FOUND DURING LIVE DEBUGGING.
@@ -1562,11 +1620,61 @@ Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-moun
         $bytes.Length | Should -Be 32
         (@($bytes[16..31] | Where-Object { $_ -ne 0 })).Count | Should -Be 0
     }
-    It 'SECURITY: the REAL ReadVhdxRawRegion NEVER references Mount-VHD / Add-VMHardDiskDrive (user-space only)' {
+    It 'MUST-FIX 1 (settle-lag WITHIN budget): -SimulateDetachSettleLag 2 still returns the recorded bytes (method tolerates a transient detach lock, like the real internal retry)' {
+        # Rebuild with a small lag inside the read's internal retry budget (matches the real helper's
+        # MaxAttempts default of 5). The method must ride it out and return the bytes.
+        $f = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16)) -SimulateDetachSettleLag 2
+        & $f.NewVM @{ Name = 'p1'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        & $f.StartVM @{ Name = 'p1' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 }
+        ($bytes -join ',') | Should -Be ((1..16) -join ',') -Because 'a lag within budget is retried away and the bytes are returned'
+    }
+    It 'MUST-FIX 1 (settle-lag BEYOND budget): -SimulateDetachSettleLag 99 fails closed with a lock message (handle never released)' {
+        $f = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16)) -SimulateDetachSettleLag 99
+        & $f.NewVM @{ Name = 'p1'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        & $f.StartVM @{ Name = 'p1' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        { & $f.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 } } |
+            Should -Throw -ExpectedMessage '*still locked*'
+    }
+    It 'MUST-FIX 2 (write-flush gate): a guest that NEVER cleanly powers off leaves the outbox UNFLUSHED -> raw read is ALL ZEROS' {
+        # -SimulateNeverOff + -SimulateOutboxBlob but NO -SimulateSelfPowerOff: the blob must NOT be recorded
+        # (a live unflushed disk reads zeros — the mock-green/live-empty trap the gate closes).
+        $f = New-FakeHyperVBackend -SimulateNeverOff -SimulateOutboxBlob ([byte[]](1..16))
+        & $f.NewVM @{ Name = 'p1'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        & $f.StartVM @{ Name = 'p1' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 }
+        (@($bytes | Where-Object { $_ -ne 0 })).Count | Should -Be 0 -Because 'no clean self-power-off means the RAW region was never flushed'
+    }
+    It 'SECURITY: the REAL ReadVhdxRawRegion invokes NO host-attach/mount cmdlet (AST, not substring)' {
+        # The project's ONLY encoded guard for the load-bearing Pass-5 no-host-attach decision, so it must
+        # BIND THE REAL PROPERTY structurally. A substring match would PASS a future impl that host-attaches
+        # via a different cmdlet (Mount-DiskImage / Add-PartitionAccessPath / a variable-built Add-VMHardDiskDrive)
+        # and would FALSE-FAIL if a rationale comment moved into the body. An AST walk over CommandAst nodes
+        # binds the actual invoked command names instead.
         $real = New-RealHyperVBackend
-        $body = $real.ReadVhdxRawRegion.ToString()
-        $body | Should -Not -Match 'Mount-VHD'
-        $body | Should -Not -Match 'Add-VMHardDiskDrive'
-        $body | Should -Match 'qemu-img'   # pin the user-space mechanism
+        $src  = $real.ReadVhdxRawRegion.ToString()
+        $ast  = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+        $cmds = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $denylist = @('Mount-VHD','Mount-DiskImage','Add-VMHardDiskDrive','Add-PartitionAccessPath','Set-Disk','Initialize-Disk')
+        foreach ($c in $cmds) {
+            $name = $c.GetCommandName()    # $null for a dynamic invocation like `& $qemu.Source ...` (legit)
+            if ($null -ne $name) { $denylist | Should -Not -Contain $name -Because "the user-space read must never host-attach/mount (Pass-5)" }
+        }
+        # No dynamic eval that could hide a mount behind a string.
+        $src | Should -Not -Match 'Invoke-Expression'
+        # The user-space mechanism is still present (positive assertion).
+        $src | Should -Match 'qemu-img'
     }
 }
