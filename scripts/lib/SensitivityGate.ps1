@@ -97,10 +97,15 @@ function Invoke-SensitivityGate {
     # Capture stdout+stderr together so we can surface the diagnostic in the throw message.
     # The screener writes its JSON to --out $vjson directly; we are not parsing stdout.
     # FAIL CLOSED: any non-zero exit means classification is incomplete => throw, release nothing.
+    # NOTE: the python executable ('python' on the host, 'python3' in-guest) and the gate's
+    # production runtime location (host vs in-guest) are wired in Phase 1 — out of scope here.
     $screenerOutput = & python $ScreenerPath --in $StagingDir --out $vjson --mode $Mode 2>&1
     if ($LASTEXITCODE -ne 0) {
+        # $screenerOutput can be $null/empty (a screener that exits non-zero silently). Coerce to a
+        # human-readable placeholder so the diagnostic never renders a bare 'Output: '.
+        $so = if ([string]::IsNullOrWhiteSpace([string]$screenerOutput)) { '(no output)' } else { [string]$screenerOutput }
         throw ("Invoke-SensitivityGate: screener failed (exit $LASTEXITCODE) — fail closed, " +
-               "nothing released. Output: $screenerOutput")
+               "nothing released. Output: $so")
     }
     if (-not (Test-Path -LiteralPath $vjson)) {
         throw ("Invoke-SensitivityGate: screener exited 0 but produced no verdicts file at " +
@@ -111,6 +116,20 @@ function Invoke-SensitivityGate {
     # Wrap with @(...) so ConvertFrom-Json single-element returns a real array, not a scalar
     # — Set-StrictMode -Version Latest would blow up on .Count of a scalar otherwise.
     $verdicts = @(Get-Content $vjson -Raw | ConvertFrom-Json)
+
+    # Fail-closed hardening (defense in depth): the screener emits BASENAMES only (its p.name). A
+    # verdict 'name' that is not a plain leaf — empty, or containing a path separator / '..' / drive /
+    # rooted path — is anomalous (a tampered or out-of-contract verdicts file). REFUSE the entire
+    # partition rather than risk copying a file from OUTSIDE the staging dir into released/. This is
+    # layered ON TOP of the exact-'SAFE' release rule: even a SAFE-marked traversal name cannot
+    # exfiltrate an unscreened external file. Run this pass over ALL verdicts BEFORE any Copy-Item,
+    # so the partition is clean all-or-nothing — nothing is copied if any single name is anomalous.
+    foreach ($v in $verdicts) {
+        $nm = [string]$v.name
+        if ([string]::IsNullOrWhiteSpace($nm) -or ($nm -ne (Split-Path -Path $nm -Leaf))) {
+            throw "Invoke-SensitivityGate: verdict name '$nm' is not a plain filename (path separator / traversal) — fail closed, refusing the partition."
+        }
+    }
 
     $rel = [System.Collections.Generic.List[object]]::new()
     $hel = [System.Collections.Generic.List[object]]::new()

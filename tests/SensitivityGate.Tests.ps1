@@ -46,8 +46,15 @@ Describe 'Invoke-SensitivityGate partition' {
     $heldNames = @((Get-ChildItem (Join-Path $script:out 'held')).Name)
     $relNames  | Should -Not -Contain 'creds.txt'
     $relNames  | Should -Not -Contain 'finance-statement.txt'
+    $relNames  | Should -Not -Contain 'health-note.txt'
+    $relNames  | Should -Not -Contain 'prose-with-token.md'
     $heldNames | Should -Contain 'creds.txt'
+    $heldNames | Should -Contain 'finance-statement.txt'
+    $heldNames | Should -Contain 'health-note.txt'
+    $heldNames | Should -Contain 'prose-with-token.md'
     $heldNames | Should -Contain 'spreadsheet-dump.csv'   # UNCERTAIN is held too (fail-closed)
+    $relNames  | Should -Contain 'prose-essay.txt'
+    $relNames  | Should -Contain 'prose-letter.md'
     @($script:r.Released).Count | Should -BeGreaterThan 0  # the prose files
     $script:r.Released | ForEach-Object { $_.verdict | Should -Be 'SAFE' }  # released ⊆ SAFE
   }
@@ -62,5 +69,25 @@ Describe 'Invoke-SensitivityGate partition' {
         -ScreenerPath "$PSScriptRoot/../guest/does-not-exist.py" } | Should -Throw
     # nothing must have been released
     @(Get-ChildItem (Join-Path $out2 'released') -ErrorAction SilentlyContinue).Count | Should -Be 0
+  }
+  It 'fails closed on a path-traversal verdict name (never releases a file outside staging)' {
+    # An external file that must NEVER be released:
+    $evil = Join-Path $TestDrive 'evil.txt'; Set-Content -LiteralPath $evil -Value 'EXTERNAL-SECRET'
+    $staging3 = Join-Path $TestDrive 'staging3'; New-Item -ItemType Directory -Path $staging3 -Force | Out-Null
+    $out3 = Join-Path $TestDrive 'out3'; New-Item -ItemType Directory -Path $out3 -Force | Out-Null
+    # A stub screener that IGNORES --in and writes a crafted verdicts.json marking a traversal name SAFE.
+    $stub = Join-Path $TestDrive 'stub-traversal.py'
+    @'
+import argparse, json, pathlib
+ap = argparse.ArgumentParser()
+ap.add_argument('--in', dest='inp'); ap.add_argument('--out'); ap.add_argument('--mode')
+a = ap.parse_args()
+pathlib.Path(a.out).write_text(json.dumps([{"name": "../evil.txt", "verdict": "SAFE", "detectors": []}]))
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+    { Invoke-SensitivityGate -StagingDir $staging3 -OutputDir $out3 -Mode aggressive -ScreenerPath $stub } | Should -Throw
+    # The external file must NOT have been copied into released/. Extract names via ForEach-Object
+    # (StrictMode-safe: '@().Name' on an empty array throws under Set-StrictMode -Version Latest).
+    $relNames3 = @(Get-ChildItem (Join-Path $out3 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames3 | Should -Not -Contain 'evil.txt'
   }
 }
