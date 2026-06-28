@@ -2,6 +2,16 @@ import sys, pathlib, hashlib, struct, pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "guest"))
 import outbox
 
+# ---------------------------------------------------------------------------
+# Helper: assemble a raw blob that bypasses pack_outbox guards
+# ---------------------------------------------------------------------------
+def _forge(records, total, payload):
+    """records: list of (name_bytes_40, off, length, sha32). total/payload may be
+    inconsistent on purpose to exercise fail-closed branches in unpack_outbox."""
+    head = outbox._HEADER.pack(outbox.MAGIC, outbox.VERSION, 0, len(records), total)
+    table = b"".join(outbox._REC.pack(nb, off, length, sha) for (nb, off, length, sha) in records)
+    return head + table + payload
+
 def test_round_trip_preserves_names_and_bytes():
     entries = [("verdicts.json", b'[{"name":"a.txt","verdict":"SAFE","detectors":[]}]'),
                ("a.txt", b"hello world\n")]
@@ -55,3 +65,37 @@ def test_write_from_dir_and_read_and_verify(tmp_path):
                                          allowed_names={"verdicts.json", "a.txt", "b.txt"})
     assert vobj == [{"name": "a.txt", "verdict": "SAFE", "detectors": []}]
     assert cands == {"a.txt": b"hello", "b.txt": b"world"}
+
+# ---------------------------------------------------------------------------
+# Forged-blob fail-closed tests (bypass pack_outbox guards via raw bytes)
+# ---------------------------------------------------------------------------
+
+def test_invalid_utf8_name_raises_outboxerror():
+    """An entry name field containing invalid UTF-8 must raise OutboxError, not UnicodeDecodeError."""
+    bad_name = (b"\xff\xfe" + b"\x00" * 38)  # 40 bytes, invalid UTF-8
+    sha_empty = hashlib.sha256(b"").digest()
+    blob = _forge([(bad_name, 0, 0, sha_empty)], total=0, payload=b"")
+    with pytest.raises(outbox.OutboxError):
+        outbox.unpack_outbox(blob)
+
+def test_unpack_rejects_duplicate_names_in_table():
+    """Two records with the same logical name must raise OutboxError (duplicate guard)."""
+    name_b = b"a.txt".ljust(40, b"\x00")
+    sha_empty = hashlib.sha256(b"").digest()
+    blob = _forge(
+        [(name_b, 0, 0, sha_empty), (name_b, 0, 0, sha_empty)],
+        total=0,
+        payload=b"",
+    )
+    with pytest.raises(outbox.OutboxError):
+        outbox.unpack_outbox(blob)
+
+def test_unpack_rejects_entry_range_past_payload():
+    """off+length > total must raise OutboxError even when blob length == declared size."""
+    name_b = b"a.txt".ljust(40, b"\x00")
+    payload = b"hello"
+    # off=0, length=10 > total=5 → range check must fire
+    sha = hashlib.sha256(b"hello").digest()
+    blob = _forge([(name_b, 0, 10, sha)], total=5, payload=payload)
+    with pytest.raises(outbox.OutboxError):
+        outbox.unpack_outbox(blob)

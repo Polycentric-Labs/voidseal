@@ -64,7 +64,10 @@ def unpack_outbox(blob, allowed_names=None):
     for i in range(count):
         rec = blob[_HEADER.size + i * _REC.size: _HEADER.size + (i + 1) * _REC.size]
         raw_name, off, length, want = _REC.unpack(rec)
-        name = raw_name.rstrip(b"\x00").decode("utf-8", "strict")
+        try:
+            name = raw_name.rstrip(b"\x00").decode("utf-8", "strict")
+        except UnicodeDecodeError as e:
+            raise OutboxError(f"entry name is not valid UTF-8: {e}") from e
         _check_name(name)
         if name in seen:
             raise OutboxError(f"duplicate name: {name!r}")
