@@ -76,7 +76,7 @@ Describe 'Invoke-BuilderVM — Tier-1 builder orchestration (Phase 2.4)' {
 # ===========================================================================
 #  Teardown — deps.vhdx persists (M2), other disks are removed
 # ===========================================================================
-Describe 'Invoke-BuilderVM — teardown leaves deps.vhdx, removes other disks' {
+Describe 'Invoke-BuilderVM — teardown removes the VM (no orphan), on success and timeout' {
 
     It 'the VM is removed after a successful builder run (no orphan)' {
         $blob = [byte[]](1..16)
