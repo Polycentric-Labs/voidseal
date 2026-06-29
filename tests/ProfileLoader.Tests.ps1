@@ -610,3 +610,59 @@ Describe 'Processor profile (Network=None) + DepsSpec/ScreenConfig' {
         @($r.categories).Count | Should -Be 0
     }
 }
+
+Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
+    It 'the real profiles/builder.psd1 loads green and is SquidSniProxy + Tier-1' {
+        $merged = Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/builder.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles"
+        $merged['EgressMode'] | Should -Be 'SquidSniProxy'
+        $merged['Tier']       | Should -Be 1
+        $merged['DepsSpec'].Keys | Should -Contain 'Pip'
+        # merged allowlist must cover apt + HF (unioned from ExtraAllowlist) and pip (from tier1)
+        @($merged['EgressAllowlist']) | Should -Contain 'deb.debian.org'
+        @($merged['EgressAllowlist']) | Should -Contain 'huggingface.co'
+    }
+    It 'Test-AllowlistCoversHost: a domain-suffix entry covers a rotating subdomain' {
+        Test-AllowlistCoversHost -Allowlist @('.hf.co') -HostName 'cas-bridge.xethub.hf.co' | Should -BeTrue
+        Test-AllowlistCoversHost -Allowlist @('huggingface.co') -HostName 'cdn-lfs.huggingface.co' | Should -BeFalse
+        Test-AllowlistCoversHost -Allowlist @('pypi.org') -HostName 'pypi.org' | Should -BeTrue
+    }
+    It 'a workload overriding EgressMode to a NON-SquidSniProxy value is REFUSED' {
+        $wl = Join-Path $TestDrive 'bad-egress.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'bad'; Entrypoint = 'x'; EgressMode = 'HostProxy' }
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
+            Should -Throw -ExpectedMessage '*may only override EgressMode to*SquidSniProxy*'
+    }
+    It 'SquidSniProxy WITHOUT a DepsSpec is REFUSED' {
+        $wl = Join-Path $TestDrive 'no-depsspec.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'nd'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+   ExtraAllowlist = @('deb.debian.org','security.debian.org') }
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
+            Should -Throw -ExpectedMessage '*MUST carry a non-empty DepsSpec*'
+    }
+    It 'SquidSniProxy with a declared fetcher but a MISSING required host is REFUSED (derived per-fetcher)' {
+        $wl = Join-Path $TestDrive 'incomplete.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'inc'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+   ExtraAllowlist = @('deb.debian.org');                      # security.debian.org MISSING
+   DepsSpec = @{ Apt = @{ Packages = @('jq') } } }
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
+            Should -Throw -ExpectedMessage '*INCOMPLETE*security.debian.org*'
+    }
+    It 'a pip-ONLY DepsSpec is NOT forced to allowlist apt/HF hosts (derived per-fetcher)' {
+        $wl = Join-Path $TestDrive 'pip-only.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'pip'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+   DepsSpec = @{ Pip = @{ Packages = @('urllib3') } } }   # pypi+pythonhosted already in tier1
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
+    }
+    It 'existing ralph/firefox profiles still load (no EgressMode override -> backward compatible)' {
+        { Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/ralph.psd1"   -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
+        { Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/firefox.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
+    }
+}

@@ -44,7 +44,7 @@ $script:TierRequiredKeys = @(
 
 # Enum domains (SCHEMA.md type column).
 $script:Enum_Substrate         = @('Container', 'HyperV-Gen2')
-$script:Enum_EgressMode        = @('HostProxy', 'NftablesAllowlist', 'HostEnvoy', 'None')
+$script:Enum_EgressMode        = @('HostProxy', 'NftablesAllowlist', 'HostEnvoy', 'SquidSniProxy', 'None')
 $script:Enum_Credentials       = @('None', 'ScopedOnDemand')
 $script:Enum_ManagementChannel = @('Com1Serial', 'PSDirect')
 $script:Enum_Extraction        = @('HostReadResultDir', 'ColdVHDX-Quarantine-CDR')
@@ -55,6 +55,44 @@ $script:Enum_Lifecycle         = @('Ephemeral', 'SnapshotRevert', 'CreateDestroy
 # is a real Set-VMFirmware reject the fake would silently accept (the fake≠real bug class), so
 # the loader fails closed here BEFORE provisioning ever reaches Hyper-V.
 $script:Enum_SecureBootTemplate = @('MicrosoftWindows', 'MicrosoftUEFICertificateAuthority', 'OpenSourceShieldedVM')
+
+# Builder (EgressMode='SquidSniProxy') derived-per-fetcher required hosts (Pass-5 §B). The
+# completeness check requires, for EACH fetcher the DepsSpec declares, that the merged
+# EgressAllowlist COVERS every representative host below (exact OR domain-suffix — the Squid
+# domain-ACL model). Rotating CDN/LFS hostnames are covered by a suffix entry (e.g. '.hf.co').
+$script:BuilderRequiredHostsByFetcher = @{
+    Pip         = @('pypi.org', 'files.pythonhosted.org')
+    Apt         = @('deb.debian.org', 'security.debian.org')
+    HuggingFace = @('huggingface.co', 'cdn-lfs.huggingface.co', 'cas-bridge.xethub.hf.co')
+    Github      = @('github.com', 'api.github.com', 'codeload.github.com',
+                    'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
+}
+
+# A Squid domain-ACL "covers" a host if:
+#   - the entry is an exact match (e.g. 'pypi.org' covers 'pypi.org'), OR
+#   - the entry starts with a leading dot (suffix entry) and the host ends with that suffix
+#     (e.g. '.hf.co' covers 'cas-bridge.xethub.hf.co').
+# An entry WITHOUT a leading dot covers ONLY itself; 'huggingface.co' does NOT cover
+# 'cdn-lfs.huggingface.co' — that requires a '.huggingface.co' suffix entry.
+function Test-AllowlistCoversHost {
+    [OutputType([bool])]
+    param([string[]] $Allowlist, [string] $HostName)
+    $h = ([string]$HostName).ToLowerInvariant()
+    foreach ($entry in @($Allowlist)) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $raw = ([string]$entry).ToLowerInvariant()
+        if ($raw.StartsWith('.')) {
+            # Suffix entry: host must end with this suffix (e.g. '.hf.co' covers 'x.hf.co').
+            $suffix = $raw.TrimStart('.')
+            if ($h -eq $suffix -or $h.EndsWith('.' + $suffix)) { return $true }
+        }
+        else {
+            # Exact entry: host must equal this exactly.
+            if ($h -eq $raw) { return $true }
+        }
+    }
+    return $false
+}
 
 # Required keys for a workload profile.
 $script:WorkloadRequiredKeys = @('BaseTier', 'Name', 'Entrypoint')
@@ -318,6 +356,35 @@ function Assert-TierProfileValid {
             throw "Processor rule (Network=None): '$Context' sets Network='None' (no NIC) but EgressAllowlist has $($allowlist.Count) entr$(if($allowlist.Count -eq 1){'y'}else{'ies'}); a no-network processor profile MUST have an empty EgressAllowlist (@())."
         }
     }
+
+    # --- builder rule: EgressMode='SquidSniProxy' => DepsSpec present + derived-per-fetcher
+    # allowlist completeness (D-1 guarded override + D-2 derived check, brainstorm 2026-06-29).
+    # SquidSniProxy is the BUILDER egress (Pass-5: nftables can't runtime-FQDN-filter). A profile
+    # selecting it MUST carry a non-empty DepsSpec, and its (merged) EgressAllowlist MUST COVER
+    # every representative host for each fetcher the DepsSpec declares — else a live builder run
+    # would reach an un-allowlisted host and stall. Fail closed at load, naming the gap.
+    if ($Profile['EgressMode'] -eq 'SquidSniProxy') {
+        if (-not $Profile.ContainsKey('DepsSpec') -or
+            -not ($Profile['DepsSpec'] -is [System.Collections.IDictionary]) -or
+            $Profile['DepsSpec'].Keys.Count -eq 0) {
+            throw "Builder rule (SquidSniProxy): '$Context' sets EgressMode='SquidSniProxy' (the builder egress) but declares no DepsSpec; a builder profile MUST carry a non-empty DepsSpec hashtable."
+        }
+        $missing = [System.Collections.Generic.List[string]]::new()
+        foreach ($fetcher in $Profile['DepsSpec'].Keys) {
+            $fname = [string]$fetcher
+            if (-not $script:BuilderRequiredHostsByFetcher.ContainsKey($fname)) {
+                throw "Builder rule (SquidSniProxy): '$Context' DepsSpec declares unknown fetcher '$fname' (known: $($script:BuilderRequiredHostsByFetcher.Keys -join ', '))."
+            }
+            foreach ($reqHost in $script:BuilderRequiredHostsByFetcher[$fname]) {
+                if (-not (Test-AllowlistCoversHost -Allowlist $allowlist -HostName $reqHost)) {
+                    $missing.Add("$reqHost (fetcher '$fname')")
+                }
+            }
+        }
+        if ($missing.Count -gt 0) {
+            throw "Builder rule (SquidSniProxy): '$Context' EgressAllowlist is INCOMPLETE for its DepsSpec — missing required host(s): $($missing -join '; '). Add them (or a covering domain suffix, e.g. '.hf.co') to the tier EgressAllowlist or the workload ExtraAllowlist."
+        }
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -504,6 +571,15 @@ function Import-WorkloadProfile {
         $merged['EgressAllowlist'] = $baseAllow
     }
 
+    # D-1 (guarded EgressMode override): a workload may override EgressMode ONLY to 'SquidSniProxy'
+    # (the builder egress — strictly stricter than the tiers' nftables/proxy modes, so it can only
+    # TIGHTEN egress, never weaken it). Any other workload-level EgressMode is refused: weakening
+    # the isolation contract from the workload layer is forbidden (EgressMode is otherwise a tier
+    # property). A workload that omits EgressMode inherits the tier's unchanged (ralph/firefox).
+    if ($raw.ContainsKey('EgressMode') -and ([string]$raw['EgressMode'] -ne 'SquidSniProxy')) {
+        throw "Import-WorkloadProfile: workload '$wlName' sets EgressMode='$($raw['EgressMode'])'; a workload may only override EgressMode to 'SquidSniProxy' (the builder egress). Other egress modes are tier-controlled."
+    }
+
     # --- layer scalar/collection workload keys onto the tier --------------
     $merged['BaseTier'] = $baseTier
     $merged['Name']     = $raw['Name']
@@ -517,7 +593,7 @@ function Import-WorkloadProfile {
     # DepsDiskPath carries the pre-built deps disk path (optional, resolved at runtime).
     foreach ($layerKey in @('Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
                             'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
-                            'DepsSpec', 'ScreenConfig', 'DepsDiskPath')) {
+                            'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath')) {
         if ($raw.ContainsKey($layerKey)) {
             $merged[$layerKey] = $raw[$layerKey]
         }
