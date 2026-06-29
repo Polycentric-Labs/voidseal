@@ -4,13 +4,17 @@
 
 .DESCRIPTION
     Builds the first-boot **NoCloud `CIDATA` seed ISO** a sandbox guest consumes on its FIRST boot.
-    Two shapes, selected by the profile's `WorkloadMode`:
+    Three shapes, selected by the profile's `WorkloadMode` (+ `EgressMode` for the builder variant):
 
-      * DISK  — the disk-passing workload runner (guest-images/debian-12-cloud.md §2a). A systemd
-        oneshot mounts the host-pre-formatted exFAT data disks by LABEL (INPUT ro -> /mnt/in,
+      * DISK-OFFLINE — the disk-passing workload runner (guest-images/debian-12-cloud.md §2a). A
+        systemd oneshot mounts the host-pre-formatted exFAT data disks by LABEL (INPUT ro -> /mnt/in,
         OUTPUT rw -> /mnt/out), runs the profile's `Entrypoint` as the non-root `sandbox` user,
         writes `result.html` + the `result.exitcode` sentinel onto OUTPUT, flushes, and self-powers
         off. The seed builder substitutes the profile's `Entrypoint` for the `__ENTRYPOINT__` token.
+      * DISK-BUILDER (`WorkloadMode='Disk'` + `EgressMode='SquidSniProxy'`) — the Tier-1 net-restricted
+        builder variant: same disk-passing runner PLUS a transparent Squid SNI domain-ACL proxy that
+        gatekeeps the guest's 80/443 egress to the `EgressAllowlist` only (substituted into the Squid
+        `dstdomain` ACL). Fetches deps over Squid into /mnt/out, writes a manifest, self-powers-off.
       * SERIAL (default) — the §2 baseline: serial-getty AUTOLOGIN on ttyS0 (the Runner's command
         seam, which does NOT authenticate), a non-root run-user, and bubblewrap.
 
@@ -210,6 +214,10 @@ write_files:
       # --- Squid transparent proxy setup ---
       systemctl restart squid 2>/dev/null || true
       # Redirect outbound HTTP/HTTPS through Squid (transparent intercept)
+      # SEC-2 (HONESTY — deferred to Phase 6): this only REDIRECTS TCP 80/443 to Squid. It does NOT yet
+      # enforce tier1's BlockProtocols (DNS/53, QUIC/UDP-443, DoH/DoT) — only 80/443 are gatekept by the
+      # domain ACL; DNS and any non-80/443 egress are NOT default-dropped. Full default-DROP egress
+      # enforcement (the BlockProtocols set) is Phase-6 work and is intentionally NOT wired here.
       iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
       iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
 
@@ -344,6 +352,9 @@ function New-CidataUserData {
         if ($null -eq $allowlist -or @($allowlist).Count -eq 0) {
             throw "New-CidataUserData: a builder Disk+SquidSniProxy profile must have a non-empty EgressAllowlist (allowlist is empty — fail-closed)."
         }
+        # SEC-1: each allowlist entry's charset (no whitespace/newline/quote) is validated at LOAD time
+        # in Assert-TierProfileValid (ProfileLoader.ps1) before it ever reaches here, so a newline-bearing
+        # entry cannot inject a directive (e.g. `http_access allow all`) into the dstdomain ACL below.
         $aclLine = ($allowlist -join ' ')
         $ud = $script:CidataBuilderRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__SQUID_ALLOWLIST_ACL__', $aclLine)
         return (ConvertTo-LfText -Text $ud)

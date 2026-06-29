@@ -282,6 +282,24 @@ function Assert-TierProfileValid {
     # EgressAllowlist must be an array (already normalized by caller, but re-check shape).
     $allowlist = @($Profile['EgressAllowlist'])
 
+    # SEC-1: hostname-charset validation. The builder substitutes ($allowlist -join ' ') straight into
+    # a Squid `dstdomain` ACL (SeedBuilder.ps1) with NO escaping; an entry bearing a newline (or quote/
+    # whitespace) could inject a directive such as `http_access allow all` and defeat the egress ACL.
+    # Validate EACH entry against a strict hostname charset (optional leading dot for a domain-suffix
+    # match; the charset excludes whitespace/newline/quote/slash), failing closed and naming the bad
+    # entry. Runs on bare tiers AND the merged builder, so the allowlist is gatekept before it ever
+    # reaches the Squid seed. (Tier>=2 enforces an EMPTY allowlist below, so this is a no-op there.)
+    $hostnameRe = '^(?i)\.?[a-z0-9][a-z0-9.-]*$'
+    foreach ($entry in $allowlist) {
+        $e = [string]$entry
+        if ($e -notmatch $hostnameRe) {
+            throw ("Schema validation: '$Context' field 'EgressAllowlist' has an invalid entry '$e' " +
+                   "(must match $hostnameRe — a hostname/domain-suffix, optional leading dot, no whitespace/" +
+                   "newline/quote/slash). An unvalidated entry could inject directives into the builder's " +
+                   "Squid dstdomain ACL. Failing closed.")
+        }
+    }
+
     # HostChannels must be a hashtable.
     if (-not ($Profile['HostChannels'] -is [System.Collections.IDictionary])) {
         throw "Schema validation: '$Context' field 'HostChannels' must be a hashtable."

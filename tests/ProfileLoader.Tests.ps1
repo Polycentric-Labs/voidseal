@@ -626,6 +626,31 @@ Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
         Test-AllowlistCoversHost -Allowlist @('huggingface.co') -HostName 'cdn-lfs.huggingface.co' | Should -BeFalse
         Test-AllowlistCoversHost -Allowlist @('pypi.org') -HostName 'pypi.org' | Should -BeTrue
     }
+    It 'SEC-1: an EgressAllowlist entry bearing a newline (Squid ACL injection) is REFUSED fail-closed, naming the bad entry' {
+        # A newline-bearing entry could inject `http_access allow all` into the builder's Squid dstdomain
+        # ACL (SeedBuilder substitutes ($allowlist -join ' ') with no escaping). The load-time charset
+        # check must reject it before it ever reaches the seed. Direct Assert-TierProfileValid on a
+        # network-tier hashtable (a .psd1 cannot even carry a literal newline-in-a-string cleanly).
+        $bad = @{
+            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='NftablesAllowlist';
+            EgressAllowlist=@("pypi.org`nhttp_access allow all"); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
+            HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
+            Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
+            Controls=@(); ManagementChannel='Com1Serial'
+        }
+        { Assert-TierProfileValid -Profile $bad -Context 'sec1' } |
+            Should -Throw -ExpectedMessage '*EgressAllowlist*invalid entry*'
+    }
+    It 'SEC-1: a clean hostname AND a leading-dot domain-suffix entry are ACCEPTED (the regex passes real allowlists)' {
+        $ok = @{
+            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='NftablesAllowlist';
+            EgressAllowlist=@('cas-bridge.xethub.hf.co', '.hf.co', 'pypi.org'); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
+            HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
+            Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
+            Controls=@(); ManagementChannel='Com1Serial'
+        }
+        { Assert-TierProfileValid -Profile $ok -Context 'sec1ok' } | Should -Not -Throw
+    }
     It 'a workload overriding EgressMode to a NON-SquidSniProxy value is REFUSED' {
         $wl = Join-Path $TestDrive 'bad-egress.psd1'
         Set-Content -LiteralPath $wl -Encoding utf8 -Value @'

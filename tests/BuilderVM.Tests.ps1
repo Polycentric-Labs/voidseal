@@ -49,14 +49,22 @@ Describe 'Invoke-BuilderVM — Tier-1 builder orchestration (Phase 2.4)' {
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld2' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'd2.vhdx')
         $r.Status | Should -Be 'Success'   # GetVhdxImageHash THROWS if still attached -> Success proves detach-before-hash
         $ops = @($fake.FakeCallLog | Where-Object { $_.Op -in @('RemoveHardDiskDrive','GetVhdxImageHash') } | ForEach-Object { $_.Op })
+        # TR-2: assert BOTH ops actually ran BEFORE the IndexOf ordering check — IndexOf returns -1 when an
+        # op is absent, and `-1 -BeLessThan <positive>` is vacuously TRUE, so the ordering assertion alone
+        # would pass even if the detach never happened (mirror InvokeVoidseal.Tests.ps1:352-363).
+        $ops | Should -Contain 'RemoveHardDiskDrive' -Because 'the OUTPUT/deps disk must be detached'
+        $ops | Should -Contain 'GetVhdxImageHash'    -Because 'the whole-image hash must run'
         ($ops.IndexOf('RemoveHardDiskDrive')) | Should -BeLessThan ($ops.IndexOf('GetVhdxImageHash'))
     }
 
     It 'a hung builder (SimulateNeverOff) times out -> Status=Failed, NO deps artifact, no hash' {
         $fake = New-FakeHyperVBackend -SimulateNeverOff -SimulateDepsImageBlob ([byte[]](1..8))
-        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld3' -Backend $fake -WorkloadTimeoutSeconds 0 -DepsDiskPath (Join-Path $TestDrive 'd3.vhdx')
+        # TR-3: capture the lifecycle-abort WARNING (instead of letting it leak into Pester output) and
+        # assert it — turning the warning into a real behavioral check that the timeout path was hit.
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld3' -Backend $fake -WorkloadTimeoutSeconds 0 -DepsDiskPath (Join-Path $TestDrive 'd3.vhdx') -WarningVariable wv -WarningAction SilentlyContinue
         $r.Status | Should -Be 'Failed'
         $r.WholeImageHash | Should -BeNullOrEmpty
+        (@($wv) -join "`n") | Should -Match 'did not power off' -Because 'the timeout path must emit the lifecycle-abort warning'
     }
 
     It 'a non-builder profile (EgressMode != SquidSniProxy) is refused' {
@@ -80,8 +88,10 @@ Describe 'Invoke-BuilderVM — teardown leaves deps.vhdx, removes other disks' {
 
     It 'the VM is removed after a timed-out builder run (no orphan)' {
         $fake = New-FakeHyperVBackend -SimulateNeverOff
-        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-timeout-td' -Backend $fake -WorkloadTimeoutSeconds 0 -DepsDiskPath (Join-Path $TestDrive 'deps-t2.vhdx')
+        # TR-3: capture + assert the lifecycle-abort warning (no leak into Pester output).
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-timeout-td' -Backend $fake -WorkloadTimeoutSeconds 0 -DepsDiskPath (Join-Path $TestDrive 'deps-t2.vhdx') -WarningVariable wv -WarningAction SilentlyContinue
         $r.Status | Should -Be 'Failed'
+        (@($wv) -join "`n") | Should -Match 'did not power off' -Because 'the timeout path must emit the lifecycle-abort warning'
         (& $fake.GetVM @{ Name = 'bld-timeout-td' }) | Should -BeNullOrEmpty -Because 'the builder VM is removed even on a timeout'
     }
 }
@@ -119,7 +129,7 @@ Describe 'Invoke-BuilderVM — RC7: SetAutomaticCheckpoints called before StartV
 
     It 'SetAutomaticCheckpoints(Enabled=$false) is applied before StartVM: the deps hash is non-empty (AutomaticCheckpoints=ON would hide the blob in a child .avhdx -> empty hash)' {
         # When AutomaticCheckpointsEnabled is still ON at StartVM, the fake routes the
-        # DepsImageBlob into OutboxChildLayer (the .avhdx child — inaccessible to GetVhdxImageHash,
+        # DepsImageBlob into DepsImageChildLayer (the .avhdx child — inaccessible to GetVhdxImageHash,
         # which reads the base). So GetVhdxImageHash would return SHA256 of empty bytes, NOT the
         # blob's hash. If RC7 is applied (Enabled=$false) before StartVM, the blob goes into
         # DepsImageRegion (the base layer) and the hash matches the blob. So a non-empty/correct

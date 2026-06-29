@@ -22,15 +22,20 @@
                   locked; the fake THROWS on GetVhdxImageHash while still attached).
       HASH        GetVhdxImageHash — whole-file SHA-256 in USER-SPACE (NEVER Mount-VHD).
       EMIT        Record DepsDiskPath + WholeImageHash + Status=Success.
-      TEARDOWN    Remove-Sandbox in a finally — leaves deps.vhdx (NOT in CreatedDisks; M2).
+      TEARDOWN    Remove-Sandbox in a finally. NOTE: in the DEFAULT case $DepsDiskPath == OutputDiskPath,
+                  which New-WorkloadDisks PUT in CreatedDisks, so Remove-Sandbox -DeleteDisks DELETES it.
+                  deps.vhdx persistence is LIVE-only, pending the Phase-6 Copy-Item to a stable path that
+                  is NOT in CreatedDisks (the commented-out Copy-Item below the hash). Until then the
+                  whole-image hash is the durable artifact; the deps .vhdx itself does not survive teardown.
 
     DESIGN DECISIONS (resolved — do not redesign):
       * No host-mount: the integrity artifact is the whole-image hash (GetVhdxImageHash, raw).
       * Success = clean power-off: -not $wait.TimedOut -> Status='Success'; timeout -> 'Failed'.
         The exitcode/per-file-manifest outbox read DEFERS to Phase 4.
-      * deps.vhdx persists (M2): teardown LEAVES deps.vhdx (not in CreatedDisks). The real file
-        copy to a stable path is LIVE-only (Phase 6); in the mock set DepsDiskPath to the
-        OUTPUT path and record the hash.
+      * deps.vhdx persistence is LIVE-only (Phase 6): in the DEFAULT case DepsDiskPath == OutputDiskPath,
+        which IS in CreatedDisks, so teardown's Remove-Sandbox -DeleteDisks DELETES it. The Phase-6
+        Copy-Item to a stable path NOT in CreatedDisks is what will make deps.vhdx survive; until then the
+        mock just sets DepsDiskPath to the OUTPUT path and records the hash (the durable artifact).
 
     Dot-source this file AFTER Invoke-Voidseal.ps1 (which dot-sources all engine libs:
     HyperVBackend.ps1, ProfileLoader.ps1, Provisioner.ps1, Sealer.ps1, Runner.ps1,
@@ -222,10 +227,12 @@ function Invoke-BuilderVM {
     }
     finally {
         # --- DESTROYED: teardown ALWAYS runs (no orphaned VM/disk/switch) ---
-        # LEAVE deps.vhdx (M2): the deps disk is the builder's persistent output artifact, NOT
-        # in CreatedDisks (we never added it). Remove-Sandbox -DeleteDisks only targets
-        # CreatedDisks (the system disk + INPUT + OUTPUT + seed disk), so deps.vhdx is left
-        # on disk whether we're using the stable $DepsDiskPath or the working OutputDiskPath.
+        # deps.vhdx persistence is LIVE-only (Phase 6). In the DEFAULT case $DepsDiskPath ==
+        # OutputDiskPath, which New-WorkloadDisks PUT in CreatedDisks (the system disk + INPUT +
+        # OUTPUT + seed disk), so Remove-Sandbox -DeleteDisks DELETES it here — deps.vhdx does NOT
+        # survive teardown today. The Phase-6 Copy-Item (commented out above the EMIT) copies the
+        # OUTPUT .vhdx to a stable path NOT in CreatedDisks; only THEN does the deps artifact persist.
+        # Until then the whole-image hash is the durable record, not the .vhdx file.
         try {
             if ($null -ne $descriptor) {
                 Remove-Sandbox -Name $Name -DeleteDisks -Descriptor $descriptor -Backend $Backend

@@ -52,7 +52,12 @@
     # deps + a per-file SHA-256 manifest under /mnt/out (-> the OUTPUT disk -> deps.vhdx).
     Entrypoint = 'python3 /mnt/in/fetch_deps.py --spec /mnt/in/deps-spec.json --out /mnt/out'
 
-    # The cloud-init NoCloud CIDATA seed (2.2 builds the builder variant with the Squid proxy +
-    # dep-fetch runner). Attached read-only at provision; ejected by the seal. Not secret-shaped.
+    # The cloud-init NoCloud CIDATA seed path. ci-2 NOTE: this is UNUSED in the disk-mode/builder path —
+    # the builder is WorkloadMode='Disk', and New-WorkloadSeedDisk (Workload.ps1) builds the seed CONTENT
+    # in-line onto a recorded CIDATA *data disk* ('<name>-cidata.vhdx' under the storage root, RC6) that
+    # survives the seal; it never reads this SeedIso file. SeedIso is consumed ONLY by the serial/DVD path
+    # (New-CidataSeed -Destination default + Add-SandboxSeed). Kept (not dropped) because the loader still
+    # carries the key (mirrors firefox.psd1, which also declares it for disk-mode) and it documents the
+    # canonical seed path; it is harmless in disk mode. Not secret-shaped.
     SeedIso = 'C:\sandbox\assets\cidata-seed.iso'
 }
