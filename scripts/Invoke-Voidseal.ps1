@@ -63,6 +63,39 @@ $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
 . (Join-Path $script:DeployLibDir 'SensitivityGate.ps1')
 
 # --------------------------------------------------------------------------
+# Fold-in #1: Resolve-PythonExe — robust host python3/python resolution.
+#
+# A hard `& python3` BREAKS the Windows host: the Windows Python installer provides
+# `python`, not `python3`. The in-guest binary is `python3` (Debian), but the HOST
+# shelling `host/read_outbox.py` at the seam-#2 gate is Windows PowerShell, which
+# needs the Windows `python` executable. Get-Command probes both names; throw fail-
+# closed naming both if NEITHER resolves (prefer python3 on non-Windows for safety).
+# --------------------------------------------------------------------------
+<#
+.SYNOPSIS
+    Resolve the host Python executable path (python3 preferred, python fallback).
+.DESCRIPTION
+    A hard `& python3` breaks on Windows hosts where the Python installer provides
+    `python`. This probes both names via Get-Command and returns the resolved path.
+    Throws a clear fail-closed message naming both candidates if neither resolves.
+#>
+function Resolve-PythonExe {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $cmd = Get-Command python3 -ErrorAction SilentlyContinue
+    if ($null -ne $cmd) { return $cmd.Source }
+
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($null -ne $cmd) { return $cmd.Source }
+
+    throw ("Resolve-PythonExe: neither 'python3' nor 'python' was found on PATH. " +
+           "Install Python and ensure it is on the PATH (Windows: the Python installer " +
+           "adds 'python'; Linux/macOS: 'python3'). Failing closed.")
+}
+
+# --------------------------------------------------------------------------
 # Internal: resolve the -Profile argument to a normalized profile hashtable (loader output).
 # --------------------------------------------------------------------------
 <#
@@ -512,9 +545,26 @@ function Invoke-Voidseal {
                     # Bridge PS bytes -> read_outbox.py via a host temp file (binary stdin is fragile on Windows PowerShell).
                     $blobFile = Join-Path $Destination 'outbox.bin'
                     [System.IO.File]::WriteAllBytes($blobFile, $blob)
+                    # Fold-in #1: use Resolve-PythonExe (robust host python3/python resolution).
+                    # Fold-in #6: capture stderr so any read_outbox.py diagnostic is surfaced in
+                    #             the throw message rather than silently swallowed.
+                    # Outbox constants (single source of truth: guest/outbox.py):
+                    #   MAGIC   = b'VSOUTBX1'  (8 bytes, offset 0)
+                    #   Header  = 24 bytes     (MAGIC[8] + version[4] + count[4] + total_bytes[8])
+                    #   Record  = 104 bytes    (label[64] + mime[32] + offset[4] + length[4])
                     $readScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'host/read_outbox.py'   # <repo>/host/read_outbox.py (see line ~103 skillRoot pattern)
-                    & python $readScript --blob $blobFile --out $gateInput 2>&1 | Out-Null
-                    if ($LASTEXITCODE -ne 0) { throw "processor gate: read_outbox.py failed (exit $LASTEXITCODE) — outbox invalid/tampered; releasing nothing." }
+                    $pyExe = Resolve-PythonExe
+                    $pyOut = & $pyExe $readScript --blob $blobFile --out $gateInput 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        $pyStderr = ($pyOut | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                                    ForEach-Object { $_.Exception.Message }) -join '; '
+                        if ([string]::IsNullOrWhiteSpace($pyStderr)) {
+                            # Capture any stdout lines as well (non-ErrorRecord items)
+                            $pyStderr = ($pyOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join '; '
+                        }
+                        $stderrSuffix = if ([string]::IsNullOrWhiteSpace($pyStderr)) { '' } else { " stderr: $pyStderr" }
+                        throw "processor gate: read_outbox.py failed (exit $LASTEXITCODE) — outbox invalid/tampered; releasing nothing.$stderrSuffix"
+                    }
                     $gateStaging  = Join-Path $gateInput 'staging'
                     $gateVerdicts = Join-Path $gateInput 'verdicts.json'
 
