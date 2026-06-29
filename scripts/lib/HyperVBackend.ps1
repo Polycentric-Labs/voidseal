@@ -1883,28 +1883,37 @@ function New-FakeHyperVBackend {
             throw "ReadVhdxRawRegion: Offset/Length exceeds the supported 2GB single-read limit ($offset/$length) — failing closed."
         }
         if (-not $state.VHDs.ContainsKey($path)) { throw "ReadVhdxRawRegion: VHD '$path' does not exist." }
-        # AXIS 1 — detach/file-lock ordering: qemu-img cannot open a Hyper-V-locked VHDX, so a raw read of
-        # a STILL-ATTACHED disk must fail exactly as the live open would. Throw if any VM still holds it.
+        # AXIS 1 — detach/file-lock ordering: qemu-img opens the VHDX with a shared read; that open is only
+        # blocked while the Hyper-V worker process (vmwp.exe) holds the file lock — i.e. ONLY while the
+        # holding VM is Running/Saved/Paused. An Off-but-attached disk (the builder's post-power-off,
+        # pre-detach window reachable via -SimulateSelfPowerOff) carries NO live worker handle and IS
+        # qemu-readable, so the real returns its bytes; gate the throw on the holder's runtime State to
+        # match. A live (Running/Saved/Paused) holder hits a sharing violation -> $LockRetry -> *locked*
+        # (the real NEVER emits *still attached*); the message carries `locked` so a consumer can branch
+        # on the single *locked* substring both factories and the real share.
         foreach ($vmRec in $state.VMs.Values) {
-            if (@($vmRec.HardDrives) -contains $path) {
-                throw "ReadVhdxRawRegion: VHD '$path' is still attached to VM '$($vmRec.Name)' (locked); detach before the host raw read. Failing closed."
+            if ((@($vmRec.HardDrives) -contains $path) -and ([string]$vmRec.State -in @('Running','Saved','Paused'))) {
+                throw "ReadVhdxRawRegion: VHDX '$path' is attached to a live VM '$($vmRec.Name)' (State=$($vmRec.State)); the VHDX is still locked — detach (and ensure the VM is Off) before the host raw read. Failing closed."
             }
         }
         $rec = $state.VHDs[$path]
         # RC8 (MUST-FIX 1, FAKE) — model the detach SETTLE-LAG the real read tolerates via its internal
         # lock-retry. Seed a per-disk countdown from -SimulateDetachSettleLag on the FIRST read, then "retry
-        # it away" up to a budget that MATCHES the real SbInvokeWithLockRetry MaxAttempts default (5): a lag
-        # WITHIN budget decrements to 0 and proceeds (the method tolerates it, returning the bytes); a lag
-        # EXCEEDING the budget throws the SAME fail-closed lock message the real helper throws.
-        $LOCK_RETRY_BUDGET = 5   # shared with $script:SbInvokeWithLockRetry's MaxAttempts default
+        # it away" via the SAME increment-then-compare arithmetic the real $script:SbInvokeWithLockRetry uses
+        # ($attempt++ then `-ge $MaxAttempts`). $LOCK_RETRY_BUDGET (5) MATCHES the real's MaxAttempts default,
+        # but the TOLERANCE is MaxAttempts-1 = 4: a lag of <=4 transient lock-failures decrements to 0 and the
+        # read proceeds (bytes returned); a lag of >=5 throws the SAME *still locked* message the real helper
+        # throws on its 5th attempt. (The earlier check-before-decrement form tolerated <=5 / threw at >=6 —
+        # one off from the real, so the fake returned bytes at lag=5 where the real fails closed.)
+        $LOCK_RETRY_BUDGET = 5   # == the real's MaxAttempts default; TOLERANCE is MaxAttempts-1 = 4
         if (-not $rec.ContainsKey('_settleRemaining')) { $rec['_settleRemaining'] = [int]$detachSettleLag }
         $attempts = 0
         while ([int]$rec['_settleRemaining'] -gt 0) {
+            $attempts++
             if ($attempts -ge $LOCK_RETRY_BUDGET) {
                 throw "ReadVhdxRawRegion: the VHDX '$path' is still locked after $LOCK_RETRY_BUDGET attempts — the VHDX handle may not have been released after detach (settle-lag did not clear). Failing closed."
             }
             $rec['_settleRemaining'] = [int]$rec['_settleRemaining'] - 1
-            $attempts++
         }
         # Log so a test can prove DETACH (RemoveHardDiskDrive) precedes the read (survives RemoveVM).
         $state.CallLog.Add(@{ Op = 'ReadVhdxRawRegion'; Path = $path; Offset = $offset; Length = $length })
@@ -1926,37 +1935,62 @@ function New-FakeHyperVBackend {
     # settle-lag is modeled as a SEPARATE per-method countdown (_hashSettleRemaining) for test isolation;
     # the real lag is a per-HANDLE property that the first read after a detach absorbs — disclosed so the
     # ULTRACODE gate can judge the representation gap.
+    # REPRESENTATION GAP (whole-file vs content blob) — INTENTIONAL, UNMODELED: the REAL hashes the WHOLE
+    # .vhdx file (header / BAT / footer / parent-locator / free-space) via OpenRead->SHA256; this fake
+    # hashes ONLY the recorded deps CONTENT blob (DepsImageRegion). Therefore the fake CANNOT model a
+    # container/footer/parent-locator-only substitution — e.g. the canonical VHDX-swap attack of rewriting
+    # the footer so a fixed disk becomes a differencing disk pointing at an attacker-controlled parent,
+    # which changes the REAL whole-file hash but NOT this fake's content-only hash. This container-tamper
+    # class is DELIBERATELY left unmodeled in the mock (building container-byte fake machinery is deferred
+    # to Phase 3, when a consumer is wired) and MUST be covered by a live Phase-6 test before
+    # verify-before-attach is trusted in production.
     $b.GetVhdxImageHash = {
         param([System.Collections.IDictionary] $P)
         $path = & $AssertArg $P 'Path' 'GetVhdxImageHash'
         if (-not $state.VHDs.ContainsKey($path)) {
             throw "GetVhdxImageHash: VHDX '$path' does not exist (cannot hash a missing artifact). Failing closed."
         }
-        # AXIS 1 — detach/file-lock ordering: a host hash of a STILL-ATTACHED disk would hit a sharing
-        # violation (the VM holds the lock). Throw if any VM still holds it.
+        # AXIS 1 — detach/file-lock ordering: the real opens with [System.IO.File]::OpenRead (FileShare.Read);
+        # that open is only blocked while the Hyper-V worker process (vmwp.exe) holds the file lock — i.e.
+        # ONLY while the holding VM is Running/Saved/Paused. An Off-but-attached disk (the builder's
+        # post-power-off, pre-detach window reachable via -SimulateSelfPowerOff) carries NO live worker handle
+        # and IS OpenRead-able, so the real returns its hash; gate the throw on the holder's runtime State to
+        # match. A live (Running/Saved/Paused) holder hits a sharing violation -> $LockRetry -> *locked* (the
+        # real NEVER emits *still attached*); the message carries `locked` so a consumer can branch on the
+        # single *locked* substring both factories and the real share.
         foreach ($vmRec in $state.VMs.Values) {
-            if (@($vmRec.HardDrives) -contains $path) {
-                throw "GetVhdxImageHash: VHDX '$path' is still attached to VM '$($vmRec.Name)' (locked); detach before the host hash. Failing closed."
+            if ((@($vmRec.HardDrives) -contains $path) -and ([string]$vmRec.State -in @('Running','Saved','Paused'))) {
+                throw "GetVhdxImageHash: VHDX '$path' is attached to a live VM '$($vmRec.Name)' (State=$($vmRec.State)); the VHDX is still locked — detach (and ensure the VM is Off) before the host hash. Failing closed."
             }
         }
         $rec = $state.VHDs[$path]
-        # AXIS 2 — RC8 detach settle-lag: same bounded tolerance the real $LockRetry gives (shared
-        # MaxAttempts default 5). A lag WITHIN budget rides out; a lag EXCEEDING it throws the same
-        # *still locked* fail-closed shape the real helper throws (Context='GetVhdxImageHash').
-        $LOCK_RETRY_BUDGET = 5   # shared with $script:SbInvokeWithLockRetry's MaxAttempts default
+        # AXIS 2 — RC8 detach settle-lag: same bounded tolerance the real $LockRetry gives, via the SAME
+        # increment-then-compare arithmetic the real $script:SbInvokeWithLockRetry uses ($attempt++ then
+        # `-ge $MaxAttempts`). $LOCK_RETRY_BUDGET (5) MATCHES the real's MaxAttempts default, but the
+        # TOLERANCE is MaxAttempts-1 = 4: a lag of <=4 transient lock-failures rides out (hash returned); a
+        # lag of >=5 throws the same *still locked* fail-closed shape the real helper throws on its 5th
+        # attempt (Context='GetVhdxImageHash'). (The earlier check-before-decrement form tolerated <=5 / threw
+        # at >=6 — one off from the real, so the fake returned a hash at lag=5 where the real fails closed.)
+        $LOCK_RETRY_BUDGET = 5   # == the real's MaxAttempts default; TOLERANCE is MaxAttempts-1 = 4
         if (-not $rec.ContainsKey('_hashSettleRemaining')) { $rec['_hashSettleRemaining'] = [int]$detachSettleLag }
         $attempts = 0
         while ([int]$rec['_hashSettleRemaining'] -gt 0) {
+            $attempts++
             if ($attempts -ge $LOCK_RETRY_BUDGET) {
                 throw "GetVhdxImageHash: the VHDX '$path' is still locked after $LOCK_RETRY_BUDGET attempts — the VHDX handle may not have been released after detach (settle-lag did not clear). Failing closed."
             }
             $rec['_hashSettleRemaining'] = [int]$rec['_hashSettleRemaining'] - 1
-            $attempts++
         }
         $state.CallLog.Add(@{ Op = 'GetVhdxImageHash'; Path = $path })
         # AXIS 3 — determinism: SHA-256 of the recorded deps bytes (stand-in for the file content). Same
-        # bytes -> same hash; different bytes -> different hash (tamper-sensitive).
+        # bytes -> same hash; different bytes -> different hash (tamper-sensitive). An Off-but-attached read
+        # of a disk with NO recorded blob (the FIX-2 path) hashes an EMPTY image — model the real, which
+        # OpenReads and SHA-256s whatever (possibly tiny) file is there. NOTE: re-cast to [byte[]] HERE (not
+        # only inside the if/else) because a PowerShell if-expression unrolls an EMPTY byte[] to $null, and
+        # SHA256.ComputeHash($null) is an ambiguous overload (byte[] vs Stream) — fail-loud-but-wrong.
         $bytes = if ($rec.ContainsKey('DepsImageRegion')) { [byte[]]$rec['DepsImageRegion'] } else { [byte[]]::new(0) }
+        if ($null -eq $bytes) { $bytes = [byte[]]::new(0) }   # the empty-blob if-branch unrolls to $null
+        [byte[]]$bytes = $bytes                                # re-pin the static type so the overload binds
         $sha = [System.Security.Cryptography.SHA256]::Create()
         try { $digest = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
         return [System.BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()

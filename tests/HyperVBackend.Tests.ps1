@@ -1602,11 +1602,33 @@ Describe 'GetVhdxImageHash — whole-image deps fingerprint (fake axes + real ne
             & $f.AddHardDiskDrive @{ VMName = $vm; Path = $disk }
             return $f
         }
+        # No -SimulateSelfPowerOff: StartVM leaves State='Running' (the live worker holds the lock). The deps
+        # blob is NOT recorded without SelfPowerOff, but the *locked*/Off-but-attached tests only assert a
+        # throw / a successful (possibly empty) hash, so that is fine.
+        function script:New-DepsFakeRunning([string] $vm = 'br', [string] $disk = 'C:\s\depsr.vhdx') {
+            $f = New-FakeHyperVBackend
+            & $f.NewVM @{ Name = $vm; Generation = 2 }
+            & $f.SetAutomaticCheckpoints @{ VMName = $vm; Enabled = $false }
+            & $f.NewOutputVhdx @{ Path = $disk; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+            & $f.AddHardDiskDrive @{ VMName = $vm; Path = $disk }
+            return $f
+        }
     }
-    It 'AXIS 1: hashing a STILL-ATTACHED disk throws (file-lock / detach ordering)' {
-        $f = New-DepsFake ([byte[]](1..32))
-        & $f.StartVM @{ Name = 'b1' }
-        { & $f.GetVhdxImageHash @{ Path = 'C:\s\deps.vhdx' } } | Should -Throw -ExpectedMessage '*still attached*'
+    It 'AXIS 1: hashing a disk attached to a RUNNING VM throws *locked* (live worker holds the lock; real never says *still attached*)' {
+        # FIX-2: gate on the holder State. A Running holder => sharing violation => $LockRetry => *locked*.
+        # (The pre-fix fake threw *still attached* for ANY attach regardless of State; the real never does.)
+        $f = New-DepsFakeRunning
+        & $f.StartVM @{ Name = 'br' }   # no SelfPowerOff -> State='Running', disk still attached
+        { & $f.GetVhdxImageHash @{ Path = 'C:\s\depsr.vhdx' } } | Should -Throw -ExpectedMessage '*locked*'
+    }
+    It 'AXIS 1 (FIX-2): an OFF-but-attached disk is OpenRead-able -> returns a hash (the real allows it; the builder post-power-off pre-detach window)' {
+        # NewVM + NewOutputVhdx + AddHardDiskDrive, but NO StartVM: State stays 'Off' while the disk is still
+        # attached. The real OpenReads (no live vmwp handle) and returns a hash; the fake must too (pre-fix it
+        # over-strictly refused). Empty image -> SHA-256 of zero bytes (the canonical empty digest).
+        $f = New-DepsFakeRunning 'boff' 'C:\s\depsoff.vhdx'
+        $h = & $f.GetVhdxImageHash @{ Path = 'C:\s\depsoff.vhdx' }   # must NOT throw (proven by reaching here)
+        $h | Should -BeOfType ([string])
+        $h | Should -Match '^[0-9a-f]{64}$'
     }
     It 'AXIS 1+3: after detach, returns the SHA-256 of the recorded bytes; deterministic; FakeCallLog proves detach precedes hash' {
         $f = New-DepsFake ([byte[]](1..32))
@@ -1637,6 +1659,17 @@ Describe 'GetVhdxImageHash — whole-image deps fingerprint (fake axes + real ne
         & $f7.StartVM @{ Name='bl2' }; & $f7.RemoveHardDiskDrive @{ VMName='bl2'; Path='C:\s\dl2.vhdx' }
         { & $f7.GetVhdxImageHash @{ Path='C:\s\dl2.vhdx' } } | Should -Throw -ExpectedMessage '*still locked*'
     }
+    It 'AXIS 2 BOUNDARY (FIX-1): lag=4 (== MaxAttempts-1) is tolerated; lag=5 (== MaxAttempts) fails closed *still locked*' {
+        # The real $SbInvokeWithLockRetry (increment-then-compare, MaxAttempts=5) tolerates 4 transient
+        # lock-failures and throws on the 5th attempt. Pin the exact edge: 4 must NOT throw, 5 must. (Pre-fix
+        # the fake's check-before-decrement tolerated 5 and threw at 6 — one off, mock-green where real fails.)
+        $f4 = New-DepsFake ([byte[]](1..8)) 4 'be4' 'C:\s\dl4.vhdx'
+        & $f4.StartVM @{ Name='be4' }; & $f4.RemoveHardDiskDrive @{ VMName='be4'; Path='C:\s\dl4.vhdx' }
+        { & $f4.GetVhdxImageHash @{ Path='C:\s\dl4.vhdx' } } | Should -Not -Throw -Because 'lag=4 == MaxAttempts-1 is the real''s tolerance'
+        $f5 = New-DepsFake ([byte[]](1..8)) 5 'be5' 'C:\s\dl5.vhdx'
+        & $f5.StartVM @{ Name='be5' }; & $f5.RemoveHardDiskDrive @{ VMName='be5'; Path='C:\s\dl5.vhdx' }
+        { & $f5.GetVhdxImageHash @{ Path='C:\s\dl5.vhdx' } } | Should -Throw -ExpectedMessage '*still locked*' -Because 'lag=5 == MaxAttempts: the real throws on the 5th attempt'
+    }
     It 'ERROR-PARITY: hashing a NON-EXISTENT disk throws (missing artifact), in both factories' {
         $f = New-DepsFake ([byte[]](1..8))
         { & $f.GetVhdxImageHash @{ Path = 'C:\s\nope.vhdx' } } | Should -Throw -ExpectedMessage '*does not exist*'
@@ -1663,10 +1696,34 @@ Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-moun
         & $script:fake.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
         & $script:fake.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
     }
-    It 'AXIS 1: reading a STILL-ATTACHED disk throws (file-lock / detach ordering)' {
-        & $script:fake.StartVM @{ Name = 'p1' }
-        { & $script:fake.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 } } |
-            Should -Throw -ExpectedMessage '*still attached*'
+    It 'AXIS 1: reading a disk attached to a RUNNING VM throws *locked* (live worker holds the lock; real never says *still attached*)' {
+        # FIX-2: gate on the holder State. Build a fake WITHOUT -SimulateSelfPowerOff so StartVM leaves
+        # State='Running' (the live vmwp.exe holds the file lock) with the disk still attached. The fake must
+        # throw a *locked* message (the real hits a sharing violation -> $LockRetry -> *locked*; it NEVER
+        # emits *still attached*). Pre-fix the fake threw *still attached* for ANY attach regardless of State.
+        $f = New-FakeHyperVBackend
+        & $f.NewVM @{ Name = 'pr'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'pr'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\outr.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'pr'; Path = 'C:\s\outr.vhdx' }
+        & $f.StartVM @{ Name = 'pr' }   # no SelfPowerOff -> State='Running', disk still attached
+        { & $f.ReadVhdxRawRegion @{ Path = 'C:\s\outr.vhdx'; Offset = 0; Length = 16 } } |
+            Should -Throw -ExpectedMessage '*locked*'
+    }
+    It 'AXIS 1 (FIX-2): an OFF-but-attached disk is qemu-readable -> returns bytes (the real allows it; the builder post-power-off pre-detach window)' {
+        # NewVM + NewOutputVhdx + AddHardDiskDrive, but NO StartVM: State stays 'Off' while the disk is still
+        # attached. The real qemu-img opens it (no live vmwp handle) and returns bytes; the fake must too
+        # (pre-fix it over-strictly refused). No blob recorded -> a zero-padded buffer of the requested length.
+        $f = New-FakeHyperVBackend
+        & $f.NewVM @{ Name = 'poff'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'poff'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\outoff.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'poff'; Path = 'C:\s\outoff.vhdx' }
+        # Call directly (must NOT throw — proven by reaching the asserts); a Should -Not -Throw scriptblock
+        # would swallow the return value in its child scope.
+        $bytes = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\outoff.vhdx'; Offset = 0; Length = 16 }
+        ,$bytes | Should -BeOfType ([byte[]])
+        $bytes.Length | Should -Be 16
     }
     It 'AXIS 1+3: after detach + SelfPowerOff, returns the recorded outbox bytes; CallLog proves detach precedes read' {
         & $script:fake.StartVM @{ Name = 'p1' }
@@ -1712,6 +1769,27 @@ Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-moun
         & $f.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
         { & $f.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 } } |
             Should -Throw -ExpectedMessage '*still locked*'
+    }
+    It 'MUST-FIX 1 BOUNDARY (FIX-1): lag=4 (== MaxAttempts-1) is tolerated; lag=5 (== MaxAttempts) fails closed *still locked*' {
+        # The real $SbInvokeWithLockRetry (increment-then-compare, MaxAttempts=5) tolerates 4 transient
+        # lock-failures and throws on the 5th attempt. Pin the exact edge: 4 must NOT throw, 5 must. (Pre-fix
+        # the fake's check-before-decrement tolerated 5 and threw at 6 — one off, mock-green where real fails.)
+        $f4 = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16)) -SimulateDetachSettleLag 4
+        & $f4.NewVM @{ Name = 'pe4'; Generation = 2 }
+        & $f4.SetAutomaticCheckpoints @{ VMName = 'pe4'; Enabled = $false }
+        & $f4.NewOutputVhdx @{ Path = 'C:\s\oe4.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f4.AddHardDiskDrive @{ VMName = 'pe4'; Path = 'C:\s\oe4.vhdx' }
+        & $f4.StartVM @{ Name = 'pe4' }
+        & $f4.RemoveHardDiskDrive @{ VMName = 'pe4'; Path = 'C:\s\oe4.vhdx' }
+        { & $f4.ReadVhdxRawRegion @{ Path = 'C:\s\oe4.vhdx'; Offset = 0; Length = 16 } } | Should -Not -Throw -Because 'lag=4 == MaxAttempts-1 is the real''s tolerance'
+        $f5 = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16)) -SimulateDetachSettleLag 5
+        & $f5.NewVM @{ Name = 'pe5'; Generation = 2 }
+        & $f5.SetAutomaticCheckpoints @{ VMName = 'pe5'; Enabled = $false }
+        & $f5.NewOutputVhdx @{ Path = 'C:\s\oe5.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f5.AddHardDiskDrive @{ VMName = 'pe5'; Path = 'C:\s\oe5.vhdx' }
+        & $f5.StartVM @{ Name = 'pe5' }
+        & $f5.RemoveHardDiskDrive @{ VMName = 'pe5'; Path = 'C:\s\oe5.vhdx' }
+        { & $f5.ReadVhdxRawRegion @{ Path = 'C:\s\oe5.vhdx'; Offset = 0; Length = 16 } } | Should -Throw -ExpectedMessage '*still locked*' -Because 'lag=5 == MaxAttempts: the real throws on the 5th attempt'
     }
     It 'MUST-FIX 2 (write-flush gate): a guest that NEVER cleanly powers off leaves the outbox UNFLUSHED -> raw read is ALL ZEROS' {
         # -SimulateNeverOff + -SimulateOutboxBlob but NO -SimulateSelfPowerOff: the blob must NOT be recorded
