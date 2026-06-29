@@ -630,8 +630,13 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         # AddHardDiskDrive requires the VHD to exist in its state (real Add-VMHardDiskDrive requires the
         # file), so we create it on the backend with NewVHD first — mirroring how a real deps.vhdx exists
         # on disk before the orchestrator attaches it.
+        # D3-B (Phase 3): the shared BeforeAll also pre-computes the whole-image hash so each It that
+        # needs to PASS the verify step can supply DepsImageHash = $script:DepsDiskHash without a per-It
+        # NewVHD call. Tests that override the hash (mismatch) or omit it (missing) create their own
+        # local backend + disk so the shared fixture stays unaffected.
         $script:DepsDisk = Join-Path $script:TmpRoot ("deps-{0}.vhdx" -f ([guid]::NewGuid().ToString('N')))
         & $script:ProcB.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $script:DepsDiskHash = [string](& $script:ProcB.GetVhdxImageHash @{ Path = $script:DepsDisk })   # the (empty) fixture's whole-image hash
     }
 
     It 'releases the SAFE candidates end-to-end: detached OUTPUT outbox -> ReadVhdxRawRegion -> read_outbox.py -> gate' {
@@ -645,9 +650,10 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         # fresh backend with the blob + re-create the DEPS disk on it (fake state is per-instance).
         $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
         & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })   # the (empty) fixture's whole-image hash
 
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
-            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-outbox' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
 
@@ -670,9 +676,10 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
         $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $bad
         & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })   # the (empty) fixture's whole-image hash
 
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
-            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-tamper' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
 
@@ -687,9 +694,10 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
     It 'DENY-on-timeout: a hung processor (SimulateNeverOff) -> gate does NOT run, Released stays $null' {
         $b = New-FakeHyperVBackend -SimulateNeverOff   # never self-powers-off -> Wait-WorkloadComplete force-stops -> TimedOut
         & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })   # the (empty) fixture's whole-image hash
 
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
-            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-timeout' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
 
@@ -723,6 +731,44 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
         ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) |
             Should -BeTrue -Because 'GateRan is never stamped when the gate did not run'
+    }
+
+    It 'DENY-on-deps-mismatch: a deps disk whose hash != the expected (builder-recorded) hash is REFUSED (no attach, no run)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        # wrong hash — 64 zero hex chars; the actual hash of an empty VHDX is non-zero
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = ('0' * 64) } `
+            -Name 'sbx-proc-depsmismatch' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'a tampered/substituted deps disk aborts BEFORE the seal'
+        $report.Error | Should -Match '(?i)deps.*(integrity|hash)|integrity check' -Because 'the abort names the deps integrity failure'
+        $report.Released | Should -BeNullOrEmpty
+    }
+
+    It 'DENY-on-missing-deps-hash: a deps disk with NO DepsImageHash is REFUSED (mandatory verification)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        # NO DepsImageHash supplied — should trigger mandatory-verification refusal
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Name 'sbx-proc-nodepshash' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        @($report.States) | Should -Not -Contain 'SEALED'
+        $report.Error | Should -Match '(?i)DepsImageHash|no .*hash|unverified' -Because 'a deps disk without a verified hash is refused'
+    }
+
+    It 'GC invariant (D3-D): the verified deps.vhdx is NOT in CreatedDisks -> teardown LEAVES it (builder-owned, reusable)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })   # detached -> hashable
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-depsgc' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        @($report.States) | Should -Contain 'SEALED' -Because 'a verified deps disk attaches + the run proceeds'
+        @($report.Descriptor.CreatedDisks) | Should -Not -Contain $script:DepsDisk -Because 'the builder-owned deps.vhdx is never in CreatedDisks; the Reaper leaves it'
+        $report.Descriptor.DepsImageHash | Should -Be $depsHash -Because 'the verified hash is recorded on the descriptor'
     }
 }
 

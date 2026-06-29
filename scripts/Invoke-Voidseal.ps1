@@ -445,8 +445,30 @@ function Invoke-Voidseal {
             $depsDiskPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
             if ([string]::IsNullOrWhiteSpace($depsDiskPath) -and $resolved.ContainsKey('DepsDiskPath')) { $depsDiskPath = [string]$resolved['DepsDiskPath'] }
             if ($resolved['Network'] -eq 'None' -and -not [string]::IsNullOrWhiteSpace($depsDiskPath)) {
-                $null = & $Backend.AddHardDiskDrive @{ VMName = $Name; Path = $depsDiskPath }   # existing method; no read-only attach (D3)
-                Set-DescriptorField -Descriptor $descriptor -Name 'DepsDiskPath' -Value $depsDiskPath
+                # PHASE 3 — VERIFY-BEFORE-ATTACH (supply-chain integrity; Pass-5 + Pass-4 P1 "offline != trustworthy").
+                # The expected whole-image hash comes from the TRUSTED caller (who ran the builder + captured its
+                # WholeImageHash) via -Workload.DepsImageHash (fallback: the resolved profile). Re-hash deps.vhdx in
+                # USER-SPACE (GetVhdxImageHash — raw bytes, NEVER Mount-VHD) while it is still DETACHED (before this
+                # AddHardDiskDrive), and REFUSE on a missing OR mismatched hash — fail-closed: no unverified or
+                # tampered/substituted dependency disk ever attaches. (Live: GetVhdxImageHash is qemu-img-free
+                # streaming SHA-256 — re-resolve at fire; the mock fake returns SHA-256 of the recorded deps bytes.)
+                $expectedHash = [string](Get-WorkloadField -Workload $Workload -Name 'DepsImageHash')
+                if ([string]::IsNullOrWhiteSpace($expectedHash) -and $resolved.ContainsKey('DepsImageHash')) { $expectedHash = [string]$resolved['DepsImageHash'] }
+                if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+                    throw "Invoke-Voidseal: '$Name' attaches a DEPS disk ('$depsDiskPath') but no DepsImageHash was supplied. A deps disk MUST carry the builder's recorded whole-image hash (pass -Workload.DepsImageHash) — refusing to attach an UNVERIFIED dependency disk. Failing closed."
+                }
+                $expectedHash = $expectedHash.Trim().ToLowerInvariant()
+                $actualHash   = ([string](& $Backend.GetVhdxImageHash @{ Path = $depsDiskPath })).Trim().ToLowerInvariant()
+                if ($actualHash -ne $expectedHash) {
+                    throw "Invoke-Voidseal: '$Name' DEPS disk integrity check FAILED — '$depsDiskPath' hashes to '$actualHash' but the expected (builder-recorded) hash is '$expectedHash'. The dependency disk was tampered or substituted — refusing to attach. Failing closed."
+                }
+                # Verified -> attach + RECORD (DepsDiskPath + the verified DepsImageHash) BEFORE Lock-Sandbox so
+                # Assert-Sealed accepts it as an expected disk. NOT added to CreatedDisks (builder-owned, reusable
+                # across runs — D3-D; teardown's Remove-Sandbox leaves the deps.vhdx FILE on disk). No read-only
+                # attach (Hyper-V can't host-enforce guest-RO — D3).
+                $null = & $Backend.AddHardDiskDrive @{ VMName = $Name; Path = $depsDiskPath }
+                Set-DescriptorField -Descriptor $descriptor -Name 'DepsDiskPath'  -Value $depsDiskPath
+                Set-DescriptorField -Descriptor $descriptor -Name 'DepsImageHash' -Value $actualHash
                 $report.Descriptor = $descriptor
             }
         }
