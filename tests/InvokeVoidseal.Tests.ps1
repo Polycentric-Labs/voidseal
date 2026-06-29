@@ -756,6 +756,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
         @($report.States) | Should -Not -Contain 'SEALED'
         $report.Error | Should -Match '(?i)DepsImageHash|no .*hash|unverified' -Because 'a deps disk without a verified hash is refused'
+        $report.Released | Should -BeNullOrEmpty -Because 'a missing-hash abort is fail-closed — nothing is released (symmetry with DENY-on-deps-mismatch)'
     }
 
     It 'GC invariant (D3-D): the verified deps.vhdx is NOT in CreatedDisks -> teardown LEAVES it (builder-owned, reusable)' {
