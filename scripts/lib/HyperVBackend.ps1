@@ -1415,11 +1415,14 @@ $script:SbCopyFakeVM = {
     runs. The seam writes through the same WriteVhdxFile state the host later reads, so it stays honest.
 .PARAMETER SimulateDepsImageBlob
     A byte array representing the deps image bytes the builder guest "wrote" to the OUTPUT (deps) disk
-    during its boot run, recorded at StartVM when paired with -SimulateSelfPowerOff. Stored as
-    DepsImageRegion on the VHD record. GetVhdxImageHash returns SHA-256 of these bytes (the stand-in for
-    the whole .vhdx file content the real streaming hash reads). Same write-flush gate as the outbox:
-    no clean power-off -> no recorded blob -> hash returns SHA-256 of empty bytes (fail-closed, not a
-    false match). Models the builder supply-chain artifact fingerprint path (Task 2.3/Phase 3).
+    during its boot run, recorded at StartVM when paired with -SimulateSelfPowerOff. Stored on the base
+    VHD record as DepsImageRegion when AutomaticCheckpointsEnabled is OFF; when checkpoints are ON the
+    blob is stashed in DepsImageChildLayer (the .avhdx child the fake GetVhdxImageHash does NOT read) to
+    model the RC7 trap — the real OpenReads the BASE descriptor.OutputDiskPath, which checkpoints-ON
+    freezes empty. GetVhdxImageHash returns SHA-256 of the base bytes (the stand-in for the whole .vhdx
+    file content the real streaming hash reads). Same write-flush gate as the outbox: no clean power-off
+    -> no recorded blob -> hash returns SHA-256 of empty bytes (fail-closed, not a false match). Models
+    the builder supply-chain artifact fingerprint path (Task 2.3/Phase 3).
 .PARAMETER SimulateDetachError
     Make RemoveHardDiskDrive THROW — modelling a transient real-Hyper-V detach failure right after a
     force-stop (VM still settling / slot already detached). The orchestrator detaches the data disks
@@ -1638,11 +1641,22 @@ function New-FakeHyperVBackend {
         # over the Squid egress, writing them onto the OUTPUT (deps) disk, then self-powering-off. SAME
         # write-flush gate as the outbox: no clean power-off -> no flushed deps image -> a host hash of an
         # empty disk (fail-closed, not a false match). Recorded as DepsImageRegion (the stand-in for the
-        # .vhdx file bytes the real GetVhdxImageHash streams). No .avhdx split is modeled — the deps hash is
-        # a whole-FILE fingerprint, not a region read, so the RC7 child-layer trap does not apply.
+        # .vhdx file bytes the real GetVhdxImageHash streams). The .avhdx identity trap (RC7) DOES apply:
+        # the real GetVhdxImageHash OpenReads the BASE descriptor.OutputDiskPath; if checkpoints are ON,
+        # the guest's deps land in the per-disk .avhdx CHILD layer and the host BASE-file hash sees an
+        # EMPTY base (SHA256 of empty) — exactly the RC7 empty-hash bug. Model that by routing the blob to
+        # DepsImageChildLayer (which the fake GetVhdxImageHash does NOT read) when checkpoints are ON, and
+        # to the base DepsImageRegion only when checkpoints are OFF (the provisioner's RC7 fix). This keeps
+        # the fake SYMMETRIC with the outbox branch above and lets a test catch checkpoints-left-ON.
         if ($null -ne $depsImageBlob -and $selfPowerOff) {
             $depsDisk = & $findOutputDisk $vm
-            if ($null -ne $depsDisk) { $state.VHDs[$depsDisk]['DepsImageRegion'] = [byte[]]$depsImageBlob }
+            if ($null -ne $depsDisk) {
+                if ([bool]$vm['AutomaticCheckpointsEnabled']) {
+                    $state.VHDs[$depsDisk]['DepsImageChildLayer'] = [byte[]]$depsImageBlob   # RC7: checkpoints ON -> guest writes land in the .avhdx child; a host BASE-file hash sees deps-EMPTY base
+                } else {
+                    $state.VHDs[$depsDisk]['DepsImageRegion'] = [byte[]]$depsImageBlob        # checkpoints OFF (the RC7 fix) -> deps in the base, host hash sees them
+                }
+            }
         }
         # SimulateSelfPowerOff: the guest booted, ran its boot workload, and powered itself off before
         # the host's first completion poll — leave State Off so Wait-WorkloadComplete reads the happy

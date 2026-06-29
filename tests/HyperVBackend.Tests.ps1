@@ -1590,7 +1590,7 @@ Describe 'Real backend — builds the right cmdlet params (out-of-process; live-
 }
 
 # ===========================================================================
-#  ReadVhdxRawRegion — user-space raw read (fake axes + real never-mounts)
+#  GetVhdxImageHash — whole-image deps fingerprint (fake axes + real never-mounts)
 # ===========================================================================
 Describe 'GetVhdxImageHash — whole-image deps fingerprint (fake axes + real never-mounts)' {
     BeforeAll {
@@ -1643,6 +1643,41 @@ Describe 'GetVhdxImageHash — whole-image deps fingerprint (fake axes + real ne
         $h1 | Should -Be $want
         $ops = @($f.FakeCallLog | Where-Object { $_.Path -eq 'C:\s\deps.vhdx' } | ForEach-Object { $_.Op })
         ($ops.IndexOf('RemoveHardDiskDrive')) | Should -BeLessThan ($ops.IndexOf('GetVhdxImageHash'))
+    }
+    It 'RC7 (fake≠real symmetry): checkpoints LEFT ON -> deps land in the .avhdx child -> a host BASE-file hash sees SHA256(empty); checkpoints OFF -> the real deps hash' {
+        # The signature RC7 model: the real GetVhdxImageHash OpenReads the BASE OutputDiskPath. If
+        # AutomaticCheckpointsEnabled is ON at StartVM, the guest's deps land in the per-disk .avhdx CHILD
+        # layer; a host BASE-file hash sees an EMPTY base. The fake models that by routing the blob to
+        # DepsImageChildLayer (which GetVhdxImageHash does NOT read) when checkpoints are ON. Build the
+        # fake WITHOUT calling SetAutomaticCheckpoints Enabled=$false (a fresh fake VM mirrors Hyper-V's
+        # real default = ON) and prove the hash is SHA256 of EMPTY — the exact empty-hash RC7 bug.
+        $blob = [byte[]](1..32)
+        $emptyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
+        # --- checkpoints ON (RC7 NOT fixed): blob hidden in the child -> base hash is SHA256(empty) ---
+        $fOn = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        & $fOn.NewVM @{ Name = 'rc7on'; Generation = 2 }                              # AutomaticCheckpointsEnabled defaults to $true (Hyper-V default)
+        (& $fOn.GetVM @{ Name = 'rc7on' }).AutomaticCheckpointsEnabled | Should -BeTrue -Because 'a fresh fake VM mirrors Hyper-V''s checkpoints-ON default'
+        & $fOn.NewOutputVhdx @{ Path = 'C:\s\rc7on.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $fOn.AddHardDiskDrive @{ VMName = 'rc7on'; Path = 'C:\s\rc7on.vhdx' }
+        & $fOn.StartVM @{ Name = 'rc7on' }
+        & $fOn.RemoveHardDiskDrive @{ VMName = 'rc7on'; Path = 'C:\s\rc7on.vhdx' }
+        (& $fOn.GetVhdxImageHash @{ Path = 'C:\s\rc7on.vhdx' }) |
+            Should -Be $emptyHash -Because 'checkpoints ON -> deps in the .avhdx child -> the host BASE-file hash sees deps-EMPTY base (RC7)'
+
+        # --- checkpoints OFF (the RC7 fix): blob in the base -> the real deps hash ---
+        $fOff = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        & $fOff.NewVM @{ Name = 'rc7off'; Generation = 2 }
+        & $fOff.SetAutomaticCheckpoints @{ VMName = 'rc7off'; Enabled = $false }      # the provisioner/builder RC7 fix
+        & $fOff.NewOutputVhdx @{ Path = 'C:\s\rc7off.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $fOff.AddHardDiskDrive @{ VMName = 'rc7off'; Path = 'C:\s\rc7off.vhdx' }
+        & $fOff.StartVM @{ Name = 'rc7off' }
+        & $fOff.RemoveHardDiskDrive @{ VMName = 'rc7off'; Path = 'C:\s\rc7off.vhdx' }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $want = [System.BitConverter]::ToString($sha.ComputeHash($blob)).Replace('-','').ToLowerInvariant(); $sha.Dispose()
+        (& $fOff.GetVhdxImageHash @{ Path = 'C:\s\rc7off.vhdx' }) |
+            Should -Be $want -Because 'checkpoints OFF -> deps in the base -> the host hash sees them'
+        $want | Should -Not -Be $emptyHash -Because 'the non-empty deps hash must differ from SHA256(empty) for the RC7 contrast to be meaningful'
     }
     It 'AXIS 3: a DIFFERENT deps blob yields a DIFFERENT hash (tamper-sensitive)' {
         $fa = New-DepsFake ([byte[]](1..32)) 0 'ba' 'C:\s\a.vhdx'
