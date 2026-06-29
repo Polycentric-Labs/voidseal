@@ -487,40 +487,54 @@ function Invoke-Voidseal {
             # (detach failed -> RunResult already set above; EXTRACTED intentionally not reached)
 
             # --- POST-DETACH SENSITIVITY GATE (processor workloads) -------------------
-            # The screener ran IN-GUEST (offline) and wrote verdicts.json + candidates onto the OUTPUT disk's
-            # staging/. Now that OUTPUT is detached, the HOST partitions: only auto-certified-SAFE artifacts are
-            # released. PHASE-1 ONLY: the host-readable staging dir + verdicts path are injected via -Workload
-            # (GateStagingDir/GateVerdictsPath). PHASE-2 (real): derive them by host-mounting the detached OUTPUT
-            # VHDX. The host re-validates the consumed verdicts (traversal+completeness+exact-SAFE) — D1.
-            # $detachOk GUARD: the gate must run ONLY after a SUCCESSFUL data-disk detach. In Phase-2 the staging
-            # dir is derived from the DETACHED OUTPUT VHDX, so a failed detach means we must NOT read a disk that
-            # may still be attached to a (possibly live) guest — exactly the read-after-detach discipline the
-            # OUTPUT read above follows. In the mock the detach succeeds ($detachOk=$true), so the processor path
-            # still runs the gate. (Defense-in-depth today; load-bearing once Phase-2 derives staging from OUTPUT.)
-            if ($detachOk -and $resolved['Network'] -eq 'None' -and $resolved.ContainsKey('ScreenConfig')) {
-                $gateStaging  = [string](Get-WorkloadField -Workload $Workload -Name 'GateStagingDir')
-                $gateVerdicts = [string](Get-WorkloadField -Workload $Workload -Name 'GateVerdictsPath')
-                if (-not [string]::IsNullOrWhiteSpace($gateStaging) -and -not [string]::IsNullOrWhiteSpace($gateVerdicts)) {
-                    try {
-                        $gateOut = Join-Path $Destination 'gate'
-                        $screenCfg = Resolve-ScreenConfig -Profile $resolved
-                        $gateResult = Invoke-SensitivityGate -StagingDir $gateStaging -OutputDir $gateOut `
-                                        -Mode $screenCfg.mode -VerdictsPath $gateVerdicts
-                        Set-DescriptorField -Descriptor $descriptor -Name 'GateRan' -Value $true
-                        $report.Descriptor        = $descriptor
-                        $report.Released          = $gateResult.Released
-                        $report.Held              = $gateResult.Held
-                        $report.SensitivityReport = $gateResult.ManifestPath
+            # The in-guest screener wrote candidates + verdicts.json as a memory-safe "outbox" onto the
+            # OUTPUT disk's raw region. Now that OUTPUT is DETACHED, read it in USER-SPACE (ReadVhdxRawRegion
+            # = qemu-img slice; NEVER Mount-VHD) and parse it fail-closed (read_outbox.py), then the EXISTING
+            # gate partitions only auto-certified-SAFE artifacts. DENY-on-timeout/failed-run EXPLICIT: the
+            # gate runs ONLY after a clean detach AND a non-timed-out run — a timed-out/force-stopped guest
+            # released NOTHING. The $detachOk guard stays load-bearing (never read a disk still attached to a
+            # possibly-live guest). (Phase-2/4 repoints the read at the dedicated FIXED raw outbox disk.)
+            if ($detachOk -and -not $wait.TimedOut -and $resolved['Network'] -eq 'None' -and $resolved.ContainsKey('ScreenConfig')) {
+                $gateInput = Join-Path $Destination 'gate-input'
+                try {
+                    $outboxPath = [string]$descriptor.OutputDiskPath
+                    if ([string]::IsNullOrWhiteSpace($outboxPath)) { throw 'processor gate: no OUTPUT disk to read the outbox from.' }
+                    # Two-phase user-space read: probe the 24-byte header for the exact blob length, then read exactly that.
+                    $hdr = [byte[]](& $Backend.ReadVhdxRawRegion @{ Path = $outboxPath; Offset = 0; Length = 24 })
+                    if ($hdr.Length -lt 24 -or [System.Text.Encoding]::ASCII.GetString($hdr, 0, 8) -ne 'VSOUTBX1') {
+                        throw 'processor gate: OUTPUT outbox header missing/!magic (empty base read? check AutomaticCheckpoints).'
                     }
-                    catch {
-                        # A gate failure is fail-closed like the seal gate: record + let the finally teardown run.
-                        # APPEND (do not clobber): a detach/read failure above may have already set $report.Error;
-                        # preserve it and chain the gate error so neither failure is lost in the report.
-                        $gateErr = "Sensitivity gate failed: $($_.Exception.Message)"
-                        if ([string]::IsNullOrWhiteSpace([string]$report.Error)) { $report.Error = $gateErr }
-                        else { $report.Error = "$($report.Error) | $gateErr" }
-                        Write-Warning "Invoke-Voidseal: '$Name' sensitivity gate failed: $($_.Exception.Message)"
-                    }
+                    $count = [System.BitConverter]::ToUInt32($hdr, 12)
+                    $total = [System.BitConverter]::ToUInt64($hdr, 16)
+                    if ($count -gt 256 -or $total -gt 67108864) { throw "processor gate: outbox header count/total over bound ($count/$total)." }
+                    $exact = 24L + ([int64]$count * 104L) + [int64]$total
+                    $blob  = [byte[]](& $Backend.ReadVhdxRawRegion @{ Path = $outboxPath; Offset = 0; Length = $exact })
+                    # Bridge PS bytes -> read_outbox.py via a host temp file (binary stdin is fragile on Windows PowerShell).
+                    $blobFile = Join-Path $Destination 'outbox.bin'
+                    [System.IO.File]::WriteAllBytes($blobFile, $blob)
+                    $readScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'host/read_outbox.py'   # <repo>/host/read_outbox.py (see line ~103 skillRoot pattern)
+                    & python $readScript --blob $blobFile --out $gateInput 2>&1 | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "processor gate: read_outbox.py failed (exit $LASTEXITCODE) — outbox invalid/tampered; releasing nothing." }
+                    $gateStaging  = Join-Path $gateInput 'staging'
+                    $gateVerdicts = Join-Path $gateInput 'verdicts.json'
+
+                    $gateOut   = Join-Path $Destination 'gate'
+                    $screenCfg = Resolve-ScreenConfig -Profile $resolved
+                    $gateResult = Invoke-SensitivityGate -StagingDir $gateStaging -OutputDir $gateOut `
+                                    -Mode $screenCfg.mode -VerdictsPath $gateVerdicts
+                    Set-DescriptorField -Descriptor $descriptor -Name 'GateRan' -Value $true
+                    $report.Descriptor        = $descriptor
+                    $report.Released          = $gateResult.Released
+                    $report.Held              = $gateResult.Held
+                    $report.SensitivityReport = $gateResult.ManifestPath
+                }
+                catch {
+                    # Fail-closed like the seal gate: record + let teardown run. APPEND (do not clobber a
+                    # detach/read error already on $report.Error) so neither failure is lost.
+                    $gateErr = "Sensitivity gate failed: $($_.Exception.Message)"
+                    if ([string]::IsNullOrWhiteSpace([string]$report.Error)) { $report.Error = $gateErr }
+                    else { $report.Error = "$($report.Error) | $gateErr" }
+                    Write-Warning "Invoke-Voidseal: '$Name' sensitivity gate failed: $($_.Exception.Message)"
                 }
             }
         }

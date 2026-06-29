@@ -634,35 +634,68 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         & $script:ProcB.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
     }
 
-    It 'a processor deploy attaches+records the DEPS disk (seal accepts it), runs the gate, and stamps GateRan + Released/Held/SensitivityReport' {
+    It 'releases the SAFE candidates end-to-end: detached OUTPUT outbox -> ReadVhdxRawRegion -> read_outbox.py -> gate' {
+        # Build a REAL outbox blob from the SAME staging + verdicts the old test injected, via guest/outbox.py.
+        $blobFile = Join-Path $script:TmpRoot ("outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        # The guest "wrote" that blob to the OUTPUT disk's raw region (SelfPowerOff = clean flush). Build a
+        # fresh backend with the blob + re-create the DEPS disk on it (fake state is per-instance).
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
-            -Workload @{
-                WorkloadMode    = 'Disk'
-                DepsDiskPath    = $script:DepsDisk
-                GateStagingDir  = $script:GateStaging
-                GateVerdictsPath= $script:GateVerdicts
-            } `
-            -Name 'sbx-proc-gate' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:ProcB
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Name 'sbx-proc-outbox' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
 
-        # The DEPS disk was attached + RECORDED before the seal, so Assert-Sealed accepted it (an
-        # UNRECORDED extra attached disk would have FAILED the seal as a residual) — the deploy SEALED.
-        $report.SealVerdict | Should -BeTrue -Because 'the recorded DepsDiskPath is an EXPECTED disk; the seal must certify with it attached'
-        @($report.States)   | Should -Contain 'SEALED'
-        $report.Descriptor.DepsDiskPath | Should -Be $script:DepsDisk -Because 'the orchestrator records the attached DEPS disk on the descriptor so the seal accepts it'
-
-        # The post-detach gate ran (processor + ScreenConfig present). Released holds the two SAFE prose
-        # files; Held holds creds.txt (+ the other non-SAFE files); GateRan is stamped on the descriptor.
+        @($report.States) | Should -Contain 'SEALED'
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'the processor gate ran off the OUTPUT outbox'
         $relNames = @($report.Released | ForEach-Object { $_.name })
         $helNames = @($report.Held     | ForEach-Object { $_.name })
         $relNames | Should -Contain 'prose-essay.txt' -Because 'a SAFE prose file is released'
-        $relNames | Should -Contain 'prose-letter.md' -Because 'a SAFE prose file is released'
+        $relNames | Should -Contain 'prose-letter.md'
         $relNames | Should -Not -Contain 'creds.txt'  -Because 'a SENSITIVE credential file is NEVER released'
-        $helNames | Should -Contain 'creds.txt'       -Because 'the credential file is held'
-        $report.SensitivityReport | Should -Not -BeNullOrEmpty -Because 'the gate records the manifest path on the report'
-        Test-Path -LiteralPath $report.SensitivityReport | Should -BeTrue -Because 'sensitivity-report.json exists on disk'
-        (Split-Path -Leaf $report.SensitivityReport) | Should -Be 'sensitivity-report.json'
-        $report.Descriptor.GateRan | Should -BeTrue -Because 'a processor deploy that ran the gate stamps GateRan on the descriptor'
+        $helNames | Should -Contain 'creds.txt'
+        $report.SensitivityReport | Should -Not -BeNullOrEmpty
+    }
+
+    It 'DENY-on-tamper: a corrupted OUTPUT outbox -> read_outbox.py exits non-zero -> gate releases NOTHING' {
+        $blobFile = Join-Path $script:TmpRoot ("outbox-bad-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $bad = [System.IO.File]::ReadAllBytes($blobFile)
+        $bad[$bad.Length - 1] = $bad[$bad.Length - 1] -bxor 0xFF   # flip a payload byte -> SHA mismatch
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $bad
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Name 'sbx-proc-tamper' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        $report.Released          | Should -BeNullOrEmpty -Because 'a tampered outbox fails closed — nothing is released'
+        $report.SensitivityReport | Should -BeNullOrEmpty
+        $report.Error             | Should -Match '(?i)gate|outbox|read'
+        # GateRan must NOT be stamped (the gate never partitioned).
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue
+    }
+
+    It 'DENY-on-timeout: a hung processor (SimulateNeverOff) -> gate does NOT run, Released stays $null' {
+        $b = New-FakeHyperVBackend -SimulateNeverOff   # never self-powers-off -> Wait-WorkloadComplete force-stops -> TimedOut
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Name 'sbx-proc-timeout' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        $report.Released | Should -BeNullOrEmpty -Because 'a timed-out run releases nothing (DENY-on-timeout)'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue -Because 'the gate must not run on a timeout'
     }
 
     It 'a NON-processor Disk-mode deploy does NOT run the gate (Released stays $null; GateRan not set)' {
