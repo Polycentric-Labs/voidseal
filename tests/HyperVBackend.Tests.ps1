@@ -63,7 +63,7 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             # host channels (the seal surface)
             'SetHostChannel', 'GetHostChannels'
             # disk
-            'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'ReadVhdxRawRegion', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
+            'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'ReadVhdxRawRegion', 'GetVhdxImageHash', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
             # switch / network
             'NewSwitch', 'GetSwitch', 'RemoveSwitch', 'ConnectNetworkAdapter', 'RemoveNetworkAdapter', 'GetNetworkAdapter'
             # checkpoint
@@ -110,6 +110,12 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
         $m = Get-HyperVBackendMethodManifest
         $m.Contains('ReadVhdxRawRegion') | Should -BeTrue
         $m['ReadVhdxRawRegion'] | Should -Be @('Path','Offset','Length')
+    }
+
+    It 'manifest documents GetVhdxImageHash with Path' {
+        $m = Get-HyperVBackendMethodManifest
+        $m.Contains('GetVhdxImageHash') | Should -BeTrue
+        $m['GetVhdxImageHash'] | Should -Be @('Path')
     }
 }
 
@@ -163,7 +169,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
             InvokeGuestCommand = 'VMName'
             SetHostChannel = 'VMName'; GetHostChannels = 'VMName'
-            NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; ReadVhdxRawRegion = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'
+            NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; ReadVhdxRawRegion = 'Path'; GetVhdxImageHash = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'
             AddHardDiskDrive = 'VMName'; RemoveHardDiskDrive = 'VMName'; SetDvdDrive = 'VMName'; RemoveDvdDrive = 'VMName'; GetDvdDrives = 'VMName'
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
@@ -1586,6 +1592,69 @@ Describe 'Real backend — builds the right cmdlet params (out-of-process; live-
 # ===========================================================================
 #  ReadVhdxRawRegion — user-space raw read (fake axes + real never-mounts)
 # ===========================================================================
+Describe 'GetVhdxImageHash — whole-image deps fingerprint (fake axes + real never-mounts)' {
+    BeforeAll {
+        function script:New-DepsFake([byte[]] $blob, [int] $lag = 0, [string] $vm = 'b1', [string] $disk = 'C:\s\deps.vhdx') {
+            $f = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob -SimulateDetachSettleLag $lag
+            & $f.NewVM @{ Name = $vm; Generation = 2 }
+            & $f.SetAutomaticCheckpoints @{ VMName = $vm; Enabled = $false }
+            & $f.NewOutputVhdx @{ Path = $disk; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+            & $f.AddHardDiskDrive @{ VMName = $vm; Path = $disk }
+            return $f
+        }
+    }
+    It 'AXIS 1: hashing a STILL-ATTACHED disk throws (file-lock / detach ordering)' {
+        $f = New-DepsFake ([byte[]](1..32))
+        & $f.StartVM @{ Name = 'b1' }
+        { & $f.GetVhdxImageHash @{ Path = 'C:\s\deps.vhdx' } } | Should -Throw -ExpectedMessage '*still attached*'
+    }
+    It 'AXIS 1+3: after detach, returns the SHA-256 of the recorded bytes; deterministic; FakeCallLog proves detach precedes hash' {
+        $f = New-DepsFake ([byte[]](1..32))
+        & $f.StartVM @{ Name = 'b1' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'b1'; Path = 'C:\s\deps.vhdx' }
+        $h1 = & $f.GetVhdxImageHash @{ Path = 'C:\s\deps.vhdx' }
+        $h2 = & $f.GetVhdxImageHash @{ Path = 'C:\s\deps.vhdx' }
+        $h1 | Should -Be $h2
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $want = [System.BitConverter]::ToString($sha.ComputeHash([byte[]](1..32))).Replace('-','').ToLowerInvariant()
+        $sha.Dispose()
+        $h1 | Should -Be $want
+        $ops = @($f.FakeCallLog | Where-Object { $_.Path -eq 'C:\s\deps.vhdx' } | ForEach-Object { $_.Op })
+        ($ops.IndexOf('RemoveHardDiskDrive')) | Should -BeLessThan ($ops.IndexOf('GetVhdxImageHash'))
+    }
+    It 'AXIS 3: a DIFFERENT deps blob yields a DIFFERENT hash (tamper-sensitive)' {
+        $fa = New-DepsFake ([byte[]](1..32)) 0 'ba' 'C:\s\a.vhdx'
+        $fb = New-DepsFake ([byte[]](100..131)) 0 'bb' 'C:\s\b.vhdx'
+        & $fa.StartVM @{ Name='ba' }; & $fa.RemoveHardDiskDrive @{ VMName='ba'; Path='C:\s\a.vhdx' }
+        & $fb.StartVM @{ Name='bb' }; & $fb.RemoveHardDiskDrive @{ VMName='bb'; Path='C:\s\b.vhdx' }
+        (& $fa.GetVhdxImageHash @{ Path='C:\s\a.vhdx' }) | Should -Not -Be (& $fb.GetVhdxImageHash @{ Path='C:\s\b.vhdx' })
+    }
+    It 'AXIS 2: settle-lag WITHIN budget rides out; EXCEEDING budget throws *still locked*' {
+        $f3 = New-DepsFake ([byte[]](1..8)) 3 'bl' 'C:\s\dl.vhdx'
+        & $f3.StartVM @{ Name='bl' }; & $f3.RemoveHardDiskDrive @{ VMName='bl'; Path='C:\s\dl.vhdx' }
+        { & $f3.GetVhdxImageHash @{ Path='C:\s\dl.vhdx' } } | Should -Not -Throw
+        $f7 = New-DepsFake ([byte[]](1..8)) 7 'bl2' 'C:\s\dl2.vhdx'
+        & $f7.StartVM @{ Name='bl2' }; & $f7.RemoveHardDiskDrive @{ VMName='bl2'; Path='C:\s\dl2.vhdx' }
+        { & $f7.GetVhdxImageHash @{ Path='C:\s\dl2.vhdx' } } | Should -Throw -ExpectedMessage '*still locked*'
+    }
+    It 'ERROR-PARITY: hashing a NON-EXISTENT disk throws (missing artifact), in both factories' {
+        $f = New-DepsFake ([byte[]](1..8))
+        { & $f.GetVhdxImageHash @{ Path = 'C:\s\nope.vhdx' } } | Should -Throw -ExpectedMessage '*does not exist*'
+        # real: same fail-closed shape when the file is absent (no VM/elevation needed — Test-Path is false)
+        $real = New-RealHyperVBackend
+        { & $real.GetVhdxImageHash @{ Path = 'C:\does\not\exist.vhdx' } } | Should -Throw -ExpectedMessage '*does not exist*'
+    }
+    It 'SECURITY: the REAL GetVhdxImageHash NEVER references Mount-VHD / Add-VMHardDiskDrive / qemu (user-space file hash only)' {
+        $real = New-RealHyperVBackend
+        $body = $real.GetVhdxImageHash.ToString()
+        $body | Should -Not -Match 'Mount-VHD'
+        $body | Should -Not -Match 'Add-VMHardDiskDrive'
+        $body | Should -Not -Match 'qemu'
+        $body | Should -Match 'SHA256'
+        $body | Should -Match 'OpenRead'
+    }
+}
+
 Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-mounts)' {
     BeforeEach {
         $script:fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16))

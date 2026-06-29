@@ -171,6 +171,17 @@ function Get-HyperVBackendMethodManifest {
         # 24-byte header then EXACTLY 24 + entry_count*104 + payload_total_len bytes from offset 0 and never
         # reads arbitrary / low offsets expecting zeros.
         ReadVhdxRawRegion    = @('Path', 'Offset', 'Length')   # user-space raw read (NEVER Mount-VHD)
+        # Hash the WHOLE .vhdx FILE (as shipped) with SHA-256, in USER-SPACE (FileStream -> SHA256) —
+        # NEVER Mount-VHD / Add-VMHardDiskDrive. The supply-chain ARTIFACT FINGERPRINT: the builder
+        # records it for deps.vhdx; Phase 3 re-streams the same file before AddHardDiskDrive and refuses
+        # a mismatch (tamper/substitution -> fail closed). NO qemu (D-3): an integrity fingerprint needs
+        # no FS interpretation, so there is zero reason to let the host kernel parse attacker bytes
+        # (Pass-5). REQUIRES the .vhdx DETACHED + VM Off (an attached disk is locked) — the orchestrator's
+        # detach guard enforces it. REAL = $LockRetry-wrapped (RC8 settle-lag) streaming hash; FAKE =
+        # SHA256 of the recorded DepsImageRegion, modeling detach-ordering + settle-lag + determinism.
+        # Added per the ReadVhdxRawRegion addendum precedent (manifest + both factories + parity/drift).
+        # Interface: -> [string] lowercase hex SHA-256.
+        GetVhdxImageHash     = @('Path')   # whole-.vhdx-file SHA-256, user-space (NEVER Mount-VHD)
         GetVHDInfo           = @('Path')                            # -> @{ Path; SizeBytes; Differencing; ParentPath; Label; FileSystem } or $null
         RemoveVHD            = @('Path')                            # delete a DETACHED .vhdx file (the Reaper's explicit cleanup)
         AddHardDiskDrive     = @('VMName', 'Path')
@@ -348,7 +359,8 @@ $script:SbInvokeWithLockRetry = {
     param(
         [Parameter(Mandatory)] [scriptblock] $Operation,
         [int] $MaxAttempts = 5,
-        [int] $DelayMilliseconds = 400
+        [int] $DelayMilliseconds = 400,
+        [string] $Context = 'ReadVhdxRawRegion'   # method name for the fail-closed message (backward-compat default)
     )
     # Lock-class signatures (case-insensitive). These are the Windows + qemu-img phrasings for a file that
     # is still open by another handle (the unreleased Hyper-V worker-process handle, here).
@@ -375,7 +387,7 @@ $script:SbInvokeWithLockRetry = {
             if (-not $isLock) { throw }
             # A lock-class error: retry until attempts are exhausted, then fail closed with remediation.
             if ($attempt -ge $MaxAttempts) {
-                throw ("ReadVhdxRawRegion: the VHDX is still locked after $MaxAttempts attempts " +
+                throw ("${Context}: the VHDX is still locked after $MaxAttempts attempts " +
                        "(`"$message`"). The VHDX handle may not have been released after detach " +
                        "(a sub-second Hyper-V worker-process settle-lag that did not clear). " +
                        "Ensure the disk is detached and the VM is Off, then retry. Failing closed.")
@@ -1090,6 +1102,34 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
+    # Whole-.vhdx-file SHA-256 in USER-SPACE — the supply-chain artifact fingerprint Phase 3 verifies
+    # before AddHardDiskDrive. NEVER Mount-VHD / attach: an integrity fingerprint needs no FS parse, so
+    # the host kernel never touches attacker bytes (Pass-5). NO qemu (D-3) — we stream the file as-is.
+    # REQUIRES the .vhdx DETACHED + the VM Off (an attached disk is locked) — the orchestrator's
+    # $detachOk guard enforces that. RC8: the FIRST OpenRead after a detach can hit a transient sharing
+    # violation while the Hyper-V worker handle releases; route open+hash through the shared $LockRetry
+    # (a lock-class error rides out, a real failure — e.g. a missing file — rethrows at once, a
+    # persistent lock fails closed clearly with Context='GetVhdxImageHash'). LIVE-ONLY-UNPROVEN until
+    # Phase 6 (the mock never runs this).
+    $b.GetVhdxImageHash = {
+        param([System.Collections.IDictionary] $P)
+        $path = & $AssertArg $P 'Path' 'GetVhdxImageHash'
+        & $InvokeOp {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "GetVhdxImageHash: VHDX '$path' does not exist (cannot hash a missing artifact). Failing closed."
+            }
+            return (& $LockRetry -Context 'GetVhdxImageHash' -Operation {
+                $fsr = [System.IO.File]::OpenRead($path)   # a lock-class IOException here is what $LockRetry rides out
+                try {
+                    $sha = [System.Security.Cryptography.SHA256]::Create()
+                    try { $digest = $sha.ComputeHash($fsr) } finally { $sha.Dispose() }
+                    return [System.BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
+                }
+                finally { $fsr.Dispose() }
+            })
+        }
+    }.GetNewClosure()
+
     $b.GetVHDInfo = {
         param([System.Collections.IDictionary] $P)
         $path = & $AssertArg $P 'Path' 'GetVHDInfo'
@@ -1373,6 +1413,13 @@ $script:SbCopyFakeVM = {
     StartVM seed e.g. @{ 'result.exitcode' = '0'; 'result.html' = '<html/>' } onto the most-recently-
     created OUTPUT-labelled disk so Read-WorkloadResult classifies Success and the EXTRACTED happy path
     runs. The seam writes through the same WriteVhdxFile state the host later reads, so it stays honest.
+.PARAMETER SimulateDepsImageBlob
+    A byte array representing the deps image bytes the builder guest "wrote" to the OUTPUT (deps) disk
+    during its boot run, recorded at StartVM when paired with -SimulateSelfPowerOff. Stored as
+    DepsImageRegion on the VHD record. GetVhdxImageHash returns SHA-256 of these bytes (the stand-in for
+    the whole .vhdx file content the real streaming hash reads). Same write-flush gate as the outbox:
+    no clean power-off -> no recorded blob -> hash returns SHA-256 of empty bytes (fail-closed, not a
+    false match). Models the builder supply-chain artifact fingerprint path (Task 2.3/Phase 3).
 .PARAMETER SimulateDetachError
     Make RemoveHardDiskDrive THROW — modelling a transient real-Hyper-V detach failure right after a
     force-stop (VM still settling / slot already detached). The orchestrator detaches the data disks
@@ -1394,6 +1441,7 @@ function New-FakeHyperVBackend {
         [switch] $SimulateSecondNewOutputVhdxError,
         [hashtable] $SimulateWorkloadOutput,
         [byte[]] $SimulateOutboxBlob,
+        [byte[]] $SimulateDepsImageBlob,
         [int] $SimulateDetachSettleLag = 0,
         [switch] $SimulateDetachError
     )
@@ -1425,6 +1473,7 @@ function New-FakeHyperVBackend {
     # so a positive Success-path e2e can reach Read-WorkloadResult -> Success -> EXTRACTED. $null = none.
     $workloadOutput    = $SimulateWorkloadOutput
     $outboxBlob = $SimulateOutboxBlob   # raw bytes the guest "wrote" to the OUTPUT disk's outbox region
+    $depsImageBlob = $SimulateDepsImageBlob   # deps bytes the builder guest "wrote" to the OUTPUT (deps) disk
     # Captured by the ReadVhdxRawRegion closure: model the RC8 detach settle-lag — qemu-img's first open can
     # hit a transient sharing violation while the Hyper-V worker-process handle is still releasing. A lag
     # WITHIN the read's internal retry budget (matches the real SbInvokeWithLockRetry MaxAttempts default of
@@ -1555,7 +1604,7 @@ function New-FakeHyperVBackend {
         # labelled VHD attached to THIS VM (New-WorkloadDisks labels it 'OUTPUT'); write each inner file
         # through the same Files table the host's ReadVhdxFile later reads — so Read-WorkloadResult sees
         # a real sentinel/result and can classify Success, letting the EXTRACTED happy path run e2e.
-        if ($null -ne $workloadOutput -and $workloadOutput.Count -gt 0) {
+        if ($null -ne $workloadOutput -and $workloadOutput.Count -gt 0 -and $selfPowerOff) {
             $outDisk = & $findOutputDisk $vm
             if ($null -ne $outDisk) {
                 if (-not $state.VHDs[$outDisk].ContainsKey('Files')) { $state.VHDs[$outDisk]['Files'] = @{} }
@@ -1584,6 +1633,16 @@ function New-FakeHyperVBackend {
                     $state.VHDs[$outDisk]['OutboxRegion'] = [byte[]]$outboxBlob        # base raw-read sees it
                 }
             }
+        }
+        # SimulateDepsImageBlob (paired with SimulateSelfPowerOff): model the BUILDER guest fetching deps
+        # over the Squid egress, writing them onto the OUTPUT (deps) disk, then self-powering-off. SAME
+        # write-flush gate as the outbox: no clean power-off -> no flushed deps image -> a host hash of an
+        # empty disk (fail-closed, not a false match). Recorded as DepsImageRegion (the stand-in for the
+        # .vhdx file bytes the real GetVhdxImageHash streams). No .avhdx split is modeled — the deps hash is
+        # a whole-FILE fingerprint, not a region read, so the RC7 child-layer trap does not apply.
+        if ($null -ne $depsImageBlob -and $selfPowerOff) {
+            $depsDisk = & $findOutputDisk $vm
+            if ($null -ne $depsDisk) { $state.VHDs[$depsDisk]['DepsImageRegion'] = [byte[]]$depsImageBlob }
         }
         # SimulateSelfPowerOff: the guest booted, ran its boot workload, and powered itself off before
         # the host's first completion poll — leave State Off so Wait-WorkloadComplete reads the happy
@@ -1859,6 +1918,48 @@ function New-FakeHyperVBackend {
             if ($avail -gt 0) { [System.Array]::Copy($region, [int]$offset, $buf, 0, $avail) }
         }
         return ,$buf
+    }.GetNewClosure()
+
+    # USER-SPACE whole-image hash (fake): SHA-256 of the recorded deps bytes, modeling the axes that
+    # apply to a streaming FILE hash (D-3) — detach/lock ordering, the RC8 settle-lag, and determinism.
+    # NO qemu/.avhdx/zero-pad (those are ReadVhdxRawRegion's region-read concerns). FIDELITY NOTE: the
+    # settle-lag is modeled as a SEPARATE per-method countdown (_hashSettleRemaining) for test isolation;
+    # the real lag is a per-HANDLE property that the first read after a detach absorbs — disclosed so the
+    # ULTRACODE gate can judge the representation gap.
+    $b.GetVhdxImageHash = {
+        param([System.Collections.IDictionary] $P)
+        $path = & $AssertArg $P 'Path' 'GetVhdxImageHash'
+        if (-not $state.VHDs.ContainsKey($path)) {
+            throw "GetVhdxImageHash: VHDX '$path' does not exist (cannot hash a missing artifact). Failing closed."
+        }
+        # AXIS 1 — detach/file-lock ordering: a host hash of a STILL-ATTACHED disk would hit a sharing
+        # violation (the VM holds the lock). Throw if any VM still holds it.
+        foreach ($vmRec in $state.VMs.Values) {
+            if (@($vmRec.HardDrives) -contains $path) {
+                throw "GetVhdxImageHash: VHDX '$path' is still attached to VM '$($vmRec.Name)' (locked); detach before the host hash. Failing closed."
+            }
+        }
+        $rec = $state.VHDs[$path]
+        # AXIS 2 — RC8 detach settle-lag: same bounded tolerance the real $LockRetry gives (shared
+        # MaxAttempts default 5). A lag WITHIN budget rides out; a lag EXCEEDING it throws the same
+        # *still locked* fail-closed shape the real helper throws (Context='GetVhdxImageHash').
+        $LOCK_RETRY_BUDGET = 5   # shared with $script:SbInvokeWithLockRetry's MaxAttempts default
+        if (-not $rec.ContainsKey('_hashSettleRemaining')) { $rec['_hashSettleRemaining'] = [int]$detachSettleLag }
+        $attempts = 0
+        while ([int]$rec['_hashSettleRemaining'] -gt 0) {
+            if ($attempts -ge $LOCK_RETRY_BUDGET) {
+                throw "GetVhdxImageHash: the VHDX '$path' is still locked after $LOCK_RETRY_BUDGET attempts — the VHDX handle may not have been released after detach (settle-lag did not clear). Failing closed."
+            }
+            $rec['_hashSettleRemaining'] = [int]$rec['_hashSettleRemaining'] - 1
+            $attempts++
+        }
+        $state.CallLog.Add(@{ Op = 'GetVhdxImageHash'; Path = $path })
+        # AXIS 3 — determinism: SHA-256 of the recorded deps bytes (stand-in for the file content). Same
+        # bytes -> same hash; different bytes -> different hash (tamper-sensitive).
+        $bytes = if ($rec.ContainsKey('DepsImageRegion')) { [byte[]]$rec['DepsImageRegion'] } else { [byte[]]::new(0) }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $digest = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+        return [System.BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant()
     }.GetNewClosure()
 
     $b.GetVHDInfo = {
