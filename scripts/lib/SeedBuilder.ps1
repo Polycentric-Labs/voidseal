@@ -160,6 +160,107 @@ runcmd:
 '@
 
 # --------------------------------------------------------------------------
+# The BUILDER disk-mode runner user-data — Tier-1 builder VM with a transparent Squid SNI proxy.
+# LIVE-only (Phase 6) validates the real network config + ssl_bump/SNI peek + CDN-rotation; the mock
+# asserts SHAPE only (the Squid ACL contains each allowlist domain + http_access deny all).
+# Single-quoted here-string: NOTHING is interpolated by PowerShell. Two placeholders are substituted:
+#   __SQUID_ALLOWLIST_ACL__  -> space-joined EgressAllowlist (dstdomain entries)
+#   __ENTRYPOINT__           -> the profile Entrypoint (same sh -c guard as the offline runner)
+# Squid dstdomain semantics MATCH Test-AllowlistCoversHost: a bare entry (huggingface.co) matches
+# exactly; a dotted entry (.hf.co) matches subdomains — the merged allowlist maps 1:1 onto dstdomain.
+# --------------------------------------------------------------------------
+$script:CidataBuilderRunnerTemplate = @'
+#cloud-config
+# Voidseal builder disk-mode seed — Tier-1 net-restricted builder VM (Phase 2.2).
+# Network is ENABLED; a transparent Squid SNI proxy gatekeeps 80/443 to the EgressAllowlist only
+# (default-deny). The workload fetches deps over Squid into /mnt/out, writes a manifest, and powers
+# off. The host reads deps-manifest.json from the OUTPUT disk.
+
+# RC2: create the non-root sandbox user (identically to the serial baseline + offline disk runner).
+users:
+  - name: sandbox
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    lock_passwd: true          # no password login anywhere; this is a sealed builder guest
+
+write_files:
+  - path: /etc/squid/squid.conf
+    permissions: '0644'
+    content: |
+      # Voidseal Tier-1 builder Squid SNI proxy — transparent intercept on 3129 (HTTP) + 3130 (HTTPS).
+      # LIVE-only (Phase 6): real ssl_bump/SNI peek + CDN-rotation resilience unproven in mock tests.
+      http_port 3129 intercept
+      https_port 3130 intercept ssl-bump
+      acl allowed_domains dstdomain __SQUID_ALLOWLIST_ACL__
+      ssl_bump peek all
+      ssl_bump splice allowed_domains
+      ssl_bump terminate all
+      http_access allow allowed_domains
+      http_access deny all
+
+  - path: /usr/local/sbin/vmdep-builder
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Voidseal builder runner: bring up Squid SNI proxy, mount data disks, run the dep-fetch
+      # entrypoint as the non-root 'sandbox' user, write result + sentinel to OUTPUT, power off.
+      set +e
+
+      # --- Squid transparent proxy setup ---
+      systemctl restart squid 2>/dev/null || true
+      # Redirect outbound HTTP/HTTPS through Squid (transparent intercept)
+      iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
+      iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
+
+      # --- Mount data disks (same robust pattern as the offline runner) ---
+      SBX_UID=$(id -u sandbox 2>/dev/null || echo 0)
+      SBX_GID=$(id -g sandbox 2>/dev/null || echo 0)
+      modprobe exfat 2>/dev/null
+      mkdir -p /mnt/in /mnt/out
+      udevadm settle 2>/dev/null
+      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in  2>/dev/null || mount LABEL=INPUT  /mnt/in  2>/dev/null
+      OUT_SANDBOX_OWNED=0
+      if mount -o uid=$SBX_UID,gid=$SBX_GID LABEL=OUTPUT /mnt/out 2>/dev/null; then OUT_SANDBOX_OWNED=1; fi
+      mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out 2>/dev/null
+      if ! mountpoint -q /mnt/out; then poweroff; exit 0; fi
+      if ! mountpoint -q /mnt/in; then printf '%s' 70 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
+
+      # --- Run the dep-fetch entrypoint ---
+      if [ "$OUT_SANDBOX_OWNED" = "1" ] && id -u sandbox >/dev/null 2>&1; then
+        runuser -u sandbox -- /bin/sh -c '__ENTRYPOINT__' > /mnt/out/stdout.log 2> /mnt/out/stderr.txt
+      else
+        /bin/sh -c '__ENTRYPOINT__' > /mnt/out/stdout.log 2> /mnt/out/stderr.txt
+      fi
+      rc=$?
+      printf '%s' "$rc" > /mnt/out/result.exitcode
+      sync
+      umount /mnt/out
+      i=0; while mountpoint -q /mnt/out && [ $i -lt 10 ]; do sleep 1; umount /mnt/out 2>/dev/null; i=$((i+1)); done
+      poweroff
+
+  - path: /etc/systemd/system/vmdep-builder.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Voidseal builder dep-fetch workload
+      After=network-online.target squid.service
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/vmdep-builder
+      TimeoutStartSec=infinity
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [ apt-get, install, -y, squid, iptables ]
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, squid.service ]
+  - [ systemctl, start, --no-block, vmdep-builder.service ]
+'@
+
+# --------------------------------------------------------------------------
 # The SERIAL-mode baseline user-data (guest-images/debian-12-cloud.md §2). Single-quoted ($TERM stays
 # literal). Brings up serial-getty AUTOLOGIN on ttyS0 (the Runner's non-authenticating command seam).
 # --------------------------------------------------------------------------
@@ -223,7 +324,30 @@ function New-CidataUserData {
     [OutputType([string])]
     param([Parameter(Mandatory)] $Profile)
 
-    $mode = [string](Get-SeedProfileField -Profile $Profile -Name 'WorkloadMode' -Default 'Serial')
+    $mode       = [string](Get-SeedProfileField -Profile $Profile -Name 'WorkloadMode'  -Default 'Serial')
+    $egressMode = [string](Get-SeedProfileField -Profile $Profile -Name 'EgressMode'    -Default '')
+
+    if ($mode -eq 'Disk' -and $egressMode -eq 'SquidSniProxy') {
+        # Builder path: network-enabled disk-mode seed with a transparent Squid SNI domain-ACL proxy.
+        $entrypoint = [string](Get-SeedProfileField -Profile $Profile -Name 'Entrypoint' -Default '')
+        # FAIL-CLOSED: same sh -c guard as the offline runner (single quote / newline / blank are refused).
+        if ([string]::IsNullOrWhiteSpace($entrypoint)) {
+            throw "New-CidataUserData: a builder Disk+SquidSniProxy profile must declare a non-blank Entrypoint."
+        }
+        if ($entrypoint.Contains("'")) {
+            throw "New-CidataUserData: the builder Entrypoint contains a single quote, which would escape the runner's sh -c '...' wrapper. Refuse it."
+        }
+        if ($entrypoint -match "[\r\n]") {
+            throw "New-CidataUserData: the builder Entrypoint is multi-line; the runner invokes it on a single sh -c line. Refuse it."
+        }
+        $allowlist = Get-SeedProfileField -Profile $Profile -Name 'EgressAllowlist' -Default @()
+        if ($null -eq $allowlist -or @($allowlist).Count -eq 0) {
+            throw "New-CidataUserData: a builder Disk+SquidSniProxy profile must have a non-empty EgressAllowlist (allowlist is empty — fail-closed)."
+        }
+        $aclLine = ($allowlist -join ' ')
+        $ud = $script:CidataBuilderRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__SQUID_ALLOWLIST_ACL__', $aclLine)
+        return (ConvertTo-LfText -Text $ud)
+    }
 
     if ($mode -eq 'Disk') {
         $entrypoint = [string](Get-SeedProfileField -Profile $Profile -Name 'Entrypoint' -Default '')

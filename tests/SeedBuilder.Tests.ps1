@@ -231,6 +231,38 @@ Describe 'New-CidataSeed — assembles meta-data + user-data and drives the (inj
     }
 }
 
+Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
+    BeforeAll {
+        $script:builderProfile = @{
+            WorkloadMode = 'Disk'; EgressMode = 'SquidSniProxy'
+            Entrypoint = 'python3 /mnt/in/fetch_deps.py --spec /mnt/in/deps-spec.json --out /mnt/out'
+            EgressAllowlist = @('pypi.org','files.pythonhosted.org','deb.debian.org','security.debian.org','huggingface.co','.hf.co')
+        }
+    }
+    It 'Disk + SquidSniProxy selects the builder seed and templates every allowlist domain into the Squid dstdomain ACL (default-deny)' {
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        $ud | Should -Match 'https_port 3130 intercept ssl-bump'
+        foreach ($d in $script:builderProfile.EgressAllowlist) { $ud | Should -BeLike "*$d*" }
+        $ud | Should -Match 'http_access deny all'
+        $ud | Should -Match ([regex]::Escape($script:builderProfile.Entrypoint))
+        $ud | Should -Not -Match '__SQUID_ALLOWLIST_ACL__'   # placeholder fully substituted
+        $ud | Should -Not -Match '__ENTRYPOINT__'
+    }
+    It 'a Disk profile WITHOUT SquidSniProxy still gets the OFFLINE disk seed (network disabled, no squid)' {
+        $ud = New-CidataUserData -Profile @{ WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/x.py' }
+        $ud | Should -Match 'network: \{config: disabled\}'
+        $ud | Should -Not -Match '(?i)squid'
+    }
+    It 'a SquidSniProxy builder profile with an EMPTY allowlist is refused (fail-closed)' {
+        { New-CidataUserData -Profile @{ WorkloadMode='Disk'; EgressMode='SquidSniProxy'; Entrypoint='python3 x'; EgressAllowlist=@() } } |
+            Should -Throw -ExpectedMessage '*allowlist*'
+    }
+    It 'a builder entrypoint containing a single quote is refused (same sh -c guard as the offline runner)' {
+        { New-CidataUserData -Profile @{ WorkloadMode='Disk'; EgressMode='SquidSniProxy'; Entrypoint="python3 'x'"; EgressAllowlist=@('pypi.org') } } |
+            Should -Throw
+    }
+}
+
 Describe 'Write-Iso9660Image — REAL IMAPI2 round-trip (gated on IMAPI availability)' {
 
     It 'builds an ISO whose volume label is CIDATA and whose staged file content is present' {
