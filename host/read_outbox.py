@@ -30,18 +30,24 @@ def main(argv=None):
         print(f"read_outbox: FAIL-CLOSED: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
 
-    # Success: write the gate's inputs (clean dir, then materialize).
-    shutil.rmtree(out, ignore_errors=True)
-    staging.mkdir(parents=True, exist_ok=True)
-    (out / "verdicts.json").write_text(json.dumps(verdicts_obj), encoding="utf-8")
-    for name, data in candidates.items():
-        # name already passed outbox's strict charset (no path sep / '..'); re-guard against escape anyway.
-        target = staging / name
-        if target.resolve().parent != staging.resolve():
-            shutil.rmtree(out, ignore_errors=True)
-            print(f"read_outbox: FAIL-CLOSED: candidate '{name}' escapes staging", file=sys.stderr)
-            return 2
-        target.write_bytes(data)
+    # Success: write the gate's inputs (clean dir, then materialize). Fail-closed: ANY write-phase error
+    # cleans <out> entirely so the gate can never see a partial release.
+    try:
+        shutil.rmtree(out, ignore_errors=True)
+        if out.exists() and out.is_file():   # rmtree ignores a regular file at <out>; remove it so mkdir won't fail
+            out.unlink()
+        staging.mkdir(parents=True, exist_ok=True)
+        (out / "verdicts.json").write_text(json.dumps(verdicts_obj), encoding="utf-8")
+        for name, data in candidates.items():
+            target = staging / name
+            # name already passed outbox's strict charset (no path sep / '..'); re-guard against escape anyway.
+            if target.resolve().parent != staging.resolve():
+                raise RuntimeError(f"candidate '{name}' escapes staging")
+            target.write_bytes(data)
+    except Exception as e:
+        shutil.rmtree(out, ignore_errors=True)
+        print(f"read_outbox: FAIL-CLOSED: write-phase error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
     return 0
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ def test_name_not_in_allowlist_exits_nonzero(tmp_path):
     r = _run(_blob(tmp_path), out, allowed=["verdicts.json"])   # 'a.txt' not allowed
     assert r.returncode != 0
     assert not (out / "staging").exists()
+    assert not out.exists()
 
 def test_missing_verdicts_json_exits_nonzero(tmp_path):
     blob = outbox.pack_outbox([("a.txt", b"x")])               # no verdicts.json
@@ -43,3 +44,20 @@ def test_missing_verdicts_json_exits_nonzero(tmp_path):
     out = tmp_path / "out"
     r = _run(p, out)
     assert r.returncode != 0
+    assert not out.exists()
+
+def test_write_phase_failure_cleans_out_and_exits_nonzero(tmp_path, monkeypatch):
+    import importlib.util, pathlib as _pl
+    spec = importlib.util.spec_from_file_location("read_outbox", ROOT / "host" / "read_outbox.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    blob = outbox.pack_outbox([("verdicts.json", b'[{"name":"a.txt","verdict":"SAFE","detectors":[]}]'),
+                               ("a.txt", b"hello")])
+    bp = tmp_path / "raw.bin"; bp.write_bytes(blob)
+    out = tmp_path / "out"
+    real_wb = _pl.Path.write_bytes
+    def boom(self, data, *a, **k):
+        raise OSError("simulated disk-full mid-candidate-write")
+    monkeypatch.setattr(_pl.Path, "write_bytes", boom)
+    rc = mod.main(["--blob", str(bp), "--out", str(out)])
+    assert rc != 0
+    assert not out.exists()   # FAIL-CLOSED: nothing left under <out>
