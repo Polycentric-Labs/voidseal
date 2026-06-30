@@ -81,6 +81,48 @@ Describe 'New-WorkloadDisks' {
         # The INPUT disk really was created+attached (so it genuinely WOULD be an orphan if unrecorded).
         @((& $b.GetVM @{ Name='wlx' }).HardDrives) | Should -Contain $expectedInput
     }
+
+    # ---- Task 4.2: processor predicate -> Raw OUTPUT ----
+    It 'New-WorkloadDisks gives a PROCESSOR profile a Raw OUTPUT disk' {
+        # A processor profile: Network='None' + ScreenConfig => OUTPUT must be Raw (offset 0 = outbox).
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='proc1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'proc1' -Tier 0
+        $procProfile = @{ Name='proc1'; Network='None'; ScreenConfig=@{ mode='aggressive' }; FileSystem='exFAT' }
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $procProfile -StorageRoot 'C:\s\proc1' -Backend $b
+        $d2.OutputDiskPath | Should -Not -BeNullOrEmpty
+        $outInfo = & $b.GetVHDInfo @{ Path = $d2.OutputDiskPath }
+        $outInfo.FileSystem | Should -Be 'Raw' -Because 'a processor OUTPUT disk must be Raw (offset 0 = outbox)'
+    }
+    It 'New-WorkloadDisks gives a PROCESSOR profile an exFAT INPUT disk (INPUT stays unchanged)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='proc2'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'proc2' -Tier 0
+        $procProfile = @{ Name='proc2'; Network='None'; ScreenConfig=@{ mode='aggressive' }; FileSystem='exFAT' }
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $procProfile -StorageRoot 'C:\s\proc2' -Backend $b
+        $inInfo = & $b.GetVHDInfo @{ Path = $d2.InputDiskPath }
+        $inInfo.FileSystem | Should -Be 'exFAT' -Because 'the INPUT disk is always exFAT (workload mounts it ro)'
+    }
+    It 'New-WorkloadDisks gives a NON-processor (firefox) profile an exFAT OUTPUT disk (regression guard)' {
+        # firefox: has no ScreenConfig -> OUTPUT stays exFAT, host-mount path unchanged.
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='ff1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'ff1' -Tier 0
+        $ffProfile = @{ Name='ff1'; FileSystem='exFAT' }   # no Network='None', no ScreenConfig
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $ffProfile -StorageRoot 'C:\s\ff1' -Backend $b
+        $outInfo = & $b.GetVHDInfo @{ Path = $d2.OutputDiskPath }
+        $outInfo.FileSystem | Should -Be 'exFAT' -Because 'a non-processor OUTPUT disk stays exFAT (firefox unchanged)'
+    }
+    It 'New-WorkloadDisks: Network=None WITHOUT ScreenConfig is NOT a processor -> exFAT OUTPUT' {
+        # Both conditions must be true: Network=None AND ScreenConfig present.
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='nsc'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'nsc' -Tier 0
+        $profile = @{ Name='nsc'; Network='None'; FileSystem='exFAT' }   # no ScreenConfig
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $profile -StorageRoot 'C:\s\nsc' -Backend $b
+        $outInfo = & $b.GetVHDInfo @{ Path = $d2.OutputDiskPath }
+        $outInfo.FileSystem | Should -Be 'exFAT' -Because 'Network=None alone does not make a processor — ScreenConfig is also required'
+    }
 }
 
 # ===========================================================================

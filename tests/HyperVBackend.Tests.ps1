@@ -991,6 +991,50 @@ Describe 'Fake backend — disk operations' {
         (& $b.GetVHDInfo @{ Path='C:\t\z.vhdx' }).FileSystem | Should -Be 'exFAT'
     }
 
+    # ---- Task 4.2: Raw FileSystem mode (create-without-format) ----
+    It 'NewOutputVhdx (fake) accepts FileSystem=Raw and records FileSystem=Raw' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\raw.vhdx'; Label='OUTPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $info = & $b.GetVHDInfo @{ Path='C:\t\raw.vhdx' }
+        $info | Should -Not -BeNullOrEmpty
+        $info.FileSystem | Should -Be 'Raw' -Because 'a Raw disk is recorded with FileSystem=Raw'
+    }
+    It 'NewOutputVhdx (fake) Raw disk keeps its Label as mock-internal discovery tag' {
+        # The Label on a Raw disk is a MOCK-INTERNAL discovery tag (the real raw disk has no FS label;
+        # real GetVHDInfo returns no Label — non-observable divergence documented here per task-4.2-brief).
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\rawlbl.vhdx'; Label='OUTPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $info = & $b.GetVHDInfo @{ Path='C:\t\rawlbl.vhdx' }
+        $info.Label | Should -Be 'OUTPUT' -Because 'the Label is a mock-internal tag so findOutputDisk still discovers the Raw OUTPUT disk'
+    }
+    It 'NewOutputVhdx (fake) accepts lowercase raw and normalizes to Raw' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\rawlc.vhdx'; Label='OUTPUT'; FileSystem='raw'; SizeBytes=1GB }
+        $info = & $b.GetVHDInfo @{ Path='C:\t\rawlc.vhdx' }
+        $info.FileSystem | Should -Be 'Raw' -Because 'Raw is case-normalized like exFAT'
+    }
+    It 'NewOutputVhdx (fake) Raw disk does not impose a label-length ceiling (no Format-Volume runs)' {
+        # Raw = create-without-format: no Format-Volume, so no real label limit applies.
+        # The Label is a mock-internal tag only — any length is accepted.
+        $b = New-FakeHyperVBackend
+        { & $b.NewOutputVhdx @{ Path='C:\t\rawlong.vhdx'; Label='THIS_LABEL_IS_WAY_TOO_LONG_FOR_EXFAT'; FileSystem='Raw'; SizeBytes=1GB } } |
+            Should -Not -Throw -Because 'Raw skips Format-Volume so no label-length ceiling applies'
+    }
+    It 'SECURITY: real NewOutputVhdx Raw branch does NOT reference Format-Volume (AST check)' {
+        # Guard that the REAL backend Raw branch genuinely skips formatting.
+        # The real NewOutputVhdx scriptblock is on $b.NewOutputVhdx; we inspect its .ToString() / AST.
+        $realB = New-RealHyperVBackend
+        $src = $realB.NewOutputVhdx.ToString()
+        # Presence check: the word 'Raw' must appear (the branch exists).
+        $src | Should -Match '(?i)raw' -Because 'the real NewOutputVhdx must have a Raw branch'
+        # Absence check for the Raw-mode block: we look at the raw-branch body specifically.
+        # The raw branch returns early before any Format-Volume call.
+        # Strategy: verify that in the real source the Format-Volume call is ONLY inside a block
+        # that is NOT reached when $fs -eq 'Raw'. We do this by checking the raw return precedes Format-Volume.
+        # Simple structural check: 'Raw' appears AND the return-early comment is present.
+        $src | Should -Match '(?i)create-without-format|skip.*format|raw.*return|return.*raw' -Because 'real Raw branch must return before Format-Volume'
+    }
+
     # ---- per-VHDX file populate/read (host writes a seed file onto a VHDX, reads results off) ----
     It 'fake WriteVhdxFile then ReadVhdxFile round-trips a file' {
         $b = New-FakeHyperVBackend

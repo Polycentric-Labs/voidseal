@@ -759,6 +759,33 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report.Released | Should -BeNullOrEmpty -Because 'a missing-hash abort is fail-closed — nothing is released (symmetry with DENY-on-deps-mismatch)'
     }
 
+    # ---- Task 4.2 D4-B: processor NEVER calls ReadVhdxFile (host-mount) on its OUTPUT disk ----
+    It 'processor run does NOT host-mount (ReadVhdxFile) its Raw OUTPUT disk — D4-B' {
+        # A processor has a Raw OUTPUT disk (no FS to mount; host-mounting untrusted guest data is P0 risk).
+        # The gate runs via ReadVhdxRawRegion (user-space); ReadVhdxFile must NEVER touch the OUTPUT path.
+        $blobFile = Join-Path $script:TmpRoot ("outbox-nohostmount-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-nohostmount' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        # The run must succeed (gate ran, SAFE candidate released)
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'the gate ran via ReadVhdxRawRegion'
+
+        # The OUTPUT disk path must NOT appear in any ReadVhdxFile call log entry
+        $outPath = [string]$report.Descriptor.OutputDiskPath
+        $hostMountOps = @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and [string]$_.Path -eq $outPath })
+        $hostMountOps.Count | Should -Be 0 -Because 'a processor must NEVER host-mount (ReadVhdxFile) its Raw OUTPUT disk (D4-B, P0 risk)'
+    }
+
     It 'GC invariant (D3-D): the verified deps.vhdx is NOT in CreatedDisks -> teardown LEAVES it (builder-owned, reusable)' {
         $b = New-FakeHyperVBackend -SimulateSelfPowerOff
         & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }

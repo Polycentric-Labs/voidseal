@@ -520,19 +520,33 @@ function Invoke-Voidseal {
                 $detachOk = $false
                 $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = "data-disk detach failed: $($_.Exception.Message)" }
             }
+            # D4-B: a PROCESSOR (Network='None' + ScreenConfig) has a Raw OUTPUT disk — there is no
+            # filesystem to mount, and host-mounting untrusted guest data is a P0 risk. Gate
+            # Read-WorkloadResult OFF for processors; the processor's result/Released comes from the
+            # post-detach outbox gate block below (ReadVhdxRawRegion, never Mount-VHD). Firefox and
+            # other non-processor profiles keep the Read-WorkloadResult host-mount path unchanged.
+            $isProcessorProfile = ($resolved['Network'] -eq 'None') -and $resolved.ContainsKey('ScreenConfig')
             if ($detachOk -and -not $wait.TimedOut) {
-                # Tier>=2 Read-WorkloadResult THROWS (quarantine NotImplemented) — try/catch so a gated
-                # hostile-tier read is reported as a failed run, not an unhandled crash that aborts the
-                # whole deploy. The seal/teardown invariants are unaffected either way.
-                try {
-                    $runResult = Read-WorkloadResult -Descriptor $descriptor -Destination $Destination `
-                                    -ResultInnerName $resultInnerName -SentinelInnerName $sentinelInnerName -Backend $Backend
-                } catch {
-                    $runResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = "result read failed: $($_.Exception.Message)" }
+                if ($isProcessorProfile) {
+                    # Processor: RunResult is derived from the outbox gate block (post-detach, below).
+                    # Do NOT call Read-WorkloadResult — the Raw OUTPUT has no FS to mount.
+                    # Set a provisional RunResult; the gate block overwrites it on success or failure.
+                    $report.RunResult = @{ Status = 'Pending'; ExitCode = $null; ArtifactPath = $null; Reason = 'processor: result from outbox gate' }
+                } else {
+                    # Non-processor (firefox etc.): exFAT OUTPUT, host-mount read, unchanged.
+                    # Tier>=2 Read-WorkloadResult THROWS (quarantine NotImplemented) — try/catch so a gated
+                    # hostile-tier read is reported as a failed run, not an unhandled crash that aborts the
+                    # whole deploy. The seal/teardown invariants are unaffected either way.
+                    try {
+                        $runResult = Read-WorkloadResult -Descriptor $descriptor -Destination $Destination `
+                                        -ResultInnerName $resultInnerName -SentinelInnerName $sentinelInnerName -Backend $Backend
+                    } catch {
+                        $runResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = "result read failed: $($_.Exception.Message)" }
+                    }
+                    $report.RunResult = $runResult
+                    if ($runResult.ArtifactPath) { $report.ExtractedArtifact = $runResult.ArtifactPath }
+                    $states.Add('EXTRACTED')
                 }
-                $report.RunResult = $runResult
-                if ($runResult.ArtifactPath) { $report.ExtractedArtifact = $runResult.ArtifactPath }
-                $states.Add('EXTRACTED')
             } elseif ($detachOk) {
                 # The guest never self-powered-off within the deadline (hung/runaway). Wait-WorkloadComplete
                 # already force-stopped it so the Reaper inherits a clean Off VM. Record a failed run; do
@@ -551,6 +565,9 @@ function Invoke-Voidseal {
             # possibly-live guest). (Phase-2/4 repoints the read at the dedicated FIXED raw outbox disk.)
             if ($detachOk -and -not $wait.TimedOut -and $resolved['Network'] -eq 'None' -and $resolved.ContainsKey('ScreenConfig')) {
                 $gateInput = Join-Path $Destination 'gate-input'
+                # D4-B: processors skip Read-WorkloadResult (which creates Destination for non-processors).
+                # Ensure Destination exists before the gate writes outbox.bin / gate-input/ into it.
+                if (-not (Test-Path -LiteralPath $Destination)) { $null = New-Item -ItemType Directory -Path $Destination -Force }
                 try {
                     $outboxPath = [string]$descriptor.OutputDiskPath
                     if ([string]::IsNullOrWhiteSpace($outboxPath)) { throw 'processor gate: no OUTPUT disk to read the outbox from.' }

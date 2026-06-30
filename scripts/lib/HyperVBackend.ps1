@@ -407,13 +407,17 @@ $script:SbInvokeWithLockRetry = {
 $script:SbValidateVhdxFormat = {
     param([string] $FileSystem, [string] $Label)
     # Allowed filesystems -> canonical casing. Case-insensitive lookup; reject anything else.
-    $canon = @{ exfat = 'exFAT'; fat32 = 'FAT32'; ntfs = 'NTFS'; fat = 'FAT' }
+    # Raw = create-without-format: no Format-Volume runs, no volume label, no label-length ceiling.
+    $canon = @{ exfat = 'exFAT'; fat32 = 'FAT32'; ntfs = 'NTFS'; fat = 'FAT'; raw = 'Raw' }
     $key = if ($null -ne $FileSystem) { ([string]$FileSystem).Trim().ToLowerInvariant() } else { '' }
     if (-not $canon.ContainsKey($key)) {
         throw ("NewOutputVhdx: unsupported FileSystem '$FileSystem' " +
-               "(allowed: exFAT, FAT32, NTFS, FAT) — live Format-Volume would reject it.")
+               "(allowed: exFAT, FAT32, NTFS, FAT, Raw) — live Format-Volume would reject it.")
     }
     $normalized = $canon[$key]
+    # Raw = create-without-format: no Format-Volume, so no real label limit applies.
+    # The Label on a Raw disk is a mock-internal discovery tag only — see NewOutputVhdx.
+    if ($normalized -eq 'Raw') { return 'Raw' }
     # Max volume-label length per filesystem (real Format-Volume limits).
     $maxLabel = @{ exFAT = 15; FAT32 = 11; NTFS = 32; FAT = 11 }[$normalized]
     $labelLen = if ($null -ne $Label) { ([string]$Label).Length } else { 0 }
@@ -933,6 +937,19 @@ function New-RealHyperVBackend {
         # FileSystem / over-length Label fails here (identically to the fake) instead of deep
         # inside live Format-Volume. Use the NORMALIZED filesystem casing from here on.
         $fs = & $ValidateFmt $fs $label
+        # Raw = create-without-format: an unformatted FIXED disk; the guest writes the outbox to its
+        # raw block device (offset 0) and the host reads it via ReadVhdxRawRegion (never mount).
+        # No FS, no volume label — the guest finds the device by SCSI position (LIVE, D4-D).
+        # LIVE-ONLY-UNPROVEN until Phase 6: the real New-VHD -Fixed raw create + skip-format +
+        # in-guest raw-device identification (SCSI position) + the dd of the outbox.
+        if ($fs -eq 'Raw') {
+            & $InvokeOp {
+                $null = New-VHD -Path $path -Fixed -SizeBytes $size -ErrorAction Stop
+                # Raw = create-without-format: no Mount, no Initialize, no Partition, no Format-Volume.
+                # The disk is intentionally left unformatted; the guest writes directly to block offset 0.
+            }
+            return
+        }
         & $InvokeOp {
             # If create succeeds but Mount/Initialize/Partition/Format throws, the .vhdx is left on
             # disk and a re-run trips on the orphan. Wrap so on failure we dismount AND remove the
@@ -1824,6 +1841,12 @@ function New-FakeHyperVBackend {
         # passed a value live Format-Volume would reject (e.g. 'ext4') fails here too, closing the
         # divergence. Runs BEFORE the state write, mirroring the real backend's pre-cmdlet validation.
         $fs = & $ValidateFmt $fs $label
+        # fake≠real boundary (DOCUMENTED, NON-OBSERVABLE): for a Raw disk the Label is a
+        # MOCK-INTERNAL discovery tag (the real raw disk has no FS volume label; the real
+        # GetVHDInfo returns no Label anyway — so no observable divergence). $findOutputDisk
+        # locates the OUTPUT disk by its Label='OUTPUT' record; keeping it here means
+        # the SimulateOutboxBlob path still works on a Raw OUTPUT. The real NewOutputVhdx
+        # Raw branch MUST NOT call Format-Volume (and does not — the branch returns early).
         $state.VHDs[$path] = @{
             Path         = $path
             SizeBytes    = $size

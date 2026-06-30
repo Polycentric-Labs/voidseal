@@ -93,7 +93,12 @@ function New-WorkloadDisks {
 
     # OUTPUT disk: create -> RECORD (field + CreatedDisks) -> attach. The INPUT disk is already recorded
     # above, so a throw anywhere in THIS block leaves the INPUT recorded on CreatedDisks for teardown.
-    $null = & $Backend.NewOutputVhdx @{ Path = $outPath; Label = $outLabel; FileSystem = $fs; SizeBytes = 1GB }
+    # Processor predicate (D4-A): a profile with Network='None' AND ScreenConfig is a processor —
+    # its OUTPUT disk is Raw (no filesystem; offset 0 = the outbox the guest writes via dd; the host
+    # reads it via ReadVhdxRawRegion, never Mount-VHD). Everything else (firefox, INPUT disks) stays exFAT.
+    $isProcessor = ($Profile['Network'] -eq 'None') -and $Profile.ContainsKey('ScreenConfig')
+    $outFs = if ($isProcessor) { 'Raw' } else { $fs }
+    $null = & $Backend.NewOutputVhdx @{ Path = $outPath; Label = $outLabel; FileSystem = $outFs; SizeBytes = 1GB }
     $Descriptor.OutputDiskPath = $outPath
     & $appendCreated $outPath
     $null = & $Backend.AddHardDiskDrive @{ VMName = $name; Path = $outPath }
