@@ -271,9 +271,67 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT'
         $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT'
         $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT'
-        # BlockProtocols enforced BY CONSTRUCTION: no rule opens QUIC/UDP-443 or DoT/853.
-        $ud | Should -Not -Match 'udp --dport 443'   # QUIC / HTTP-3
-        $ud | Should -Not -Match 'dport 853'         # DoT
+
+        # --- SEC-2 / Named-Risk-2 hardening: STRUCTURAL allow-list assertion -------------------------
+        # The two guards this replaces (`Should -Not -Match 'udp --dport 443'` / `'dport 853'`) are
+        # literal-string matches: a differently-worded hole (e.g. `-m multiport --dports 443,853`)
+        # matches NEITHER string and would pass the old test vacuously. Instead, extract every
+        # `iptables -A OUTPUT ... -j ACCEPT` rule the seed actually emits and assert the SET is
+        # exactly the intended minimal allow-list — 6 rules, nothing else. A 7th rule, a reworded
+        # rule, a multiport rule, or any extra/renamed port/proto opens the count or the set and
+        # fails this test, regardless of how the hole is spelled.
+        $outputLines  = $ud -split "`r?`n"
+        $acceptRules  = $outputLines | Where-Object { $_ -match '^\s*iptables\s+-A\s+OUTPUT\b.*-j\s+ACCEPT\s*$' } | ForEach-Object { $_.Trim() }
+
+        $acceptRules.Count | Should -Be 6 -Because 'the builder OUTPUT allow-list must contain EXACTLY the 6 intended rules (lo, established/related, dns udp/tcp, http, https) — any extra ACCEPT rule (a 7th rule, a widened/renamed port, a multiport rule) must fail this test even if it does not match the literal strings "udp --dport 443" or "dport 853"'
+
+        # Per-expected-rule presence within the extracted set (order-independent).
+        $expectedRules = @(
+            'iptables -A OUTPUT -o lo -j ACCEPT'
+            'iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT'
+            'iptables -A OUTPUT -p udp --dport 53 -j ACCEPT'
+            'iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT'
+            'iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT'
+            'iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT'
+        )
+        foreach ($rule in $expectedRules) {
+            $acceptRules | Should -Contain $rule -Because "the minimal allow-list must contain '$rule'"
+        }
+        # And the reverse: every extracted rule must be one of the expected 6 (closes the set both ways —
+        # count-equality alone would not catch a rule that REPLACES an expected one with a different hole
+        # while another expected rule is duplicated).
+        foreach ($rule in $acceptRules) {
+            $expectedRules | Should -Contain $rule -Because "found an OUTPUT ACCEPT rule not in the intended minimal allow-list: '$rule' — this is exactly the drift SEC-2 guards against"
+        }
+
+        # Structural port/proto extraction: for every ACCEPT rule that carries a proto+dport, assert the
+        # (proto, dport) set is exactly {(udp,53), (tcp,53), (tcp,80), (tcp,443)}. This is a second,
+        # independent lens on the same rules (parsed rather than string-compared) so a rule that is
+        # byte-identical to an expected one except for a transposed proto/port still gets caught.
+        $portRulePattern = '-p\s+(?<proto>udp|tcp)\s+--dport\s+(?<port>\d+)\s+-j\s+ACCEPT'
+        $portRules = @()
+        foreach ($rule in $acceptRules) {
+            if ($rule -match $portRulePattern) {
+                $portRules += [pscustomobject]@{ Proto = $Matches['proto']; Port = $Matches['port'] }
+            }
+        }
+        $portRules.Count | Should -Be 4 -Because 'exactly 4 of the 6 ACCEPT rules carry an explicit proto+dport (dns udp/tcp, http, https); lo and established/related do not'
+        $portSet = $portRules | ForEach-Object { "$($_.Proto):$($_.Port)" } | Sort-Object -Unique
+        ($portSet -join ',') | Should -Be 'tcp:443,tcp:53,tcp:80,udp:53' -Because 'the (proto,port) set of every dport-bearing ACCEPT rule must be EXACTLY {udp/53, tcp/53, tcp/80, tcp/443} — no udp/443 (QUIC), no port 853 (DoT), no additional port under any proto'
+
+        # --- Belt-and-braces (defense in depth; the set-equality above is the primary guard) -----------
+        # BlockProtocols enforced BY CONSTRUCTION: no rule anywhere opens QUIC/UDP-443 or DoT/853, and no
+        # ACCEPT rule combines udp with 443 in any form (covers e.g. a stray `-m multiport --dports 443,853`
+        # that the structural extraction above wouldn't even classify as a plain port rule). Scoped to
+        # non-comment lines only — the seed's own honesty comment legitimately DISCUSSES "DoT/853" in prose
+        # to explain why it's dropped, so a raw whole-`$ud` substring match would false-positive on that
+        # comment; a real rule/directive line never starts with '#'.
+        $nonCommentLines = $outputLines | Where-Object { $_.Trim() -notmatch '^#' -and $_.Trim() -ne '' }
+        ($nonCommentLines | Where-Object { $_ -match '853' }) |
+            Should -BeNullOrEmpty -Because 'DoT (853) must never appear in any non-comment (rule/config) line of the builder seed'
+        ($outputLines | Where-Object { $_ -match 'iptables\s+-A\s+OUTPUT' -and $_ -match '-j\s+ACCEPT' -and $_ -match 'udp' -and $_ -match '443' }) |
+            Should -BeNullOrEmpty -Because 'no OUTPUT ACCEPT rule may combine udp with port 443 (QUIC/HTTP-3), in any spelling (plain --dport or -m multiport --dports)'
+
         # The transparent-proxy REDIRECTs still gatekeep 80/443 to Squid.
         $ud | Should -Match 'REDIRECT --to-port 3129'
         $ud | Should -Match 'REDIRECT --to-port 3130'
