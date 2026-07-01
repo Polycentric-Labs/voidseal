@@ -1021,18 +1021,47 @@ Describe 'Fake backend — disk operations' {
             Should -Not -Throw -Because 'Raw skips Format-Volume so no label-length ceiling applies'
     }
     It 'SECURITY: real NewOutputVhdx Raw branch does NOT reference Format-Volume (AST check)' {
-        # Guard that the REAL backend Raw branch genuinely skips formatting.
-        # The real NewOutputVhdx scriptblock is on $b.NewOutputVhdx; we inspect its .ToString() / AST.
+        # Guard that the REAL backend Raw branch genuinely skips formatting — via a real AST walk,
+        # not a comment-canary regex (a comment can survive deletion of the actual guard it describes).
         $realB = New-RealHyperVBackend
+        $ast = $realB.NewOutputVhdx.Ast
+
+        # Presence check: a Raw branch exists at all.
         $src = $realB.NewOutputVhdx.ToString()
-        # Presence check: the word 'Raw' must appear (the branch exists).
         $src | Should -Match '(?i)raw' -Because 'the real NewOutputVhdx must have a Raw branch'
-        # Absence check for the Raw-mode block: we look at the raw-branch body specifically.
-        # The raw branch returns early before any Format-Volume call.
-        # Strategy: verify that in the real source the Format-Volume call is ONLY inside a block
-        # that is NOT reached when $fs -eq 'Raw'. We do this by checking the raw return precedes Format-Volume.
-        # Simple structural check: 'Raw' appears AND the return-early comment is present.
-        $src | Should -Match '(?i)create-without-format|skip.*format|raw.*return|return.*raw' -Because 'real Raw branch must return before Format-Volume'
+
+        # Find every Format-Volume command node. At least one must exist (the non-Raw path formats).
+        $fmtCalls = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Format-Volume'
+            }, $true)
+        $fmtCalls.Count | Should -BeGreaterThan 0 -Because 'the non-Raw path must call Format-Volume'
+
+        # Find the Raw-branch IfStatementAst: the clause whose condition extent mentions 'Raw'.
+        $ifStatements = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.IfStatementAst]
+            }, $true)
+        $rawIf = $ifStatements | Where-Object {
+            $_.Clauses | Where-Object { $_.Item1.Extent.Text -match "-eq 'Raw'|Raw" }
+        } | Select-Object -First 1
+        $rawIf | Should -Not -BeNullOrEmpty -Because 'an if-statement gating on Raw must exist'
+
+        # Within the Raw clause's body, find the early ReturnStatementAst.
+        $rawClause = $rawIf.Clauses | Where-Object { $_.Item1.Extent.Text -match "-eq 'Raw'|Raw" } | Select-Object -First 1
+        $rawReturn = $rawClause.Item2.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.ReturnStatementAst]
+            }, $true) | Select-Object -First 1
+        $rawReturn | Should -Not -BeNullOrEmpty -Because 'the Raw branch must contain an early return'
+
+        # THE core assertion: the Raw branch's return occurs (textually/structurally) BEFORE every
+        # Format-Volume call reachable in the scriptblock. This fails if the early return is removed
+        # or moved to after Format-Volume — which the old comment-canary would not have caught.
+        foreach ($fmt in $fmtCalls) {
+            $rawReturn.Extent.StartOffset | Should -BeLessThan $fmt.Extent.StartOffset `
+                -Because 'the Raw path must return before any Format-Volume is reachable'
+        }
     }
 
     # ---- per-VHDX file populate/read (host writes a seed file onto a VHDX, reads results off) ----

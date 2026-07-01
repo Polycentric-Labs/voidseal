@@ -182,7 +182,9 @@ function Get-HyperVBackendMethodManifest {
         # Added per the ReadVhdxRawRegion addendum precedent (manifest + both factories + parity/drift).
         # Interface: -> [string] lowercase hex SHA-256.
         GetVhdxImageHash     = @('Path')   # whole-.vhdx-file SHA-256, user-space (NEVER Mount-VHD)
-        GetVHDInfo           = @('Path')                            # -> @{ Path; SizeBytes; Differencing; ParentPath; Label; FileSystem } or $null
+        GetVHDInfo           = @('Path')                            # -> @{ Path; SizeBytes; Differencing; ParentPath } or $null (real Get-VHD shape;
+                                                                     # the fake ALSO surfaces Label/FileSystem as a mock-internal convenience for the
+                                                                     # $findOutputDisk OUTPUT-disk tag — those two fields are non-observable on real)
         RemoveVHD            = @('Path')                            # delete a DETACHED .vhdx file (the Reaper's explicit cleanup)
         AddHardDiskDrive     = @('VMName', 'Path')
         RemoveHardDiskDrive  = @('VMName', 'Path')
