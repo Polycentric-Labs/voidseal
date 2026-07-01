@@ -261,6 +261,23 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         { New-CidataUserData -Profile @{ WorkloadMode='Disk'; EgressMode='SquidSniProxy'; Entrypoint="python3 'x'"; EgressAllowlist=@('pypi.org') } } |
             Should -Throw
     }
+    It 'SEC-2: builder egress is DEFAULT-DROP + a minimal allow-list (BlockProtocols enforced by construction)' {
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        # Default-drop egress policy + the minimal allow-list (loopback, established, DNS 53, TCP 80/443).
+        $ud | Should -Match 'iptables -P OUTPUT DROP'
+        $ud | Should -Match 'iptables -A OUTPUT -o lo -j ACCEPT'
+        $ud | Should -Match 'ESTABLISHED,RELATED -j ACCEPT'
+        $ud | Should -Match 'iptables -A OUTPUT -p udp --dport 53 -j ACCEPT'
+        $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT'
+        $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT'
+        $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT'
+        # BlockProtocols enforced BY CONSTRUCTION: no rule opens QUIC/UDP-443 or DoT/853.
+        $ud | Should -Not -Match 'udp --dport 443'   # QUIC / HTTP-3
+        $ud | Should -Not -Match 'dport 853'         # DoT
+        # The transparent-proxy REDIRECTs still gatekeep 80/443 to Squid.
+        $ud | Should -Match 'REDIRECT --to-port 3129'
+        $ud | Should -Match 'REDIRECT --to-port 3130'
+    }
 }
 
 Describe 'Write-Iso9660Image — REAL IMAPI2 round-trip (gated on IMAPI availability)' {

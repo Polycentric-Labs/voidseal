@@ -213,11 +213,26 @@ write_files:
 
       # --- Squid transparent proxy setup ---
       systemctl restart squid 2>/dev/null || true
-      # Redirect outbound HTTP/HTTPS through Squid (transparent intercept)
-      # SEC-2 (HONESTY — deferred to Phase 6): this only REDIRECTS TCP 80/443 to Squid. It does NOT yet
-      # enforce tier1's BlockProtocols (DNS/53, QUIC/UDP-443, DoH/DoT) — only 80/443 are gatekept by the
-      # domain ACL; DNS and any non-80/443 egress are NOT default-dropped. Full default-DROP egress
-      # enforcement (the BlockProtocols set) is Phase-6 work and is intentionally NOT wired here.
+      # --- Egress lockdown: DEFAULT-DROP OUTPUT + a minimal allow-list (SEC-2) ---
+      # tier1 BlockProtocols (QUIC/UDP-443, DoH, DoT) is enforced BY CONSTRUCTION: only the flows below are
+      # permitted, so QUIC/UDP-443 and DoT/853 are dropped, and DoH (443) hits Squid's domain-ACL (a DoH
+      # resolver isn't in the deps allowlist -> denied). DNS/53 is allowed broadly (UDP+TCP): the transparent
+      # proxy needs it to resolve the allowlist domains, and the builder carries ZERO personal data (two-VM
+      # split) so DNS-tunnel exfil is a non-threat; the Squid domain-ACL is the real fetch control. Squid was
+      # started above (network still open); its own egress (uid proxy) to upstream:80/443 rides the 80/443
+      # ACCEPTs, and a REDIRECT'd client connection rides '-o lo'. FAIL-CLOSED: if this setup errors partway,
+      # the OUTPUT policy stays DROP -> no egress -> the fetch fails cleanly.
+      # LIVE-ONLY (Phase 6): real packet-drop is unproven in mock - the seed asserts SHAPE only.
+      iptables -F OUTPUT 2>/dev/null
+      iptables -P OUTPUT DROP
+      iptables -A OUTPUT -o lo -j ACCEPT
+      iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+      iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+      iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
+      iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+      # Transparent-proxy REDIRECT of outbound 80/443 through Squid (domain-ACL gatekeeps the fetch); the
+      # owner-exclusion keeps Squid's OWN upstream egress from being re-redirected.
       iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
       iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
 
