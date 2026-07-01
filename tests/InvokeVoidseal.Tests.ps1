@@ -706,6 +706,116 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue -Because 'the gate must not run on a timeout'
     }
 
+    It '(a) DENY-on-no-outbox: a clean power-off that wrote NO outbox (in-guest screener aborted) -> header-magic probe fails closed, Released $null' {
+        # The guest self-powered-off cleanly (SelfPowerOff) but produced NO outbox (its screener aborted;
+        # producer fail-closed is locked separately by test_run_disk_workload.py:34). No SimulateOutboxBlob
+        # -> the OUTPUT base region reads as ZEROS -> the orchestrator's 24-byte header magic check
+        # (Invoke-Voidseal.ps1:576) fails 'VSOUTBX1' -> gate catch -> nothing released.
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff       # NOTE: no -SimulateOutboxBlob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-nooutbox' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        @($report.States)         | Should -Contain 'SEALED' -Because 'the VM still sealed + ran; only the outbox is absent'
+        $report.Released          | Should -BeNullOrEmpty -Because 'an empty/absent outbox fails closed — nothing is released'
+        $report.SensitivityReport | Should -BeNullOrEmpty
+        $report.Error             | Should -Match '(?i)outbox|magic|header'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue -Because 'the gate never partitioned'
+        (& $b.GetVM @{ Name = 'sbx-proc-nooutbox' }) | Should -BeNullOrEmpty -Because 'teardown still runs (no orphan)'
+    }
+
+    It '(a-verdict) an outbox whose verdicts are ALL non-SAFE -> the gate runs but releases NOTHING (Held, not Released)' {
+        # Distinct from the happy path (:642, which releases the two SAFE files): here EVERY staged file is
+        # non-SAFE, so the gate runs cleanly (GateRan=$true, no Error) yet Released is EMPTY and everything
+        # is Held. Proves the screener-verdict fail-closed at the partition, separate from a parse failure.
+        $allHeld = Join-Path $script:TmpRoot ("verdicts-allheld-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        @(
+            [pscustomobject]@{ name = 'creds.txt';             verdict = 'SENSITIVE'; detectors = @('credential-pattern') }
+            [pscustomobject]@{ name = 'finance-statement.txt'; verdict = 'SENSITIVE'; detectors = @('financial-keyword') }
+            [pscustomobject]@{ name = 'health-note.txt';       verdict = 'SENSITIVE'; detectors = @('health-keyword') }
+            [pscustomobject]@{ name = 'prose-essay.txt';       verdict = 'UNCERTAIN'; detectors = @('non-prose') }
+            [pscustomobject]@{ name = 'prose-letter.md';       verdict = 'UNCERTAIN'; detectors = @('non-prose') }
+            [pscustomobject]@{ name = 'spreadsheet-dump.csv';  verdict = 'SENSITIVE'; detectors = @('financial-keyword') }
+            [pscustomobject]@{ name = 'prose-with-token.md';   verdict = 'SENSITIVE'; detectors = @('token-pattern') }
+        ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $allHeld -Encoding utf8
+
+        $blobFile = Join-Path $script:TmpRoot ("outbox-allheld-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$allHeld', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-allheld' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'a well-formed outbox lets the gate run — this is a verdict outcome, not a parse failure'
+        $report.Error              | Should -BeNullOrEmpty -Because 'an all-non-SAFE verdict set is a normal gate outcome, not an error'
+        @($report.Released)        | Should -BeNullOrEmpty -Because 'not one file is SAFE -> release NOTHING'
+        @($report.Held | ForEach-Object { $_.name }) | Should -Contain 'creds.txt' -Because 'every file is held'
+    }
+
+    It '(b) DENY-on-missing-verdicts: an outbox with candidates but NO verdicts.json -> read_outbox.py exits non-zero -> Released $null' {
+        # write_outbox_from_dir always includes verdicts.json, so pack a LONE candidate directly with
+        # pack_outbox to omit it. read_and_verify raises OutboxError('outbox missing verdicts.json') ->
+        # read_outbox.py exit != 0 -> the orchestrator throws (Invoke-Voidseal.ps1:605) -> gate catch.
+        $blobFile = Join-Path $script:TmpRoot ("outbox-noverdicts-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox, pathlib; pathlib.Path(r'$blobFile').write_bytes(outbox.pack_outbox([('candidate.txt', b'hello world\n')]))"
+        $LASTEXITCODE | Should -Be 0 -Because 'packing a lone candidate must succeed'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-noverdicts' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        $report.Released          | Should -BeNullOrEmpty -Because 'no verdicts.json -> fail closed, release nothing'
+        $report.SensitivityReport | Should -BeNullOrEmpty
+        $report.Error             | Should -Match '(?i)gate|outbox|read|verdicts'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue
+    }
+
+    It '(d) DENY-on-oversize-header: an outbox header claiming count > MAX_ENTRIES -> the header bound check fails closed BEFORE a huge read' {
+        # The disk-full / oversize analogue, testable WITHOUT a new backend switch: craft a valid-magic
+        # 24-byte header whose entry_count exceeds MAX_ENTRIES (256). The orchestrator bounds count/total
+        # (Invoke-Voidseal.ps1:581) BEFORE computing $exact + issuing the full ReadVhdxRawRegion, so a
+        # bogus/oversize length-prefix cannot drive an enormous read. (Windows is little-endian, matching
+        # the outbox '<' format; the unit-level bound is covered by test_outbox.py's oversize/truncation.)
+        $hdr = [byte[]]::new(24)
+        [System.Text.Encoding]::ASCII.GetBytes('VSOUTBX1').CopyTo($hdr, 0)
+        [System.BitConverter]::GetBytes([uint16]1).CopyTo($hdr, 8)      # version = 1
+        [System.BitConverter]::GetBytes([uint32]1000).CopyTo($hdr, 12)  # entry_count = 1000 (> 256)
+        [System.BitConverter]::GetBytes([uint64]0).CopyTo($hdr, 16)     # payload_total_len = 0
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $hdr
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-oversize' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        $report.Released | Should -BeNullOrEmpty -Because 'an over-bound header fails closed — nothing released'
+        $report.Error    | Should -Match '(?i)bound|count|total|outbox'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue
+    }
+
     It 'a NON-processor Disk-mode deploy does NOT run the gate (Released stays $null; GateRan not set)' {
         # Reuse the established Tier-0 NON-processor Disk-mode fixture (no Network='None', no ScreenConfig).
         $nonProc = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
