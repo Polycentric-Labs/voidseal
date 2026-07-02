@@ -143,6 +143,98 @@ def test_off_schema_reserved_not_emitted_by_producer(tmp_path):
         assert obj["error_code"] != "OFF_SCHEMA"
 
 
+# --- C2.8 (M3): detector-vocabulary pin -- the module constants ARE the single source of truth ------
+# M3 (architecture-review-findings.md): consume-mode Pester fixtures HAND-WRITE tags (e.g. 'aws_key',
+# 'financial') that must match the screener's REAL emitted tags, not a drifted/stale copy. The C2.1
+# rewrite already fixed the specific drift M3 originally caught (old free-form 'credential-pattern'
+# style tags vs the real 'credential'/'financial'/'email' flags), but nothing yet pinned the vocabulary
+# ITSELF as the source of truth -- the constants above (_VERDICT_ENUM/_ERR_ENUM/_FLAG_VOCAB) are a
+# hand-typed COPY of guest/screener.py's module constants, so a future rename in screener.py (e.g.
+# renaming the 'aws_key' flag, or adding/removing a vocabulary member) would NOT fail this file's
+# other tests -- they only assert "subset of vocab", which stays true even if the real vocab drifts
+# out from under the copy. This test closes that gap two ways:
+#   (a) imports screener.py directly and asserts this file's hand-typed enum copies are EXACTLY the
+#       real module constants (VERDICT_ENUM/ERROR_CODE_ENUM/FLAG_VOCAB) -- a rename on either side
+#       fails here, immediately, with no drift window.
+#   (b) re-screens the actual tests/fixtures/messy-drive/ directory (the SAME fixture
+#       SensitivityGate.Tests.ps1's "consume mode" Describe block hand-writes verdicts for) and pins
+#       the REAL emitted flags/verdict for each known-SENSITIVE file to the REAL vocabulary members,
+#       so a tag rename that slips past (a) (e.g. a value that is still a valid-looking string, just
+#       different from what the Pester fixture hand-typed) is still caught by a live re-screen.
+def test_module_enum_constants_match_the_pinned_vocabulary_copies():
+    sys.path.insert(0, str(ROOT / "guest"))
+    import importlib
+    screener = importlib.import_module("screener")
+    importlib.reload(screener)
+    assert set(screener.VERDICT_ENUM) == _VERDICT_ENUM, (
+        "guest/screener.py VERDICT_ENUM drifted from the pinned vocabulary in this test file -- "
+        "update BOTH this file's _VERDICT_ENUM AND every consumer (SensitivityGate.ps1's mirrored "
+        "VerdictSchema.VerdictEnum, SECURITY.md's published bit bound) in lockstep, not just one."
+    )
+    assert set(screener.ERROR_CODE_ENUM) == _ERR_ENUM, (
+        "guest/screener.py ERROR_CODE_ENUM drifted from the pinned vocabulary in this test file -- "
+        "update BOTH this file's _ERR_ENUM AND SensitivityGate.ps1's mirrored VerdictSchema.ErrorCodeEnum."
+    )
+    assert set(screener.FLAG_VOCAB) == _FLAG_VOCAB, (
+        "guest/screener.py FLAG_VOCAB drifted from the pinned vocabulary in this test file -- update "
+        "BOTH this file's _FLAG_VOCAB AND SensitivityGate.ps1's mirrored VerdictSchema.FlagVocab AND "
+        "the published Sigma log2(|enum_i|) bit bound in SECURITY.md (the flags bitset width feeds it "
+        "directly: a vocabulary size change moves the bound)."
+    )
+
+
+def test_messy_drive_fixture_known_sensitive_files_use_the_real_pinned_flag_vocabulary(tmp_path):
+    # Re-screen the SAME real fixture tests/fixtures/messy-drive/ that SensitivityGate.Tests.ps1's
+    # "consume mode" Describe block hand-writes verdicts for (see HashOf/the verdicts array at
+    # tests/SensitivityGate.Tests.ps1 ~138-153). This test does NOT hand-write expected flags -- it
+    # calls the REAL screener.py against the REAL fixture files and asserts the output against the
+    # REAL module vocabulary, so a rename anywhere in the pipeline (screener.py's _TAG_TO_FLAG mapping,
+    # the SENSITIVE regex list's tag names, a fixture file's content changing what it trips) surfaces
+    # here as a failure, not as a silent divergence between what the Pester fixture assumes and what
+    # the screener actually emits.
+    # `--in` reads the fixture directly (read-only); `--out` writes to pytest's own tmp_path (never
+    # into the repo tree) so this test leaves no artifact behind, matching every other test in this file.
+    fixture_dir = ROOT / "tests" / "fixtures" / "messy-drive"
+    tmp_out = tmp_path / "m3-messy-drive-verdicts.json"
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "guest" / "screener.py"),
+         "--in", str(fixture_dir), "--out", str(tmp_out), "--mode", "aggressive"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    verdicts = {v["name"]: v for v in json.loads(tmp_out.read_text(encoding="utf-8"))}
+
+    # Known-SENSITIVE fixtures: real verdict/flags, pinned against the REAL FLAG_VOCAB members
+    # (imported indirectly via the module-equality test above; asserted directly here so THIS test
+    # is self-contained and still fails on its own if the vocabulary drifts).
+    expected = {
+        "creds.txt":             {"verdict": "HELD", "flags": {"aws_key"}},
+        "finance-statement.txt": {"verdict": "HELD", "flags": {"financial"}},
+        "health-note.txt":       {"verdict": "HELD", "flags": {"health"}},
+        "prose-with-token.md":   {"verdict": "HELD", "flags": {"credential"}},
+        "spreadsheet-dump.csv":  {"verdict": "HELD", "flags": set()},
+        "prose-essay.txt":       {"verdict": "SAFE", "flags": set()},
+        "prose-letter.md":       {"verdict": "SAFE", "flags": set()},
+    }
+    assert set(verdicts) == set(expected), (
+        f"messy-drive fixture file set changed ({set(verdicts)}) -- update this pin AND the mirrored "
+        f"consume-mode fixture in tests/SensitivityGate.Tests.ps1 together."
+    )
+    for name, exp in expected.items():
+        got_flags = set(verdicts[name]["flags"])
+        assert verdicts[name]["verdict"] == exp["verdict"], (
+            f"{name}: verdict drifted to {verdicts[name]['verdict']!r}, expected {exp['verdict']!r} -- "
+            f"a screener behavior change must update this pin AND tests/SensitivityGate.Tests.ps1's "
+            f"hand-written consume-mode fixture in lockstep."
+        )
+        assert got_flags == exp["flags"], (
+            f"{name}: flags drifted to {got_flags}, expected {exp['flags']} -- a detector/tag-mapping "
+            f"rename must update this pin AND tests/SensitivityGate.Tests.ps1's hand-written consume-"
+            f"mode fixture (and the published bit bound in SECURITY.md if the vocabulary SIZE changed)."
+        )
+        assert got_flags <= _FLAG_VOCAB, f"{name}: flag(s) {got_flags - _FLAG_VOCAB} not in the pinned vocabulary"
+
+
 # --- C2.2: verdict.sha256 <-> content binding (producer side) -------------------------------------
 # The `sha256` field is the host-verifiable binding the regenerator's content-binding clause (C2.4
 # re-hash-before-release) checks against. It MUST be computed over the EXACT bytes the screener read
