@@ -1018,6 +1018,98 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 }
 
 # ===========================================================================
+#  C1.2 — non-processor OutboxOutput read-path: user-space outbox, NEVER Mount-VHD
+# ===========================================================================
+#  Intent (plan _dev/plans/2026-07-01-pre-phase6-hardening-plan.md Task C1.2): a Disk-mode profile
+#  that opts into OutboxOutput=$true (C1.1's Raw-OUTPUT predicate) but is NOT a processor (no
+#  ScreenConfig) must have its result read via the SAME user-space path a processor uses
+#  (ReadVhdxRawRegion -> read_outbox.py), NEVER Read-WorkloadResult/ReadVhdxFile — the Raw OUTPUT has
+#  no filesystem to mount. Unlike a processor, the result is TRANSPORT-ONLY: the outbox's sole
+#  candidate (result.html) is materialized verbatim to $Destination as ExtractedArtifact, with NO
+#  sensitivity-gate partition (Released/Held stay null) — this is firefox's shape, not a screener's.
+Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-space, no Mount-VHD)' {
+
+    BeforeAll {
+        # A Tier-0 firefox-SHAPED profile: OutboxOutput=$true (Raw OUTPUT, C1.1) but NO ScreenConfig
+        # (NOT a processor) and Network stays whatever tier0 declares (a non-processor is not forced
+        # to Network='None'). WorkloadMode='Disk' + an Entrypoint so the disk-mode seed builds.
+        $script:Fx = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $script:Fx = @{} + $script:Fx                    # mutable copy
+        $script:Fx['Name']         = 'firefox-outbox-test'
+        $script:Fx['WorkloadMode'] = 'Disk'
+        $script:Fx['Inputs']       = @{}
+        $script:Fx['FileSystem']   = 'exFAT'
+        $script:Fx['OutboxOutput'] = $true                # C1.1: Raw OUTPUT, no ScreenConfig -> transport-only
+        $script:Fx['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+        Assert-TierProfileValid -Profile $script:Fx -Context 'TEST Tier-0 firefox-outbox fixture'
+
+        $script:FxArt  = Join-Path $script:TmpRoot ("art-fx-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:FxDest = Join-Path $script:TmpRoot ("dest-fx-{0}" -f ([guid]::NewGuid().ToString('N')))
+
+        # A minimal outbox: verdicts.json is REQUIRED by the container format (guest/outbox.py:96)
+        # even for a transport-only producer with no screener — an empty array is honest (nothing was
+        # screened). staging/result.html is the sole candidate; outbox.write_outbox_from_dir packs
+        # every flat file in the staging dir alongside verdicts.json.
+        $script:FxStaging = Join-Path $script:TmpRoot ("fx-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:FxStaging -Force | Out-Null
+        $script:FxResultBytes = [System.Text.Encoding]::UTF8.GetBytes('<!DOCTYPE NETSCAPE-Bookmark-file-1><TITLE>Bookmarks</TITLE>')
+        [System.IO.File]::WriteAllBytes((Join-Path $script:FxStaging 'result.html'), $script:FxResultBytes)
+
+        $script:FxVerdicts = Join-Path $script:TmpRoot ("fx-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        '[]' | Set-Content -LiteralPath $script:FxVerdicts -Encoding utf8 -NoNewline
+
+        $script:FxBlobFile = Join-Path $script:TmpRoot ("fx-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:FxStaging', r'$script:FxVerdicts', r'$script:FxBlobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $script:FxBlob = [System.IO.File]::ReadAllBytes($script:FxBlobFile)
+    }
+
+    It 'materializes the outbox result.html to Destination as ExtractedArtifact via ReadVhdxRawRegion, NEVER ReadVhdxFile' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-fx-outbox' -ArtifactRoot $script:FxArt -Destination $script:FxDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        @($report.States) | Should -Contain 'SEALED'
+        $report.ExtractedArtifact | Should -Not -BeNullOrEmpty -Because 'a transport-only outbox still yields an ExtractedArtifact'
+        $artifactPath = @($report.ExtractedArtifact)[0]
+        Test-Path -LiteralPath $artifactPath | Should -BeTrue
+        [System.IO.File]::ReadAllBytes($artifactPath) | Should -Be $script:FxResultBytes -Because 'the materialized bytes must equal the outbox result.html entry verbatim (transport-only, not screened)'
+
+        # Not screened: this is a transport-only read, not a sensitivity-gate partition.
+        $report.Released | Should -BeNullOrEmpty -Because 'a non-processor OutboxOutput profile is NEVER screened/Released'
+        $report.Held     | Should -BeNullOrEmpty
+
+        # The host-mount path (Read-WorkloadResult -> ReadVhdxFile) must NEVER be taken for an OUTPUT
+        # disk with no filesystem. Prove via the fake's CallLog: a ReadVhdxRawRegion op on the OUTPUT
+        # path is present; NO ReadVhdxFile op targets that same path.
+        $outputPath = [string]$report.Descriptor.OutputDiskPath
+        $rawOps  = @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxRawRegion' -and $_.Path -eq $outputPath })
+        $mountOps = @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.Path -eq $outputPath })
+        $rawOps.Count   | Should -BeGreaterThan 0 -Because 'the result must be read user-space via ReadVhdxRawRegion'
+        $mountOps.Count | Should -Be 0 -Because 'the host must NEVER Mount-VHD / ReadVhdxFile a Raw OUTPUT with no filesystem'
+    }
+
+    It 'DENY-on-no-outbox: a clean power-off with NO outbox written -> header-magic probe fails closed, no artifact' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff       # NOTE: no -SimulateOutboxBlob
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-fx-nooutbox' -ArtifactRoot $script:FxArt -Destination $script:FxDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        @($report.States)         | Should -Contain 'SEALED'
+        $report.ExtractedArtifact | Should -BeNullOrEmpty -Because 'no outbox was written — fail closed, nothing materialized'
+        $report.Error             | Should -Match '(?i)outbox|magic|header'
+        $outputPath = [string]$report.Descriptor.OutputDiskPath
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.Path -eq $outputPath }).Count |
+            Should -Be 0 -Because 'still no host-mount read, even on the fail-closed path'
+    }
+}
+
+# ===========================================================================
 #  Task 5.2 (e / D5-C) — guest-command failure (SERIAL only)
 # ===========================================================================
 #  D5-C: this is deliberately a SERIAL Tier-1 test, NOT a processor test — a Disk-mode processor

@@ -96,6 +96,84 @@ function Resolve-PythonExe {
 }
 
 # --------------------------------------------------------------------------
+# C1.2: shared outbox-producer READ template — user-space, NEVER Mount-VHD.
+#
+# Both a PROCESSOR (Network='None' + ScreenConfig) and a transport-only OutboxOutput profile
+# (firefox: OutboxOutput=$true, no ScreenConfig) write their result as a memory-safe "outbox"
+# container (guest/outbox.py) onto the Raw OUTPUT disk (C1.1) instead of a mountable filesystem.
+# This function is the ONE read-side implementation both branches share: two-phase
+# ReadVhdxRawRegion (probe the 24-byte header for the exact blob length, then read exactly that),
+# then shell host/read_outbox.py to parse it fail-closed into <out>/verdicts.json + <out>/staging/.
+# The host NEVER calls ReadVhdxFile / Mount-VHD on this disk — extracted from the processor gate
+# block (formerly inline at ~571-606) so the transport-only branch (below) can reuse it verbatim.
+# ANY anomaly (missing/short disk, bad magic, oversize header, read_outbox.py non-zero exit) THROWS
+# — the caller is responsible for catching + recording a fail-closed outcome; nothing is released
+# on a thrown outbox read.
+# --------------------------------------------------------------------------
+<#
+.SYNOPSIS
+    Read a Raw-OUTPUT disk's outbox container user-space (ReadVhdxRawRegion, never Mount-VHD) and
+    parse it fail-closed via host/read_outbox.py into <Destination>/gate-input/{verdicts.json,staging/}.
+.DESCRIPTION
+    Shared by the processor gate and the C1.2 transport-only OutboxOutput read path. THROWS on any
+    anomaly (missing/absent outbox, bad magic, oversize header, tamper, read_outbox.py failure) —
+    the caller must catch and record a fail-closed outcome.
+.PARAMETER OutputDiskPath
+    The (detached) Raw OUTPUT disk's host path.
+.PARAMETER Destination
+    The host destination dir; a 'gate-input' subdir + 'outbox.bin' are written under it.
+.PARAMETER Backend
+    The Hyper-V backend (real or fake) — ReadVhdxRawRegion is called through it.
+.OUTPUTS
+    The path to the gate-input dir (containing verdicts.json + staging/).
+#>
+function Read-OutboxToGateInput {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string] $OutputDiskPath,
+        [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] [hashtable] $Backend
+    )
+    if ([string]::IsNullOrWhiteSpace($OutputDiskPath)) { throw 'Read-OutboxToGateInput: no OUTPUT disk to read the outbox from.' }
+    if (-not (Test-Path -LiteralPath $Destination)) { $null = New-Item -ItemType Directory -Path $Destination -Force }
+
+    $gateInput = Join-Path $Destination 'gate-input'
+
+    # Two-phase user-space read: probe the 24-byte header for the exact blob length, then read exactly that.
+    $hdr = [byte[]](& $Backend.ReadVhdxRawRegion @{ Path = $OutputDiskPath; Offset = 0; Length = 24 })
+    if ($hdr.Length -lt 24 -or [System.Text.Encoding]::ASCII.GetString($hdr, 0, 8) -ne 'VSOUTBX1') {
+        throw 'outbox read: OUTPUT outbox header missing/!magic (empty base read? check AutomaticCheckpoints).'
+    }
+    $count = [System.BitConverter]::ToUInt32($hdr, 12)
+    $total = [System.BitConverter]::ToUInt64($hdr, 16)
+    if ($count -gt 256 -or $total -gt 67108864) { throw "outbox read: outbox header count/total over bound ($count/$total)." }
+    $exact = 24L + ([int64]$count * 104L) + [int64]$total
+    $blob  = [byte[]](& $Backend.ReadVhdxRawRegion @{ Path = $OutputDiskPath; Offset = 0; Length = $exact })
+    # Bridge PS bytes -> read_outbox.py via a host temp file (binary stdin is fragile on Windows PowerShell).
+    $blobFile = Join-Path $Destination 'outbox.bin'
+    [System.IO.File]::WriteAllBytes($blobFile, $blob)
+    # Outbox constants (single source of truth: guest/outbox.py):
+    #   MAGIC   = b'VSOUTBX1'  (8 bytes, offset 0)
+    #   Header  = 24 bytes     (MAGIC[8] + version[4] + count[4] + total_bytes[8])
+    #   Record  = 104 bytes    (label[64] + mime[32] + offset[4] + length[4])
+    $readScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'host/read_outbox.py'   # <repo>/host/read_outbox.py
+    $pyExe = Resolve-PythonExe
+    $pyOut = & $pyExe $readScript --blob $blobFile --out $gateInput 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $pyStderr = ($pyOut | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                    ForEach-Object { $_.Exception.Message }) -join '; '
+        if ([string]::IsNullOrWhiteSpace($pyStderr)) {
+            # Capture any stdout lines as well (non-ErrorRecord items)
+            $pyStderr = ($pyOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join '; '
+        }
+        $stderrSuffix = if ([string]::IsNullOrWhiteSpace($pyStderr)) { '' } else { " stderr: $pyStderr" }
+        throw "outbox read: read_outbox.py failed (exit $LASTEXITCODE) — outbox invalid/tampered; releasing nothing.$stderrSuffix"
+    }
+    return $gateInput
+}
+
+# --------------------------------------------------------------------------
 # Internal: resolve the -Profile argument to a normalized profile hashtable (loader output).
 # --------------------------------------------------------------------------
 <#
@@ -520,20 +598,23 @@ function Invoke-Voidseal {
                 $detachOk = $false
                 $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = "data-disk detach failed: $($_.Exception.Message)" }
             }
-            # D4-B: a PROCESSOR (Network='None' + ScreenConfig) has a Raw OUTPUT disk — there is no
-            # filesystem to mount, and host-mounting untrusted guest data is a P0 risk. Gate
-            # Read-WorkloadResult OFF for processors; the processor's result/Released comes from the
-            # post-detach outbox gate block below (ReadVhdxRawRegion, never Mount-VHD). Firefox and
-            # other non-processor profiles keep the Read-WorkloadResult host-mount path unchanged.
+            # D4-B / C1.2: a PROCESSOR (Network='None' + ScreenConfig) OR a transport-only OutboxOutput
+            # profile (firefox: OutboxOutput=$true, no ScreenConfig — C1.1) has a Raw OUTPUT disk —
+            # there is no filesystem to mount, and host-mounting untrusted guest data is a P0 risk. Gate
+            # Read-WorkloadResult OFF for BOTH; their result comes from the shared post-detach outbox
+            # block below (Read-OutboxToGateInput -> ReadVhdxRawRegion, never Mount-VHD). Only a legacy
+            # non-outbox, non-processor profile keeps the Read-WorkloadResult host-mount path.
             $isProcessorProfile = ($resolved['Network'] -eq 'None') -and $resolved.ContainsKey('ScreenConfig')
+            $wantsOutboxOutput  = $resolved.ContainsKey('OutboxOutput') -and [bool]$resolved['OutboxOutput']
+            $usesOutbox         = $isProcessorProfile -or $wantsOutboxOutput
             if ($detachOk -and -not $wait.TimedOut) {
-                if ($isProcessorProfile) {
-                    # Processor: RunResult is derived from the outbox gate block (post-detach, below).
-                    # Do NOT call Read-WorkloadResult — the Raw OUTPUT has no FS to mount.
-                    # Set a provisional RunResult; the gate block overwrites it on success or failure.
-                    $report.RunResult = @{ Status = 'Pending'; ExitCode = $null; ArtifactPath = $null; Reason = 'processor: result from outbox gate' }
+                if ($usesOutbox) {
+                    # Processor OR transport-only outbox: RunResult is derived from the shared outbox
+                    # block (post-detach, below). Do NOT call Read-WorkloadResult — the Raw OUTPUT has no
+                    # FS to mount. Set a provisional RunResult; the outbox block overwrites it below.
+                    $report.RunResult = @{ Status = 'Pending'; ExitCode = $null; ArtifactPath = $null; Reason = 'outbox: result from outbox read' }
                 } else {
-                    # Non-processor (firefox etc.): exFAT OUTPUT, host-mount read, unchanged.
+                    # Legacy non-outbox non-processor (exFAT OUTPUT): host-mount read, unchanged.
                     # Tier>=2 Read-WorkloadResult THROWS (quarantine NotImplemented) — try/catch so a gated
                     # hostile-tier read is reported as a failed run, not an unhandled crash that aborts the
                     # whole deploy. The seal/teardown invariants are unaffected either way.
@@ -555,67 +636,54 @@ function Invoke-Voidseal {
             }
             # (detach failed -> RunResult already set above; EXTRACTED intentionally not reached)
 
-            # --- POST-DETACH SENSITIVITY GATE (processor workloads) -------------------
-            # The in-guest screener wrote candidates + verdicts.json as a memory-safe "outbox" onto the
-            # OUTPUT disk's raw region. Now that OUTPUT is DETACHED, read it in USER-SPACE (ReadVhdxRawRegion
-            # = qemu-img slice; NEVER Mount-VHD) and parse it fail-closed (read_outbox.py), then the EXISTING
-            # gate partitions only auto-certified-SAFE artifacts. DENY-on-timeout/failed-run EXPLICIT: the
-            # gate runs ONLY after a clean detach AND a non-timed-out run — a timed-out/force-stopped guest
-            # released NOTHING. The $detachOk guard stays load-bearing (never read a disk still attached to a
-            # possibly-live guest). (Phase-2/4 repoints the read at the dedicated FIXED raw outbox disk.)
-            if ($detachOk -and -not $wait.TimedOut -and $resolved['Network'] -eq 'None' -and $resolved.ContainsKey('ScreenConfig')) {
-                $gateInput = Join-Path $Destination 'gate-input'
-                # D4-B: processors skip Read-WorkloadResult (which creates Destination for non-processors).
-                # Ensure Destination exists before the gate writes outbox.bin / gate-input/ into it.
+            # --- POST-DETACH OUTBOX READ (processor gate OR transport-only OutboxOutput, C1.2) --------
+            # The guest wrote its result as a memory-safe "outbox" onto the OUTPUT disk's raw region
+            # (a PROCESSOR's screener candidates + verdicts.json, OR — post-C1.1 — a transport-only
+            # profile's plain result, e.g. firefox's result.html). Now that OUTPUT is DETACHED, read it
+            # in USER-SPACE (Read-OutboxToGateInput: ReadVhdxRawRegion = qemu-img slice; NEVER Mount-VHD)
+            # and parse it fail-closed (read_outbox.py). A PROCESSOR then runs the EXISTING sensitivity
+            # gate, which partitions only auto-certified-SAFE artifacts into Released/Held. A
+            # TRANSPORT-ONLY profile ($wantsOutboxOutput -and -not $isProcessorProfile) is NOT screened —
+            # its sole candidate is materialized VERBATIM to $Destination as ExtractedArtifact (no
+            # SAFE-partition; Released/Held stay $null). DENY-on-timeout/failed-run EXPLICIT: this block
+            # runs ONLY after a clean detach AND a non-timed-out run — a timed-out/force-stopped guest
+            # released NOTHING. The $detachOk guard stays load-bearing (never read a disk still attached
+            # to a possibly-live guest). (Phase-2/4 repoints the read at the dedicated FIXED raw outbox disk.)
+            if ($detachOk -and -not $wait.TimedOut -and $usesOutbox) {
+                # D4-B: outbox profiles skip Read-WorkloadResult (which creates Destination for others).
+                # Ensure Destination exists before the read writes outbox.bin / gate-input/ into it.
                 if (-not (Test-Path -LiteralPath $Destination)) { $null = New-Item -ItemType Directory -Path $Destination -Force }
                 try {
                     $outboxPath = [string]$descriptor.OutputDiskPath
-                    if ([string]::IsNullOrWhiteSpace($outboxPath)) { throw 'processor gate: no OUTPUT disk to read the outbox from.' }
-                    # Two-phase user-space read: probe the 24-byte header for the exact blob length, then read exactly that.
-                    $hdr = [byte[]](& $Backend.ReadVhdxRawRegion @{ Path = $outboxPath; Offset = 0; Length = 24 })
-                    if ($hdr.Length -lt 24 -or [System.Text.Encoding]::ASCII.GetString($hdr, 0, 8) -ne 'VSOUTBX1') {
-                        throw 'processor gate: OUTPUT outbox header missing/!magic (empty base read? check AutomaticCheckpoints).'
-                    }
-                    $count = [System.BitConverter]::ToUInt32($hdr, 12)
-                    $total = [System.BitConverter]::ToUInt64($hdr, 16)
-                    if ($count -gt 256 -or $total -gt 67108864) { throw "processor gate: outbox header count/total over bound ($count/$total)." }
-                    $exact = 24L + ([int64]$count * 104L) + [int64]$total
-                    $blob  = [byte[]](& $Backend.ReadVhdxRawRegion @{ Path = $outboxPath; Offset = 0; Length = $exact })
-                    # Bridge PS bytes -> read_outbox.py via a host temp file (binary stdin is fragile on Windows PowerShell).
-                    $blobFile = Join-Path $Destination 'outbox.bin'
-                    [System.IO.File]::WriteAllBytes($blobFile, $blob)
-                    # Fold-in #1: use Resolve-PythonExe (robust host python3/python resolution).
-                    # Fold-in #6: capture stderr so any read_outbox.py diagnostic is surfaced in
-                    #             the throw message rather than silently swallowed.
-                    # Outbox constants (single source of truth: guest/outbox.py):
-                    #   MAGIC   = b'VSOUTBX1'  (8 bytes, offset 0)
-                    #   Header  = 24 bytes     (MAGIC[8] + version[4] + count[4] + total_bytes[8])
-                    #   Record  = 104 bytes    (label[64] + mime[32] + offset[4] + length[4])
-                    $readScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'host/read_outbox.py'   # <repo>/host/read_outbox.py (see line ~103 skillRoot pattern)
-                    $pyExe = Resolve-PythonExe
-                    $pyOut = & $pyExe $readScript --blob $blobFile --out $gateInput 2>&1
-                    if ($LASTEXITCODE -ne 0) {
-                        $pyStderr = ($pyOut | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
-                                    ForEach-Object { $_.Exception.Message }) -join '; '
-                        if ([string]::IsNullOrWhiteSpace($pyStderr)) {
-                            # Capture any stdout lines as well (non-ErrorRecord items)
-                            $pyStderr = ($pyOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join '; '
-                        }
-                        $stderrSuffix = if ([string]::IsNullOrWhiteSpace($pyStderr)) { '' } else { " stderr: $pyStderr" }
-                        throw "processor gate: read_outbox.py failed (exit $LASTEXITCODE) — outbox invalid/tampered; releasing nothing.$stderrSuffix"
-                    }
+                    $gateInput  = Read-OutboxToGateInput -OutputDiskPath $outboxPath -Destination $Destination -Backend $Backend
                     $gateStaging  = Join-Path $gateInput 'staging'
                     $gateVerdicts = Join-Path $gateInput 'verdicts.json'
 
-                    $gateOut   = Join-Path $Destination 'gate'
-                    $screenCfg = Resolve-ScreenConfig -Profile $resolved
-                    $gateResult = Invoke-SensitivityGate -StagingDir $gateStaging -OutputDir $gateOut `
-                                    -Mode $screenCfg.mode -VerdictsPath $gateVerdicts
-                    Set-DescriptorField -Descriptor $descriptor -Name 'GateRan' -Value $true
-                    $report.Descriptor        = $descriptor
-                    $report.Released          = $gateResult.Released
-                    $report.Held              = $gateResult.Held
-                    $report.SensitivityReport = $gateResult.ManifestPath
+                    if ($isProcessorProfile) {
+                        $gateOut   = Join-Path $Destination 'gate'
+                        $screenCfg = Resolve-ScreenConfig -Profile $resolved
+                        $gateResult = Invoke-SensitivityGate -StagingDir $gateStaging -OutputDir $gateOut `
+                                        -Mode $screenCfg.mode -VerdictsPath $gateVerdicts
+                        Set-DescriptorField -Descriptor $descriptor -Name 'GateRan' -Value $true
+                        $report.Descriptor        = $descriptor
+                        $report.Released          = $gateResult.Released
+                        $report.Held              = $gateResult.Held
+                        $report.SensitivityReport = $gateResult.ManifestPath
+                        $report.RunResult = @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $gateResult.ManifestPath; Reason = $null }
+                    } else {
+                        # C1.2 transport-only: materialize the outbox's sole candidate verbatim — NOT
+                        # screened/Released. LOCKED design (plan Task C1.2): firefox's result rides the
+                        # outbox transport but is never gated through the sensitivity screener.
+                        $resultSrc = Join-Path $gateStaging $resultInnerName
+                        if (-not (Test-Path -LiteralPath $resultSrc -PathType Leaf)) {
+                            throw "outbox read: transport-only outbox has no '$resultInnerName' candidate."
+                        }
+                        $artifact = Join-Path $Destination $resultInnerName
+                        Copy-Item -LiteralPath $resultSrc -Destination $artifact -Force
+                        $report.ExtractedArtifact = $artifact
+                        $report.RunResult = @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $artifact; Reason = $null }
+                    }
+                    $states.Add('EXTRACTED')
                 }
                 catch {
                     # Fail-closed like the seal gate: record + let teardown run. APPEND (do not clobber a
@@ -623,7 +691,8 @@ function Invoke-Voidseal {
                     $gateErr = "Sensitivity gate failed: $($_.Exception.Message)"
                     if ([string]::IsNullOrWhiteSpace([string]$report.Error)) { $report.Error = $gateErr }
                     else { $report.Error = "$($report.Error) | $gateErr" }
-                    Write-Warning "Invoke-Voidseal: '$Name' sensitivity gate failed: $($_.Exception.Message)"
+                    $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = $gateErr }
+                    Write-Warning "Invoke-Voidseal: '$Name' outbox read/gate failed: $($_.Exception.Message)"
                 }
             }
         }
