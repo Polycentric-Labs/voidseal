@@ -62,15 +62,39 @@
     Inputs       = @{}
 
     # ------------------------------------------------------------------
+    # OutboxOutput (C1.4) — firefox converges onto the SAME user-space outbox transport a
+    # PROCESSOR uses (Workload.ps1's Raw-OUTPUT predicate; Invoke-Voidseal.ps1's post-detach outbox
+    # read), but WITHOUT a ScreenConfig — so it is transport-only, NEVER screened (LOCKED design,
+    # Allen 2026-07-01). Effect: the OUTPUT data disk is created Raw (no filesystem — NewOutputVhdx
+    # FileSystem='Raw'); the host NEVER Mount-VHDs it. Instead, post-detach, the host reads the outbox
+    # in user-space (ReadVhdxRawRegion -> read_outbox.py — never mounts untrusted guest data) and, for
+    # a transport-only profile like this one, materializes the sole candidate (result.html) verbatim
+    # to Destination as ExtractedArtifact — no sensitivity-gate partition (Released/Held stay $null;
+    # that partition is a PROCESSOR-only concept). The in-guest seed runner that packs the outbox is
+    # guest/run_disk_workload.py --transport-only (delivered below via InputFiles, same mechanism as
+    # the organizer script itself), which writes a well-formed placeholder verdicts.json ([]) so the
+    # SAME container format (guest/outbox.py) the host read path expects parses cleanly.
+    # ------------------------------------------------------------------
+    OutboxOutput = $true
+
+    # ------------------------------------------------------------------
     # InputFiles (Disk-mode, live-acceptance) — innerName -> host FILE PATH. This is DOC-ONLY
     # metadata: New-WorkloadDisks consumes `Inputs` (innerName -> CONTENT), NOT this map, so the
     # live-acceptance step reads each of these host files and folds them into `Inputs` before the
     # deploy (do NOT add a new loader path — just populate Inputs from these). The organizer script
     # + the sample profile both land on the INPUT disk and mount read-only at /mnt/in in the guest.
+    #
+    # C1.4: run_disk_workload.py + outbox.py ride the SAME INPUT disk, delivered the SAME way — the
+    # seed's OutboxOutput disk-mode runner (SeedBuilder.ps1 CidataOutboxDiskRunnerTemplate) invokes
+    # `python3 /mnt/in/run_disk_workload.py --transport-only` after the Entrypoint populates staging,
+    # and run_disk_workload.py imports `outbox` off its OWN directory (sys.path.insert(0, HERE)) — so
+    # outbox.py must land alongside it at /mnt/in, not just organize_bookmarks.py's own dependencies.
     # ------------------------------------------------------------------
     InputFiles = @{
         'organize_bookmarks.py' = 'C:\sandbox\organizer-src\organize_bookmarks.py'
         'sample-bookmarks.json' = 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json'
+        'run_disk_workload.py'  = 'C:\sandbox\organizer-src\run_disk_workload.py'
+        'outbox.py'             = 'C:\sandbox\organizer-src\outbox.py'
     }
 
     # ------------------------------------------------------------------

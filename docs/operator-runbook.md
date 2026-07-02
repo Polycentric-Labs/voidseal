@@ -79,15 +79,21 @@ INPUT data disk (guest `/mnt/in`), the result lands on the OUTPUT data disk at t
 inner-name `result.html` (guest `/mnt/out/result.html`), and the guest self-powers-off. The profile
 ships `Inputs = @{}` because a `.psd1` cannot cleanly inline a whole Python file — so the
 **live-acceptance step populates `Inputs` from the host files** declared in the profile's
-`InputFiles` map, then passes them through `-Workload`. The populate is 3 lines (read each host file
-into an innerName→content hashtable):
+`InputFiles` map, then passes them through `-Workload`. The populate reads each host file into an
+innerName→content hashtable. Since C1.4, `firefox` opts into the shared user-space outbox transport
+(`OutboxOutput = $true` — Raw OUTPUT, host reads it via `ReadVhdxRawRegion`, never `Mount-VHD`), so
+`InputFiles` carries **four** entries: the organizer script + sample profile (the workload itself)
+plus `run_disk_workload.py` + its `outbox.py` dependency (the shared in-guest outbox producer the
+seed's disk-mode runner invokes after the organizer writes `result.html` into staging):
 
 ```powershell
-# Populate the INPUT-disk inputs from the host files (organizer script + sample profile).
-# These paths are the profile's InputFiles entries (innerName -> host FILE PATH).
+# Populate the INPUT-disk inputs from the host files — the organizer + sample profile (the
+# workload) and run_disk_workload.py + outbox.py (the shared outbox producer, C1.3/C1.4).
 $inputs = @{
     'organize_bookmarks.py' = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\organize_bookmarks.py' -Raw)
     'sample-bookmarks.json' = (Get-Content -LiteralPath 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json' -Raw)
+    'run_disk_workload.py'  = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\run_disk_workload.py' -Raw)
+    'outbox.py'             = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\outbox.py' -Raw)
 }
 
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `

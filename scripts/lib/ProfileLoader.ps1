@@ -609,9 +609,12 @@ function Import-WorkloadProfile {
     # DepsSpec / ScreenConfig / DepsDiskPath are processor-profile keys: DepsSpec carries the
     # dependency set the builder stages; ScreenConfig carries gate mode + categories;
     # DepsDiskPath carries the pre-built deps disk path (optional, resolved at runtime).
+    # OutboxOutput (C1.4) is the transport-only counterpart: a non-processor Disk-mode workload
+    # (firefox) that still wants the Raw-OUTPUT / user-space-outbox-read path (Workload.ps1's
+    # Raw-OUTPUT predicate + Invoke-Voidseal.ps1's post-detach outbox read) without a ScreenConfig.
     foreach ($layerKey in @('Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
                             'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
-                            'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath')) {
+                            'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput')) {
         if ($raw.ContainsKey($layerKey)) {
             $merged[$layerKey] = $raw[$layerKey]
         }

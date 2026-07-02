@@ -152,6 +152,36 @@ Describe 'profiles/firefox.psd1 — loads + merges through Import-WorkloadProfil
         $raw | Should -Match '(?i)synthetic'  -Because 'the profile must state synthetic/sample data is the default'
         $raw | Should -Match '(?i)(per-task|authoriz)' -Because 'reading real profile data must require explicit per-task authorization'
     }
+
+    # ----- C1.4: firefox opts into the user-space outbox transport (Raw OUTPUT, no host Mount-VHD) -----
+    It 'opts into OutboxOutput=$true (Raw OUTPUT + user-space outbox read, C1.1/C1.2 transport path)' {
+        $script:Firefox.ContainsKey('OutboxOutput') | Should -BeTrue -Because 'firefox converges onto the shared outbox transport (C1.4)'
+        $script:Firefox.OutboxOutput | Should -BeTrue
+    }
+
+    It 'regression: OutboxOutput does not disturb WorkloadMode/Tier/Network/EgressAllowlist' {
+        $script:Firefox.WorkloadMode | Should -Be 'Disk' -Because 'C1.4 is transport-only; the disk-passing model is unchanged'
+        $script:Firefox.Tier         | Should -Be 0
+        $script:Firefox.BaseTier     | Should -Be 0
+        @($script:Firefox.EgressAllowlist).Count | Should -Be 0 -Because 'firefox stays offline; OutboxOutput is a transport change, not a network change'
+    }
+
+    It 'is transport-only: NOT a processor (no ScreenConfig, Network unforced to None)' {
+        $script:Firefox.ContainsKey('ScreenConfig') | Should -BeFalse -Because 'firefox is transport-only (LOCKED design) — never screened, so it must not carry a processor ScreenConfig'
+    }
+
+    It 'delivers run_disk_workload.py (the shared outbox producer) + its outbox.py dependency via the INPUT disk' {
+        # C1.3 handoff: run_disk_workload.py is the shared in-guest outbox-producer template, delivered
+        # the SAME way as organize_bookmarks.py — via InputFiles (raw .psd1 doc-only metadata; the
+        # live-acceptance step folds these host paths into Inputs before deploy — see the InputFiles
+        # header comment in firefox.psd1 and Invoke-Voidseal.ps1:471). It imports outbox.py from its
+        # own directory (sys.path.insert(0, HERE)), so outbox.py must ride alongside it on the INPUT disk too.
+        $raw = Import-PowerShellDataFile -LiteralPath $script:FirefoxPath
+        $raw.InputFiles.ContainsKey('run_disk_workload.py') | Should -BeTrue -Because 'the seed runner invokes python3 /mnt/in/run_disk_workload.py (SeedBuilder.ps1 CidataOutboxDiskRunnerTemplate)'
+        $raw.InputFiles.ContainsKey('outbox.py') | Should -BeTrue -Because 'run_disk_workload.py imports outbox from its own directory — it must ride the INPUT disk alongside it'
+        [string]$raw.InputFiles['run_disk_workload.py'] | Should -Match '(?i)run_disk_workload\.py$'
+        [string]$raw.InputFiles['outbox.py'] | Should -Match '(?i)outbox\.py$'
+    }
 }
 
 Describe 'Negative guard — the live credentials path WOULD be refused (why we copy to a .token)' {
