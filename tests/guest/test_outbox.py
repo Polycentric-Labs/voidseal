@@ -99,3 +99,12 @@ def test_unpack_rejects_entry_range_past_payload():
     blob = _forge([(name_b, 0, 10, sha)], total=5, payload=payload)
     with pytest.raises(outbox.OutboxError):
         outbox.unpack_outbox(blob)
+
+# ---------------------------------------------------------------------------
+# C1.5 / M1: pin the record-layout sizes outbox.py is the single source of truth for. Any consumer
+# that restates these sizes in a comment (scripts/Invoke-Voidseal.ps1's Read-OutboxToGateInput) must
+# match them exactly — this test fails if outbox.py's structs ever drift from the documented 24/104,
+# which is the same drift class that caused the M1 stale-comment bug this task fixes.
+def test_header_and_record_sizes_match_the_documented_layout():
+    assert outbox._HEADER.size == 24, "header layout: magic[8]+version[2]+reserved[2]+count[4]+total[8] = 24"
+    assert outbox._REC.size == 104, "record layout: name[40]+offset[8]+length[8]+sha256[32]+reserved[16] = 104"

@@ -1110,6 +1110,82 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
 }
 
 # ===========================================================================
+#  Task C1.5 — no-Mount security test (AST): the C1 invariant, structurally pinned
+# ===========================================================================
+#  The behavioral test above (FakeCallLog) proves the observed CALLS on one run. This test proves
+#  the STRUCTURAL guarantee: Read-OutboxToGateInput — the ONE function both the processor and the
+#  transport-only OutboxOutput branch use to read the guest-written OUTPUT disk (C1.2) — contains NO
+#  reference to Mount-VHD, Add-VMHardDiskDrive, or ReadVhdxFile anywhere in its body, by parsing
+#  Invoke-Voidseal.ps1 fresh and walking the real AST (mirrors the "Raw skips Format-Volume" AST
+#  canary in HyperVBackend.Tests.ps1, committed fa1c384 — a genuine AST assertion, not a comment/
+#  regex canary that a refactor could silently invalidate).
+Describe 'Invoke-Voidseal — SECURITY (AST): Read-OutboxToGateInput never Mount-VHD / ReadVhdxFile (C1.5)' {
+
+    BeforeAll {
+        $tokens = $null; $parseErrors = $null
+        $script:OrchAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:OrchPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0 -Because 'the orchestrator must parse cleanly to be analyzed'
+
+        $script:OutboxReadFn = $script:OrchAst.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                          $n.Name -eq 'Read-OutboxToGateInput'
+            }, $true) | Select-Object -First 1
+        $script:OutboxReadFn | Should -Not -BeNullOrEmpty -Because 'Read-OutboxToGateInput must exist — it is the shared outbox result-read path (C1.2)'
+    }
+
+    It 'the function body references ReadVhdxRawRegion (the user-space read it must use)' {
+        $cmdNames = @($script:OutboxReadFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst]
+            }, $true) | ForEach-Object { $_.Member.Extent.Text })
+        $cmdNames | Should -Contain 'ReadVhdxRawRegion' -Because 'the outbox must be read via the raw user-space region reader'
+    }
+
+    It 'SECURITY: the function body contains ZERO Mount-VHD command references' {
+        $mountCalls = @($script:OutboxReadFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Mount-VHD'
+            }, $true))
+        $mountCalls.Count | Should -Be 0 -Because 'the C1 invariant: the host must NEVER kernel-mount a guest-written OUTPUT filesystem'
+    }
+
+    It 'SECURITY: the function body contains ZERO Add-VMHardDiskDrive command references' {
+        $attachCalls = @($script:OutboxReadFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-VMHardDiskDrive'
+            }, $true))
+        $attachCalls.Count | Should -Be 0 -Because 'a user-space raw-region read never needs to (re)attach the disk to any VM'
+    }
+
+    It 'SECURITY: the function body contains ZERO ReadVhdxFile member-call references' {
+        $memberCalls = @($script:OutboxReadFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst]
+            }, $true) | Where-Object { $_.Member.Extent.Text -eq 'ReadVhdxFile' })
+        $memberCalls.Count | Should -Be 0 -Because 'ReadVhdxFile is the host-mount-backed backend method — the outbox path must use ONLY ReadVhdxRawRegion'
+    }
+
+    # ---- non-vacuousness proof (this test file documents it; the mutation itself is done + reverted
+    #      manually during implementation, per the C1.5 brief — see task report for the transcript) ----
+    It 'non-vacuousness: a synthetic AST WITH an injected Mount-VHD call fails the same assertion shape' {
+        # Parse a scratch scriptblock that mimics the real function shape but adds a Mount-VHD call,
+        # proving the assertion pattern above is not vacuously true (it would catch a real regression).
+        $mutated = @'
+function Read-OutboxToGateInput {
+    param($OutputDiskPath, $Destination, $Backend)
+    $hdr = & $Backend.ReadVhdxRawRegion @{ Path = $OutputDiskPath; Offset = 0; Length = 24 }
+    Mount-VHD -Path $OutputDiskPath
+}
+'@
+        $mTokens = $null; $mErrors = $null
+        $mAst = [System.Management.Automation.Language.Parser]::ParseInput($mutated, [ref]$mTokens, [ref]$mErrors)
+        $mFn = $mAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Read-OutboxToGateInput' }, $true) |
+            Select-Object -First 1
+        $mMountCalls = @($mFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Mount-VHD'
+            }, $true))
+        $mMountCalls.Count | Should -BeGreaterThan 0 -Because 'proves the AST walk DOES detect a Mount-VHD call when one is present — the real-file assertion above is non-vacuous'
+    }
+}
+
+# ===========================================================================
 #  Task 5.2 (e / D5-C) — guest-command failure (SERIAL only)
 # ===========================================================================
 #  D5-C: this is deliberately a SERIAL Tier-1 test, NOT a processor test — a Disk-mode processor

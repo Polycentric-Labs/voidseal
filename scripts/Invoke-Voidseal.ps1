@@ -153,10 +153,11 @@ function Read-OutboxToGateInput {
     # Bridge PS bytes -> read_outbox.py via a host temp file (binary stdin is fragile on Windows PowerShell).
     $blobFile = Join-Path $Destination 'outbox.bin'
     [System.IO.File]::WriteAllBytes($blobFile, $blob)
-    # Outbox constants (single source of truth: guest/outbox.py):
+    # Outbox constants (single source of truth: guest/outbox.py's _HEADER/_REC — read them there,
+    # not here, if this drifts again):
     #   MAGIC   = b'VSOUTBX1'  (8 bytes, offset 0)
-    #   Header  = 24 bytes     (MAGIC[8] + version[4] + count[4] + total_bytes[8])
-    #   Record  = 104 bytes    (label[64] + mime[32] + offset[4] + length[4])
+    #   Header  = 24 bytes     (_HEADER = '<8sHHIQ' = magic[8] + version[2] + reserved[2] + count[4] + total_bytes[8])
+    #   Record  = 104 bytes    (_REC = '<40sQQ32s16x' = name[40] + offset[8] + length[8] + sha256[32] + reserved[16])
     $readScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'host/read_outbox.py'   # <repo>/host/read_outbox.py
     $pyExe = Resolve-PythonExe
     $pyOut = & $pyExe $readScript --blob $blobFile --out $gateInput 2>&1
