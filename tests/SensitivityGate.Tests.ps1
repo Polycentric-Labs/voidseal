@@ -51,25 +51,34 @@ Describe 'Invoke-SensitivityGate partition' {
                   -Mode aggressive -ScreenerPath $script:screener
   }
   It 'releases ONLY SAFE; everything else held (released subset of SAFE)' {
-    $relNames = @((Get-ChildItem (Join-Path $script:out 'released')).Name)
+    # Fix 3: released/ + .Released now carry HOST-DERIVED (sha256) names, never the guest's
+    # original name — recover the WHICH-files-released semantics via the regenerated report's
+    # 'released_audit' mapping (host name -> original guest name) instead of asserting on the
+    # released filename directly.
+    $report = Get-Content $script:r.ManifestPath -Raw | ConvertFrom-Json
+    $relOriginalNames = @($report.released_audit | ForEach-Object { $_.original_name })
     $heldNames = @((Get-ChildItem (Join-Path $script:out 'held')).Name)
-    $relNames  | Should -Not -Contain 'creds.txt'
-    $relNames  | Should -Not -Contain 'finance-statement.txt'
-    $relNames  | Should -Not -Contain 'health-note.txt'
-    $relNames  | Should -Not -Contain 'prose-with-token.md'
+    $relOriginalNames | Should -Not -Contain 'creds.txt'
+    $relOriginalNames | Should -Not -Contain 'finance-statement.txt'
+    $relOriginalNames | Should -Not -Contain 'health-note.txt'
+    $relOriginalNames | Should -Not -Contain 'prose-with-token.md'
     $heldNames | Should -Contain 'creds.txt'
     $heldNames | Should -Contain 'finance-statement.txt'
     $heldNames | Should -Contain 'health-note.txt'
     $heldNames | Should -Contain 'prose-with-token.md'
     $heldNames | Should -Contain 'spreadsheet-dump.csv'   # UNCERTAIN is held too (fail-closed)
-    $relNames  | Should -Contain 'prose-essay.txt'
-    $relNames  | Should -Contain 'prose-letter.md'
+    $relOriginalNames | Should -Contain 'prose-essay.txt'
+    $relOriginalNames | Should -Contain 'prose-letter.md'
     @($script:r.Released).Count | Should -BeGreaterThan 0  # the prose files
-    # C2.4 (Fix 2): .Released is {name,sha256}-only (host-regenerated) — no 'verdict' field to
-    # assert on here; that every released entry IS SAFE is a structural invariant of the
-    # regenerator (enforced above by the partition + belt-and-braces re-assertion), not something
-    # the returned .Released surface restates.
-    @($script:r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'creds.txt'  # SENSITIVE never in .Released
+    # C2.4 (Fix 2) + Fix 3: .Released is {name,sha256}-only (host-regenerated, host-derived name)
+    # — no 'verdict' field to assert on here; that every released entry IS SAFE is a structural
+    # invariant of the regenerator (enforced above by the partition + belt-and-braces
+    # re-assertion), not something the returned .Released surface restates.
+    @($script:r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'creds.txt'  # SENSITIVE never in .Released (also never any original name at all now)
+    # Fix 3 sanity: the actual released filenames on disk are host-derived sha256 hex, matching
+    # neither the original guest name nor each other's collisions (each is 64 lowercase-hex).
+    $relOnDiskNames = @((Get-ChildItem (Join-Path $script:out 'released')).Name)
+    foreach ($n in $relOnDiskNames) { $n | Should -Match '^[0-9a-f]{64}$' }
   }
   It 'writes a sensitivity manifest with released/held + reasons' {
     Test-Path (Join-Path $script:out 'manifest/sensitivity-report.json') | Should -BeTrue
@@ -168,8 +177,11 @@ Describe 'Invoke-SensitivityGate -VerdictsPath (consume mode)' {
 
     $r = Invoke-SensitivityGate -StagingDir $staging -OutputDir $output -VerdictsPath $vfile
 
-    # Partition assertions: exactly the two SAFE prose files released.
-    $relNames = @(Get-ChildItem (Join-Path $output 'released') | ForEach-Object { $_.Name })
+    # Partition assertions: exactly the two SAFE prose files released. Fix 3: released/ +
+    # .Released carry HOST-DERIVED (sha256) names now — recover WHICH original files released
+    # via the regenerated report's 'released_audit' mapping instead of the released filename.
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    $relNames = @($report.released_audit | ForEach-Object { $_.original_name })
     $helNames = @(Get-ChildItem (Join-Path $output 'held')     | ForEach-Object { $_.Name })
 
     $relNames | Should -Contain 'prose-essay.txt'
@@ -404,12 +416,21 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
 
     $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
 
+    # Fix 3: released/ + .Released now carry the HOST-DERIVED (sha256) name, never 'essay.txt'.
     $relNames = @(Get-ChildItem (Join-Path $output 'released') | ForEach-Object { $_.Name })
-    $relNames | Should -Contain 'essay.txt'
+    $relNames | Should -Contain $script:safeHash
     @($r.Released).Count | Should -Be 1
-    # C2.4 (Fix 2): .Released is {name,sha256}-only — no 'verdict' field on the returned entry.
-    $r.Released[0].name   | Should -Be 'essay.txt'
+    # C2.4 (Fix 2) + Fix 3: .Released is {name,sha256}-only — name is HOST-DERIVED (== sha256),
+    # never the guest's original 'essay.txt'.
+    $r.Released[0].name   | Should -Be $script:safeHash
     $r.Released[0].sha256 | Should -Be $script:safeHash
+
+    # The original name is recoverable ONLY via the regenerated report's audit mapping.
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    $auditEntry = @($report.released_audit)[0]
+    $auditEntry.released_name | Should -Be $script:safeHash
+    $auditEntry.original_name | Should -Be 'essay.txt'
+    $auditEntry.sha256        | Should -Be $script:safeHash
   }
 
   It 'host run_id: the manifest carries a host-generated run_id, non-empty and NOT the decoy the input supplied' {
@@ -463,7 +484,8 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
     $allowedReleasedKeys = @('name', 'sha256')
     $actualKeys = @($releasedEntry.PSObject.Properties.Name)
     foreach ($k in $actualKeys) { $allowedReleasedKeys | Should -Contain $k -Because "released report entries must be host-regenerated from validated fields only (found extra key '$k')" }
-    $releasedEntry.name   | Should -Be 'essay.txt'
+    # Fix 3: 'name' is now the HOST-DERIVED name (== sha256), never the guest's 'essay.txt'.
+    $releasedEntry.name   | Should -Be $script:safeHash
     $releasedEntry.sha256 | Should -Be $script:safeHash
   }
 
@@ -490,11 +512,15 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
 
     $r = Invoke-SensitivityGate -StagingDir $canaryStaging -OutputDir $output -VerdictsPath $vfile
 
-    # canary.txt is off-schema (extra key) -> HELD, never released; essay.txt IS released.
-    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'essay.txt'
-    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'canary.txt'
-
+    # canary.txt is off-schema (extra key) -> HELD, never released; essay.txt IS released. Fix 3:
+    # .Released carries the HOST-DERIVED (sha256) name now, never 'essay.txt'/'canary.txt' — use
+    # the audit mapping to confirm WHICH original file released.
     $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    @($report.released_audit | ForEach-Object { $_.original_name }) | Should -Contain 'essay.txt'
+    @($report.released_audit | ForEach-Object { $_.original_name }) | Should -Not -Contain 'canary.txt'
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain $essayHash
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain $canaryHash
+
     $reportReleasedRaw = $report.released | ConvertTo-Json -Depth 6
     $reportReleasedRaw | Should -Not -Match 'FREEFORM-EXFIL-CHANNEL-CANARY-STRING' -Because 'the regenerated released section must never carry a free-form guest value, even one attached to a different file in the same run'
   }
@@ -537,7 +563,10 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
 
     $r = Invoke-SensitivityGate -StagingDir $batchStaging -OutputDir $output -VerdictsPath $vfile
 
-    $relNames = @($r.Released | ForEach-Object { $_.name })
+    # C2.7: .Released carries HOST-DERIVED (sha256) names now — verify WHICH original files
+    # released via the regenerated report's 'released_audit' mapping.
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    $relNames = @($report.released_audit | ForEach-Object { $_.original_name })
     $relNames | Should -Contain 'prose-essay.txt'
     $relNames | Should -Contain 'prose-letter.md'
     $relNames | Should -Not -Contain 'creds.txt'
@@ -857,9 +886,14 @@ Describe 'Invoke-SensitivityGate — whole-branch-review hardening (Fix A name c
 
     $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
 
-    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'sanity-clean.txt'
-    $entry = @($r.Released | Where-Object { $_.name -eq 'sanity-clean.txt' })[0]
+    # C2.7: .Released carries the HOST-DERIVED (sha256) name — assert via sha256, and confirm the
+    # original name is recoverable only through the audit mapping.
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain $f.Sha256
+    $entry = @($r.Released | Where-Object { $_.name -eq $f.Sha256 })[0]
     @($entry.PSObject.Properties.Name | Sort-Object) | Should -Be @('name', 'sha256')
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    $auditEntry = @($report.released_audit | Where-Object { $_.original_name -eq 'sanity-clean.txt' })[0]
+    $auditEntry.released_name | Should -Be $f.Sha256
   }
 }
 
@@ -918,9 +952,10 @@ Describe 'Invoke-SensitivityGate — C2.5 released-byte budget backstop (per-art
 
     $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile -MaxReleasedBytes 1024 -MaxReleasedFiles 16
 
-    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'exact.txt' -Because 'a file exactly AT the byte cap must still release (cap is an inclusive upper bound)'
+    # C2.7: released names are HOST-DERIVED (sha256) now — key on the sha256, not 'exact.txt'.
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain $f.Verdict.sha256 -Because 'a file exactly AT the byte cap must still release (cap is an inclusive upper bound)'
     $relNames = @(Get-ChildItem (Join-Path $output 'released') | ForEach-Object { $_.Name })
-    $relNames | Should -Contain 'exact.txt'
+    $relNames | Should -Contain $f.Verdict.sha256
   }
 
   It 'within-budget: a small file under -MaxReleasedBytes releases normally' {
@@ -933,7 +968,8 @@ Describe 'Invoke-SensitivityGate — C2.5 released-byte budget backstop (per-art
 
     $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile -MaxReleasedBytes 1048576 -MaxReleasedFiles 16
 
-    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'small.txt'
+    # C2.7: released names are HOST-DERIVED (sha256) now — key on the sha256, not 'small.txt'.
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain $f.Verdict.sha256
   }
 
   It 'default budget: -MaxReleasedBytes defaults to 1 MiB (1048576) when not supplied' {
@@ -1063,7 +1099,10 @@ Describe 'Invoke-SensitivityGate — C2.5 released-byte budget backstop (per-art
     # No -MaxReleasedBytes/-MaxReleasedFiles supplied -- exercise the production defaults.
     $r = Invoke-SensitivityGate -StagingDir $batchStaging -OutputDir $output -VerdictsPath $vfile
 
-    $relNames = @($r.Released | ForEach-Object { $_.name })
+    # C2.7: .Released carries HOST-DERIVED (sha256) names now — verify WHICH original files
+    # released via the regenerated report's 'released_audit' mapping.
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    $relNames = @($report.released_audit | ForEach-Object { $_.original_name })
     $relNames | Should -Contain 'prose-essay.txt'
     $relNames | Should -Contain 'prose-letter.md'
     @($r.Released).Count | Should -Be 2

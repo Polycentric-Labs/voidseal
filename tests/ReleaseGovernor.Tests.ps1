@@ -148,7 +148,11 @@ Describe 'Invoke-SensitivityGate -- C2.6 runs/day rate cap integration (over-cap
     $r = Invoke-SensitivityGate -StagingDir $script:rateStaging -OutputDir $output -VerdictsPath $vfile `
            -RateLedgerPath $ledger -RateProfile 'ralph' -RateToday '2026-07-01' -MaxReleasesPerDay 5
 
-    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'note.txt'
+    # C2.7: .Released carries the HOST-DERIVED (sha256) name now, never 'note.txt' — confirm via
+    # the gate report's 'released_audit' mapping that the original file did release.
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain $script:safeHash
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    @($report.released_audit | ForEach-Object { $_.original_name }) | Should -Contain 'note.txt'
     $doc = Get-Content -LiteralPath $ledger -Raw | ConvertFrom-Json
     $doc.ralph.'2026-07-01' | Should -Be 1
   }
@@ -222,7 +226,11 @@ Describe 'Invoke-SensitivityGate -- C2.6 runs/day rate cap integration (over-cap
 
     $r = Invoke-SensitivityGate -StagingDir $script:rateStaging -OutputDir $output -VerdictsPath $vfile
 
-    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'note.txt'
+    # C2.7: .Released carries the HOST-DERIVED (sha256) name now, never 'note.txt' — confirm via
+    # the gate report's 'released_audit' mapping that the original file did release.
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain $script:safeHash
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    @($report.released_audit | ForEach-Object { $_.original_name }) | Should -Contain 'note.txt'
   }
 
   It 'sacred (tighten-only): an over-cap HELD entry keeps its true verdict=SAFE in the audit record -- the cap HOLDS, it does not relabel' {

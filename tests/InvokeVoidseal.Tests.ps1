@@ -665,13 +665,20 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
         @($report.States) | Should -Contain 'SEALED'
         $report.Descriptor.GateRan | Should -BeTrue -Because 'the processor gate ran off the OUTPUT outbox'
-        $relNames = @($report.Released | ForEach-Object { $_.name })
+        # C2.7: .Released carries HOST-DERIVED (sha256) names now, never the guest's original
+        # name — recover WHICH original files released via the regenerated report's
+        # 'released_audit' mapping (SensitivityReport is the gate's on-disk manifest path).
+        $gateReport = Get-Content $report.SensitivityReport -Raw | ConvertFrom-Json
+        $relNames = @($gateReport.released_audit | ForEach-Object { $_.original_name })
         $helNames = @($report.Held     | ForEach-Object { $_.name })
         $relNames | Should -Contain 'prose-essay.txt' -Because 'a SAFE prose file is released'
         $relNames | Should -Contain 'prose-letter.md'
         $relNames | Should -Not -Contain 'creds.txt'  -Because 'a SENSITIVE credential file is NEVER released'
         $helNames | Should -Contain 'creds.txt'
         $report.SensitivityReport | Should -Not -BeNullOrEmpty
+        # C2.7 sanity: the in-memory .Released surface never carries a producer-chosen name.
+        @($report.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'creds.txt'
+        foreach ($n in @($report.Released | ForEach-Object { $_.name })) { $n | Should -Match '^[0-9a-f]{64}$' }
     }
 
     It 'DENY-on-tamper: a corrupted OUTPUT outbox -> read_outbox.py exits non-zero -> gate releases NOTHING' {
@@ -901,7 +908,10 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
         # The existing green processor e2e behavior is unaffected: the default cap (5) is well above
         # this single release, so the SAFE candidates still release exactly as the un-rate-capped test does.
-        $relNames = @($report.Released | ForEach-Object { $_.name })
+        # C2.7: .Released carries HOST-DERIVED (sha256) names — recover WHICH originals released
+        # via the gate report's 'released_audit' mapping.
+        $gateReport = Get-Content $report.SensitivityReport -Raw | ConvertFrom-Json
+        $relNames = @($gateReport.released_audit | ForEach-Object { $_.original_name })
         $relNames | Should -Contain 'prose-essay.txt' -Because 'under the default cap, a single release proceeds exactly as before Fix B'
         $relNames | Should -Contain 'prose-letter.md'
 

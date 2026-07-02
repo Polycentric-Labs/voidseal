@@ -43,11 +43,10 @@ accuracy on benign inputs says nothing about a worst-case adversarial input.
   `credential`, `email`, `entropy`, `financial`, `health`, `other`, `pii`, `secret`, `ssn`) — plus
   `name` and `sha256`. `sha256` is independently re-derived and re-checked by the host rather than
   trusted (the host re-hashes the staged bytes and compares; a producer-claimed hash that doesn't
-  match the real bytes never releases). `name` is **not** re-derived — it rides through to
-  `released[].name` as the producer chose it — so the host instead **bounds** it: any name outside
-  a fixed 40-character `[A-Za-z0-9._-]` charset is rejected as off-schema (`held/`, never released),
-  and its residual bit contribution *within* that bound is counted explicitly in the published bound
-  below, not ignored.
+  match the real bytes never releases). `name` is validated against a fixed 40-character
+  `[A-Za-z0-9._-]` charset (a violating name is rejected as off-schema — `held/`, never released) —
+  but even a charset-confined guest name is **never itself released**: see the name-regeneration
+  point below, which is what keeps `name` off the published bound entirely.
 - The host **validates every verdict against that exact closed schema** before trusting it — an unknown
   key, an out-of-enum value, an off-vocabulary flag, an array-typed field where a scalar is expected,
   a name outside the 40-char restricted alphabet, or a malformed hash is rejected outright (routed to
@@ -60,51 +59,58 @@ accuracy on benign inputs says nothing about a worst-case adversarial input.
   themselves carry only `name` + a host-recomputed `sha256` (the `verdict`/`error_code`/`flags` enum
   fields stay on the `held/`-side audit trail; they never ride on the released surface at all). The
   `run_id` stamped on the report is a fresh host-generated GUID, never a producer-supplied value.
+- **The released filename is host-regenerated, not the producer's name** (`scripts/lib/SensitivityGate.ps1`,
+  `Get-ReleasedName`). Even confined to the 40-char restricted alphabet, a producer-chosen name is still
+  a real channel — the same regeneration argument that applies to file *content* applies to the name,
+  since detection/charset-capping cannot bound a worst-case adversarial string any more than a screener
+  can bound worst-case adversarial bytes. So `released[].name` (and the in-memory `.Released` returned to
+  `Invoke-Voidseal`'s caller) is **always the host-recomputed `sha256` of the released bytes** — a value
+  the producer does not choose and cannot influence — never the guest's original filename. The original
+  guest-chosen name is preserved *only* in the regenerated report's `released_audit` array
+  (`{released_name, original_name, sha256}`, written to `manifest/sensitivity-report.json` alongside the
+  retained verbatim `manifest/verdicts.json` audit copy) so an operator can still recover which released
+  file is which — but that mapping never rides on `released/` or `.Released`. This closes the name channel
+  to **zero** producer-influenced bits on the released surface.
 
 Because every field that reaches the released surface is either drawn from a small closed enum the host
-validates, or independently recomputed by the host, the **worst-case channel capacity is computable
-directly from the schema**, not from how well the detectors happen to work on benign input. That is the
-honest guarantee: **policy-enforced release with a quantified covert-channel bandwidth** — a one-way,
-TCB-controlled declassification channel with a bounded, published worst-case capacity, not an absolute
-information barrier.
+validates, or independently recomputed by the host (both the byte-content `sha256` and, as of the
+host-name-regeneration hardening above, the filename itself), the **worst-case channel capacity is
+computable directly from the schema**, not from how well the detectors happen to work on benign input.
+That is the honest guarantee: **policy-enforced release with a quantified covert-channel bandwidth** — a
+one-way, TCB-controlled declassification channel with a bounded, published worst-case capacity, not an
+absolute information barrier.
 
 **The published bound.** Summing `log2(|enum_i|)` over the verdict schema's enum fields (Σ over
 `verdict{3}`, `error_code{5}`, and `flags` as a 10-bit subset-selector over the fixed 10-tag vocabulary,
-since `flags` is a *set* — any of 2¹⁰ combinations — not a single enum draw), **plus** the `name` field's
-own bounded channel (a producer-chosen string, but confined to a fixed 40-character `[A-Za-z0-9._-]`
-alphabet — 65 symbols — so its *worst-case* capacity is bounded by `40 × log2(65)`, treating it as if
-every one of the 40 character slots could independently carry a full alphabet symbol; the true capacity
-for any *particular* released name is lower, since real filenames aren't random noise, but this is the
-honest ceiling, not a hand-picked lower estimate):
+since `flags` is a *set* — any of 2¹⁰ combinations — not a single enum draw):
 
 | Field | Domain | Bits (`log2`) |
 |---|---|---|
 | `verdict` | 3 values | log2(3) ≈ 1.58 |
 | `error_code` | 5 values | log2(5) ≈ 2.32 |
 | `flags` | subset of 10 tags (2¹⁰ combinations) | log2(2¹⁰) = 10.00 |
-| `name` | ≤40 chars, 65-symbol alphabet (worst case) | 40 × log2(65) ≈ 240.9 |
-| **Σ per screened artifact** | | **≈ 254.8 bits** |
+| **Σ per screened artifact** | | **≈ 13.9 bits** |
 
-Earlier drafts of this document published only the ≈13.9-bit sum of the `verdict`/`error_code`/`flags`
-enum fields and *omitted* `name` from the count — on the reasoning that `verdict`/`error_code`/`flags`
-are the only fields that "never appear on the released surface." That omission was wrong: `name` **does**
-appear on the released surface (`released[].name`, and the in-memory `.Released` returned to the caller of
-`Invoke-Voidseal`), verbatim as the producer chose it, subject only to the 40-char restricted-alphabet
-cap — it is a real producer-influenced channel and had to be counted, not assumed away. The corrected
-Σ ≈ 254.8-bit figure is dominated by `name`; it is still a conservative *over*-statement of the true
-released-surface bound in one respect (`verdict`/`error_code`/`flags` are genuinely held-side audit fields
-that never ride on `released/` — see the regenerator design above — so their ≈13.9 bits are a ceiling for
-a hypothetical future schema change, not bits an attacker can use today), but the `name` component is not
-an over-statement: it is the real, current bound on that field, because the gate does not re-derive or
-re-hash the name the way it does the file's byte content. The remaining producer-influenced degrees of
-freedom that reach `released/` are: (1) *which* of the staged files the host accepted as `SAFE` (one bit
-per staged file, bounded by the file-count backstop below), (2) each released file's `name` (bounded above,
-per file), and (3) each released file's own byte content (bounded by the byte-budget backstop below). The
-enum sizes are directly checkable against `guest/screener.py` (`VERDICT_ENUM`, `ERROR_CODE_ENUM`,
-`FLAG_VOCAB`) and their pinned mirror in `scripts/lib/SensitivityGate.ps1` (`$script:VerdictSchema`,
-including `NameRE`). Both are covered by a drift-pinning test (`tests/guest/test_screener.py`,
+`name` is **not** in this table: an earlier draft of this document counted a ≈240.9-bit worst-case
+channel for `name` (40 chars × log2(65), the charset-capped-but-still-producer-chosen name riding
+verbatim onto `released[].name`) — that was the correct bound *for the design at the time*, but it is no
+longer the design. The released filename is now host-regenerated (see the name-regeneration point above):
+the producer's name never reaches `released[].name` in any form, charset-capped or otherwise, so it
+contributes exactly **0 bits** to the released surface today. `verdict`/`error_code`/`flags` are
+genuinely held-side audit fields that never ride on `released/` at all (see the regenerator design above)
+— their ≈13.9 bits are a ceiling for a hypothetical future schema change that put them on the released
+surface, not bits an attacker can use today; the honest current bound on the released surface's
+*enumerable* fields is 0 bits (the `name` field is host-derived; no other free field rides on
+`released[]`). The remaining producer-influenced degrees of freedom that reach `released/` are: (1)
+*which* of the staged files the host accepted as `SAFE` (one bit per staged file, bounded by the
+file-count backstop below), and (2) each released file's own byte content (bounded by the byte-budget
+backstop below) — filename is no longer one of them. The enum sizes are directly checkable against
+`guest/screener.py` (`VERDICT_ENUM`, `ERROR_CODE_ENUM`, `FLAG_VOCAB`) and their pinned mirror in
+`scripts/lib/SensitivityGate.ps1` (`$script:VerdictSchema`, including `NameRE`, which still gates what
+name the host will even *trust* enough to hash-bind and audit-map, even though that name is never
+released verbatim). Both are covered by a drift-pinning test (`tests/guest/test_screener.py`,
 `test_module_enum_constants_match_the_pinned_vocabulary_copies`) so this number cannot silently go stale:
-any change to the enum sizes or the name charset/length cap must update this table in the same change.
+any change to the enum sizes must update this table in the same change.
 
 **Two aggregate backstops, independent of the per-run bound.** The per-run figure above bounds a single
 processor invocation; aggregate exposure over many runs is bounded separately by two host-enforced,

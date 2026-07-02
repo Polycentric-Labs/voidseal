@@ -52,8 +52,23 @@
            audit copy under manifest/verdicts.json (unchanged from pre-C2.4), and HELD entries in
            the report keep their full audit detail (including heldReason) — only the RELEASED
            section is regenerated to the minimal schema.
-      All four are strictly-tightening: they can only narrow the releasable set relative to the
-      pre-C2.4 partition, never widen it.
+        5. HOST-REGENERATED released name (C2.7, 2026-07-02 — supersedes
+           Fix 1's cap-and-keep-name choice): the charset/length cap in step 1 confines the
+           GUEST-chosen name to a 40-char restricted alphabet, but even a confined name is still
+           up to ~240 producer-influenced bits (SECURITY.md's published bound). Detection cannot
+           bound a producer-chosen string any more than it can bound file content — the same
+           regeneration argument in this header's opening paragraph applies to 'name' as much as
+           to any other field. So the RELEASED name is never the guest's name: it is the
+           HOST-COMPUTED sha256 hex digest of the released bytes (already independently
+           re-derived at step 2 above), a value the producer does not choose and cannot
+           influence. The original guest-chosen name is preserved ONLY in the audit trail — the
+           per-file 'released_audit' array on the regenerated report (host-derived name ->
+           original guest name + sha256) — so an operator can still recover which released file
+           is which, but that mapping never rides on released/ or the in-memory .Released surface
+           returned to Invoke-Voidseal's caller. This closes the name channel to 0 released bits
+           without losing operator traceability.
+      All five are strictly-tightening: they can only narrow the releasable set, or the bits that
+      ride on the released surface, relative to the pre-C2.4 partition — never widen either.
 
     C2.5 — RELEASED-BYTE BUDGET BACKSTOP (the second quantitative backstop behind the
     regenerator, layered strictly AFTER the C2.4 schema/re-hash gates on every Consume-mode
@@ -235,6 +250,29 @@ function Test-VerdictSchema {
     }
 
     return $true
+}
+
+<#
+.SYNOPSIS
+    C2.7 (2026-07-02) — derive the RELEASED filename entirely from
+    host-known, host-computed material: never the producer/guest-chosen name.
+.DESCRIPTION
+    Takes the sha256 the host has ALREADY independently re-derived from the staged bytes at the
+    re-hash step (never a producer-claimed value) and returns it verbatim (lowercase hex, 64
+    chars) as the released filename with no extension. This is deliberately the plainest
+    possible host-derived form: self-documenting (the name IS the content hash), collision-
+    resistant, and carries exactly 0 producer-influenced bits — the guest contributes nothing to
+    this string. (Task C2-regen offered two equivalent options — content-hash or a host index
+    'f<NN>'; the hash form is chosen because the host has already computed it for the re-hash
+    gate, so no extra host-side state/counter is needed to keep it deterministic across a run.)
+#>
+function Get-ReleasedName {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string] $Sha256
+    )
+    return $Sha256
 }
 
 function Invoke-SensitivityGate {
@@ -449,8 +487,13 @@ function Invoke-SensitivityGate {
                                  -Today $RateToday -MaxReleasesPerDay $MaxReleasesPerDay)
     }
 
-    $rel = [System.Collections.Generic.List[object]]::new()
-    $hel = [System.Collections.Generic.List[object]]::new()
+    $rel      = [System.Collections.Generic.List[object]]::new()
+    $hel      = [System.Collections.Generic.List[object]]::new()
+    # C2.7 (2026-07-02) — the original-name<->host-derived-name audit
+    # mapping, built alongside $rel as files actually release (see the release branch below).
+    # Lives ONLY on the regenerated report's 'released_audit' field — never on released/ or the
+    # in-memory .Released surface returned to Invoke-Voidseal's caller.
+    $relAudit = [System.Collections.Generic.List[object]]::new()
 
     # C2.5 — released-byte budget backstop. This is the SECOND backstop behind the regenerator
     # (C2.4): even a schema-valid, hash-bound, exact-SAFE file is capped on a per-artifact SIZE
@@ -532,12 +575,28 @@ function Invoke-SensitivityGate {
             continue
         }
 
-        # -ErrorAction Stop makes a failed copy THROW rather than emit a swallowed non-terminating
-        # error: without it, a missing source file would let $rel.Add run anyway, so .Released /
-        # the manifest would CLAIM a release that never hit disk. Fail closed — record a release
-        # only AFTER the copy is confirmed.
-        Copy-Item -LiteralPath $src -Destination $released -ErrorAction Stop
+        # C2.7 (2026-07-02) — HOST-REGENERATE the released filename. The
+        # guest-chosen name (already charset/length-validated above) is used ONLY as the STAGING
+        # source leaf; the file lands in released/ under a HOST-DERIVED name (Get-ReleasedName —
+        # the host-recomputed sha256, already independently re-derived at the re-hash step two
+        # gates above, never the producer's string), so the name channel contributes 0
+        # producer-influenced bits to the released surface, matching the byte-content channel's
+        # own host-recomputed binding. -ErrorAction Stop makes a failed copy THROW rather than
+        # emit a swallowed non-terminating error: without it, a missing source file would let
+        # $rel.Add run anyway, so .Released / the manifest would CLAIM a release that never hit
+        # disk. Fail closed — record a release only AFTER the copy is confirmed.
+        $releasedName = Get-ReleasedName -Sha256 $got
+        Copy-Item -LiteralPath $src -Destination (Join-Path $released $releasedName) -ErrorAction Stop
         $rel.Add($v)
+        # Audit mapping (C2.7): host-derived released name -> original guest name + sha256, kept
+        # ONLY in the regenerated report's 'released_audit' array (manifest/, never released/ and
+        # never the in-memory .Released surface) so an operator can still recover which released
+        # file is which without the released surface itself carrying the producer's name.
+        $relAudit.Add([pscustomobject]@{
+            released_name = $releasedName
+            original_name = [string]$v.name
+            sha256        = [string]$v.sha256
+        })
         $releasedCount++
     }
 
@@ -562,8 +621,15 @@ function Invoke-SensitivityGate {
     # audit detail, not part of the regenerated released report). The consumed guest verdicts.json
     # remains available as an audit copy under manifest/verdicts.json (written above, unchanged) —
     # it is not part of, and never referenced by, the released/ dir.
+    #
+    # C2.7 (2026-07-02): 'name' here is the HOST-DERIVED released name
+    # (Get-ReleasedName's sha256-based output, computed alongside $relAudit in the loop above) —
+    # NOT the guest's original name. The guest name survives ONLY on $relAudit / the report's
+    # 'released_audit' field below, never on this array (which is exactly what .Released returns
+    # to Invoke-Voidseal's caller and what released/ contains on disk).
     $regeneratedReleased = @($rel | ForEach-Object {
-        [pscustomobject]@{ name = [string]$_.name; sha256 = [string]$_.sha256 }
+        $sha = [string]$_.sha256
+        [pscustomobject]@{ name = (Get-ReleasedName -Sha256 $sha); sha256 = $sha }
     })
 
     # C2.6 — increment the rate-cap ledger IFF (a) the rate cap is enabled for this call AND
@@ -579,12 +645,19 @@ function Invoke-SensitivityGate {
         Register-Release -Profile $RateProfile -LedgerPath $RateLedgerPath -Today $RateToday
     }
 
+    # C2.7 (2026-07-02): 'released_audit' is the ONLY place the original
+    # guest-chosen name is preserved alongside the released surface's identity — an
+    # operator-facing recovery mapping, written to the AUDIT manifest file (manifest/, alongside
+    # the retained verbatim verdicts.json) but structurally separate from 'released' (which stays
+    # host-derived-name-only, per the C2.4 Fix-2 {name,sha256} contract, and is exactly what
+    # .Released / released/ expose). Never surfaced on .Released, never copied into released/.
     $report = [pscustomobject]@{
-        run_id   = $runId
-        mode     = $Mode
-        released = $regeneratedReleased
-        held     = @($hel)
-        total    = $verdicts.Count
+        run_id         = $runId
+        mode           = $Mode
+        released       = $regeneratedReleased
+        released_audit = @($relAudit)
+        held           = @($hel)
+        total          = $verdicts.Count
     }
     $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $man 'sensitivity-report.json')
 
@@ -596,6 +669,10 @@ function Invoke-SensitivityGate {
     # bounded-enum) 'flags'/'error_code'/'verdict' field must never ride out on that surface. .Held
     # intentionally KEEPS its full audit shape (including heldReason) — HELD entries are meant to
     # carry forensic detail; only the RELEASED surface is minimized to the fixed release contract.
+    # C2.7: as of this change, 'name' within .Released is ALSO host-derived (never the guest's
+    # name) — the original name is recoverable only via the on-disk report's 'released_audit'
+    # field (Join-Path $man 'sensitivity-report.json', i.e. .ManifestPath below), not via any
+    # in-memory property this function returns.
     [pscustomobject]@{
         Released     = $regeneratedReleased
         Held         = @($hel)
