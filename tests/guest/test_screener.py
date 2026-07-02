@@ -13,7 +13,7 @@ the bound); any per-file detail that used to live there is now folded into `flag
 (a bounded closed set) or omitted. See guest/screener.py module docstring for the
 full enum definitions and the OFF_SCHEMA reservation note.
 """
-import sys, json, subprocess, pathlib
+import sys, json, hashlib, subprocess, pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -141,3 +141,36 @@ def test_off_schema_reserved_not_emitted_by_producer(tmp_path):
     v = _screen(tmp_path, {"essay.txt": _PROSE, "creds.txt": "password=s3cr3tP@ssw0rd123\n"})
     for obj in v.values():
         assert obj["error_code"] != "OFF_SCHEMA"
+
+
+# --- C2.2: verdict.sha256 <-> content binding (producer side) -------------------------------------
+# The `sha256` field is the host-verifiable binding the regenerator's content-binding clause (C2.4
+# re-hash-before-release) checks against. It MUST be computed over the EXACT bytes the screener read
+# (p.read_bytes()) -- the same basis outbox.py hashes in write_outbox_from_dir/pack_outbox -- so that
+# "released bytes == screened bytes" is provable per file, not merely asserted. This test pins that
+# basis so a future change to either hash source (e.g. switching to a normalized/decoded view, or
+# hashing text instead of raw bytes) fails here rather than silently breaking the binding.
+
+def test_verdict_sha256_is_over_the_exact_raw_bytes_screened(tmp_path):
+    files = {
+        "essay.txt": _PROSE,
+        "creds.txt": "password=s3cr3tP@ssw0rd123\n",
+        # non-UTF-8-clean bytes take the ERROR/EXTRACT_FAIL path -- the binding must still hold
+        # over the raw bytes even when the screener could not decode them as text.
+        "mixed.bin": _PROSE.encode("utf-8") + b"\xff\xfe\x00rawbinary",
+    }
+    v = _screen(tmp_path, files)
+    for name, data in files.items():
+        raw = data if isinstance(data, bytes) else data.encode("utf-8")
+        assert v[name]["sha256"] == hashlib.sha256(raw).hexdigest(), (
+            f"verdict sha256 for {name!r} does not bind to the exact screened bytes"
+        )
+
+
+def test_verdict_sha256_differs_when_bytes_differ_even_with_same_verdict(tmp_path):
+    # A same-verdict, different-content pair must NOT collide on sha256 -- the binding is per-content,
+    # not per-verdict-class (guards against an implementation that hashes something coarser, like the
+    # verdict string or a fixed per-class placeholder, instead of the file's own bytes).
+    v = _screen(tmp_path, {"a.txt": _PROSE, "b.txt": _PROSE + " \n"})
+    assert v["a.txt"]["verdict"] == v["b.txt"]["verdict"] == "SAFE"
+    assert v["a.txt"]["sha256"] != v["b.txt"]["sha256"]
