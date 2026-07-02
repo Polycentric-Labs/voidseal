@@ -164,6 +164,134 @@ runcmd:
 '@
 
 # --------------------------------------------------------------------------
+# C1.3: the OutboxOutput disk-mode runner user-data — for a Disk-mode profile that opts into the
+# user-space outbox transport (OutboxOutput=$true; firefox post-C1 convergence, see Workload.ps1's
+# Raw-OUTPUT predicate). The OUTPUT disk here is Raw (host-formatted with NO filesystem — New-
+# WorkloadDisks / NewOutputVhdx FileSystem='Raw'), so unlike CidataDiskRunnerTemplate this runner does
+# NOT mount OUTPUT by label (there is nothing to mount). Instead the entrypoint runs into a STAGING
+# dir, and the SHARED outbox-producer template (guest/run_disk_workload.py --transport-only) packs
+# staging into the memory-safe outbox container (guest/outbox.py) and writes it to the raw OUTPUT
+# block device the host later reads USER-SPACE (ReadVhdxRawRegion, never Mount-VHD — Invoke-
+# Voidseal.ps1's Read-OutboxToGateInput). --transport-only is LOCKED design (Allen 2026-07-01): this
+# profile's result is NOT screened — run_disk_workload.py skips screener.py entirely and packs a
+# well-formed placeholder verdicts.json ([]) alongside the result so the SAME container format (and
+# the SAME host read path) a processor's screened outbox uses still parses cleanly (guest/outbox.py's
+# read_and_verify() unconditionally requires a verdicts.json entry).
+#
+# run_disk_workload.py + its outbox.py dependency ride the INPUT disk (Inputs/InputFiles), exactly
+# like the entrypoint script itself (firefox.psd1's organize_bookmarks.py) — no new delivery
+# mechanism; they are read-only-mounted at /mnt/in alongside the workload's own inputs.
+#
+# RAW-OUTPUT DEVICE IDENTIFICATION: OUTPUT carries no filesystem/label to mount by, so the runner
+# identifies it structurally — enumerate the whole-disk block devices, exclude the root/boot disk and
+# any INPUT-labelled (exFAT) disk, and take the sole remaining candidate. FAIL-CLOSED: if that does
+# not resolve to EXACTLY ONE candidate device, the runner powers off with no outbox written (mirrors
+# the "no OUTPUT -> poweroff" guard in the exFAT runner above).
+#
+# Single-quoted here-string: NOTHING is interpolated by PowerShell ($rc, $(...), __ENTRYPOINT__ all
+# stay literal). The builder substitutes __ENTRYPOINT__ with the profile's Entrypoint.
+# --------------------------------------------------------------------------
+$script:CidataOutboxDiskRunnerTemplate = @'
+#cloud-config
+network: {config: disabled}
+# Voidseal OutboxOutput disk-mode seed (C1.3). NO apt / no network — sealed, offline guest. The
+# workload's inputs (+ the shared outbox-producer template) arrive on the INPUT data disk; the
+# result is packed into a memory-safe outbox and written to the raw OUTPUT data disk (no filesystem);
+# the guest self-powers-off and the host reads the outbox user-space (never Mount-VHD).
+
+users:
+  - name: sandbox
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    lock_passwd: true          # no password login anywhere; this is a sealed offline guest
+
+# Network stays disabled; mask the pointless wait-online delay (same as the exFAT offline runner).
+bootcmd:
+  - [ systemctl, mask, --now, systemd-networkd-wait-online.service ]
+
+write_files:
+  - path: /usr/local/sbin/vmdep-workload
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Voidseal OutboxOutput disk-mode runner: mount the host-formatted exFAT INPUT disk read-only,
+      # run the entrypoint into a STAGING dir, then hand staging to the shared outbox-producer
+      # template (run_disk_workload.py --transport-only), which packs it into the outbox container
+      # and writes it to the raw OUTPUT block device. No OUTPUT filesystem is ever mounted/formatted.
+      set +e
+      SBX_UID=$(id -u sandbox 2>/dev/null || echo 0)
+      SBX_GID=$(id -g sandbox 2>/dev/null || echo 0)
+      modprobe exfat 2>/dev/null   # host-pre-formatted INPUT is exFAT; in-kernel since 5.7.
+      mkdir -p /mnt/in /run/staging
+      # The INPUT/OUTPUT SCSI data disks are not in fstab; settle udev so mount-by-LABEL + blkid resolve.
+      udevadm settle 2>/dev/null
+      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT /mnt/in 2>/dev/null || mount LABEL=INPUT /mnt/in 2>/dev/null
+      # No INPUT -> the entrypoint (which lives on /mnt/in) AND the producer script cannot run. There
+      # is no OUTPUT filesystem to record a determinate sentinel on, so simply power off (the host's
+      # outbox read fails closed on a missing/empty raw region — same DENY-on-absence contract).
+      if ! mountpoint -q /mnt/in; then poweroff; exit 0; fi
+      chown -R "$SBX_UID:$SBX_GID" /run/staging 2>/dev/null
+      # --- Identify the raw OUTPUT block device structurally (no filesystem/label to mount by) ---
+      # Candidates = every whole-disk block device MINUS the root/boot disk MINUS any exFAT/INPUT-
+      # labelled disk. FAIL-CLOSED: anything other than exactly one remaining candidate -> poweroff,
+      # no outbox written (mirrors the exFAT runner's "no OUTPUT -> poweroff" guard above).
+      ROOT_SRC=$(findmnt -no SOURCE / 2>/dev/null)
+      ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null)
+      # PKNAME is empty when the root SOURCE is already a whole disk (no partition) — fall back to
+      # its own basename so ROOT_DISK is never blank (a blank ROOT_DISK would match nothing below and
+      # wrongly leave the root disk itself as an OUTPUT candidate).
+      [ -z "$ROOT_DISK" ] && ROOT_DISK=$(basename "$ROOT_SRC")
+      INPUT_SRC=$(blkid -L INPUT 2>/dev/null)
+      INPUT_DISK=$(lsblk -no PKNAME "$INPUT_SRC" 2>/dev/null)
+      [ -z "$INPUT_DISK" ] && [ -n "$INPUT_SRC" ] && INPUT_DISK=$(basename "$INPUT_SRC")
+      OUT_CANDIDATES=""
+      for d in /sys/block/sd*; do
+        dev=$(basename "$d")
+        [ "$dev" = "$ROOT_DISK" ] && continue
+        [ "$dev" = "$INPUT_DISK" ] && continue
+        OUT_CANDIDATES="$OUT_CANDIDATES $dev"
+      done
+      OUT_CANDIDATES=$(echo "$OUT_CANDIDATES" | xargs)   # trim whitespace
+      set -- $OUT_CANDIDATES
+      if [ "$#" -ne 1 ]; then poweroff; exit 0; fi
+      OUTPUT_DEV="/dev/$1"
+      # Run the workload ONCE, into staging (not directly onto OUTPUT — there is no OUTPUT mount).
+      # NOTE: run via sh -c '<entrypoint>', so the entrypoint must contain no single quote.
+      if id -u sandbox >/dev/null 2>&1; then
+        runuser -u sandbox -- /bin/sh -c '__ENTRYPOINT__' > /run/stdout.log 2> /run/stderr.txt
+      else
+        /bin/sh -c '__ENTRYPOINT__' > /run/stdout.log 2> /run/stderr.txt
+      fi
+      # The shared outbox-producer template packs /run/staging into the outbox container and writes
+      # it to the raw OUTPUT device. --transport-only: no screener invocation (LOCKED design) — a
+      # well-formed placeholder verdicts.json rides the outbox so the host read path parses cleanly.
+      python3 /mnt/in/run_disk_workload.py --staging /run/staging --verdicts /run/verdicts.json --out "$OUTPUT_DEV" --transport-only
+      sync
+      poweroff
+
+  - path: /etc/systemd/system/vmdep-workload.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Voidseal OutboxOutput disk-mode workload
+      After=local-fs.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/vmdep-workload
+      TimeoutStartSec=infinity
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [ systemctl, daemon-reload ]
+  # --no-block is LOAD-BEARING: a blocking start would make cloud-final WAIT on a oneshot that ends
+  # in poweroff (SIGTERM-ing the very cloud-final blocked on it, racing the result flush). --no-block
+  # lets the unit run independently so poweroff is its own last act.
+  - [ systemctl, start, --no-block, vmdep-workload.service ]
+'@
+
+# --------------------------------------------------------------------------
 # The BUILDER disk-mode runner user-data — Tier-1 builder VM with a transparent Squid SNI proxy.
 # LIVE-only (Phase 6) validates the real network config + ssl_bump/SNI peek + CDN-rotation; the mock
 # asserts SHAPE only (the Squid ACL contains each allowlist domain + http_access deny all).
@@ -418,6 +546,16 @@ function New-CidataUserData {
         }
         if ($entrypoint -match "[\r\n]") {
             throw "New-CidataUserData: the Disk-mode Entrypoint is multi-line; the runner invokes it on a single sh -c line. Refuse it."
+        }
+        # C1.3: a profile that opts into the user-space outbox transport (OutboxOutput=$true — same
+        # predicate as Workload.ps1's Raw-OUTPUT selection) gets the OutboxOutput runner: the OUTPUT
+        # disk is Raw (no filesystem), so the entrypoint runs into a staging dir and the shared
+        # outbox-producer template (run_disk_workload.py --transport-only) packs + writes the outbox.
+        # Everything else (legacy non-outbox Disk profiles) keeps the direct exFAT result.html runner.
+        $wantsOutbox = [bool](Get-SeedProfileField -Profile $Profile -Name 'OutboxOutput' -Default $false)
+        if ($wantsOutbox) {
+            $ud = $script:CidataOutboxDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint)
+            return (ConvertTo-LfText -Text $ud)
         }
         $ud = $script:CidataDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint)
         return (ConvertTo-LfText -Text $ud)

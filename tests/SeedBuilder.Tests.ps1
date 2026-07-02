@@ -158,6 +158,91 @@ Describe 'New-CidataUserData — disk-mode runner' {
     }
 }
 
+Describe 'New-CidataUserData — OutboxOutput disk runner (C1.3, firefox transport-only outbox)' {
+    BeforeAll {
+        # The OutboxOutput convergence entrypoint shape: writes result.html into the STAGING dir
+        # (/run/staging), NOT onto a mounted /mnt/out (there is none — OUTPUT is Raw). The exact
+        # firefox.psd1 Entrypoint string is superseded by a later convergence task (C1.4); this fixture
+        # is representative of that eventual shape and is what the OutboxOutput runner packs -> outbox.
+        $script:OutboxEntrypoint = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
+
+        # A firefox-shaped OutboxOutput Disk profile: WorkloadMode='Disk' + OutboxOutput=$true, no
+        # ScreenConfig (the C1.1/C1.2 predicate for a transport-only, non-processor outbox profile).
+        # The entrypoint runs into a STAGING dir (not directly onto a mounted exFAT OUTPUT) — the
+        # shared outbox producer (run_disk_workload.py --transport-only) packs staging -> raw OUTPUT.
+        $script:OutboxProfile = @{
+            Tier         = 0
+            Name         = 'firefox'
+            WorkloadMode = 'Disk'
+            OutboxOutput = $true
+            Entrypoint   = $script:OutboxEntrypoint
+            SeedIso      = (Join-Path ([System.IO.Path]::GetTempPath()) ("vmdep-seedb-outbox-{0}.iso" -f ([guid]::NewGuid().ToString('N'))))
+        }
+    }
+
+    It 'references run_disk_workload.py as the outbox producer' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -BeLike '*run_disk_workload.py*' -Because 'an OutboxOutput profile packs its result via the shared outbox-producer template, not a direct exFAT write'
+    }
+
+    It 'invokes the producer in --transport-only mode (firefox: transport rides the outbox, never screened)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -BeLike '*run_disk_workload.py*--transport-only*' -Because 'LOCKED design: firefox is transport-only — the shared producer must skip the screener'
+    }
+
+    It 'does NOT format/mount an exFAT OUTPUT for the result (no LABEL=OUTPUT mount, no result.html exFAT write)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -Not -BeLike '*LABEL=OUTPUT*' -Because 'OUTPUT is a Raw disk for an OutboxOutput profile — there is no filesystem to mount by label'
+        $ud | Should -Not -BeLike '*mkfs*' -Because 'the guest never formats OUTPUT — it is host-pre-formatted Raw (New-WorkloadDisks, C1.1)'
+    }
+
+    It 'still mounts INPUT read-only by label (the entrypoint reads its inputs from /mnt/in, unchanged)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -BeLike '*LABEL=INPUT*' -Because 'the entrypoint still reads its inputs off the host-formatted exFAT INPUT disk'
+        $ud | Should -BeLike '*/mnt/in*'
+    }
+
+    It 'runs the entrypoint into a staging dir, not directly onto a mounted OUTPUT' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -BeLike '*staging*' -Because 'the producer packs a STAGING dir (run_disk_workload --staging) into the outbox, mirroring the processor producer shape'
+        # Precise structural check (not a loose comment-prose match): no ACTUAL `mount ... OUTPUT`
+        # invocation anywhere in the emitted user-data — only the (separately asserted) absence of
+        # LABEL=OUTPUT / mkfs covers the mount-by-label case; this additionally rules out any
+        # `mount /dev/...` call naming OUTPUT directly.
+        $mountLines = ($ud -split "`r?`n") | Where-Object { $_ -match '^\s*(mount|mountpoint)\b' }
+        ($mountLines -join "`n") | Should -Not -Match 'OUTPUT' -Because 'no mount/mountpoint invocation may reference OUTPUT — it is a raw disk with nothing to mount'
+    }
+
+    It 'substitutes the profile Entrypoint for __ENTRYPOINT__ (and leaves no token behind)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -BeLike "*$($script:OutboxEntrypoint)*" -Because 'the runner still runs the profile entrypoint (into staging)'
+        $ud | Should -Not -BeLike '*__ENTRYPOINT__*' -Because 'an unsubstituted token means the guest runs literally nothing'
+    }
+
+    It 'still self-powers-off after the producer runs' {
+        New-CidataUserData -Profile $script:OutboxProfile | Should -BeLike '*poweroff*'
+    }
+
+    It 'FAILS CLOSED on an OutboxOutput entrypoint containing a single quote (same sh -c guard)' {
+        $bad = $script:OutboxProfile.Clone(); $bad['Entrypoint'] = "python3 -c 'print(1)'"
+        { New-CidataUserData -Profile $bad } | Should -Throw -Because 'a single quote escapes the runner sh -c wrapper — refuse it, same as the non-outbox disk runner'
+    }
+
+    It 'FAILS CLOSED on a blank OutboxOutput entrypoint' {
+        $bad = $script:OutboxProfile.Clone(); $bad['Entrypoint'] = '   '
+        { New-CidataUserData -Profile $bad } | Should -Throw -Because 'an outbox runner with no command cannot produce a result'
+    }
+
+    It 'a plain (non-OutboxOutput) Disk profile is UNCHANGED — still the direct exFAT result.html runner' {
+        # Regression guard: C1.3 must not touch the existing non-outbox Disk-mode runner (a legacy
+        # profile with WorkloadMode='Disk' and no OutboxOutput key keeps the old exFAT contract).
+        $ud = New-CidataUserData -Profile $script:DiskProfile
+        $ud | Should -BeLike '*LABEL=OUTPUT*'
+        $ud | Should -BeLike '*/mnt/out/result.html*'
+        $ud | Should -Not -BeLike '*run_disk_workload.py*'
+    }
+}
+
 Describe 'New-CidataUserData — serial-mode baseline (no regression for ralph)' {
 
     It 'emits the serial-getty autologin baseline, NOT the disk-mode runner' {
