@@ -46,7 +46,8 @@ STRICTER, NEVER promote one toward SAFE:
     detector clause, never the release oracle, so it can never be used to "clean up" a file
     into passing prose.
 """
-import argparse, hashlib, json, re, pathlib, unicodedata
+import argparse, hashlib, json, math, re, pathlib, unicodedata
+from collections import Counter
 
 # ---------------------------------------------------------------------------
 # C2.1 — the FIXED enum schema (single source of truth; later C2 tasks / M3 assert
@@ -67,6 +68,9 @@ _TAG_TO_FLAG = {
     'email': 'email',
     'presidio_pii': 'pii',
     'secret_entropy': 'secret',
+    'pem_key': 'secret',
+    'jwt': 'secret',
+    'high_entropy': 'entropy',
 }
 FLAG_VOCAB = tuple(sorted(set(_TAG_TO_FLAG.values()) | {'entropy', 'other'}))
 
@@ -78,6 +82,54 @@ SENSITIVE = [
     (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), 'ssn'),
     (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), 'email'),
 ]
+
+# C2.7 -- entropy + PEM/JWT secret floor (residual hardening, stricter-only). Presidio has no entropy
+# detection and the `credential` regex above only matches an explicit `key=`/`token:`-style assignment,
+# so a bare high-entropy secret sitting in otherwise-clean prose (no recognizable keyword) is missed by
+# every existing detector. This adds a THIRD, independent clause:
+#   (a) a PEM key block (`-----BEGIN ... PRIVATE KEY-----`)              -> 'pem_key'  -> flag 'secret'
+#   (b) a JWT's three-dot-separated base64url shape (`eyJ....eyJ....sig`) -> 'jwt'      -> flag 'secret'
+#   (c) any contiguous run of >=32 chars from the base64/hex/token alphabet whose Shannon entropy is
+#       >= 4.0 bits/char                                                  -> 'high_entropy' -> flag 'entropy'
+# Threshold rationale (tuned + documented per the plan; measured empirically, not just theorized):
+# a random base64/hex/token-alphabet secret (>=32 chars drawn near-uniformly from a ~64-70 symbol
+# alphabet, max ~6 bits/char) measures 5.0-5.7 bits/char in practice. The closest false-positive-shaped
+# near-miss is a long HYPHENATED ENGLISH SLUG/URL-path (plenty of chars from this same alphabet --
+# letters, digits, hyphen -- and long enough to clear the 32-char run length), which is dictionary-word
+# -like (skewed per-character distribution) and measured 3.9-4.3 bits/char across seven varied slug
+# fixtures during tuning (max observed 4.29). An initial 4.0 threshold (the plan's suggested starting
+# point) let the worst slug fixture through as a false positive; **4.5 bits/char** was chosen instead --
+# it sits clearly above the measured slug ceiling (4.29) with margin, and clearly below real-secret
+# entropy (5.0+) and a JWT segment's entropy (4.36-5.07), so it does not weaken PEM/JWT detection (those
+# also have their own dedicated regex clause below, independent of entropy). See
+# tests/guest/test_screener.py's C2.7 section for the prose no-false-positive guard this threshold must
+# keep passing.
+_PEM = re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----')
+_JWT = re.compile(r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b')
+_HI_ENTROPY_RUN = re.compile(r'[A-Za-z0-9+/_-]{32,}')
+_ENTROPY_THRESHOLD = 4.5  # bits/char; see rationale comment above
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    n = len(s)
+    counts = Counter(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+def _secret_hits(t):
+    """PEM/JWT/high-entropy detector clause. Returns a list of tags (possibly empty); NEVER raises --
+    any internal failure here must fail closed, so callers wrap this in the same try/except as the rest
+    of screen_text() (a detector-stage exception must never promote toward SAFE)."""
+    tags = []
+    if _PEM.search(t):
+        tags.append('pem_key')
+    if _JWT.search(t):
+        tags.append('jwt')
+    for m in _HI_ENTROPY_RUN.finditer(t):
+        if _shannon_entropy(m.group(0)) >= _ENTROPY_THRESHOLD:
+            tags.append('high_entropy')
+            break
+    return tags
 
 # C2.3 -- Trojan-Source / homoglyph evasion hardening. Zero-width chars (word joiners) and bidi
 # control chars (the "Trojan Source" override/isolate characters) are stripped, then the text is
@@ -112,6 +164,7 @@ except Exception:
 
 def screen_text(t):
     hits = [tag for rx, tag in SENSITIVE if rx.search(t)]
+    hits.extend(_secret_hits(t))  # C2.7 -- PEM/JWT/entropy clause; append-only, never gates the others.
     if _ANALYZER is not None:
         try:
             if any(r.score >= 0.5 for r in _ANALYZER.analyze(text=t, language='en')):

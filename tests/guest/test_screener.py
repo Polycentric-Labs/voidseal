@@ -243,3 +243,121 @@ def test_clean_prose_with_ordinary_unicode_stays_safe_no_false_positive_from_nor
     assert v["cafe.txt"]["verdict"] == "SAFE"
     assert v["cafe.txt"]["error_code"] == "NONE"
     assert v["cafe.txt"]["flags"] == []
+
+
+# --- C2.7: entropy + PEM/JWT secret floor (residual hardening, stricter-only) ------------------------
+# Presidio has no entropy detection and the regex floor's `credential` rule only matches an explicit
+# `key=`/`token:`-style assignment -- a bare high-entropy secret sitting in otherwise-clean prose (no
+# recognizable keyword) sails through both as SAFE today. This adds a THIRD, independent detector clause
+# (PEM block / JWT three-part shape / Shannon-entropy run) to the SENSITIVE floor. It can only ADD hits:
+# no existing SAFE fixture may flip to HELD/ERROR unless it now matches one of these three new shapes, and
+# no existing HELD fixture may flip toward SAFE. New tags map into the ALREADY-CLOSED C2.1 `FLAG_VOCAB`
+# (`secret` for PEM/JWT bearer-credential shapes, `entropy` for the generic high-entropy-run case) --
+# no new flag value is introduced, so the published per-run bit bound is unchanged.
+
+_PEM_BLOCK = (
+    "-----BEGIN PRIVATE KEY-----\n"
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n"
+    "MzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT8jNbvJZHtCSuYEvu\n"
+    "NMoSfm76oqFvAp8Gy0iz5sxjZmSnXyCdPEovGhLa0VzMaQ8s+CLOyS56YyCFGeJZ\n"
+    "-----END PRIVATE KEY-----\n"
+)
+
+_JWT_TOKEN = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ."
+    "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+)
+
+# A realistic high-entropy API-key-shaped token (random-looking base64/hex-ish run, >=32 chars,
+# no recognizable "key="/"token:" keyword prefix so the existing `credential` regex does NOT match it).
+_HIGH_ENTROPY_TOKEN = "7pQ2zR9mLxT4vB8nK1wA6yD3sF0hJ5cU_gN-eV7iX2oZ4qW9rY6tP1lM8bK3jH5d"
+
+
+def test_pem_private_key_block_is_held_with_secret_flag(tmp_path):
+    v = _screen(tmp_path, {"id_rsa.txt": _PEM_BLOCK})
+    assert v["id_rsa.txt"]["verdict"] == "HELD"
+    assert "secret" in v["id_rsa.txt"]["flags"]
+    assert set(v["id_rsa.txt"]["flags"]) <= _FLAG_VOCAB
+
+
+def test_pem_block_embedded_in_prose_is_held_never_safe(tmp_path):
+    text = _PROSE + "\nFor reference, here is the key:\n" + _PEM_BLOCK
+    v = _screen(tmp_path, {"notes-with-key.txt": text})
+    assert v["notes-with-key.txt"]["verdict"] == "HELD"
+    assert "secret" in v["notes-with-key.txt"]["flags"]
+
+
+def test_jwt_token_is_held_with_secret_flag(tmp_path):
+    v = _screen(tmp_path, {"session.txt": _JWT_TOKEN + "\n"})
+    assert v["session.txt"]["verdict"] == "HELD"
+    assert "secret" in v["session.txt"]["flags"]
+    assert set(v["session.txt"]["flags"]) <= _FLAG_VOCAB
+
+
+def test_jwt_embedded_in_prose_is_held_never_safe(tmp_path):
+    text = _PROSE + "\nAuthorization: Bearer " + _JWT_TOKEN + "\n"
+    v = _screen(tmp_path, {"log-snippet.txt": text})
+    assert v["log-snippet.txt"]["verdict"] == "HELD"
+    assert "secret" in v["log-snippet.txt"]["flags"]
+
+
+def test_high_entropy_token_in_clean_prose_is_held_with_entropy_flag(tmp_path):
+    # The load-bearing positive case for this task: a real-secret-shaped high-entropy token sitting
+    # in otherwise-clean, keyword-free prose. No regex keyword (key=/token:/password=) is present, so
+    # only an entropy detector can catch it -- this is exactly the gap Presidio + the regex floor leave.
+    text = (
+        "Here are my notes from the sync. Everything looked fine overall, and the team agreed "
+        "to revisit the plan next week. One more thing before I forget -- the value we discussed "
+        "was " + _HIGH_ENTROPY_TOKEN + " -- please keep a copy somewhere safe.\n"
+    )
+    v = _screen(tmp_path, {"sync-notes.txt": text})
+    assert v["sync-notes.txt"]["verdict"] == "HELD"
+    assert "entropy" in v["sync-notes.txt"]["flags"]
+    assert set(v["sync-notes.txt"]["flags"]) <= _FLAG_VOCAB
+
+
+def test_bare_high_entropy_token_alone_is_held_with_entropy_flag(tmp_path):
+    v = _screen(tmp_path, {"token.txt": _HIGH_ENTROPY_TOKEN + "\n"})
+    assert v["token.txt"]["verdict"] == "HELD"
+    assert "entropy" in v["token.txt"]["flags"]
+
+
+def test_clean_prose_no_false_positive_from_entropy_detector(tmp_path):
+    # THE prose no-false-positive guard: normal English narrative prose -- no secrets, no unusually
+    # long unbroken alphanumeric runs -- must NOT trip the entropy detector and must stay SAFE. Natural
+    # language has low per-character Shannon entropy (dominated by common letters/spaces) and words are
+    # broken by spaces/punctuation well under the 32-char contiguous-run threshold, so this is not a
+    # coincidence of the fixture -- it is the structural reason entropy detection doesn't false-positive
+    # on prose. This is the regression guard C2.7 requires before the detector may ship.
+    v = _screen(tmp_path, {"essay.txt": _PROSE})
+    assert v["essay.txt"]["verdict"] == "SAFE"
+    assert v["essay.txt"]["error_code"] == "NONE"
+    assert v["essay.txt"]["flags"] == []
+
+
+def test_long_prose_paragraph_still_no_entropy_false_positive(tmp_path):
+    # A longer, denser prose sample (more total characters than _PROSE, still ordinary narrative text
+    # with no long unbroken token-like runs) -- guards against a threshold that happens to work only for
+    # the one canonical _PROSE fixture.
+    long_prose = (_PROSE + _PROSE.replace("morning", "evening").replace("farmer", "traveler")) * 2
+    v = _screen(tmp_path, {"long-essay.txt": long_prose})
+    assert v["long-essay.txt"]["verdict"] == "SAFE"
+    assert v["long-essay.txt"]["flags"] == []
+
+
+def test_hyphenated_url_like_prose_text_no_entropy_false_positive(tmp_path):
+    # A plausible near-miss: a long hyphenated/slugged phrase or URL-like path embedded in otherwise
+    # clean, sufficiently long narrative prose (long enough to clear the existing crude-prose word-count
+    # gate on its own, so this test isolates the entropy detector rather than tripping the unrelated
+    # UNSUPPORTED/non-prose path). The slug has plenty of characters from the secret alphabet (letters,
+    # digits, hyphens) but is NOT random -- low entropy, structured/dictionary-word-like -- so it must
+    # not trip the detector.
+    text = _PROSE + (
+        "You can find the writeup at our internal wiki under the page "
+        "planning-notes-for-the-quarterly-offsite-agenda-and-budget-review "
+        "if you want the full context before the meeting on Thursday.\n"
+    )
+    v = _screen(tmp_path, {"link-mention.txt": text})
+    assert v["link-mention.txt"]["verdict"] == "SAFE"
+    assert v["link-mention.txt"]["flags"] == []
