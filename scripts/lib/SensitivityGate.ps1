@@ -55,6 +55,20 @@
       All four are strictly-tightening: they can only narrow the releasable set relative to the
       pre-C2.4 partition, never widen it.
 
+    C2.5 — RELEASED-BYTE BUDGET BACKSTOP (the second quantitative backstop behind the
+    regenerator, layered strictly AFTER the C2.4 schema/re-hash gates on every Consume-mode
+    verdict): the host caps what the SAFE partition may release on two axes —
+    -MaxReleasedBytes (a per-artifact size cap; default 1 MiB / 1048576, a FORK for Allen,
+    tunable at Phase 6) and -MaxReleasedFiles (a per-run releasable-file-count cap; default 16,
+    also a FORK). A SAFE, schema-valid, hash-bound file that exceeds the size cap -> HELD with
+    heldReason='over-byte-budget'; once a run has already released -MaxReleasedFiles files,
+    every further candidate -> HELD with heldReason='over-file-budget' (fail-closed,
+    hold-all-over-cap — there is no meaningful risk-priority ordering to pick a "least bad"
+    excess file). Both caps are INCLUSIVE upper bounds (a file exactly AT the size cap, or
+    exactly the Nth file AT the count cap, still releases). SACRED (tighten-only): this backstop
+    can only move a would-have-released file to HELD — never the reverse; it never runs before,
+    or in place of, the C2.4 schema/re-hash/regenerated-report gates.
+
     FAIL-CLOSED ON ERROR:
       Run mode: a non-zero screener exit code or a missing verdicts file means the screen did
       not complete → THROW, release nothing.
@@ -189,6 +203,16 @@ function Invoke-SensitivityGate {
     host-side guards as a screener-produced file (traversal guard, completeness guard,
     exact-SAFE partition, invariant re-assertion). Fail-closed: throws if the file is absent.
 
+.PARAMETER MaxReleasedBytes
+    C2.5 backstop. Per-artifact size cap in bytes (inclusive upper bound); a SAFE file over
+    this size is HELD with heldReason='over-byte-budget'. Default 1048576 (1 MiB) — a FORK for
+    Allen, tunable at Phase 6; injectable so tests pin behavior without a hard-coded constant.
+
+.PARAMETER MaxReleasedFiles
+    C2.5 backstop. Per-run releasable-file-count cap (inclusive upper bound); once this many
+    files have released in the current run, every further SAFE candidate is HELD with
+    heldReason='over-file-budget'. Default 16 — a FORK for Allen, tunable at Phase 6.
+
 .OUTPUTS
     [pscustomobject] @{ Released=[array]; Held=[array]; ManifestPath=[string] }
     where Released/Held are arrays of the screener's verdict objects ({name,verdict,detectors}).
@@ -199,7 +223,13 @@ function Invoke-SensitivityGate {
         [Parameter(Mandatory)] [string] $OutputDir,
         [ValidateSet('aggressive','moderate')] [string] $Mode = 'aggressive',
         [Parameter(Mandatory, ParameterSetName='Run')]     [string] $ScreenerPath,
-        [Parameter(Mandatory, ParameterSetName='Consume')] [string] $VerdictsPath
+        [Parameter(Mandatory, ParameterSetName='Consume')] [string] $VerdictsPath,
+        # C2.5 — released-byte budget backstop. FORK (Allen, plan Task C2.5): these are
+        # conservative placeholder defaults, tunable at Phase 6 — NOT a claim that 1 MiB / 16
+        # files is the production number. Injectable so tests pin behavior without hard-coding
+        # a production constant (mirrors -ScreenerPath's injection pattern).
+        [ValidateRange(1, [long]::MaxValue)] [long] $MaxReleasedBytes = 1048576,
+        [ValidateRange(1, [int]::MaxValue)]  [int]  $MaxReleasedFiles = 16
     )
 
     # Create output subdirs unconditionally — fail-closed means these exist even when we throw
@@ -288,6 +318,16 @@ function Invoke-SensitivityGate {
     $rel = [System.Collections.Generic.List[object]]::new()
     $hel = [System.Collections.Generic.List[object]]::new()
 
+    # C2.5 — released-byte budget backstop. This is the SECOND backstop behind the regenerator
+    # (C2.4): even a schema-valid, hash-bound, exact-SAFE file is capped on a per-artifact SIZE
+    # and on the RUN'S total releasable FILE COUNT. Both caps are inclusive upper bounds (a file
+    # exactly AT -MaxReleasedBytes, or the Nth file exactly AT -MaxReleasedFiles, still releases).
+    # Over either cap -> HELD (fail-closed; "lowest-risk-first" ordering is not meaningful here,
+    # so ALL excess-over-the-count-cap candidates are held, not just the last one in). This is
+    # SACRED-tightening-only: the budget can only move a would-have-released file to HELD, never
+    # the reverse — it is layered strictly AFTER the schema/re-hash gates below, never before.
+    $releasedCount = 0
+
     foreach ($v in $verdicts) {
         $src = Join-Path $StagingDir $v.name
 
@@ -324,12 +364,35 @@ function Invoke-SensitivityGate {
             continue
         }
 
+        # C2.5 step 1 — per-artifact size cap. An oversize file is a backstop HOLD regardless of
+        # how clean the verdict is (schema-valid, hash-bound, exact-SAFE). Measure the STAGED
+        # file's actual on-disk length — the same bytes the re-hash gate above just confirmed
+        # match the verdict — never a producer-claimed size field (there is no such field; the
+        # verdict schema has none, by design).
+        $sizeBytes = (Get-Item -LiteralPath $src).Length
+        if ($sizeBytes -gt $MaxReleasedBytes) {
+            Copy-Item -LiteralPath $src -Destination $held -ErrorAction Stop
+            $hel.Add(($v | Select-Object *, @{Name='heldReason'; Expression={'over-byte-budget'}}))
+            continue
+        }
+
+        # C2.5 step 2 — releasable file-count cap. Fail-closed / hold-all-over-cap: once the
+        # run has already accepted $MaxReleasedFiles releases, EVERY further candidate this run
+        # — no matter how clean — is HELD. There is no meaningful "lowest risk first" ordering
+        # to prioritize by, so the cap is enforced strictly in verdicts-array order.
+        if ($releasedCount -ge $MaxReleasedFiles) {
+            Copy-Item -LiteralPath $src -Destination $held -ErrorAction Stop
+            $hel.Add(($v | Select-Object *, @{Name='heldReason'; Expression={'over-file-budget'}}))
+            continue
+        }
+
         # -ErrorAction Stop makes a failed copy THROW rather than emit a swallowed non-terminating
         # error: without it, a missing source file would let $rel.Add run anyway, so .Released /
         # the manifest would CLAIM a release that never hit disk. Fail closed — record a release
         # only AFTER the copy is confirmed.
         Copy-Item -LiteralPath $src -Destination $released -ErrorAction Stop
         $rel.Add($v)
+        $releasedCount++
     }
 
     # Phase 3: belt-and-braces re-assertion of the released ⊆ SAFE invariant.

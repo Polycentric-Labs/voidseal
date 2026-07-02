@@ -647,6 +647,213 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
   }
 }
 
+Describe 'Invoke-SensitivityGate — C2.5 released-byte budget backstop (per-artifact size + file-count caps)' {
+  BeforeAll {
+    . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"
+  }
+
+  # Helper: create a FRESH staging dir + write a SAFE, enum-valid, hash-matching file+verdict
+  # pair into it. Each call gets its OWN staging dir (a $TestDrive subfolder keyed by $Name) —
+  # NOT a directory shared across It blocks — because Invoke-SensitivityGate's completeness
+  # guard (SensitivityGate.ps1, ~line 268) throws if a staging dir contains any file with no
+  # matching verdict, so files from an earlier test must never linger alongside a later test's
+  # single-verdict input.
+  # Defined as $script: scope (not a bare function) — Pester's per-It scoping means a plain
+  # 'function' declared in BeforeAll is not visible inside each It block.
+  function script:New-BudgetSafeFile {
+    param([string] $Name, [byte[]] $Bytes)
+    $stagingDir = Join-Path $TestDrive "budget-staging-$Name"
+    New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+    $path = Join-Path $stagingDir $Name
+    [System.IO.File]::WriteAllBytes($path, $Bytes)
+    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    [pscustomobject]@{
+      StagingDir = $stagingDir
+      Verdict    = [pscustomobject]@{ name = $Name; sha256 = $hash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+    }
+  }
+
+  It 'over-budget: a SAFE, enum-valid, hash-matching file whose size exceeds -MaxReleasedBytes -> HELD (heldReason=over-byte-budget)' {
+    $bigBytes = [byte[]]::new(2048)
+    $f = New-BudgetSafeFile -Name 'big.txt' -Bytes $bigBytes
+    $vfile = Join-Path $TestDrive 'over-budget-bytes.json'
+    @($f.Verdict) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'over-budget-bytes-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile -MaxReleasedBytes 1024 -MaxReleasedFiles 16
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'big.txt' -Because 'a file over -MaxReleasedBytes must never release'
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain 'big.txt'
+    $helNames = @(Get-ChildItem (Join-Path $output 'held') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $helNames | Should -Contain 'big.txt'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'big.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'over-byte-budget'
+  }
+
+  It 'at-limit: a file whose size is EXACTLY -MaxReleasedBytes passes (cap is inclusive)' {
+    $exactBytes = [byte[]]::new(1024)
+    $f = New-BudgetSafeFile -Name 'exact.txt' -Bytes $exactBytes
+    $vfile = Join-Path $TestDrive 'at-limit-bytes.json'
+    @($f.Verdict) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'at-limit-bytes-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile -MaxReleasedBytes 1024 -MaxReleasedFiles 16
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'exact.txt' -Because 'a file exactly AT the byte cap must still release (cap is an inclusive upper bound)'
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') | ForEach-Object { $_.Name })
+    $relNames | Should -Contain 'exact.txt'
+  }
+
+  It 'within-budget: a small file under -MaxReleasedBytes releases normally' {
+    $smallBytes = [System.Text.Encoding]::UTF8.GetBytes('a small safe file, well under any reasonable byte budget')
+    $f = New-BudgetSafeFile -Name 'small.txt' -Bytes $smallBytes
+    $vfile = Join-Path $TestDrive 'within-budget.json'
+    @($f.Verdict) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'within-budget-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile -MaxReleasedBytes 1048576 -MaxReleasedFiles 16
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'small.txt'
+  }
+
+  It 'default budget: -MaxReleasedBytes defaults to 1 MiB (1048576) when not supplied' {
+    # Pin the documented default so a future accidental change to the FORK constant is caught.
+    # A file at exactly 1MiB+1 byte must be HELD under the DEFAULT (no -MaxReleasedBytes passed).
+    $overDefaultBytes = [byte[]]::new(1048577)
+    $f = New-BudgetSafeFile -Name 'over-default.txt' -Bytes $overDefaultBytes
+    $vfile = Join-Path $TestDrive 'default-bytes.json'
+    @($f.Verdict) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'default-bytes-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'over-default.txt' -Because 'the default -MaxReleasedBytes is 1 MiB (1048576) -- a 1MiB+1 file must HELD under defaults'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'over-default.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'over-byte-budget'
+  }
+
+  It 'over-file-count: more than -MaxReleasedFiles SAFE candidates -> the excess are HELD (heldReason=over-file-budget), the rest release' {
+    $countStaging = Join-Path $TestDrive 'count-staging'
+    New-Item -ItemType Directory -Path $countStaging -Force | Out-Null
+    $verdicts = @()
+    for ($i = 1; $i -le 5; $i++) {
+      $name = "file$i.txt"
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes("small safe content number $i, well under any byte cap")
+      $path = Join-Path $countStaging $name
+      [System.IO.File]::WriteAllBytes($path, $bytes)
+      $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+      $verdicts += [pscustomobject]@{ name = $name; sha256 = $hash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+    }
+    $vfile = Join-Path $TestDrive 'over-file-count.json'
+    $verdicts | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'over-file-count-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $countStaging -OutputDir $output -VerdictsPath $vfile -MaxReleasedBytes 1048576 -MaxReleasedFiles 3
+
+    @($r.Released).Count | Should -Be 3 -Because 'only the first -MaxReleasedFiles SAFE candidates may release; the excess is HELD (fail-closed, hold-all-over-cap)'
+    @($r.Held | Where-Object { $_.heldReason -eq 'over-file-budget' }).Count | Should -Be 2 -Because 'exactly the overflow (5 candidates - 3 cap = 2) must be HELD with heldReason=over-file-budget'
+    # released ⊆ SAFE still holds: nothing HELD by count leaks into released/.
+    $relOnDisk = @(Get-ChildItem (Join-Path $output 'released') | ForEach-Object { $_.Name })
+    $relOnDisk.Count | Should -Be 3
+  }
+
+  It 'at-file-count-limit: exactly -MaxReleasedFiles SAFE candidates all release (cap is inclusive)' {
+    $countStaging = Join-Path $TestDrive 'count-limit-staging'
+    New-Item -ItemType Directory -Path $countStaging -Force | Out-Null
+    $verdicts = @()
+    for ($i = 1; $i -le 3; $i++) {
+      $name = "limit$i.txt"
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes("small safe content number $i")
+      $path = Join-Path $countStaging $name
+      [System.IO.File]::WriteAllBytes($path, $bytes)
+      $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+      $verdicts += [pscustomobject]@{ name = $name; sha256 = $hash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+    }
+    $vfile = Join-Path $TestDrive 'at-file-count-limit.json'
+    $verdicts | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'at-file-count-limit-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $countStaging -OutputDir $output -VerdictsPath $vfile -MaxReleasedBytes 1048576 -MaxReleasedFiles 3
+
+    @($r.Released).Count | Should -Be 3 -Because 'exactly AT the file-count cap must still all release (cap is an inclusive upper bound)'
+  }
+
+  It 'default budget: -MaxReleasedFiles defaults to 16 when not supplied' {
+    $countStaging = Join-Path $TestDrive 'default-count-staging'
+    New-Item -ItemType Directory -Path $countStaging -Force | Out-Null
+    $verdicts = @()
+    for ($i = 1; $i -le 17; $i++) {
+      $name = "dflt$i.txt"
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes("small safe content number $i")
+      $path = Join-Path $countStaging $name
+      [System.IO.File]::WriteAllBytes($path, $bytes)
+      $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+      $verdicts += [pscustomobject]@{ name = $name; sha256 = $hash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+    }
+    $vfile = Join-Path $TestDrive 'default-count.json'
+    $verdicts | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'default-count-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    # No -MaxReleasedFiles supplied -- exercise the documented default (16).
+    $r = Invoke-SensitivityGate -StagingDir $countStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released).Count | Should -Be 16 -Because 'the default -MaxReleasedFiles is 16 -- 17 SAFE candidates means exactly 1 excess is HELD'
+    @($r.Held | Where-Object { $_.heldReason -eq 'over-file-budget' }).Count | Should -Be 1
+  }
+
+  It 'sacred (tighten-only): the budget can only REMOVE files from released, never add — an over-budget file stays HELD even though it is otherwise a clean SAFE/enum-valid/hash-matching verdict' {
+    # This is a regression guard for the SACRED invariant text in the plan: the budget is a
+    # BACKSTOP layered strictly on top of the existing gates, never a path that could release
+    # something the pre-C2.5 partition would have held.
+    $bigBytes = [byte[]]::new(4096)
+    $f = New-BudgetSafeFile -Name 'sacred-big.txt' -Bytes $bigBytes
+    $vfile = Join-Path $TestDrive 'sacred.json'
+    @($f.Verdict) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'sacred-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile -MaxReleasedBytes 1024 -MaxReleasedFiles 16
+
+    @($r.Released) | Should -BeNullOrEmpty
+    (@($r.Held | Where-Object { $_.name -eq 'sacred-big.txt' })[0]).verdict | Should -Be 'SAFE' -Because 'the held audit entry keeps its true verdict=SAFE -- the budget HOLDS it, it does not relabel it as unsafe'
+  }
+
+  It 'existing processor e2e stays green: the messy-drive fixture SAFE files (small/few) still release under DEFAULT budgets' {
+    $batchStaging = Join-Path $TestDrive 'default-batch-staging'
+    New-Item -ItemType Directory -Path $batchStaging -Force | Out-Null
+    Copy-Item "$PSScriptRoot/fixtures/messy-drive/*" $batchStaging
+    function _h($n) { (Get-FileHash -LiteralPath (Join-Path $batchStaging $n) -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $vfile = Join-Path $TestDrive 'default-batch-verdicts.json'
+    @(
+      [pscustomobject]@{ name = 'creds.txt';             sha256 = (_h 'creds.txt');             verdict = 'HELD'; error_code = 'NONE';        flags = @('aws_key') }
+      [pscustomobject]@{ name = 'finance-statement.txt'; sha256 = (_h 'finance-statement.txt'); verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+      [pscustomobject]@{ name = 'health-note.txt';       sha256 = (_h 'health-note.txt');       verdict = 'HELD'; error_code = 'NONE';        flags = @('health') }
+      [pscustomobject]@{ name = 'prose-essay.txt';       sha256 = (_h 'prose-essay.txt');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+      [pscustomobject]@{ name = 'prose-letter.md';       sha256 = (_h 'prose-letter.md');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+      [pscustomobject]@{ name = 'spreadsheet-dump.csv';  sha256 = (_h 'spreadsheet-dump.csv');  verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+      [pscustomobject]@{ name = 'prose-with-token.md';   sha256 = (_h 'prose-with-token.md');   verdict = 'HELD'; error_code = 'NONE';        flags = @('credential') }
+    ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'default-batch-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    # No -MaxReleasedBytes/-MaxReleasedFiles supplied -- exercise the production defaults.
+    $r = Invoke-SensitivityGate -StagingDir $batchStaging -OutputDir $output -VerdictsPath $vfile
+
+    $relNames = @($r.Released | ForEach-Object { $_.name })
+    $relNames | Should -Contain 'prose-essay.txt'
+    $relNames | Should -Contain 'prose-letter.md'
+    @($r.Released).Count | Should -Be 2
+  }
+}
+
 Describe 'screener.py Presidio+spaCy upgrade (regex/crude fallback, strictly tighter)' {
   BeforeAll {
     $script:screener = "$PSScriptRoot/../guest/screener.py"
