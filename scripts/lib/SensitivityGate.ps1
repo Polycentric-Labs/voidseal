@@ -126,15 +126,21 @@ function Test-VerdictSchema {
     $missing = @($script:VerdictSchema.AllowedKeys | Where-Object { $props -notcontains $_ })
     if ($extra.Count -gt 0 -or $missing.Count -gt 0) { return $false }
 
-    if ($script:VerdictSchema.VerdictEnum -notcontains [string]$Verdict.verdict) { return $false }
-    if ($script:VerdictSchema.ErrorCodeEnum -notcontains [string]$Verdict.error_code) { return $false }
+    # CASE-SENSITIVE (-ccontains/-cnotmatch): PowerShell's default comparison operators are
+    # case-INSENSITIVE, so without the 'c'-prefixed variants 'safe'/'Safe'/'SAFE_but_lowercase'
+    # would all wrongly match the 'SAFE' enum member, an uppercase-hex sha256 would pass the
+    # lowercase-hex shape check, etc. The producer (guest/screener.py) emits an EXACT alphabet
+    # (uppercase enum members, lowercase hex sha256) — the host must reject any case variant as
+    # off-schema, not silently normalize/accept it.
+    if ($script:VerdictSchema.VerdictEnum -cnotcontains [string]$Verdict.verdict) { return $false }
+    if ($script:VerdictSchema.ErrorCodeEnum -cnotcontains [string]$Verdict.error_code) { return $false }
 
     $sha = [string]$Verdict.sha256
-    if ($sha -notmatch '^[0-9a-f]{64}$') { return $false }
+    if ($sha -cnotmatch '^[0-9a-f]{64}$') { return $false }
 
     $flags = @($Verdict.flags)
     foreach ($f in $flags) {
-        if ($script:VerdictSchema.FlagVocab -notcontains [string]$f) { return $false }
+        if ($script:VerdictSchema.FlagVocab -cnotcontains [string]$f) { return $false }
     }
 
     return $true
@@ -298,8 +304,9 @@ function Invoke-SensitivityGate {
         }
 
         # The ONE releasable verdict is the exact string 'SAFE'. HELD/ERROR (and any value that
-        # somehow slipped past schema validation) → HELD (fail-closed).
-        if ($v.verdict -ne 'SAFE') {
+        # somehow slipped past schema validation) → HELD (fail-closed). CASE-SENSITIVE (-cne):
+        # a lowercase/mixed-case 'safe'/'Safe' must never satisfy this check.
+        if ($v.verdict -cne 'SAFE') {
             Copy-Item -LiteralPath $src -Destination $held -ErrorAction Stop
             $hel.Add($v)
             continue
@@ -328,8 +335,9 @@ function Invoke-SensitivityGate {
     # Phase 3: belt-and-braces re-assertion of the released ⊆ SAFE invariant.
     # This SHOULD be unreachable given the loop above, but defends against future edits that
     # accidentally widen the releasable set (e.g. adding an OR branch). We throw rather than
-    # emit a silently-corrupted partition.
-    $violation = @($rel | Where-Object { $_.verdict -ne 'SAFE' })
+    # emit a silently-corrupted partition. CASE-SENSITIVE (-cne): a case-variant verdict is a
+    # violation of the exact-alphabet contract, not a valid SAFE.
+    $violation = @($rel | Where-Object { $_.verdict -cne 'SAFE' })
     if ($violation.Count -gt 0) {
         throw ("Invoke-SensitivityGate: INVARIANT VIOLATION — a non-SAFE artifact reached " +
                "'released'. Fail closed. Violators: " +
@@ -358,8 +366,15 @@ function Invoke-SensitivityGate {
     $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $man 'sensitivity-report.json')
 
     # Return a thin result object — callers gate their next pipeline stage on .Released.
+    # C2.4 (Fix 2): .Released is the SAME host-regenerated {name,sha256}-only array used for the
+    # on-disk report ($regeneratedReleased), NOT the raw $rel list of guest verdict objects.
+    # scripts/Invoke-Voidseal.ps1 surfaces $gateResult.Released directly on $report.Released, which
+    # is returned to the CALLER of Invoke-Voidseal — so a producer-controlled (even schema-valid,
+    # bounded-enum) 'flags'/'error_code'/'verdict' field must never ride out on that surface. .Held
+    # intentionally KEEPS its full audit shape (including heldReason) — HELD entries are meant to
+    # carry forensic detail; only the RELEASED surface is minimized to the fixed release contract.
     [pscustomobject]@{
-        Released     = @($rel)
+        Released     = $regeneratedReleased
         Held         = @($hel)
         ManifestPath = Join-Path $man 'sensitivity-report.json'
     }

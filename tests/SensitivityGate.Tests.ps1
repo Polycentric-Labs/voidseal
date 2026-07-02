@@ -65,7 +65,10 @@ Describe 'Invoke-SensitivityGate partition' {
     $relNames  | Should -Contain 'prose-essay.txt'
     $relNames  | Should -Contain 'prose-letter.md'
     @($script:r.Released).Count | Should -BeGreaterThan 0  # the prose files
-    $script:r.Released | ForEach-Object { $_.verdict | Should -Be 'SAFE' }  # released ⊆ SAFE
+    # C2.4 (Fix 2): .Released is {name,sha256}-only (host-regenerated) — no 'verdict' field to
+    # assert on here; that every released entry IS SAFE is a structural invariant of the
+    # regenerator (enforced above by the partition + belt-and-braces re-assertion), not something
+    # the returned .Released surface restates.
     @($script:r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'creds.txt'  # SENSITIVE never in .Released
   }
   It 'writes a sensitivity manifest with released/held + reasons' {
@@ -183,9 +186,12 @@ Describe 'Invoke-SensitivityGate -VerdictsPath (consume mode)' {
     $helNames | Should -Contain 'spreadsheet-dump.csv'
     $helNames | Should -Contain 'prose-with-token.md'
 
-    # Every Released entry must carry exactly verdict='SAFE'.
+    # C2.4 (Fix 2): .Released is {name,sha256}-only (host-regenerated) — no 'verdict' field
+    # rides on the returned surface; the exact-SAFE partition is enforced upstream of this return.
     @($r.Released).Count | Should -BeGreaterThan 0
-    $r.Released | ForEach-Object { $_.verdict | Should -Be 'SAFE' }
+    foreach ($entry in @($r.Released)) {
+      @($entry.PSObject.Properties.Name | Sort-Object) | Should -Be @('name', 'sha256')
+    }
   }
 
   It 'host re-validates consumed file — traversal name still throws; evil.txt NOT released' {
@@ -401,7 +407,9 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
     $relNames = @(Get-ChildItem (Join-Path $output 'released') | ForEach-Object { $_.Name })
     $relNames | Should -Contain 'essay.txt'
     @($r.Released).Count | Should -Be 1
-    $r.Released[0].verdict | Should -Be 'SAFE'
+    # C2.4 (Fix 2): .Released is {name,sha256}-only — no 'verdict' field on the returned entry.
+    $r.Released[0].name   | Should -Be 'essay.txt'
+    $r.Released[0].sha256 | Should -Be $script:safeHash
   }
 
   It 'host run_id: the manifest carries a host-generated run_id, non-empty and NOT the decoy the input supplied' {
@@ -534,6 +542,108 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
     $relNames | Should -Contain 'prose-letter.md'
     $relNames | Should -Not -Contain 'creds.txt'
     @($r.Released).Count | Should -Be 2
+  }
+
+  # =========================================================================
+  # Fix 3 (adversarial-review) — exact-case enum alphabet enforcement. The producer
+  # (guest/screener.py) emits an EXACT alphabet: uppercase verdict/error_code enum members,
+  # lowercase-hex sha256. PowerShell's default comparison operators (-contains/-notmatch/-ne)
+  # are case-INSENSITIVE, so without -ccontains/-cnotmatch/-cne a case-variant value
+  # ('safe', 'Safe', an uppercase sha256, etc.) would wrongly validate/release. These tests
+  # prove the host REJECTS every case variant — each one would have been RED (wrongly
+  # released, or wrongly missing the {name,sha256}-only shape) against the pre-Fix-1/Fix-2
+  # case-insensitive code.
+  # =========================================================================
+  It 'exact-case: verdict=''safe'' (all-lowercase) is HELD, never released' {
+    $vfile = Join-Path $TestDrive 'case-lower-safe.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'safe'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'case-lower-safe-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because "verdict='safe' is a case variant of the 'SAFE' enum member, not a member of it -> off-schema -> HELD"
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain 'essay.txt'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'exact-case: verdict=''Safe'' (title-case) is HELD, never released' {
+    $vfile = Join-Path $TestDrive 'case-title-safe.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'Safe'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'case-title-safe-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because "verdict='Safe' is a case variant of the 'SAFE' enum member, not a member of it -> off-schema -> HELD"
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'exact-case: error_code=''none'' (lowercase) is HELD/rejected as off-schema' {
+    $vfile = Join-Path $TestDrive 'case-lower-errorcode.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'none'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'case-lower-errorcode-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because "error_code='none' is a case variant of the 'NONE' enum member, not a member of it -> off-schema -> HELD (even though verdict=SAFE)"
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'exact-case: flags=@(''AWS_KEY'') (uppercase) is HELD/rejected as off-schema' {
+    $vfile = Join-Path $TestDrive 'case-upper-flag.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @('AWS_KEY') } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'case-upper-flag-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because "flags=@('AWS_KEY') is a case variant of the 'aws_key' flag vocabulary member, not a member of it -> off-schema -> HELD (even though verdict=SAFE)"
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'exact-case: an UPPERCASED real sha256 is HELD/rejected as off-schema (never SAFE-released)' {
+    $vfile = Join-Path $TestDrive 'case-upper-sha.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash.ToUpperInvariant(); verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'case-upper-sha-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'an uppercase-hex sha256 fails the lowercase-hex shape check -> off-schema -> HELD, even though it is the correct hash value modulo case'
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain 'essay.txt'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'exact-case: .Released entries expose ONLY name+sha256 — no flags/error_code/verdict property (Fix 2, {name,sha256}-only surface)' {
+    $vfile = Join-Path $TestDrive 'released-shape.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'released-shape-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released).Count | Should -Be 1
+    $entry = $r.Released[0]
+    $actualKeys = @($entry.PSObject.Properties.Name | Sort-Object)
+    $actualKeys | Should -Be @('name', 'sha256') -Because 'the in-memory .Released surface (scripts/Invoke-Voidseal.ps1 forwards this as $report.Released to the CALLER) must never carry a producer-controlled verdict/error_code/flags field'
+    $actualKeys | Should -Not -Contain 'verdict'
+    $actualKeys | Should -Not -Contain 'error_code'
+    $actualKeys | Should -Not -Contain 'flags'
   }
 }
 
