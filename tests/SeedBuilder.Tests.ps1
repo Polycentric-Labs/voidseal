@@ -336,6 +336,43 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         $ud | Should -Match 'REDIRECT --to-port 3129'
         $ud | Should -Match 'REDIRECT --to-port 3130'
     }
+
+    It 'SEC-2/C3: IPv6 is disabled pre-network (bootcmd) AND ip6tables default-DROPs, closing the IPv4-only egress bypass' {
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        $outputLines = $ud -split "`r?`n"
+
+        # --- Primary: IPv6 disabled via sysctl, applied EARLY (bootcmd runs before network-config) ---
+        $ud | Should -Match 'net\.ipv6\.conf\.all\.disable_ipv6\s*=\s*1' -Because 'SLAAC/DHCPv6 must never bring up a usable IPv6 route on the builder'
+        $ud | Should -Match 'net\.ipv6\.conf\.default\.disable_ipv6\s*=\s*1' -Because 'new interfaces must also come up with IPv6 disabled'
+
+        $bootcmdIdx = ($outputLines | Select-String -Pattern '^bootcmd:' -SimpleMatch:$false | Select-Object -First 1).LineNumber
+        $bootcmdIdx | Should -Not -BeNullOrEmpty -Because 'the builder seed must have a bootcmd: section (runs before network-config, unlike runcmd)'
+        # bootcmd is a YAML list; find the next top-level (non-indented, non-comment, non-blank) key after
+        # it to bound the section, then assert a sysctl invocation disabling ipv6 appears inside that bound.
+        $afterBootcmd = $outputLines[$bootcmdIdx..($outputLines.Count - 1)]
+        $nextTopLevelOffset = ($afterBootcmd | Select-Object -Skip 1 | Select-String -Pattern '^[A-Za-z_][A-Za-z0-9_]*:' | Select-Object -First 1).LineNumber
+        if ($nextTopLevelOffset) { $bootcmdSection = $afterBootcmd[0..$nextTopLevelOffset] } else { $bootcmdSection = $afterBootcmd }
+        ($bootcmdSection -join "`n") | Should -Match 'sysctl' -Because 'IPv6 must be disabled inside bootcmd (pre-network), not only via a dropped-in sysctl.d file that a later stage applies'
+        ($bootcmdSection -join "`n") | Should -Match 'disable_ipv6' -Because 'the bootcmd sysctl invocation must reference disable_ipv6, not some unrelated sysctl'
+
+        # --- Belt-and-braces: ip6tables default-DROP, guarded so a missing binary cannot abort the script ---
+        $ud | Should -Match 'ip6tables -P OUTPUT DROP' -Because 'IPv6 egress must default-DROP even if disable_ipv6 somehow fails to take effect'
+        $ud | Should -Match 'ip6tables -A OUTPUT -o lo -j ACCEPT'
+        $ud | Should -Match 'ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT'
+        $ud | Should -Match 'command -v ip6tables' -Because 'a missing ip6tables binary must not abort the set +e egress-lockdown script; guard the whole ip6tables block'
+
+        # --- No IPv6 egress ACCEPT is ever opened for 53/80/443 — IPv6 stays fully dropped ---
+        $ip6Lines = $outputLines | Where-Object { $_ -match 'ip6tables' }
+        ($ip6Lines | Where-Object { $_ -match '-A\s+OUTPUT' -and $_ -match '-j\s+ACCEPT' -and $_ -match '--dport\s+(53|80|443)\b' }) |
+            Should -BeNullOrEmpty -Because 'the builder fetch is IPv4-only through Squid; no ip6tables rule may ACCEPT egress on 53/80/443'
+    }
+
+    It 'the OFFLINE (non-builder) disk seed is unaffected by the IPv6 lockdown (network is disabled entirely, no iptables/ip6tables at all)' {
+        $ud = New-CidataUserData -Profile @{ WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/x.py' }
+        $ud | Should -Not -Match '(?i)ip6tables'
+        $ud | Should -Not -Match '(?i)disable_ipv6'
+        $ud | Should -Match 'network: \{config: disabled\}'
+    }
 }
 
 Describe 'Write-Iso9660Image — REAL IMAPI2 round-trip (gated on IMAPI availability)' {

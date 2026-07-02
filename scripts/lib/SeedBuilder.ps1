@@ -188,7 +188,26 @@ users:
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
     lock_passwd: true          # no password login anywhere; this is a sealed builder guest
 
+# SEC-2/C3: disable IPv6 BEFORE the network comes up. bootcmd runs on every boot, earlier than
+# runcmd/network-config — SLAAC/DHCPv6 (both on-by-default on Debian cloud images) never gets a
+# chance to bring up a usable IPv6 route, so there is nothing for a malicious dependency to route
+# over. This is the PRIMARY control; the ip6tables default-DROP below is belt-and-braces in case
+# disable_ipv6 is ever bypassed or a kernel/module quirk re-enables it.
+bootcmd:
+  - [ sysctl, -w, 'net.ipv6.conf.all.disable_ipv6=1' ]
+  - [ sysctl, -w, 'net.ipv6.conf.default.disable_ipv6=1' ]
+
 write_files:
+  - path: /etc/sysctl.d/99-voidseal-noipv6.conf
+    permissions: '0644'
+    content: |
+      # SEC-2/C3: IPv6 disabled for this Tier-1 builder guest. Debian cloud images bring IPv6 up by
+      # default (SLAAC/DHCPv6); the egress lockdown below is otherwise IPv4-only and a malicious
+      # dependency could egress over IPv6 entirely unfiltered. bootcmd applies this at boot (before
+      # network-config); this file makes the setting persist/re-apply across `sysctl --system`.
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv6.conf.default.disable_ipv6 = 1
+
   - path: /etc/squid/squid.conf
     permissions: '0644'
     content: |
@@ -221,7 +240,9 @@ write_files:
       # split) so DNS-tunnel exfil is a non-threat; the Squid domain-ACL is the real fetch control. Squid was
       # started above (network still open); its own egress (uid proxy) to upstream:80/443 rides the 80/443
       # ACCEPTs, and a REDIRECT'd client connection rides '-o lo'. FAIL-CLOSED: if this setup errors partway,
-      # the OUTPUT policy stays DROP -> no egress -> the fetch fails cleanly.
+      # the OUTPUT policy stays DROP -> no egress -> the fetch fails cleanly. IPv6 is disabled at boot
+      # (bootcmd, pre-network) AND ip6tables default-DROPs below — this lockdown is no longer IPv4-only
+      # (SEC-2/C3: an unfiltered IPv6 route was a complete bypass of both this DROP and the Squid ACL).
       # LIVE-ONLY (Phase 6): real packet-drop is unproven in mock - the seed asserts SHAPE only.
       iptables -F OUTPUT 2>/dev/null
       iptables -P OUTPUT DROP
@@ -235,6 +256,17 @@ write_files:
       # owner-exclusion keeps Squid's OWN upstream egress from being re-redirected.
       iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
       iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
+      # --- IPv6 belt-and-braces (SEC-2/C3): default-DROP OUTPUT over ip6tables too. disable_ipv6 above
+      # is the primary control (no IPv6 route should exist at all); this guards the case where it is
+      # somehow bypassed. Guarded on `command -v` so a missing ip6tables binary cannot abort this
+      # `set +e` script — fail-closed intent: if IPv6 is disabled there is nothing to route anyway, and
+      # NO IPv6 egress ACCEPT is opened for 53/80/443 (the builder fetch is IPv4-only through Squid).
+      if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -F OUTPUT 2>/dev/null
+        ip6tables -P OUTPUT DROP
+        ip6tables -A OUTPUT -o lo -j ACCEPT
+        ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      fi
 
       # --- Mount data disks (same robust pattern as the offline runner) ---
       SBX_UID=$(id -u sandbox 2>/dev/null || echo 0)
