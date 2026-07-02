@@ -607,6 +607,21 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $script:ProcArt  = Join-Path $script:TmpRoot ("art-proc-{0}"  -f ([guid]::NewGuid().ToString('N')))
         $script:ProcDest = Join-Path $script:TmpRoot ("dest-proc-{0}" -f ([guid]::NewGuid().ToString('N')))
 
+        # TEST ISOLATION (fix: shared-ledger flakiness): Invoke-Voidseal now ALWAYS defaults
+        # -RateLedgerPath to a SHARED, PERSISTENT host path ('<temp>\Voidseal\state\release-ledger.json')
+        # when the caller omits it — by design, so the runs/day cap actually accumulates across separate
+        # live Invoke-Voidseal calls on the same host (see Invoke-Voidseal.ps1's -RateLedgerPath doc). But
+        # that means every processor test in THIS Describe block that reaches the gate (Invoke-SensitivityGate
+        # is called whenever the outbox parses, per Invoke-Voidseal.ps1:~697-701) reads/writes that SAME
+        # shared file unless it supplies its own path — and several release SAFE candidates for the SAME
+        # profile name ('firefox-proc-test'), so repeated same-day full-suite runs accumulate real release
+        # counts against the shared ledger and eventually trip the default cap (5), turning a should-release
+        # test into a false DENY. Generate a fresh per-It, GUID-named ledger path under $TestDrive here so
+        # EVERY It in this block starts from a clean, isolated ledger and NEVER touches the shared %TEMP%
+        # default — mirrors the isolation the two dedicated C2.6-wiring tests already use for their own
+        # explicit ledgers below.
+        $script:ProcLedger = Join-Path $TestDrive ("ratecap-ledger-proc-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+
         # The HOST-readable gate inputs the orchestrator consumes via -Workload (Phase-1 mock injection;
         # Phase-2 derives these from host-mounting the detached OUTPUT VHDX). The staging dir is a real
         # temp dir with the messy-drive fixture copied in; the verdicts.json is hand-written to cover all
@@ -661,7 +676,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-outbox' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         @($report.States) | Should -Contain 'SEALED'
         $report.Descriptor.GateRan | Should -BeTrue -Because 'the processor gate ran off the OUTPUT outbox'
@@ -694,7 +709,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-tamper' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         $report.Released          | Should -BeNullOrEmpty -Because 'a tampered outbox fails closed — nothing is released'
         $report.SensitivityReport | Should -BeNullOrEmpty
@@ -712,7 +727,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-timeout' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         $report.Released | Should -BeNullOrEmpty -Because 'a timed-out run releases nothing (DENY-on-timeout)'
         $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
@@ -731,7 +746,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-nooutbox' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         @($report.States)         | Should -Contain 'SEALED' -Because 'the VM still sealed + ran; only the outbox is absent'
         $report.Released          | Should -BeNullOrEmpty -Because 'an empty/absent outbox fails closed — nothing is released'
@@ -769,7 +784,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-allheld' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         $report.Descriptor.GateRan | Should -BeTrue -Because 'a well-formed outbox lets the gate run — this is a verdict outcome, not a parse failure'
         $report.Error              | Should -BeNullOrEmpty -Because 'an all-non-SAFE verdict set is a normal gate outcome, not an error'
@@ -793,7 +808,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-noverdicts' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         $report.Released          | Should -BeNullOrEmpty -Because 'no verdicts.json -> fail closed, release nothing'
         $report.SensitivityReport | Should -BeNullOrEmpty
@@ -821,7 +836,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-oversize' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         $report.Released | Should -BeNullOrEmpty -Because 'an over-bound header fails closed — nothing released'
         $report.Error    | Should -Match '(?i)bound|count|total|outbox'
@@ -863,7 +878,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = ('0' * 64) } `
             -Name 'sbx-proc-depsmismatch' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
         @($report.States) | Should -Not -Contain 'SEALED' -Because 'a tampered/substituted deps disk aborts BEFORE the seal'
         $report.Error | Should -Match '(?i)deps.*(integrity|hash)|integrity check' -Because 'the abort names the deps integrity failure'
         $report.Released | Should -BeNullOrEmpty
@@ -876,7 +891,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
             -Name 'sbx-proc-nodepshash' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
         @($report.States) | Should -Not -Contain 'SEALED'
         $report.Error | Should -Match '(?i)DepsImageHash|no .*hash|unverified' -Because 'a deps disk without a verified hash is refused'
         $report.Released | Should -BeNullOrEmpty -Because 'a missing-hash abort is fail-closed — nothing is released (symmetry with DENY-on-deps-mismatch)'
@@ -980,7 +995,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-nohostmount' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         # The run must succeed (gate ran, SAFE candidate released)
         $report.Descriptor.GateRan | Should -BeTrue -Because 'the gate ran via ReadVhdxRawRegion'
@@ -998,7 +1013,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-depsgc' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
         @($report.States) | Should -Contain 'SEALED' -Because 'a verified deps disk attaches + the run proceeds'
         @($report.Descriptor.CreatedDisks) | Should -Not -Contain $script:DepsDisk -Because 'the builder-owned deps.vhdx is never in CreatedDisks; the Reaper leaves it'
         $report.Descriptor.DepsImageHash | Should -Be $depsHash -Because 'the verified hash is recorded on the descriptor'
@@ -1027,7 +1042,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
             -Name 'sbx-proc-detachfail' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         $report.RunResult        | Should -Not -BeNullOrEmpty
         $report.RunResult.Status | Should -Be 'Failed' -Because 'a data-disk detach failure is a Failed run (Invoke-Voidseal.ps1:521)'
@@ -1052,7 +1067,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk' } `
             -Name 'sbx-proc-startfail' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -ErrorAction SilentlyContinue
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -ErrorAction SilentlyContinue
 
         $report.Error     | Should -Match '(?i)start|boot' -Because 'StartVM''s simulated failure names the guest not booting'
         $report.Released  | Should -BeNullOrEmpty -Because 'the gate never runs when the VM never started'
@@ -1076,7 +1091,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk' } `
             -Name 'sbx-proc-unavailable' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -ErrorAction SilentlyContinue
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -ErrorAction SilentlyContinue
 
         $report.Error     | Should -Match '(?i)available|unreachable|privilege|Hyper-V' -Because 'New-SandboxVM''s preflight names the unavailable/insufficient-privilege backend'
         $report.Released  | Should -BeNullOrEmpty -Because 'the gate never runs when provisioning never happened'
@@ -1098,7 +1113,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
             -Workload @{ WorkloadMode = 'Disk' } `
             -Name 'sbx-proc-channelfail' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -ErrorAction SilentlyContinue
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -ErrorAction SilentlyContinue
 
         $report.Released    | Should -BeNullOrEmpty -Because 'the gate never runs — the seal never certified'
         $report.SealVerdict | Should -BeFalse -Because 'Assert-Sealed is throw-only; it never returned a true verdict for this run'
