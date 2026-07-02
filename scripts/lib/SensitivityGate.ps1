@@ -69,6 +69,32 @@
     can only move a would-have-released file to HELD — never the reverse; it never runs before,
     or in place of, the C2.4 schema/re-hash/regenerated-report gates.
 
+    C2.6 — RUNS/DAY RELEASE RATE CAP BACKSTOP (the third quantitative backstop, an OPT-IN
+    layer consulted ONCE per gate invocation, strictly BEFORE the per-file C2.4/C2.5 loop):
+    where C2.4/C2.5 bound the leakage of a SINGLE run, C2.6 bounds AGGREGATE leakage across
+    MANY runs of the same profile (per-run bit bound x runs/interval — see
+    _dev/plans/2026-07-01-pre-phase6-hardening-plan.md, C2 header). Pass -RateLedgerPath (+
+    -RateProfile, -RateToday, optionally -MaxReleasesPerDay) to enable it; omitting
+    -RateLedgerPath skips the rate-cap check entirely (pre-C2.6 callers/tests are unaffected —
+    this is an ADDITIVE backstop, never a mandatory global gate keyed on an implicit default
+    path). When enabled, ReleaseGovernor.ps1's Test-ReleaseAllowed is consulted against a
+    host-side JSON ledger keyed by -RateProfile + the UTC calendar day (-RateToday, injected —
+    see ReleaseGovernor.ps1's header for why host-observed time, never guest time, is the
+    policy source): if the profile is already AT or OVER -MaxReleasesPerDay releases for that
+    day, this run's ENTIRE candidate set is routed to HELD with heldReason='over-rate-cap' —
+    release NOTHING this run, before the C2.4 schema/re-hash gates even run per-file (fail-
+    closed: an over-cap run must not leak a single byte, and a corrupt/unreadable ledger is
+    treated identically to over-cap — Test-ReleaseAllowed's own fail-closed contract, see
+    ReleaseGovernor.ps1). If the rate check passes (or is not enabled), the run proceeds through
+    the normal C2.4/C2.5 gates; AFTER partitioning, if the rate cap was enabled AND this run's
+    regenerated .Released ended up non-empty, EXACTLY ONE Register-Release call increments the
+    ledger for -RateProfile/-RateToday — a "release event" is counted once per run that released
+    something, never once per file and never for a run (including this run's own denial) that
+    released nothing. SACRED (tighten-only): like C2.5, this backstop can only move a
+    would-have-released run's files to HELD — it is layered strictly BEFORE the per-file gates
+    (an over-cap run never even reaches the schema/re-hash/byte-budget checks), and it can never
+    cause anything to release that the underlying per-file gates would not have already allowed.
+
     FAIL-CLOSED ON ERROR:
       Run mode: a non-zero screener exit code or a missing verdicts file means the screen did
       not complete → THROW, release nothing.
@@ -95,6 +121,16 @@
 #>
 
 Set-StrictMode -Version Latest
+
+# C2.6 — pull in the runs/day release-rate-cap primitives (Test-ReleaseAllowed / Register-
+# Release). Dot-sourced from the SAME directory (mirrors this file's own role as a standalone,
+# independently-dot-sourceable module — every existing test Describe block dot-sources ONLY
+# "SensitivityGate.ps1" today, so pulling ReleaseGovernor.ps1 in here, rather than requiring
+# every caller/test to dot-source both files, keeps that contract unbroken). Idempotent: PS
+# re-dot-sourcing the same file just redefines the same functions, so this is safe even if a
+# caller ALSO explicitly dot-sources ReleaseGovernor.ps1 itself (as ReleaseGovernor.Tests.ps1's
+# own Describe blocks do, to call Test-ReleaseAllowed/Register-Release directly).
+. (Join-Path $PSScriptRoot 'ReleaseGovernor.ps1')
 
 # ---------------------------------------------------------------------------
 # C2.4 — REGENERATOR CORE. The host is the sole author of the RELEASED surface: it validates
@@ -213,6 +249,30 @@ function Invoke-SensitivityGate {
     files have released in the current run, every further SAFE candidate is HELD with
     heldReason='over-file-budget'. Default 16 — a FORK for Allen, tunable at Phase 6.
 
+.PARAMETER RateLedgerPath
+    C2.6 backstop, OPT-IN. Path to the host-side runs/day release-rate JSON ledger (see
+    ReleaseGovernor.ps1). Omit to skip the rate-cap check entirely (unchanged pre-C2.6
+    behavior). When supplied, -RateProfile and -RateToday become effectively required (the
+    rate check needs both to look up the right ledger entry) — this is intentionally NOT
+    enforced via ParameterSetName so a caller who supplies -RateLedgerPath alone gets a clear
+    runtime error rather than a confusing parameter-set resolution failure.
+
+.PARAMETER RateProfile
+    C2.6 backstop. The profile name the ledger is keyed by (e.g. 'ralph'). Required when
+    -RateLedgerPath is supplied.
+
+.PARAMETER RateToday
+    C2.6 backstop. The UTC calendar day ('yyyy-MM-dd') to check/increment against. INJECTED
+    (never computed from the live wall clock inside this module) so tests are deterministic;
+    the production caller (Invoke-Voidseal.ps1) is responsible for supplying the HOST's real
+    [datetime]::UtcNow.ToString('yyyy-MM-dd') — never guest-reported time. Required when
+    -RateLedgerPath is supplied.
+
+.PARAMETER MaxReleasesPerDay
+    C2.6 backstop. Per-profile, per-UTC-day release-event cap (inclusive upper bound; a
+    profile already AT this many releases today is denied the next one). Default 5 — a FORK
+    for Allen, tunable at Phase 6. Only consulted when -RateLedgerPath is supplied.
+
 .OUTPUTS
     [pscustomobject] @{ Released=[array]; Held=[array]; ManifestPath=[string] }
     where Released/Held are arrays of the screener's verdict objects ({name,verdict,detectors}).
@@ -229,8 +289,26 @@ function Invoke-SensitivityGate {
         # files is the production number. Injectable so tests pin behavior without hard-coding
         # a production constant (mirrors -ScreenerPath's injection pattern).
         [ValidateRange(1, [long]::MaxValue)] [long] $MaxReleasedBytes = 1048576,
-        [ValidateRange(1, [int]::MaxValue)]  [int]  $MaxReleasedFiles = 16
+        [ValidateRange(1, [int]::MaxValue)]  [int]  $MaxReleasedFiles = 16,
+        # C2.6 — runs/day release rate cap backstop. OPT-IN: omitting -RateLedgerPath skips the
+        # check entirely (see the .PARAMETER doc block above + the C2.6 module-header section).
+        [string] $RateLedgerPath,
+        [string] $RateProfile,
+        [string] $RateToday,
+        [ValidateRange(1, [int]::MaxValue)] [int] $MaxReleasesPerDay = 5
     )
+
+    # C2.6 — validate the opt-in trio together (NOT via ParameterSetName; -RateLedgerPath can
+    # legitimately combine with EITHER -ScreenerPath OR -VerdictsPath, and PowerShell parameter
+    # sets are one-dimensional, so layering a second set here would force an awkward 4-way
+    # cross-product). A caller that supplies -RateLedgerPath without both -RateProfile and
+    # -RateToday cannot be safely evaluated (there is no ledger KEY) — fail closed with a clear
+    # message rather than silently skipping the rate check the caller explicitly asked to enable.
+    $rateCapEnabled = -not [string]::IsNullOrWhiteSpace($RateLedgerPath)
+    if ($rateCapEnabled -and ([string]::IsNullOrWhiteSpace($RateProfile) -or [string]::IsNullOrWhiteSpace($RateToday))) {
+        throw ("Invoke-SensitivityGate: -RateLedgerPath was supplied but -RateProfile/-RateToday " +
+               "were not — the rate cap needs both to identify the ledger entry. Fail closed.")
+    }
 
     # Create output subdirs unconditionally — fail-closed means these exist even when we throw
     # below, so the caller can inspect an empty released/ to confirm nothing escaped.
@@ -315,6 +393,21 @@ function Invoke-SensitivityGate {
     # ever weakened, the regenerated report below only ever writes THIS host-generated value).
     $runId = [guid]::NewGuid().ToString()
 
+    # C2.6 — runs/day release rate cap (THIRD backstop; consulted ONCE, before the per-file
+    # loop, not per-candidate). When enabled (-RateLedgerPath supplied), an over-cap or
+    # unprovable (corrupt/unreadable) ledger means this ENTIRE run releases nothing — every
+    # candidate is routed to HELD with heldReason='over-rate-cap' regardless of how clean its
+    # own verdict is, BEFORE the C2.4 schema/re-hash checks even run. This mirrors C2.5's
+    # fail-closed hold-all-over-cap posture: there is no meaningful "release the first N anyway"
+    # partial-allow here — the cap is per-RUN (a run either may release or may not), not
+    # per-file. $rateCapDenied gates the loop below; the C2.4/C2.5 per-file logic is UNCHANGED
+    # when the rate cap is disabled (default) or under-cap.
+    $rateCapDenied = $false
+    if ($rateCapEnabled) {
+        $rateCapDenied = -not (Test-ReleaseAllowed -Profile $RateProfile -LedgerPath $RateLedgerPath `
+                                 -Today $RateToday -MaxReleasesPerDay $MaxReleasesPerDay)
+    }
+
     $rel = [System.Collections.Generic.List[object]]::new()
     $hel = [System.Collections.Generic.List[object]]::new()
 
@@ -330,6 +423,18 @@ function Invoke-SensitivityGate {
 
     foreach ($v in $verdicts) {
         $src = Join-Path $StagingDir $v.name
+
+        # C2.6 step 0 — runs/day rate cap, checked FIRST (before C2.4's own schema/re-hash
+        # gates): an over-cap/unprovable-ledger run holds EVERY candidate, independent of that
+        # candidate's own verdict validity. Skipping straight to HELD here (rather than falling
+        # through into the schema check) is deliberate — heldReason must read 'over-rate-cap'
+        # for the WHOLE run, not get overwritten by a coincidental 'off-schema' on some entries
+        # and 'over-rate-cap' on others, which would obscure the actual reason nothing released.
+        if ($rateCapDenied) {
+            Copy-Item -LiteralPath $src -Destination $held -ErrorAction Stop
+            $hel.Add(($v | Select-Object *, @{Name='heldReason'; Expression={'over-rate-cap'}}))
+            continue
+        }
 
         # C2.4 step 1 — enum-schema validation (REGENERATOR CORE). A verdict that is not built
         # EXACTLY from the fixed producer enum (unknown key, out-of-enum verdict/error_code, an
@@ -419,6 +524,20 @@ function Invoke-SensitivityGate {
     $regeneratedReleased = @($rel | ForEach-Object {
         [pscustomobject]@{ name = [string]$_.name; sha256 = [string]$_.sha256 }
     })
+
+    # C2.6 — increment the rate-cap ledger IFF (a) the rate cap is enabled for this call AND
+    # (b) this run actually released at least one file. This is the ONE place Register-Release
+    # is invoked: exactly once per run that released something, never once per file (see the
+    # "RELEASE-EVENT SEMANTICS" note in ReleaseGovernor.ps1) and never for a run whose .Released
+    # ended up empty — including a run THIS SAME rate cap just denied ($rateCapDenied -> the
+    # loop above HELD everything, so $regeneratedReleased.Count is 0 here, so this branch is
+    # correctly skipped; a denial must never count as a release, or a persistent attacker could
+    # use denied runs to inflate the ledger and starve out a legitimate later release, which
+    # would be a self-inflicted availability bug, not a security one, but is still wrong).
+    if ($rateCapEnabled -and $regeneratedReleased.Count -gt 0) {
+        Register-Release -Profile $RateProfile -LedgerPath $RateLedgerPath -Today $RateToday
+    }
+
     $report = [pscustomobject]@{
         run_id   = $runId
         mode     = $Mode
