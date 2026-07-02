@@ -39,8 +39,14 @@ STRICTER, NEVER promote one toward SAFE:
   * An UNMAPPABLE/unknown detector tag (one not in the fixed `_FLAG_VOCAB`) must NEVER be
     silently dropped and must NEVER become a new free-form value — it forces `verdict=HELD`
     with the `other` flag, so the flag alphabet stays fixed even as detectors evolve.
+  * (C2.3) Detectors run over the RAW text AND an NFKC-normalized, zero-width/bidi-stripped
+    view (Trojan-Source / homoglyph evasion hardening); a hit in EITHER view counts — this is
+    a UNION, so it can only ADD hits relative to raw-only screening, never remove one. The
+    `is_prose` SAFE clause still evaluates the raw text only; normalization only feeds the
+    detector clause, never the release oracle, so it can never be used to "clean up" a file
+    into passing prose.
 """
-import argparse, hashlib, json, re, pathlib
+import argparse, hashlib, json, re, pathlib, unicodedata
 
 # ---------------------------------------------------------------------------
 # C2.1 — the FIXED enum schema (single source of truth; later C2 tasks / M3 assert
@@ -72,6 +78,21 @@ SENSITIVE = [
     (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), 'ssn'),
     (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), 'email'),
 ]
+
+# C2.3 -- Trojan-Source / homoglyph evasion hardening. Zero-width chars (word joiners) and bidi
+# control chars (the "Trojan Source" override/isolate characters) are stripped, then the text is
+# NFKC-normalized (folds compatibility variants -- e.g. fullwidth Latin letters -- to their
+# canonical ASCII form). This is a STRICTLY-TIGHTENING addition: screen_text() below unions hits
+# from the raw text with hits from this normalized view, so it can only ADD detector hits relative
+# to the pre-C2.3 raw-only floor, never remove one (SACRED invariant).
+_ZERO_WIDTH_AND_BIDI = dict.fromkeys([
+    0x200B, 0x200C, 0x200D, 0xFEFF,                     # zero-width space/non-joiner/joiner, BOM
+    0x202A, 0x202B, 0x202C, 0x202D, 0x202E,             # bidi embedding/override controls
+    0x2066, 0x2067, 0x2068, 0x2069,                     # bidi isolate controls
+], None)
+
+def _normalize(t: str) -> str:
+    return unicodedata.normalize('NFKC', t.translate(_ZERO_WIDTH_AND_BIDI))
 
 # Conditional Presidio init: constructed at import if installed, else None (regex floor stands).
 # Adds hits only (stricter) -> only moves a verdict toward HELD, never toward SAFE.
@@ -160,7 +181,11 @@ def _verdict_for(raw: bytes):
     """
     text, extractable, extract_err = _extract_text(raw)
     try:
-        hits = screen_text(text)
+        # C2.3 -- screen BOTH the raw text and the NFKC-normalized, zero-width/bidi-stripped view;
+        # a hit in EITHER view counts (union). This can only ADD hits relative to raw-only screening
+        # (Trojan-Source / homoglyph evasion hardening) -- it never removes a raw hit, and the
+        # is_prose SAFE clause below still runs over the raw text only (unchanged).
+        hits = sorted(set(screen_text(text)) | set(screen_text(_normalize(text))))
     except Exception:
         # A detector-stage exception must NEVER promote toward SAFE (SACRED invariant) --
         # fail closed to HELD with a dedicated error_code.

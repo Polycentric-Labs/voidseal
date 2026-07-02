@@ -174,3 +174,72 @@ def test_verdict_sha256_differs_when_bytes_differ_even_with_same_verdict(tmp_pat
     v = _screen(tmp_path, {"a.txt": _PROSE, "b.txt": _PROSE + " \n"})
     assert v["a.txt"]["verdict"] == v["b.txt"]["verdict"] == "SAFE"
     assert v["a.txt"]["sha256"] != v["b.txt"]["sha256"]
+
+
+# --- C2.3: NFKC + zero-width/bidi strip; screen BOTH raw and normalized views ------------------------
+# Trojan-Source / homoglyph evasion hardening (Pass-3 P1#4). A hit in EITHER the raw text OR the
+# NFKC-normalized, zero-width/bidi-stripped text must force HELD. This can only ADD hits relative to
+# the C2.1 floor (screening only the raw view) -- it must never cause a raw-flagged file to become SAFE,
+# and a clean, unobfuscated prose file must be unaffected (no false positive from normalization alone).
+
+def test_zero_width_obfuscated_credential_missed_by_raw_is_caught_after_normalization(tmp_path):
+    # U+200B (ZERO WIDTH SPACE) split inside the keyword defeats the raw regex outright but
+    # disappears under NFKC + zero-width strip, exposing "password=..." to the detector.
+    obfuscated = "pass​word=s3cr3tP@ssw0rd123\n"
+    import re
+    raw_rx = re.compile(r'(?i)(?<![A-Za-z])(secret|api[_-]?key|password|token)(?![A-Za-z])\s*[=:]\s*\S+')
+    assert raw_rx.search(obfuscated) is None, "test fixture assumption broken: raw regex should NOT match"
+    v = _screen(tmp_path, {"sneaky.txt": obfuscated})
+    assert v["sneaky.txt"]["verdict"] == "HELD"
+    assert "credential" in v["sneaky.txt"]["flags"]
+
+
+def test_bidi_control_obfuscated_credential_is_caught_after_normalization(tmp_path):
+    # A bidi override (U+202E RIGHT-TO-LEFT OVERRIDE, the classic "Trojan Source" character) spliced
+    # into the keyword also defeats the raw regex; the strip removes it and exposes the credential.
+    obfuscated = "pass‮word=s3cr3tP@ssw0rd123\n"
+    import re
+    raw_rx = re.compile(r'(?i)(?<![A-Za-z])(secret|api[_-]?key|password|token)(?![A-Za-z])\s*[=:]\s*\S+')
+    assert raw_rx.search(obfuscated) is None, "test fixture assumption broken: raw regex should NOT match"
+    v = _screen(tmp_path, {"bidi.txt": obfuscated})
+    assert v["bidi.txt"]["verdict"] == "HELD"
+    assert "credential" in v["bidi.txt"]["flags"]
+
+
+def test_homoglyph_fullwidth_credential_is_caught_after_nfkc_normalization(tmp_path):
+    # Fullwidth-form Latin letters (U+FF01-FF5E block) are a common homoglyph evasion; NFKC's
+    # compatibility decomposition folds them back to standard ASCII, exposing the keyword.
+    fullwidth_password = "ｐａｓｓｗｏｒｄ"  # "password" fullwidth
+    obfuscated = f"{fullwidth_password}=s3cr3tP@ssw0rd123\n"
+    import re
+    raw_rx = re.compile(r'(?i)(?<![A-Za-z])(secret|api[_-]?key|password|token)(?![A-Za-z])\s*[=:]\s*\S+')
+    assert raw_rx.search(obfuscated) is None, "test fixture assumption broken: raw regex should NOT match"
+    v = _screen(tmp_path, {"homoglyph.txt": obfuscated})
+    assert v["homoglyph.txt"]["verdict"] == "HELD"
+    assert "credential" in v["homoglyph.txt"]["flags"]
+
+
+def test_raw_flagged_credential_stays_held_screening_normalized_view_never_loosens(tmp_path):
+    # SACRED invariant pin: a credential the RAW regex already catches must stay HELD once the
+    # normalized-view union is added -- screening both views can only ADD hits, never remove one.
+    v = _screen(tmp_path, {"creds.txt": "password=s3cr3tP@ssw0rd123\n"})
+    assert v["creds.txt"]["verdict"] == "HELD"
+    assert "credential" in v["creds.txt"]["flags"]
+
+
+def test_clean_prose_with_ordinary_unicode_stays_safe_no_false_positive_from_normalization(tmp_path):
+    # A clean prose file containing benign, non-obfuscating Unicode (accented characters, an em dash,
+    # curly quotes -- normal typography, no zero-width/bidi controls, no homoglyph substitution of a
+    # sensitive keyword) must remain SAFE. Screening the normalized view must not manufacture a false
+    # positive out of ordinary Unicode text.
+    prose_with_unicode = (
+        "The café on the corner — a quiet, well-loved place — served “crème "
+        "brûlée” every evening. Visitors from naïve tourists to seasoned locals "
+        "agreed the atmosphere felt effortless and warm. The owner, Renée, greeted everyone by name "
+        "and always asked how their day had gone. Regulars lingered for hours over coffee and quiet "
+        "conversation, watching the light change outside the window as the afternoon wore on slowly.\n"
+    )
+    v = _screen(tmp_path, {"cafe.txt": prose_with_unicode})
+    assert v["cafe.txt"]["verdict"] == "SAFE"
+    assert v["cafe.txt"]["error_code"] == "NONE"
+    assert v["cafe.txt"]["flags"] == []
