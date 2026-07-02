@@ -647,6 +647,222 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
   }
 }
 
+# ===========================================================================
+# WHOLE-BRANCH-REVIEW HARDENING (C2-regen, 2026-07-02) — Fix A + the 3 MINOR schema-strictness
+# fixes. Fix A: the producer-controlled verdict 'name' rides VERBATIM onto released[].name /
+# .Released today; the host must independently enforce the outbox's own
+# ^[A-Za-z0-9._-]{1,40}$ charset/length cap (guest/outbox.py's _NAME_RE) so the gate is
+# self-sufficient even if the upstream outbox check were ever bypassed/changed — a violating
+# name is UNTRUSTED, exactly like any other off-schema field (heldReason='off-schema').
+# MINOR 1: sha256 '$' -> '\z' (a trailing-newline-suffixed 65-char value must not pass).
+# MINOR 2: reject array-typed scalar fields (a JSON-round-tripped 'verdict':["SAFE"] must not
+# [string]-coerce past the exact-case check). MINOR 3: ':'/wildcard chars in name are covered
+# by the same charset cap as Fix A (confirmed by a dedicated ADS-shaped-name case below).
+# ===========================================================================
+Describe 'Invoke-SensitivityGate — whole-branch-review hardening (Fix A name charset/length + MINOR schema strictness)' {
+  BeforeAll {
+    . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"
+
+    $script:hardBytes = [System.Text.Encoding]::UTF8.GetBytes(
+      "A calm, unremarkable paragraph of ordinary prose, included only so the file has some " +
+      "harmless bytes to hash and release under the various hardening test scenarios below."
+    )
+  }
+
+  # Helper: FRESH staging dir per call (mirrors New-BudgetSafeFile above) — stage $Name (the
+  # ON-DISK filename) with the shared hardening bytes and return {StagingDir, Path, Sha256}.
+  # Callers may then hand a DIFFERENT (e.g. illegal) name in the verdict while the real file
+  # backing it is legally named on disk, or vice versa, per scenario.
+  function script:New-HardeningFile {
+    param([string] $Name, [string] $Key = $Name)
+    $stagingDir = Join-Path $TestDrive "hardening-staging-$Key"
+    New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+    $path = Join-Path $stagingDir $Name
+    [System.IO.File]::WriteAllBytes($path, $script:hardBytes)
+    [pscustomobject]@{
+      StagingDir = $stagingDir
+      Sha256     = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+  }
+
+  It 'Fix A: an oversize (41-char) SAFE verdict name is HELD (heldReason=off-schema), never released' {
+    $name = ('a' * 41) + '.txt'   # 45 chars total, well over the 40-char cap
+    $f = New-HardeningFile -Name $name -Key 'oversize'
+
+    $vfile = Join-Path $TestDrive 'fixa-oversize.json'
+    @( [pscustomobject]@{ name = $name; sha256 = $f.Sha256; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'fixa-oversize-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'a 41+-char name exceeds the outbox NAME_RE 40-char cap -> off-schema -> HELD even though verdict=SAFE'
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain $name
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq $name })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'Fix A: an ADS-shaped name (colon, e.g. note.txt:ads) fails Test-VerdictSchema directly (off-schema)' {
+    # A colon is outside the outbox's ^[A-Za-z0-9._-]{1,40}$ alphabet. We cannot literally create
+    # an NTFS ADS-named FILE on disk here (Windows would treat 'note.txt:ads' as a stream on
+    # 'note.txt'), so this proves the SCHEMA gate itself rejects the verdict's name field directly —
+    # the property under test is that Test-VerdictSchema's charset check fires on ':' regardless
+    # of whether a real file could ever be staged under that literal name.
+    $verdict = [pscustomobject]@{ name = 'note.txt:ads'; sha256 = ('0' * 64); verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+    Test-VerdictSchema -Verdict $verdict | Should -BeFalse -Because "a colon (ADS-shaped name) is outside ^[A-Za-z0-9._-]{1,40}`$ -> off-schema"
+  }
+
+  It 'Fix A: an ADS-shaped verdict name is HELD end-to-end (heldReason=off-schema), never released' {
+    $f = New-HardeningFile -Name 'note.txt' -Key 'ads-e2e'
+    $vfile = Join-Path $TestDrive 'fixa-ads-e2e.json'
+    @( [pscustomobject]@{ name = 'note.txt:ads'; sha256 = $f.Sha256; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'fixa-ads-e2e-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    # The verdict names 'note.txt:ads' but staging only has 'note.txt' -- the completeness guard
+    # would ALSO catch this (an unvouched staged file), so the whole run throws (fail-closed).
+    # Either failure mode (per-file HELD or whole-run throw) satisfies "never released"; assert
+    # the observable property that matters: nothing escapes to released/.
+    { Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile } | Should -Throw
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain 'note.txt:ads'
+    $relNames | Should -Not -Contain 'note.txt'
+  }
+
+  It 'Fix A: a traversal-shaped name (../x) fails Test-VerdictSchema directly (name charset excludes path separators)' {
+    $verdict = [pscustomobject]@{ name = '../x'; sha256 = ('0' * 64); verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+    Test-VerdictSchema -Verdict $verdict | Should -BeFalse -Because "'../x' contains '/' which is outside the ^[A-Za-z0-9._-]{1,40}`$ charset -> off-schema (belt-and-braces alongside the existing traversal guard)"
+  }
+
+  It 'MINOR 1 (sha256 \z): a sha256 with a trailing newline (65 chars, .NET "$" would match before it) is off-schema -> HELD' {
+    $f = New-HardeningFile -Name 'trailing-nl.txt' -Key 'trailing-nl'
+    $vfile = Join-Path $TestDrive 'minor1-trailing-nl.json'
+    # ConvertTo-Json would escape a literal "`n" safely; embed it directly in the sha256 string.
+    $badSha = "$($f.Sha256)`n"
+    @( [pscustomobject]@{ name = 'trailing-nl.txt'; sha256 = $badSha; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'minor1-trailing-nl-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'trailing-nl.txt' -Because 'a 65-char sha256 ending in a newline must fail a \z-anchored check, even though .NET "$" would match before the trailing newline'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'trailing-nl.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'MINOR 1 (sha256 \z): direct schema-function proof — a 65-char newline-suffixed sha256 fails Test-VerdictSchema' {
+    $f = New-HardeningFile -Name 'direct-nl.txt' -Key 'direct-nl'
+    $verdict = [pscustomobject]@{ name = 'direct-nl.txt'; sha256 = "$($f.Sha256)`n"; verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+    Test-VerdictSchema -Verdict $verdict | Should -BeFalse -Because '.NET regex "$" matches before a trailing newline; only \z is a true end-of-string anchor'
+  }
+
+  It 'MINOR 2 (array-typed fields): a JSON-round-tripped verdict:["SAFE"] array is off-schema -> HELD, never released' {
+    $f = New-HardeningFile -Name 'array-verdict.txt' -Key 'array-verdict'
+    # Hand-construct the raw JSON so 'verdict' is a genuine JSON array, then let ConvertFrom-Json
+    # (inside the gate) materialize it as an Object[] the way a compromised/buggy producer's
+    # verdicts.json could. ConvertTo-Json on a PS array of one element would normally COLLAPSE to
+    # a scalar, so we write the JSON text directly to force a true array-typed field.
+    $rawJson = @"
+[
+  { "name": "array-verdict.txt", "sha256": "$($f.Sha256)", "verdict": ["SAFE"], "error_code": "NONE", "flags": [] }
+]
+"@
+    $vfile = Join-Path $TestDrive 'minor2-array-verdict.json'
+    Set-Content -LiteralPath $vfile -Value $rawJson -Encoding utf8
+    $output = Join-Path $TestDrive 'minor2-array-verdict-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'array-verdict.txt' -Because 'verdict:["SAFE"] is an array-typed field that must not [string]-coerce past the exact-case SAFE check'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'array-verdict.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'MINOR 2 (array-typed fields): a JSON-round-tripped sha256 wrapped in an array is off-schema -> HELD' {
+    $f = New-HardeningFile -Name 'array-sha.txt' -Key 'array-sha'
+    $rawJson = @"
+[
+  { "name": "array-sha.txt", "sha256": ["$($f.Sha256)"], "verdict": "SAFE", "error_code": "NONE", "flags": [] }
+]
+"@
+    $vfile = Join-Path $TestDrive 'minor2-array-sha.json'
+    Set-Content -LiteralPath $vfile -Value $rawJson -Encoding utf8
+    $output = Join-Path $TestDrive 'minor2-array-sha-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'array-sha.txt' -Because 'sha256:["<hash>"] is an array-typed field that must not [string]-coerce past the sha256 shape check'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'array-sha.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'MINOR 2 (array-typed fields): a JSON-round-tripped error_code:["NONE"] array is off-schema -> HELD' {
+    $f = New-HardeningFile -Name 'array-errorcode.txt' -Key 'array-errorcode'
+    $rawJson = @"
+[
+  { "name": "array-errorcode.txt", "sha256": "$($f.Sha256)", "verdict": "SAFE", "error_code": ["NONE"], "flags": [] }
+]
+"@
+    $vfile = Join-Path $TestDrive 'minor2-array-errorcode.json'
+    Set-Content -LiteralPath $vfile -Value $rawJson -Encoding utf8
+    $output = Join-Path $TestDrive 'minor2-array-errorcode-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'array-errorcode.txt' -Because 'error_code:["NONE"] is an array-typed field that must not [string]-coerce past the exact-case check'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'array-errorcode.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'MINOR 2 (array-typed fields): a JSON-round-tripped name array is off-schema -> HELD, never released' {
+    $f = New-HardeningFile -Name 'array-name-target.txt' -Key 'array-name'
+    $rawJson = @"
+[
+  { "name": ["array-name-target.txt"], "sha256": "$($f.Sha256)", "verdict": "SAFE", "error_code": "NONE", "flags": [] }
+]
+"@
+    $vfile = Join-Path $TestDrive 'minor2-array-name.json'
+    Set-Content -LiteralPath $vfile -Value $rawJson -Encoding utf8
+    $output = Join-Path $TestDrive 'minor2-array-name-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    # An array-typed 'name' does NOT fool Split-Path -Leaf's traversal guard (PowerShell
+    # positionally unwraps a single-element array to its scalar there, so 'name' -eq
+    # Split-Path-Leaf(name) still holds) — the real backstop is Test-VerdictSchema's array-type
+    # rejection (MINOR 2), which routes this to the normal off-schema HELD path, same as any
+    # other malformed verdict. No exception; nothing released.
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'array-name-target.txt' -Because 'an array-typed name must not [string]-coerce past the schema check'
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain 'array-name-target.txt'
+    $heldEntry = @($r.Held)[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'sanity: .Released entries still expose only the intended {name, sha256} shape after hardening (no regression)' {
+    $f = New-HardeningFile -Name 'sanity-clean.txt' -Key 'sanity-clean'
+    $vfile = Join-Path $TestDrive 'sanity-clean.json'
+    @( [pscustomobject]@{ name = 'sanity-clean.txt'; sha256 = $f.Sha256; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'sanity-clean-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $f.StagingDir -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'sanity-clean.txt'
+    $entry = @($r.Released | Where-Object { $_.name -eq 'sanity-clean.txt' })[0]
+    @($entry.PSObject.Properties.Name | Sort-Object) | Should -Be @('name', 'sha256')
+  }
+}
+
 Describe 'Invoke-SensitivityGate — C2.5 released-byte budget backstop (per-artifact size + file-count caps)' {
   BeforeAll {
     . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"

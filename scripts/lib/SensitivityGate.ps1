@@ -147,6 +147,13 @@ $script:VerdictSchema = @{
     ErrorCodeEnum = @('NONE', 'EXTRACT_FAIL', 'OFF_SCHEMA', 'DETECTOR_ERROR', 'UNSUPPORTED')
     FlagVocab     = @('aws_key', 'credential', 'financial', 'health', 'ssn', 'email', 'pii', 'secret', 'entropy', 'other')
     AllowedKeys   = @('name', 'sha256', 'verdict', 'error_code', 'flags')
+    # Whole-branch-review hardening (C2-regen, 2026-07-02) — Fix A: mirrors guest/outbox.py's
+    # _NAME_RE EXACTLY (^[A-Za-z0-9._-]{1,40}$). The verdict 'name' rides VERBATIM onto
+    # released[].name / .Released (see the regenerated-report block below), so it is itself a
+    # producer-influenced degree of freedom the host must independently bound — never rely
+    # solely on the upstream outbox check having already enforced this. A name outside this
+    # charset/length cap is UNTRUSTED, exactly like any other off-schema field.
+    NameRE        = '^[A-Za-z0-9._-]{1,40}$'
 }
 
 <#
@@ -157,11 +164,23 @@ $script:VerdictSchema = @{
     pinned enum alphabet (Task C2.1's producer schema, mirrored above) — no unknown key
     (including a producer-supplied 'run_id', which is NOT part of the verdict schema; the
     host generates run_id itself, never trusting a producer-supplied value), no out-of-enum
-    'verdict'/'error_code' value, no off-vocabulary 'flags' entry, and a well-formed 64-char
-    lowercase-hex 'sha256'. Anything else -> $false, which routes the verdict to HELD with
-    heldReason='off-schema' in the caller. This confines the verdict channel to the schema
-    alphabet even against a malicious/buggy producer — the ONE place a careless widening of
-    the accepted shape could reopen a free-form channel, so keep this strict and literal.
+    'verdict'/'error_code' value, no off-vocabulary 'flags' entry, a well-formed 64-char
+    lowercase-hex 'sha256', and a 'name' matching the outbox's own ^[A-Za-z0-9._-]{1,40}$
+    charset/length cap (Fix A, whole-branch-review 2026-07-02 — the host independently
+    re-enforces this rather than trusting the upstream outbox check alone, since 'name' rides
+    verbatim onto the released surface). Anything else -> $false, which routes the verdict to
+    HELD with heldReason='off-schema' in the caller. This confines the verdict channel to the
+    schema alphabet even against a malicious/buggy producer — the ONE place a careless
+    widening of the accepted shape could reopen a free-form channel, so keep this strict and
+    literal.
+
+    ARRAY-TYPED FIELD REJECTION (MINOR 2, whole-branch-review 2026-07-02): a scalar field
+    (name/sha256/verdict/error_code) that arrives as an array — e.g. a JSON producer emitting
+    "verdict":["SAFE"] — is rejected BEFORE any [string] coercion. PowerShell's [string] cast
+    of a single-element array silently collapses it to that element's value (e.g.
+    [string]@('SAFE') -eq 'SAFE'), which would let an array-typed field slip past the
+    exact-case enum/regex checks below undetected. 'flags' is the ONE field that IS meant to
+    be an array (a set of tags) and is exempted from this check.
 #>
 function Test-VerdictSchema {
     [CmdletBinding()]
@@ -176,6 +195,16 @@ function Test-VerdictSchema {
     $missing = @($script:VerdictSchema.AllowedKeys | Where-Object { $props -notcontains $_ })
     if ($extra.Count -gt 0 -or $missing.Count -gt 0) { return $false }
 
+    # MINOR 2 — reject array-typed scalar fields BEFORE any [string] coercion. A JSON producer
+    # that emits "verdict":["SAFE"] (or the same for name/sha256/error_code) yields a genuine
+    # System.Object[] from ConvertFrom-Json; PowerShell's [string] cast of a SINGLE-element
+    # array silently collapses to that element's bare value, which would otherwise slip past
+    # every exact-case check below. 'flags' is intentionally NOT in this list — it is the one
+    # field the schema defines as an array (a subset of the fixed flag vocabulary).
+    foreach ($scalarField in @('name', 'sha256', 'verdict', 'error_code')) {
+        if ($Verdict.$scalarField -is [array]) { return $false }
+    }
+
     # CASE-SENSITIVE (-ccontains/-cnotmatch): PowerShell's default comparison operators are
     # case-INSENSITIVE, so without the 'c'-prefixed variants 'safe'/'Safe'/'SAFE_but_lowercase'
     # would all wrongly match the 'SAFE' enum member, an uppercase-hex sha256 would pass the
@@ -185,8 +214,20 @@ function Test-VerdictSchema {
     if ($script:VerdictSchema.VerdictEnum -cnotcontains [string]$Verdict.verdict) { return $false }
     if ($script:VerdictSchema.ErrorCodeEnum -cnotcontains [string]$Verdict.error_code) { return $false }
 
+    # Fix A — name charset/length cap, mirroring guest/outbox.py's _NAME_RE exactly (that
+    # upstream check confines what a WELL-BEHAVED producer ever writes into the outbox; this
+    # independent host-side re-check confines what the GATE ever trusts, so the gate remains
+    # self-sufficient even if the upstream check were ever bypassed, weakened, or the verdict
+    # arrived by a path other than the outbox). A violating name is UNTRUSTED -> off-schema.
+    $nm = [string]$Verdict.name
+    if ($nm -cnotmatch $script:VerdictSchema.NameRE) { return $false }
+
     $sha = [string]$Verdict.sha256
-    if ($sha -cnotmatch '^[0-9a-f]{64}$') { return $false }
+    # \z (not '$'): .NET regex '$' matches at the end of the string OR immediately before a
+    # trailing "\n" — so a 65-char value consisting of 64 valid hex chars + a trailing newline
+    # would WRONGLY pass a '$'-anchored check. \z is the true, unconditional end-of-string
+    # anchor with no such carve-out.
+    if ($sha -cnotmatch '^[0-9a-f]{64}\z') { return $false }
 
     $flags = @($Verdict.flags)
     foreach ($f in $flags) {
