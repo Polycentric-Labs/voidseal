@@ -9,8 +9,9 @@ def _run(*args):
 
 def test_runner_screens_and_packs_a_valid_outbox(tmp_path):
     staging = tmp_path / "staging"; staging.mkdir()
-    # A clear SAFE prose file: >=60 words, alpha ratio >0.85, >=3 sentence terminators, no SENSITIVE hits.
-    # A clear SENSITIVE credential file: triggers the 'credential' regex via SECRET keyword.
+    # A clear SAFE prose file: >=60 words, alpha ratio >0.85, >=3 sentence terminators, no detector hits.
+    # A clear HELD credential file: triggers the 'credential' regex via SECRET keyword (C2.1 minimal
+    # enum schema: verdict in {SAFE, HELD, ERROR} -- a detector hit -> HELD, never SENSITIVE).
     (staging / "essay.txt").write_text(
         "The morning light filtered gently through the tall oak trees, casting long golden shadows "
         "across the damp meadow. Birds began their chorus well before dawn, filling the air with "
@@ -28,7 +29,7 @@ def test_runner_screens_and_packs_a_valid_outbox(tmp_path):
     verdicts_obj, candidates = outbox.read_and_verify(out.read_bytes())   # round-trips => a valid outbox
     by = {v["name"]: v["verdict"] for v in verdicts_obj}
     assert by["essay.txt"] == "SAFE"
-    assert by["creds.txt"] == "SENSITIVE"
+    assert by["creds.txt"] == "HELD"
     assert set(candidates) == {"essay.txt", "creds.txt"}   # the outbox carries ALL candidates; the HOST gate partitions
 
 def test_runner_fails_closed_on_screener_error_no_outbox_written(tmp_path):
