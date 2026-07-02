@@ -125,6 +125,36 @@ Describe 'New-WorkloadDisks' {
     }
 }
 
+Describe 'New-WorkloadDisks — outbox-producing non-processor gets a Raw OUTPUT (C1)' {
+  BeforeAll {
+    . "$PSScriptRoot/../scripts/lib/HyperVBackend.ps1"
+    . "$PSScriptRoot/../scripts/lib/Provisioner.ps1"
+    . "$PSScriptRoot/../scripts/lib/Workload.ps1"
+  }
+  It 'creates the OUTPUT disk as Raw when the profile sets OutboxOutput (no ScreenConfig)' {
+    $backend = New-FakeHyperVBackend
+    $d = New-SandboxDescriptor -Name 'fx1' -Tier 0
+    # Register the VM so AddHardDiskDrive has a target (mirrors other Workload tests).
+    $null = & $backend.NewVM @{ Name = 'fx1'; MemoryStartupBytes = 512MB; VhdPath = 'C:\v\fx1.vhdx'; SwitchName = $null }
+    $profile = @{ WorkloadMode = 'Disk'; OutboxOutput = $true; FileSystem = 'exFAT' }
+    $out = New-WorkloadDisks -Descriptor $d -Profile $profile -StorageRoot 'C:\v' -Backend $backend
+    $info = & $backend.GetVHDInfo @{ Path = $out.OutputDiskPath }
+    # The fake surfaces the format it was created with; a Raw OUTPUT reports FileSystem 'Raw'.
+    $info.FileSystem | Should -Be 'Raw'
+    # The INPUT disk stays exFAT (only OUTPUT is Raw).
+    $inInfo = & $backend.GetVHDInfo @{ Path = $out.InputDiskPath }
+    $inInfo.FileSystem | Should -Be 'exFAT'
+  }
+  It 'still makes a non-outbox non-processor OUTPUT exFAT (firefox pre-convergence regression guard)' {
+    $backend = New-FakeHyperVBackend
+    $d = New-SandboxDescriptor -Name 'fx2' -Tier 0
+    $null = & $backend.NewVM @{ Name = 'fx2'; MemoryStartupBytes = 512MB; VhdPath = 'C:\v\fx2.vhdx'; SwitchName = $null }
+    $profile = @{ WorkloadMode = 'Disk'; FileSystem = 'exFAT' }   # no OutboxOutput, no ScreenConfig
+    $out = New-WorkloadDisks -Descriptor $d -Profile $profile -StorageRoot 'C:\v' -Backend $backend
+    (& $backend.GetVHDInfo @{ Path = $out.OutputDiskPath }).FileSystem | Should -Be 'exFAT'
+  }
+}
+
 # ===========================================================================
 #  RC6 — New-WorkloadSeedDisk: deliver the disk-mode cloud-init seed on a CIDATA
 #  DATA DISK that survives the seal (the seal ejects DVDs; a recorded data disk stays).

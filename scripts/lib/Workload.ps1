@@ -93,11 +93,13 @@ function New-WorkloadDisks {
 
     # OUTPUT disk: create -> RECORD (field + CreatedDisks) -> attach. The INPUT disk is already recorded
     # above, so a throw anywhere in THIS block leaves the INPUT recorded on CreatedDisks for teardown.
-    # Processor predicate (D4-A): a profile with Network='None' AND ScreenConfig is a processor —
-    # its OUTPUT disk is Raw (no filesystem; offset 0 = the outbox the guest writes via dd; the host
-    # reads it via ReadVhdxRawRegion, never Mount-VHD). Everything else (firefox, INPUT disks) stays exFAT.
-    $isProcessor = ($Profile['Network'] -eq 'None') -and $Profile.ContainsKey('ScreenConfig')
-    $outFs = if ($isProcessor) { 'Raw' } else { $fs }
+    # Raw-OUTPUT predicate: a PROCESSOR (Network='None' AND ScreenConfig) OR any profile that opts into the
+    # user-space outbox transport (OutboxOutput=$true — firefox post-C1 convergence). Either way the OUTPUT is
+    # Raw (no host-mountable FS; offset 0 = the outbox the guest writes; host reads via ReadVhdxRawRegion,
+    # NEVER Mount-VHD). Everything else (INPUT disks, legacy non-outbox non-processors) stays exFAT.
+    $isProcessor  = ($Profile['Network'] -eq 'None') -and $Profile.ContainsKey('ScreenConfig')
+    $wantsOutbox  = $Profile.ContainsKey('OutboxOutput') -and [bool]$Profile['OutboxOutput']
+    $outFs = if ($isProcessor -or $wantsOutbox) { 'Raw' } else { $fs }
     $null = & $Backend.NewOutputVhdx @{ Path = $outPath; Label = $outLabel; FileSystem = $outFs; SizeBytes = 1GB }
     $Descriptor.OutputDiskPath = $outPath
     & $appendCreated $outPath
