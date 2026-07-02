@@ -611,19 +611,25 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         # Phase-2 derives these from host-mounting the detached OUTPUT VHDX). The staging dir is a real
         # temp dir with the messy-drive fixture copied in; the verdicts.json is hand-written to cover all
         # seven staged files (the gate's completeness guard refuses an unaccounted staged file).
+        # C2.1/C2.4 locked schema: verdict in {SAFE, HELD, ERROR}, error_code in the fixed enum, flags a
+        # bounded closed vocabulary, sha256 the content-binding field C2.4's re-hash-at-release checks
+        # against — computed HERE from the actual staged bytes so it can never silently desync.
         $script:GateStaging = Join-Path $script:TmpRoot ("gate-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
         New-Item -ItemType Directory -Path $script:GateStaging -Force | Out-Null
         Copy-Item (Join-Path $script:SkillRoot 'tests/fixtures/messy-drive/*') $script:GateStaging
+        function script:GateHashOf($name) {
+            (Get-FileHash -LiteralPath (Join-Path $script:GateStaging $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
 
         $script:GateVerdicts = Join-Path $script:TmpRoot ("gate-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
         @(
-            [pscustomobject]@{ name = 'creds.txt';             verdict = 'SENSITIVE'; detectors = @('credential-pattern') }
-            [pscustomobject]@{ name = 'finance-statement.txt'; verdict = 'SENSITIVE'; detectors = @('financial-keyword') }
-            [pscustomobject]@{ name = 'health-note.txt';       verdict = 'SENSITIVE'; detectors = @('health-keyword') }
-            [pscustomobject]@{ name = 'prose-essay.txt';       verdict = 'SAFE';      detectors = @() }
-            [pscustomobject]@{ name = 'prose-letter.md';       verdict = 'SAFE';      detectors = @() }
-            [pscustomobject]@{ name = 'spreadsheet-dump.csv';  verdict = 'UNCERTAIN'; detectors = @('non-prose') }
-            [pscustomobject]@{ name = 'prose-with-token.md';   verdict = 'SENSITIVE'; detectors = @('token-pattern') }
+            [pscustomobject]@{ name = 'creds.txt';             sha256 = (GateHashOf 'creds.txt');             verdict = 'HELD'; error_code = 'NONE';        flags = @('aws_key') }
+            [pscustomobject]@{ name = 'finance-statement.txt'; sha256 = (GateHashOf 'finance-statement.txt'); verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+            [pscustomobject]@{ name = 'health-note.txt';       sha256 = (GateHashOf 'health-note.txt');       verdict = 'HELD'; error_code = 'NONE';        flags = @('health') }
+            [pscustomobject]@{ name = 'prose-essay.txt';       sha256 = (GateHashOf 'prose-essay.txt');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+            [pscustomobject]@{ name = 'prose-letter.md';       sha256 = (GateHashOf 'prose-letter.md');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+            [pscustomobject]@{ name = 'spreadsheet-dump.csv';  sha256 = (GateHashOf 'spreadsheet-dump.csv');  verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+            [pscustomobject]@{ name = 'prose-with-token.md';   sha256 = (GateHashOf 'prose-with-token.md');   verdict = 'HELD'; error_code = 'NONE';        flags = @('credential') }
         ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:GateVerdicts -Encoding utf8
 
         # A mock DEPS disk: a pre-existing VHDX the builder would have produced (Phase 2). The fake's
@@ -735,13 +741,13 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         # is Held. Proves the screener-verdict fail-closed at the partition, separate from a parse failure.
         $allHeld = Join-Path $script:TmpRoot ("verdicts-allheld-{0}.json" -f ([guid]::NewGuid().ToString('N')))
         @(
-            [pscustomobject]@{ name = 'creds.txt';             verdict = 'SENSITIVE'; detectors = @('credential-pattern') }
-            [pscustomobject]@{ name = 'finance-statement.txt'; verdict = 'SENSITIVE'; detectors = @('financial-keyword') }
-            [pscustomobject]@{ name = 'health-note.txt';       verdict = 'SENSITIVE'; detectors = @('health-keyword') }
-            [pscustomobject]@{ name = 'prose-essay.txt';       verdict = 'UNCERTAIN'; detectors = @('non-prose') }
-            [pscustomobject]@{ name = 'prose-letter.md';       verdict = 'UNCERTAIN'; detectors = @('non-prose') }
-            [pscustomobject]@{ name = 'spreadsheet-dump.csv';  verdict = 'SENSITIVE'; detectors = @('financial-keyword') }
-            [pscustomobject]@{ name = 'prose-with-token.md';   verdict = 'SENSITIVE'; detectors = @('token-pattern') }
+            [pscustomobject]@{ name = 'creds.txt';             sha256 = (GateHashOf 'creds.txt');             verdict = 'HELD'; error_code = 'NONE';        flags = @('aws_key') }
+            [pscustomobject]@{ name = 'finance-statement.txt'; sha256 = (GateHashOf 'finance-statement.txt'); verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+            [pscustomobject]@{ name = 'health-note.txt';       sha256 = (GateHashOf 'health-note.txt');       verdict = 'HELD'; error_code = 'NONE';        flags = @('health') }
+            [pscustomobject]@{ name = 'prose-essay.txt';       sha256 = (GateHashOf 'prose-essay.txt');       verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+            [pscustomobject]@{ name = 'prose-letter.md';       sha256 = (GateHashOf 'prose-letter.md');       verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+            [pscustomobject]@{ name = 'spreadsheet-dump.csv';  sha256 = (GateHashOf 'spreadsheet-dump.csv');  verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+            [pscustomobject]@{ name = 'prose-with-token.md';   sha256 = (GateHashOf 'prose-with-token.md');   verdict = 'HELD'; error_code = 'NONE';        flags = @('credential') }
         ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $allHeld -Encoding utf8
 
         $blobFile = Join-Path $script:TmpRoot ("outbox-allheld-{0}.bin" -f ([guid]::NewGuid().ToString('N')))

@@ -116,7 +116,12 @@ pathlib.Path(a.out).write_text(json.dumps([{"name": "a.txt", "verdict": "SAFE", 
   }
   It 'manifest content reflects the partition (released=SAFE, held includes sensitive, total counted)' {
     $report = Get-Content (Join-Path $script:out 'manifest/sensitivity-report.json') -Raw | ConvertFrom-Json
-    @($report.released | ForEach-Object { $_.verdict } | Where-Object { $_ -ne 'SAFE' }).Count | Should -Be 0
+    # C2.4: the released section is HOST-REGENERATED from validated fields only — entries carry
+    # ONLY name/sha256 (no 'verdict' field; that every released entry IS SAFE is a structural
+    # invariant of the regenerator, not something the released report itself needs to restate).
+    @($report.released) | ForEach-Object {
+      @($_.PSObject.Properties.Name | Sort-Object) | Should -Be @('name', 'sha256')
+    }
     @($report.held | ForEach-Object { $_.name }) | Should -Contain 'creds.txt'
     $report.total | Should -Be 7
   }
@@ -127,15 +132,22 @@ Describe 'Invoke-SensitivityGate -VerdictsPath (consume mode)' {
     . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"
 
     # Helper: create a verdicts array that matches what the real screener produces for
-    # the messy-drive fixture (7 files, verdicts as documented in acceptance tests).
+    # the messy-drive fixture (7 files). C2.1 locked schema: verdict in {SAFE, HELD, ERROR},
+    # error_code in {NONE, EXTRACT_FAIL, OFF_SCHEMA, DETECTOR_ERROR, UNSUPPORTED}, flags is a
+    # bounded closed vocabulary, sha256 is the content-binding field C2.4's re-hash gate checks.
+    # sha256 is computed HERE (not hardcoded) so a fixture edit can never silently desync it from
+    # the real file bytes under tests/fixtures/messy-drive.
+    function script:HashOf($name) {
+      (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot "fixtures/messy-drive/$name") -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
     $script:messyVerdicts = @(
-      [pscustomobject]@{ name = 'creds.txt';             verdict = 'SENSITIVE';  detectors = @('credential-pattern') }
-      [pscustomobject]@{ name = 'finance-statement.txt'; verdict = 'SENSITIVE';  detectors = @('financial-keyword') }
-      [pscustomobject]@{ name = 'health-note.txt';       verdict = 'SENSITIVE';  detectors = @('health-keyword') }
-      [pscustomobject]@{ name = 'prose-essay.txt';       verdict = 'SAFE';       detectors = @() }
-      [pscustomobject]@{ name = 'prose-letter.md';       verdict = 'SAFE';       detectors = @() }
-      [pscustomobject]@{ name = 'spreadsheet-dump.csv';  verdict = 'UNCERTAIN';  detectors = @('non-prose') }
-      [pscustomobject]@{ name = 'prose-with-token.md';   verdict = 'SENSITIVE';  detectors = @('token-pattern') }
+      [pscustomobject]@{ name = 'creds.txt';             sha256 = (HashOf 'creds.txt');             verdict = 'HELD'; error_code = 'NONE';        flags = @('aws_key') }
+      [pscustomobject]@{ name = 'finance-statement.txt'; sha256 = (HashOf 'finance-statement.txt'); verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+      [pscustomobject]@{ name = 'health-note.txt';       sha256 = (HashOf 'health-note.txt');       verdict = 'HELD'; error_code = 'NONE';        flags = @('health') }
+      [pscustomobject]@{ name = 'prose-essay.txt';       sha256 = (HashOf 'prose-essay.txt');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+      [pscustomobject]@{ name = 'prose-letter.md';       sha256 = (HashOf 'prose-letter.md');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+      [pscustomobject]@{ name = 'spreadsheet-dump.csv';  sha256 = (HashOf 'spreadsheet-dump.csv');  verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+      [pscustomobject]@{ name = 'prose-with-token.md';   sha256 = (HashOf 'prose-with-token.md');   verdict = 'HELD'; error_code = 'NONE';        flags = @('credential') }
     )
   }
 
@@ -233,6 +245,295 @@ Describe 'Invoke-SensitivityGate -VerdictsPath (consume mode)' {
 
     { Invoke-SensitivityGate -StagingDir $staging -OutputDir $output -VerdictsPath $nonExistent } |
       Should -Throw
+  }
+}
+
+# ===========================================================================
+# C2.4 — REGENERATOR CORE (gate side, [KEY]). Invoke-SensitivityGate Consume mode must, for
+# every verdict, in order: (1) validate against the C2.1 enum schema (unknown key / out-of-
+# enum value / off-vocab flag / malformed sha256 -> HELD heldReason=off-schema, NEVER trusted
+# or released); (2) immediately before release, RE-HASH the staged file's bytes and release a
+# SAFE verdict ONLY if current_sha256 == verdict.sha256 (else HELD heldReason=hash-mismatch —
+# closes the P1#3 TOCTOU/post-screen-swap); (3) stamp a HOST-generated run_id (a producer-
+# supplied run_id field is itself off-schema, since run_id is not in the C2.1 verdict schema,
+# and must be ignored/rejected); (4) REGENERATE the released report from a TCB-owned template
+# parameterized ONLY by validated enum fields + run_id + released name/sha256 — the guest's
+# verdicts.json bytes / any free-form field NEVER appear in the released report. All four are
+# strictly-tightening (only ever narrow the releasable set) and layered UNDER the existing
+# traversal guard / completeness guard / exact-SAFE partition / invariant re-assertion.
+# ===========================================================================
+Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + re-hash + host run_id + regenerated report)' {
+  BeforeAll {
+    . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"
+
+    $script:regenStaging = Join-Path $TestDrive 'regen-staging'
+    New-Item -ItemType Directory -Path $script:regenStaging -Force | Out-Null
+    $script:safeBytes = [System.Text.Encoding]::UTF8.GetBytes(
+      "The morning light filtered gently through the tall oak trees, casting long shadows. " +
+      "Birds began their chorus well before dawn, filling the quiet air with intricate song."
+    )
+    [System.IO.File]::WriteAllBytes((Join-Path $script:regenStaging 'essay.txt'), $script:safeBytes)
+    $script:safeHash = (Get-FileHash -LiteralPath (Join-Path $script:regenStaging 'essay.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
+  }
+
+  It 'off-schema: an out-of-enum verdict value routes to HELD (heldReason=off-schema), never released' {
+    $vfile = Join-Path $TestDrive 'off-schema-verdict.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE_BUT_ACTUALLY_FREEFORM'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'off-schema-verdict-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'an out-of-enum verdict value is off-schema -> HELD, never released'
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain 'essay.txt'
+    $helNames = @(Get-ChildItem (Join-Path $output 'held') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $helNames | Should -Contain 'essay.txt'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'off-schema'
+  }
+
+  It 'off-schema: an extra free-form key on an otherwise-SAFE verdict routes to HELD (heldReason=off-schema)' {
+    $vfile = Join-Path $TestDrive 'off-schema-key.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @(); smuggled = 'free-form-canary-value' } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'off-schema-key-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'an extra free-form key is off-schema even though verdict=SAFE -> HELD'
+    (@($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]).heldReason | Should -Be 'off-schema'
+  }
+
+  It 'off-schema: an off-vocabulary flag routes to HELD (heldReason=off-schema)' {
+    $vfile = Join-Path $TestDrive 'off-schema-flag.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @('not_a_real_flag') } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'off-schema-flag-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'an off-vocabulary flag is off-schema -> HELD'
+    (@($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]).heldReason | Should -Be 'off-schema'
+  }
+
+  It 'off-schema: a malformed sha256 (wrong length / non-hex) routes to HELD (heldReason=off-schema)' {
+    $vfile = Join-Path $TestDrive 'off-schema-sha.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = 'not-a-real-sha256'; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'off-schema-sha-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'a malformed sha256 is off-schema -> HELD'
+    (@($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]).heldReason | Should -Be 'off-schema'
+  }
+
+  It 'off-schema: a producer-supplied run_id field is rejected as off-schema (host run_id is never consumer-derived)' {
+    # run_id is NOT part of the C2.1 verdict schema. A producer that stuffs a decoy run_id
+    # into a verdict must be treated exactly like any other unknown-key smuggle attempt.
+    $vfile = Join-Path $TestDrive 'off-schema-runid.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @(); run_id = 'PRODUCER-CHOSEN-RUN-ID-DECOY' } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'off-schema-runid-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'a producer-supplied run_id is an off-schema key -> HELD'
+    (@($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]).heldReason | Should -Be 'off-schema'
+  }
+
+  It 'hash-mismatch: a SAFE, enum-valid verdict whose sha256 does not match the staged bytes -> HELD (heldReason=hash-mismatch)' {
+    $vfile = Join-Path $TestDrive 'hash-mismatch.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = ('0' * 64); verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'hash-mismatch-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'a SHA mismatch means the staged bytes are not provably what was screened -> HELD (TOCTOU close)'
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $relNames | Should -Not -Contain 'essay.txt'
+    $heldEntry = @($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]
+    $heldEntry.heldReason | Should -Be 'hash-mismatch'
+  }
+
+  It 'hash-mismatch: a post-screen swapped file (bytes on disk changed after the verdict was formed) -> HELD, not released' {
+    # Simulates the P1#3 TOCTOU: the verdict was computed over the ORIGINAL bytes; the staged
+    # file is then swapped for different content before the gate runs. Re-hash-at-release must
+    # catch this even though the sha256 field itself is well-formed (64 lowercase hex chars).
+    $swapStaging = Join-Path $TestDrive 'swap-staging'
+    New-Item -ItemType Directory -Path $swapStaging -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $swapStaging 'essay.txt'), $script:safeBytes)
+    $originalHash = (Get-FileHash -LiteralPath (Join-Path $swapStaging 'essay.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    $vfile = Join-Path $TestDrive 'swap-verdicts.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $originalHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+
+    # Swap the staged bytes AFTER the verdict was formed but BEFORE the gate runs.
+    [System.IO.File]::WriteAllBytes((Join-Path $swapStaging 'essay.txt'), [System.Text.Encoding]::UTF8.GetBytes('SWAPPED-AFTER-SCREEN'))
+
+    $output = Join-Path $TestDrive 'swap-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $swapStaging -OutputDir $output -VerdictsPath $vfile
+
+    @($r.Released) | Should -BeNullOrEmpty -Because 'the staged bytes no longer match the screened hash -> HELD, closes the TOCTOU swap'
+    (@($r.Held | Where-Object { $_.name -eq 'essay.txt' })[0]).heldReason | Should -Be 'hash-mismatch'
+  }
+
+  It 'positive path: a clean, enum-valid SAFE verdict whose sha256 matches the staged bytes is released' {
+    $vfile = Join-Path $TestDrive 'positive-path.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'positive-path-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    $relNames = @(Get-ChildItem (Join-Path $output 'released') | ForEach-Object { $_.Name })
+    $relNames | Should -Contain 'essay.txt'
+    @($r.Released).Count | Should -Be 1
+    $r.Released[0].verdict | Should -Be 'SAFE'
+  }
+
+  It 'host run_id: the manifest carries a host-generated run_id, non-empty and NOT the decoy the input supplied' {
+    $vfile = Join-Path $TestDrive 'runid-manifest.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'runid-manifest-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    [string]$report.run_id | Should -Not -BeNullOrEmpty -Because 'the regenerated report must carry a host-generated run_id'
+    [string]$report.run_id | Should -Not -Be 'PRODUCER-CHOSEN-RUN-ID-DECOY'
+  }
+
+  It 'host run_id: two separate gate runs against the same input get DIFFERENT run_ids (host-generated per invocation, not derived from content)' {
+    $vfile = Join-Path $TestDrive 'runid-distinct.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+
+    $out1 = Join-Path $TestDrive 'runid-distinct-out1'; New-Item -ItemType Directory -Path $out1 -Force | Out-Null
+    $out2 = Join-Path $TestDrive 'runid-distinct-out2'; New-Item -ItemType Directory -Path $out2 -Force | Out-Null
+
+    $r1 = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $out1 -VerdictsPath $vfile
+    $r2 = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $out2 -VerdictsPath $vfile
+
+    $report1 = Get-Content $r1.ManifestPath -Raw | ConvertFrom-Json
+    $report2 = Get-Content $r2.ManifestPath -Raw | ConvertFrom-Json
+    [string]$report1.run_id | Should -Not -Be ([string]$report2.run_id)
+  }
+
+  It 'regenerated report: contains ONLY schema fields + run_id + released name/sha256 — a free-form guest canary string never appears' {
+    # The consumed verdicts.json carries a canary free-form value smuggled into an otherwise
+    # off-schema (rejected) entry AND, separately, a legitimate SAFE entry. The regenerated
+    # released report must be built FRESH from validated enum values only — even the raw
+    # (audit-copy) guest verdicts.json content must not leak into the report's released section.
+    $vfile = Join-Path $TestDrive 'regen-report.json'
+    @(
+      [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+    ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'regen-report-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+    $reportRaw = Get-Content $r.ManifestPath -Raw
+    $report = $reportRaw | ConvertFrom-Json
+
+    # The released section is a FRESH host object: only the fixed field set, nothing else.
+    $releasedEntry = @($report.released)[0]
+    $allowedReleasedKeys = @('name', 'sha256')
+    $actualKeys = @($releasedEntry.PSObject.Properties.Name)
+    foreach ($k in $actualKeys) { $allowedReleasedKeys | Should -Contain $k -Because "released report entries must be host-regenerated from validated fields only (found extra key '$k')" }
+    $releasedEntry.name   | Should -Be 'essay.txt'
+    $releasedEntry.sha256 | Should -Be $script:safeHash
+  }
+
+  It 'regenerated report: a free-form canary value on an off-schema entry never appears in the released section (may appear only in the held audit trail)' {
+    # Two files: 'canary.txt' carries a smuggled free-form key (off-schema -> HELD, audit-recorded
+    # verbatim as forensic evidence) and 'essay.txt' is a legitimate, separate SAFE file that DOES
+    # release. The regenerator property under test: the canary must NEVER appear in the report's
+    # 'released' section (host-regenerated from validated fields only), even though the raw guest
+    # verdicts.json (and this HELD entry's audit copy) may retain it for forensics.
+    $canaryStaging = Join-Path $TestDrive 'canary-staging'
+    New-Item -ItemType Directory -Path $canaryStaging -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $canaryStaging 'essay.txt'), $script:safeBytes)
+    [System.IO.File]::WriteAllBytes((Join-Path $canaryStaging 'canary.txt'), [System.Text.Encoding]::UTF8.GetBytes('irrelevant content'))
+    $essayHash  = (Get-FileHash -LiteralPath (Join-Path $canaryStaging 'essay.txt')  -Algorithm SHA256).Hash.ToLowerInvariant()
+    $canaryHash = (Get-FileHash -LiteralPath (Join-Path $canaryStaging 'canary.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    $vfile = Join-Path $TestDrive 'regen-canary.json'
+    @(
+      [pscustomobject]@{ name = 'essay.txt';  sha256 = $essayHash;  verdict = 'SAFE'; error_code = 'NONE'; flags = @() }
+      [pscustomobject]@{ name = 'canary.txt'; sha256 = $canaryHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @(); canary = 'FREEFORM-EXFIL-CHANNEL-CANARY-STRING' }
+    ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'regen-canary-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $canaryStaging -OutputDir $output -VerdictsPath $vfile
+
+    # canary.txt is off-schema (extra key) -> HELD, never released; essay.txt IS released.
+    @($r.Released | ForEach-Object { $_.name }) | Should -Contain 'essay.txt'
+    @($r.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'canary.txt'
+
+    $report = Get-Content $r.ManifestPath -Raw | ConvertFrom-Json
+    $reportReleasedRaw = $report.released | ConvertTo-Json -Depth 6
+    $reportReleasedRaw | Should -Not -Match 'FREEFORM-EXFIL-CHANNEL-CANARY-STRING' -Because 'the regenerated released section must never carry a free-form guest value, even one attached to a different file in the same run'
+  }
+
+  It 'guest verdicts.json is retained ONLY as an audit copy under manifest/, never on the released path' {
+    $vfile = Join-Path $TestDrive 'audit-copy.json'
+    @( [pscustomobject]@{ name = 'essay.txt'; sha256 = $script:safeHash; verdict = 'SAFE'; error_code = 'NONE'; flags = @() } ) |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'audit-copy-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $null = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
+
+    # The audit copy of the guest's raw verdicts.json lives under manifest/ (already the case
+    # pre-C2.4 at SensitivityGate.ps1:155) — assert it is NOT duplicated into released/.
+    Test-Path (Join-Path $output 'manifest/verdicts.json') | Should -BeTrue -Because 'the guest verdicts.json audit copy must still exist under manifest/'
+    Test-Path (Join-Path $output 'released/verdicts.json') | Should -BeFalse -Because 'the guest verdicts.json must NEVER appear on the released path'
+  }
+
+  It 'well-formed multi-file SAFE batch still releases all matching files (existing processor e2e stays green)' {
+    # A regression guard: the regenerator additions must not break the ordinary multi-file
+    # happy path any differently than before — every enum-valid, hash-matching SAFE file
+    # releases; everything else (HELD/ERROR-shaped) does not.
+    $batchStaging = Join-Path $TestDrive 'batch-staging'
+    New-Item -ItemType Directory -Path $batchStaging -Force | Out-Null
+    Copy-Item "$PSScriptRoot/fixtures/messy-drive/*" $batchStaging
+    function _h($n) { (Get-FileHash -LiteralPath (Join-Path $batchStaging $n) -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $vfile = Join-Path $TestDrive 'batch-verdicts.json'
+    @(
+      [pscustomobject]@{ name = 'creds.txt';             sha256 = (_h 'creds.txt');             verdict = 'HELD'; error_code = 'NONE';        flags = @('aws_key') }
+      [pscustomobject]@{ name = 'finance-statement.txt'; sha256 = (_h 'finance-statement.txt'); verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+      [pscustomobject]@{ name = 'health-note.txt';       sha256 = (_h 'health-note.txt');       verdict = 'HELD'; error_code = 'NONE';        flags = @('health') }
+      [pscustomobject]@{ name = 'prose-essay.txt';       sha256 = (_h 'prose-essay.txt');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+      [pscustomobject]@{ name = 'prose-letter.md';       sha256 = (_h 'prose-letter.md');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+      [pscustomobject]@{ name = 'spreadsheet-dump.csv';  sha256 = (_h 'spreadsheet-dump.csv');  verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+      [pscustomobject]@{ name = 'prose-with-token.md';   sha256 = (_h 'prose-with-token.md');   verdict = 'HELD'; error_code = 'NONE';        flags = @('credential') }
+    ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $vfile -Encoding utf8
+    $output = Join-Path $TestDrive 'batch-out'
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+    $r = Invoke-SensitivityGate -StagingDir $batchStaging -OutputDir $output -VerdictsPath $vfile
+
+    $relNames = @($r.Released | ForEach-Object { $_.name })
+    $relNames | Should -Contain 'prose-essay.txt'
+    $relNames | Should -Contain 'prose-letter.md'
+    $relNames | Should -Not -Contain 'creds.txt'
+    @($r.Released).Count | Should -Be 2
   }
 }
 

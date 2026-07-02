@@ -19,14 +19,41 @@
       then PARTITION them into two output buckets:
 
           <OutputDir>/released/   — ONLY files the screener marked exactly 'SAFE'
-          <OutputDir>/held/       — EVERYTHING else (SENSITIVE, UNCERTAIN, or any unknown verdict)
-          <OutputDir>/manifest/sensitivity-report.json  — full partition record
+          <OutputDir>/held/       — EVERYTHING else (HELD, ERROR, off-schema, or hash-mismatch)
+          <OutputDir>/manifest/sensitivity-report.json  — HOST-REGENERATED partition record
 
     THE INVARIANT (released ⊆ SAFE):
       This is the non-negotiable security property of the gate. The only releasable verdict is
-      the exact string 'SAFE'. SENSITIVE, UNCERTAIN, and any unrecognised verdict are HELD
+      the exact string 'SAFE'. HELD, ERROR, and any unrecognised verdict are HELD
       (fail-closed by construction). A belt-and-braces re-assertion throws immediately if the
       partition logic ever produces a violation — defence in depth against future code changes.
+
+    C2.4 — REGENERATOR CORE (the load-bearing hardening on top of the base partition, gate side):
+      an offline content screen cannot give an information-theoretic leakage bound against an
+      adversarial producer that controls the released content (detection cannot bound leakage;
+      regeneration can — see _dev/plans/2026-07-01-pre-phase6-hardening-plan.md, C2 header). So
+      the host acts as a REGENERATOR, not a passive partitioner, on every Consume-mode verdict:
+        1. Enum-schema validation (Test-VerdictSchema): a verdict with an unknown key (including
+           a producer-supplied 'run_id' — never part of the schema), an out-of-enum verdict/
+           error_code value, an off-vocabulary flag, or a malformed sha256 is UNTRUSTED -> HELD
+           with heldReason='off-schema'. This confines the verdict channel to the fixed C2.1
+           producer enum alphabet even against a malicious/buggy producer.
+        2. Re-hash binding at release: immediately before copying a SAFE, schema-valid file into
+           released/, the host re-hashes the STAGED bytes and releases ONLY if they match the
+           verdict's own sha256; a mismatch -> HELD with heldReason='hash-mismatch' (closes the
+           post-screen-swap / TOCTOU window between when the verdict was formed and when the gate
+           runs).
+        3. Host-generated run_id: a fresh GUID is minted per gate invocation and stamped on the
+           regenerated report — NEVER a producer-supplied value (which would fail step 1 anyway).
+        4. Regenerated released report: the report's 'released' array is built FRESH as
+           [pscustomobject]@{name; sha256} for each released file — never the guest's raw verdict
+           object — so a free-form value smuggled onto (or beside) a verdict has no path into the
+           released surface. The consumed guest verdicts.json is still retained VERBATIM as an
+           audit copy under manifest/verdicts.json (unchanged from pre-C2.4), and HELD entries in
+           the report keep their full audit detail (including heldReason) — only the RELEASED
+           section is regenerated to the minimal schema.
+      All four are strictly-tightening: they can only narrow the releasable set relative to the
+      pre-C2.4 partition, never widen it.
 
     FAIL-CLOSED ON ERROR:
       Run mode: a non-zero screener exit code or a missing verdicts file means the screen did
@@ -54,6 +81,64 @@
 #>
 
 Set-StrictMode -Version Latest
+
+# ---------------------------------------------------------------------------
+# C2.4 — REGENERATOR CORE. The host is the sole author of the RELEASED surface: it validates
+# every consumed verdict against the SAME fixed enum schema the producer (guest/screener.py,
+# C2.1) emits, re-hashes each file immediately before release, and builds the released report
+# fresh from validated fields only — the guest's verdicts.json is never copied verbatim into
+# the released report (it is retained ONLY as an audit copy under manifest/). Mirrored here
+# (not imported) because this module is pure PowerShell with no Python dependency at load time;
+# a drift between this mirror and screener.py's enums is caught by SensitivityGate.Tests.ps1's
+# schema-validation Describe block plus the shared messy-drive fixture round-trip.
+# ---------------------------------------------------------------------------
+$script:VerdictSchema = @{
+    VerdictEnum   = @('SAFE', 'HELD', 'ERROR')
+    ErrorCodeEnum = @('NONE', 'EXTRACT_FAIL', 'OFF_SCHEMA', 'DETECTOR_ERROR', 'UNSUPPORTED')
+    FlagVocab     = @('aws_key', 'credential', 'financial', 'health', 'ssn', 'email', 'pii', 'secret', 'entropy', 'other')
+    AllowedKeys   = @('name', 'sha256', 'verdict', 'error_code', 'flags')
+}
+
+<#
+.SYNOPSIS
+    C2.4 — validate a single consumed verdict object against the fixed enum schema.
+.DESCRIPTION
+    Fail-closed schema gate: returns $true ONLY if the verdict is built EXACTLY from the
+    pinned enum alphabet (Task C2.1's producer schema, mirrored above) — no unknown key
+    (including a producer-supplied 'run_id', which is NOT part of the verdict schema; the
+    host generates run_id itself, never trusting a producer-supplied value), no out-of-enum
+    'verdict'/'error_code' value, no off-vocabulary 'flags' entry, and a well-formed 64-char
+    lowercase-hex 'sha256'. Anything else -> $false, which routes the verdict to HELD with
+    heldReason='off-schema' in the caller. This confines the verdict channel to the schema
+    alphabet even against a malicious/buggy producer — the ONE place a careless widening of
+    the accepted shape could reopen a free-form channel, so keep this strict and literal.
+#>
+function Test-VerdictSchema {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)] $Verdict
+    )
+    $props = @($Verdict.PSObject.Properties.Name)
+    # Exact key set match (not subset): an off-schema key (including a decoy 'run_id') fails
+    # closed here. A MISSING required key also fails closed (fewer keys != a valid partial verdict).
+    $extra   = @($props | Where-Object { $script:VerdictSchema.AllowedKeys -notcontains $_ })
+    $missing = @($script:VerdictSchema.AllowedKeys | Where-Object { $props -notcontains $_ })
+    if ($extra.Count -gt 0 -or $missing.Count -gt 0) { return $false }
+
+    if ($script:VerdictSchema.VerdictEnum -notcontains [string]$Verdict.verdict) { return $false }
+    if ($script:VerdictSchema.ErrorCodeEnum -notcontains [string]$Verdict.error_code) { return $false }
+
+    $sha = [string]$Verdict.sha256
+    if ($sha -notmatch '^[0-9a-f]{64}$') { return $false }
+
+    $flags = @($Verdict.flags)
+    foreach ($f in $flags) {
+        if ($script:VerdictSchema.FlagVocab -notcontains [string]$f) { return $false }
+    }
+
+    return $true
+}
 
 function Invoke-SensitivityGate {
 <#
@@ -187,24 +272,57 @@ function Invoke-SensitivityGate {
         }
     }
 
+    # C2.4 — host-generated run_id. Generated ONCE per gate invocation, NEVER derived from or
+    # trusted from any producer-supplied field (a verdict carrying its own 'run_id' key is itself
+    # off-schema per Test-VerdictSchema's exact-key-set check above, so a decoy can never survive
+    # to this point anyway — this is the second, independent layer: even if schema validation were
+    # ever weakened, the regenerated report below only ever writes THIS host-generated value).
+    $runId = [guid]::NewGuid().ToString()
+
     $rel = [System.Collections.Generic.List[object]]::new()
     $hel = [System.Collections.Generic.List[object]]::new()
 
     foreach ($v in $verdicts) {
         $src = Join-Path $StagingDir $v.name
-        # The ONE releasable verdict is the exact string 'SAFE'.
-        # SENSITIVE, UNCERTAIN, and any future/unknown verdict → HELD (fail-closed).
-        # -ErrorAction Stop makes a failed copy THROW rather than emit a swallowed non-terminating
-        # error: without it, a missing source file would let $rel.Add/$hel.Add run anyway, so
-        # .Released / the manifest would CLAIM a release that never hit disk. Fail closed — record a
-        # release/hold only AFTER the copy is confirmed.
-        if ($v.verdict -eq 'SAFE') {
-            Copy-Item -LiteralPath $src -Destination $released -ErrorAction Stop
-            $rel.Add($v)
-        } else {
+
+        # C2.4 step 1 — enum-schema validation (REGENERATOR CORE). A verdict that is not built
+        # EXACTLY from the fixed producer enum (unknown key, out-of-enum verdict/error_code, an
+        # off-vocabulary flag, or a malformed sha256) is UNTRUSTED — route it to HELD with
+        # heldReason='off-schema' rather than trusting/copying it. This confines the verdict
+        # channel to the schema alphabet even against a malicious producer (the alphabet stays
+        # fixed regardless of what free-form content a compromised/buggy guest tries to smuggle).
+        if (-not (Test-VerdictSchema -Verdict $v)) {
+            Copy-Item -LiteralPath $src -Destination $held -ErrorAction Stop
+            $hel.Add(($v | Select-Object *, @{Name='heldReason'; Expression={'off-schema'}}))
+            continue
+        }
+
+        # The ONE releasable verdict is the exact string 'SAFE'. HELD/ERROR (and any value that
+        # somehow slipped past schema validation) → HELD (fail-closed).
+        if ($v.verdict -ne 'SAFE') {
             Copy-Item -LiteralPath $src -Destination $held -ErrorAction Stop
             $hel.Add($v)
+            continue
         }
+
+        # C2.4 step 2 — re-hash binding (closes the P1#3 TOCTOU / post-screen swap). Re-hash the
+        # STAGED file's bytes immediately before release and compare against the verdict's own
+        # (schema-validated, well-formed) sha256. A mismatch means the bytes on disk right now are
+        # NOT provably what the screener evaluated — release nothing for this file; HELD instead.
+        $want = [string]$v.sha256
+        $got  = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($got -ne $want) {
+            Copy-Item -LiteralPath $src -Destination $held -ErrorAction Stop
+            $hel.Add(($v | Select-Object *, @{Name='heldReason'; Expression={'hash-mismatch'}}))
+            continue
+        }
+
+        # -ErrorAction Stop makes a failed copy THROW rather than emit a swallowed non-terminating
+        # error: without it, a missing source file would let $rel.Add run anyway, so .Released /
+        # the manifest would CLAIM a release that never hit disk. Fail closed — record a release
+        # only AFTER the copy is confirmed.
+        Copy-Item -LiteralPath $src -Destination $released -ErrorAction Stop
+        $rel.Add($v)
     }
 
     # Phase 3: belt-and-braces re-assertion of the released ⊆ SAFE invariant.
@@ -218,11 +336,22 @@ function Invoke-SensitivityGate {
                ($violation | ForEach-Object { "$($_.name)=$($_.verdict)" } | Join-String -Separator ', '))
     }
 
-    # Write the manifest. Includes full verdict objects (name, verdict, detectors) so the record
-    # is self-contained — a reviewer can audit why each file was held without re-running the screener.
+    # C2.4 step 4 — REGENERATE the released report from a HOST/TCB template parameterized ONLY by
+    # validated enum values + the host run_id + released name/sha256. The guest's verdicts.json
+    # bytes are NEVER copied verbatim into this report — building each released entry as a FRESH
+    # [pscustomobject] with a hard-coded field set means a free-form value on an (already-rejected)
+    # off-schema verdict has no path into the released surface, and even a SAFE, schema-valid
+    # verdict's released entry carries only 'name'/'sha256' (verdict/error_code/flags are HELD-side
+    # audit detail, not part of the regenerated released report). The consumed guest verdicts.json
+    # remains available as an audit copy under manifest/verdicts.json (written above, unchanged) —
+    # it is not part of, and never referenced by, the released/ dir.
+    $regeneratedReleased = @($rel | ForEach-Object {
+        [pscustomobject]@{ name = [string]$_.name; sha256 = [string]$_.sha256 }
+    })
     $report = [pscustomobject]@{
+        run_id   = $runId
         mode     = $Mode
-        released = @($rel)
+        released = $regeneratedReleased
         held     = @($hel)
         total    = $verdicts.Count
     }
