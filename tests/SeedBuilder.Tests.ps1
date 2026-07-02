@@ -365,10 +365,23 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         # exactly the intended minimal allow-list — 6 rules, nothing else. A 7th rule, a reworded
         # rule, a multiport rule, or any extra/renamed port/proto opens the count or the set and
         # fails this test, regardless of how the hole is spelled.
+        # TABLE-AGNOSTIC anchor (whole-branch-review Fix C): iptables accepts an optional explicit
+        # `-t <table>` token before the chain op (e.g. `iptables -t filter -A OUTPUT ...`) — `filter`
+        # is the implicit default table, so `-t filter -A OUTPUT ... -j ACCEPT` is FUNCTIONALLY
+        # IDENTICAL to the un-qualified spelling this seed emits. The prior anchor
+        # ('^\s*iptables\s+-A\s+OUTPUT\b...') required the un-qualified spelling immediately after
+        # `iptables`, so a `-t filter`-qualified rule (e.g. a QUIC/UDP-443 hole spelled
+        # `iptables -t filter -A OUTPUT -p udp --dport 443 -j ACCEPT`) matched NEITHER this
+        # extraction NOR the udp/443 belt-and-braces guard below — an evasion that passed this test
+        # GREEN while opening a real hole. The optional `(\s+-t\s+\S+)?` group closes that gap; it is
+        # non-capturing on the table name itself (any table spelling is still caught), so a `-t nat`
+        # rule (the REDIRECTs, which end in `-j REDIRECT`, not `-j ACCEPT`) is correctly excluded by
+        # the trailing `-j\s+ACCEPT\s*$` the same as before.
+        $acceptRuleAnchor = '^\s*iptables(\s+-t\s+\S+)?\s+-A\s+OUTPUT\b.*-j\s+ACCEPT\s*$'
         $outputLines  = $ud -split "`r?`n"
-        $acceptRules  = $outputLines | Where-Object { $_ -match '^\s*iptables\s+-A\s+OUTPUT\b.*-j\s+ACCEPT\s*$' } | ForEach-Object { $_.Trim() }
+        $acceptRules  = $outputLines | Where-Object { $_ -match $acceptRuleAnchor } | ForEach-Object { $_.Trim() }
 
-        $acceptRules.Count | Should -Be 6 -Because 'the builder OUTPUT allow-list must contain EXACTLY the 6 intended rules (lo, established/related, dns udp/tcp, http, https) — any extra ACCEPT rule (a 7th rule, a widened/renamed port, a multiport rule) must fail this test even if it does not match the literal strings "udp --dport 443" or "dport 853"'
+        $acceptRules.Count | Should -Be 6 -Because 'the builder OUTPUT allow-list must contain EXACTLY the 6 intended rules (lo, established/related, dns udp/tcp, http, https) — any extra ACCEPT rule (a 7th rule, a widened/renamed port, a multiport rule, or a -t-table-qualified duplicate) must fail this test even if it does not match the literal strings "udp --dport 443" or "dport 853"'
 
         # Per-expected-rule presence within the extracted set (order-independent).
         $expectedRules = @(
@@ -414,12 +427,40 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         $nonCommentLines = $outputLines | Where-Object { $_.Trim() -notmatch '^#' -and $_.Trim() -ne '' }
         ($nonCommentLines | Where-Object { $_ -match '853' }) |
             Should -BeNullOrEmpty -Because 'DoT (853) must never appear in any non-comment (rule/config) line of the builder seed'
-        ($outputLines | Where-Object { $_ -match 'iptables\s+-A\s+OUTPUT' -and $_ -match '-j\s+ACCEPT' -and $_ -match 'udp' -and $_ -match '443' }) |
-            Should -BeNullOrEmpty -Because 'no OUTPUT ACCEPT rule may combine udp with port 443 (QUIC/HTTP-3), in any spelling (plain --dport or -m multiport --dports)'
+        # Table-agnostic here too (mirrors the extraction anchor above): 'iptables\s+-A\s+OUTPUT'
+        # alone does NOT match a `-t <table>`-qualified rule (e.g. `iptables -t filter -A OUTPUT -p
+        # udp --dport 443 -j ACCEPT`), which is functionally identical to the un-qualified spelling
+        # since 'filter' is the implicit default table. Without the optional -t group this belt-and-
+        # braces guard silently no-ops against exactly that spelling of a QUIC/UDP-443 hole.
+        ($outputLines | Where-Object { $_ -match 'iptables(\s+-t\s+\S+)?\s+-A\s+OUTPUT' -and $_ -match '-j\s+ACCEPT' -and $_ -match 'udp' -and $_ -match '443' }) |
+            Should -BeNullOrEmpty -Because 'no OUTPUT ACCEPT rule may combine udp with port 443 (QUIC/HTTP-3), in any spelling (plain --dport, -m multiport --dports, or -t filter -A ...)'
 
         # The transparent-proxy REDIRECTs still gatekeep 80/443 to Squid.
         $ud | Should -Match 'REDIRECT --to-port 3129'
         $ud | Should -Match 'REDIRECT --to-port 3130'
+    }
+
+    It 'SEC-2 (MINOR): the Squid ACL http_access ordering is deny-all-last, with no shadowing allow-all above it' {
+        # The iptables allow-list above is the primary control, but Squid's OWN domain ACL
+        # (acl allowed_domains dstdomain ... / http_access allow allowed_domains / http_access deny
+        # all) is the actual per-FQDN fetch gate. Ordering matters for squid.conf: http_access rules
+        # are evaluated FIRST-MATCH-WINS, so an `http_access allow all` (or any unconditional allow)
+        # ABOVE the `deny all` would shadow it and defeat the domain restriction even though `deny
+        # all` still appears later in the file. Assert structurally: extract every ordered
+        # `http_access` line from the seed and check (a) the LAST one is exactly `deny all`, and (b)
+        # no EARLIER line is an unconditional allow (i.e. `http_access allow all` or a bare
+        # `http_access allow` with no ACL name).
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        $outputLines = $ud -split "`r?`n"
+
+        $httpAccessLines = $outputLines | Where-Object { $_.Trim() -match '^http_access\b' } | ForEach-Object { $_.Trim() }
+        $httpAccessLines.Count | Should -BeGreaterOrEqual 2 -Because 'the seed must carry at least an allow (scoped to allowed_domains) and a final deny'
+
+        $httpAccessLines[-1] | Should -Be 'http_access deny all' -Because 'the LAST http_access rule must be the unconditional deny — Squid is first-match-wins, so anything reachable after an allow-all would still be reachable if deny-all is not last'
+
+        $earlierLines = $httpAccessLines[0..($httpAccessLines.Count - 2)]
+        $shadowingAllowAll = $earlierLines | Where-Object { $_ -match '^http_access\s+allow\s+all\s*$' -or $_ -match '^http_access\s+allow\s*$' }
+        $shadowingAllowAll | Should -BeNullOrEmpty -Because 'an unconditional allow ABOVE the final deny would shadow it (first-match-wins) and defeat the allowed_domains restriction regardless of what the deny line says'
     }
 
     It 'SEC-2/C3: IPv6 is disabled pre-network (bootcmd) AND ip6tables default-DROPs, closing the IPv4-only egress bypass' {

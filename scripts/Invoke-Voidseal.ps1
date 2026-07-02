@@ -326,6 +326,20 @@ function Get-WorkloadField {
     mode the guest runs its boot workload then powers ITSELF off; the host polls VM State until Off or
     this deadline fires (Wait-WorkloadComplete force-stops a hung guest on timeout). Default 600. Tests
     inject 0 (one instant poll then trip the deadline) so they never sleep. Unused by Serial mode.
+.PARAMETER RateLedgerPath
+    (Optional) host-side path to the C2.6 runs/day release-rate JSON ledger (ReleaseGovernor.ps1).
+    ONLY consulted for a PROCESSOR profile (Network='None' + ScreenConfig) — a transport-only
+    OutboxOutput profile (firefox) is never screened, so it is never rate-capped either. Defaults to
+    a location UNDER the system temp path but OUTSIDE any single run's -ArtifactRoot: '<temp>\Voidseal\
+    state\release-ledger.json' — -ArtifactRoot defaults to a fresh GUID-named dir per run
+    ('<temp>\Voidseal\artifacts\<Name>'), so a ledger placed there would never accumulate across
+    separate Invoke-Voidseal calls and the runs/day cap would be silently inert. The default ledger
+    path is deliberately a SIBLING of the artifacts root, not a child of it, so it persists across runs
+    on the same host (the aggregate-leakage backstop this cap exists for is inherently a same-host,
+    cross-run concern). Pass an explicit path to relocate it (e.g. tests point it at $TestDrive).
+.PARAMETER MaxReleasesPerDay
+    (Optional) C2.6 per-profile, per-UTC-day release-event cap passed through to Invoke-SensitivityGate.
+    Default 5 (ReleaseGovernor.ps1's own conservative FORK default for Allen, tunable at Phase 6).
 .PARAMETER Backend
     The Hyper-V backend. Defaults to the real one; tests inject the fake.
 #>
@@ -343,6 +357,8 @@ function Invoke-Voidseal {
         [int]    $BootWaitSeconds = 180,
         [int]    $BootPollDelaySeconds = 5,
         [int]    $WorkloadTimeoutSeconds = 600,
+        [string] $RateLedgerPath,
+        [ValidateRange(1, [int]::MaxValue)] [int] $MaxReleasesPerDay = 5,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -368,6 +384,15 @@ function Invoke-Voidseal {
     }
     if ([string]::IsNullOrWhiteSpace($Destination)) {
         $Destination = Join-Path $ArtifactRoot 'extracted'
+    }
+    # C2.6 — the rate-cap ledger MUST NOT default under -ArtifactRoot: -ArtifactRoot defaults to a
+    # fresh GUID-named dir PER RUN ('<temp>\Voidseal\artifacts\<Name>'), so a ledger nested under it
+    # would never accumulate across separate Invoke-Voidseal calls and the runs/day cap would be
+    # silently inert (every run would see an empty ledger). Default it as a SIBLING of the artifacts
+    # root instead — stable across runs on the same host, which is the whole point of an aggregate-
+    # leakage backstop. See the .PARAMETER RateLedgerPath doc above for the full rationale.
+    if ([string]::IsNullOrWhiteSpace($RateLedgerPath)) {
+        $RateLedgerPath = Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\state\release-ledger.json'
     }
 
     # The entrypoint: prefer the workload spec, fall back to a workload profile's Entrypoint.
@@ -663,8 +688,17 @@ function Invoke-Voidseal {
                     if ($isProcessorProfile) {
                         $gateOut   = Join-Path $Destination 'gate'
                         $screenCfg = Resolve-ScreenConfig -Profile $resolved
+                        # C2.6 wiring: consult the runs/day rate-cap ledger for a PROCESSOR run only
+                        # (a transport-only OutboxOutput profile, e.g. firefox, is never screened — see
+                        # the $isProcessorProfile guard above — so it is never rate-capped either). The
+                        # ledger is keyed by the resolved profile's OWN Name (e.g. 'ralph'), never the
+                        # per-run VM -Name, and by the HOST-observed UTC calendar day — never a
+                        # guest-reported time (ReleaseGovernor.ps1's fail-closed threat model).
                         $gateResult = Invoke-SensitivityGate -StagingDir $gateStaging -OutputDir $gateOut `
-                                        -Mode $screenCfg.mode -VerdictsPath $gateVerdicts
+                                        -Mode $screenCfg.mode -VerdictsPath $gateVerdicts `
+                                        -RateLedgerPath $RateLedgerPath -RateProfile ([string]$resolved['Name']) `
+                                        -RateToday ([datetime]::UtcNow.ToString('yyyy-MM-dd')) `
+                                        -MaxReleasesPerDay $MaxReleasesPerDay
                         Set-DescriptorField -Descriptor $descriptor -Name 'GateRan' -Value $true
                         $report.Descriptor        = $descriptor
                         $report.Released          = $gateResult.Released

@@ -875,6 +875,85 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report.Released | Should -BeNullOrEmpty -Because 'a missing-hash abort is fail-closed — nothing is released (symmetry with DENY-on-deps-mismatch)'
     }
 
+    # ---- whole-branch-review Fix B: the C2.6 runs/day rate cap is now WIRED into the orchestrator's
+    # sole Invoke-SensitivityGate call (processor gate only) — these two tests prove it is actually
+    # consulted on a real processor run, not merely available-but-dark. ----
+    It 'C2.6 wiring: a processor run supplies -RateLedgerPath/-RateProfile/-RateToday — the rate cap is consulted (the ledger records the release)' {
+        # An explicit -RateLedgerPath under $TmpRoot (never real host state) proves the orchestrator
+        # actually PASSES the ledger through to Invoke-SensitivityGate: if the wiring were dark (the
+        # pre-fix state), this file would never be created/incremented by a run through Invoke-Voidseal.
+        $ledger = Join-Path $script:TmpRoot ("ratecap-ledger-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        Test-Path -LiteralPath $ledger | Should -BeFalse -Because 'the ledger must not pre-exist — its creation proves the orchestrator wired the call through'
+
+        $blobFile = Join-Path $script:TmpRoot ("outbox-ratecap-wired-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-ratecap-wired' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $ledger
+
+        # The existing green processor e2e behavior is unaffected: the default cap (5) is well above
+        # this single release, so the SAFE candidates still release exactly as the un-rate-capped test does.
+        $relNames = @($report.Released | ForEach-Object { $_.name })
+        $relNames | Should -Contain 'prose-essay.txt' -Because 'under the default cap, a single release proceeds exactly as before Fix B'
+        $relNames | Should -Contain 'prose-letter.md'
+
+        # Non-vacuousness: the ledger now EXISTS and records the release for the profile's OWN Name
+        # ('firefox-proc-test', $script:Proc's fixture Name) on today's UTC calendar day — proving
+        # -RateProfile/-RateToday were both threaded through, not just -RateLedgerPath.
+        Test-Path -LiteralPath $ledger | Should -BeTrue -Because 'Register-Release only creates the ledger file when the gate was actually called WITH -RateLedgerPath — this is the load-bearing proof the orchestrator wires the rate cap on a real run'
+        $doc = Get-Content -LiteralPath $ledger -Raw | ConvertFrom-Json
+        $today = [datetime]::UtcNow.ToString('yyyy-MM-dd')
+        $profileNode = $doc.PSObject.Properties[[string]$script:Proc['Name']]
+        $profileNode | Should -Not -BeNullOrEmpty -Because 'the ledger must be keyed by the RESOLVED PROFILE name ($resolved[''Name'']), not the per-run VM -Name'
+        [int]$profileNode.Value.$today | Should -Be 1 -Because 'exactly one release event was recorded for today'
+    }
+
+    It 'C2.6 wiring: over-cap (ledger pre-seeded AT the default cap for today) — a 6th same-profile-same-day release is DENIED, nothing released' {
+        # Pre-seed the ledger at the DEFAULT cap (5) for $script:Proc's profile name, for TODAY (the
+        # real host UTC day the orchestrator will compute internally — the orchestrator does not
+        # accept an injected -RateToday, so this test uses the real clock to stay honest to production
+        # wiring, mirroring how the orchestrator itself calls [datetime]::UtcNow).
+        $ledger = Join-Path $script:TmpRoot ("ratecap-ledger-overcap-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        $today  = [datetime]::UtcNow.ToString('yyyy-MM-dd')
+        $profileName = [string]$script:Proc['Name']
+        $seedDoc = [pscustomobject]@{}
+        $seedDoc | Add-Member -NotePropertyName $profileName -NotePropertyValue ([pscustomobject]@{ $today = 5 })
+        $seedDoc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ledger -Encoding utf8
+
+        $blobFile = Join-Path $script:TmpRoot ("outbox-ratecap-overcap-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-ratecap-overcap' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $ledger
+
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'the gate still runs off the outbox — the rate cap is a release-time backstop, not a gate-skip'
+        @($report.Released) | Should -BeNullOrEmpty -Because 'the profile is already AT the default cap (5) for today — the 6th release attempt is DENIED, nothing released'
+        $helEntry = @($report.Held) | Where-Object { $_.name -eq 'prose-essay.txt' } | Select-Object -First 1
+        $helEntry | Should -Not -BeNullOrEmpty -Because 'an otherwise-SAFE candidate is HELD, not silently dropped, when over-cap'
+        $helEntry.heldReason | Should -Be 'over-rate-cap' -Because 'the held reason must name the rate cap specifically, not a coincidental schema/hash failure'
+
+        # The ledger count must NOT have incremented past 5 — a denied run is not itself a release event
+        # (Register-Release is only called when .Released ends up non-empty).
+        $doc = Get-Content -LiteralPath $ledger -Raw | ConvertFrom-Json
+        [int]$doc.$profileName.$today | Should -Be 5 -Because 'a DENIED run must not further inflate the ledger — only an actual release increments it'
+    }
+
     # ---- Task 4.2 D4-B: processor NEVER calls ReadVhdxFile (host-mount) on its OUTPUT disk ----
     It 'processor run does NOT host-mount (ReadVhdxFile) its Raw OUTPUT disk — D4-B' {
         # A processor has a Raw OUTPUT disk (no FS to mount; host-mounting untrusted guest data is P0 risk).
