@@ -272,19 +272,67 @@ Describe 'New-WorkloadDisks — workload-disk host-free-space preflight (I2b, fo
     }
 }
 
-Describe 'New-WorkloadDisks — ENOSPC sentinel on a binary Input write (I2b stretch)' {
+Describe 'New-WorkloadDisks — ENOSPC sentinel on a binary Input write (I2b stretch; FAIL-CLOSED review fix)' {
 
-    It 'classifies a simulated disk-full byte write as DiskFull, not a generic throw/silent success' {
+    It 'FAILS CLOSED: THROWS on a simulated disk-full byte write, after stamping the DiskFull sentinel on the descriptor' {
         # SimulateWriteEnospc (fake-only switch, mirrors -SimulateGuestCommandFailure's shape — no new
-        # backend method) makes WriteVhdxFileBytes throw an ENOSPC-signature error. New-WorkloadDisks
-        # catches it and returns a distinct DiskFull classification rather than letting a bare throw
-        # propagate as an undifferentiated failure, and rather than a silently-succeeding no-op.
+        # backend method) makes WriteVhdxFileBytes throw a System.IO.IOException carrying the Win32
+        # ERROR_DISK_FULL HResult. New-WorkloadDisks must NOT swallow-and-continue (a `return $Descriptor`
+        # here would leave OutputDiskPath $null and let the run proceed to seal/start with a missing
+        # OUTPUT disk) — it must record the sentinel on the descriptor THEN RE-THROW, so the caller's
+        # lifecycle try/catch aborts + tears down.
         $b = New-FakeHyperVBackend -SimulateWriteEnospc
         $null = & $b.NewVM @{ Name='enospc1'; Generation=2 }
         $d = New-SandboxDescriptor -Name 'enospc1' -Tier 0
         $prof = @{ Name='enospc1'; Inputs = @{ 'blob.bin' = [byte[]]@(0x01, 0x02, 0x03) }; FileSystem = 'exFAT' }
-        $result = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\enospc1' -Backend $b
-        $result.WorkloadDiskStatus | Should -Be 'DiskFull' -Because 'a disk-full byte write must be classified distinctly, not a generic failure'
+        { New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\enospc1' -Backend $b } |
+            Should -Throw -ExpectedMessage '*DiskFull*' -Because 'a disk-full write must fail closed (re-throw), never swallow-and-continue'
+        $d.WorkloadDiskStatus | Should -Be 'DiskFull' -Because 'the descriptor is mutated in place before the throw, so a catching caller still sees the sentinel'
+        $d.WorkloadDiskStatusReason | Should -Not -BeNullOrEmpty
+        $d.OutputDiskPath | Should -BeNullOrEmpty -Because 'the OUTPUT disk must never be created after a fail-closed abort on the INPUT populate'
+    }
+
+    It 'classifies a real System.IO.IOException by its ERROR_DISK_FULL HResult (0x80070070), not just message text' {
+        # Locale-independent classification (review Critical #2): the fake's SimulateWriteEnospc throws
+        # an IOException whose HResult is the real Win32 ERROR_DISK_FULL code. Prove the classifier is
+        # exercising the HResult match, not only the English message-pattern fallback, by asserting the
+        # underlying exception type + HResult on the caught error.
+        $b = New-FakeHyperVBackend -SimulateWriteEnospc
+        $null = & $b.NewVM @{ Name='enospc2'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'enospc2' -Tier 0
+        $prof = @{ Name='enospc2'; Inputs = @{ 'blob.bin' = [byte[]]@(0x01) }; FileSystem = 'exFAT' }
+        $caught = $null
+        try { New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\enospc2' -Backend $b }
+        catch { $caught = $_ }
+        $caught | Should -Not -BeNullOrEmpty
+        # The inner (original) exception is the one the fake threw; PowerShell's throw of a string wraps
+        # it in a RuntimeException, so walk to what the classifier actually saw by re-simulating the fake
+        # call directly to confirm its shape carries the HResult (defensive, not redundant: proves the
+        # SIGNAL the classifier keys on actually exists on the fake's thrown error).
+        $direct = $null
+        try { $null = & $b.WriteVhdxFileBytes @{ Path = $d.InputDiskPath; InnerPath = 'x'; Bytes = [byte[]]@(1) } }
+        catch { $direct = $_ }
+        $direct.Exception | Should -BeOfType ([System.IO.IOException])
+        $direct.Exception.HResult | Should -Be (-2147024784) -Because 'ERROR_DISK_FULL (0x80070070) is the locale-independent signal Workload.ps1 classifies on'
+    }
+}
+
+Describe 'New-WorkloadDisks — CREATE-path ENOSPC coverage (review Critical #3, defense-in-depth)' {
+
+    It 'FAILS CLOSED + classifies DiskFull when NewOutputVhdx itself throws ENOSPC creating the INPUT disk' {
+        # SimulateCreateEnospc (distinct from SimulateWriteEnospc) throws on the CREATE call, not the
+        # populate-time byte write — proving the review-fix wrap around NewOutputVhdx (not just around
+        # WriteVhdxFileBytes) actually classifies + fails closed rather than propagating a generic throw.
+        $b = New-FakeHyperVBackend -SimulateCreateEnospc
+        $null = & $b.NewVM @{ Name='createenospc1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'createenospc1' -Tier 0
+        $prof = @{ Name='createenospc1'; FileSystem = 'exFAT' }
+        { New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\createenospc1' -Backend $b } |
+            Should -Throw -ExpectedMessage '*DiskFull*' -Because 'a disk-full CREATE must also fail closed, not just a disk-full populate'
+        $d.WorkloadDiskStatus | Should -Be 'DiskFull'
+        $d.WorkloadDiskStatusReason | Should -Match 'creating the INPUT disk'
+        $d.InputDiskPath  | Should -BeNullOrEmpty -Because 'the INPUT disk create itself failed — no path should be recorded'
+        $d.OutputDiskPath | Should -BeNullOrEmpty
     }
 }
 

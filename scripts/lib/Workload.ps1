@@ -42,13 +42,30 @@
     disk is created — fail-closed, mirroring the Provisioner's system-disk preflight exactly (same
     helper, same fixed 1GB headroom default).
 
-    ENOSPC SENTINEL (I2b, stretch): a HOST-side disk-full write during Inputs population (e.g. a race
-    where free space was consumed between the preflight above and the actual write) is classified as
-    a distinct DiskFull outcome (a $Descriptor.WorkloadDiskStatus='DiskFull' + a captured Reason)
-    rather than an undifferentiated propagated throw. This covers the HOST-write case only; a GUEST
-    filling the OUTPUT disk DURING its own run is a live/run-time concern this function cannot observe
-    (no live channel once sealed) and is NOT modelled here — see Wait-WorkloadComplete / Read-
-    WorkloadResult for the guest-side completion/classification path.
+    ENOSPC SENTINEL (I2b, FAIL-CLOSED — review Critical fix): a HOST-side disk-full write (during Inputs
+    population, OR creating either data disk — e.g. a race where free space was consumed between the
+    preflight above and the actual write) is classified as a distinct DiskFull outcome: the descriptor is
+    stamped ($Descriptor.WorkloadDiskStatus='DiskFull' + a captured WorkloadDiskStatusReason) and the
+    classified error is RE-THROWN — NEVER swallowed. New-WorkloadDisks does NOT return normally on this
+    path. A caller (Invoke-Voidseal.ps1) that returns early here without re-throwing would proceed to
+    Lock-Sandbox/Assert-Sealed/VM-start with a MISSING OUTPUT disk and a PARTIALLY-populated INPUT disk —
+    Assert-Sealed does not check for a null OutputDiskPath, so a swallow-and-continue would seal a broken
+    sandbox and only surface the failure much later at Read-WorkloadResult. Re-throwing lets the existing
+    outer lifecycle try/catch (Invoke-Voidseal.ps1) abort + tear down immediately, the same way any other
+    mid-flow throw (e.g. a StartVM failure) already does — no new orchestrator wiring needed.
+
+    CLASSIFICATION is locale-independent: it keys PRIMARILY on the caught exception's HResult matching
+    either Win32 ERROR_DISK_FULL (0x80070070 / -2147024784) or ERROR_HANDLE_DISK_FULL (0x80070027 /
+    -2147024857) — the same codes a real disk-full System.IO.IOException carries on Windows — with the
+    prior English-only message pattern ('(?i)ENOSPC|disk full|not enough space') kept only as a fallback
+    for a caught exception that doesn't carry one of those HResults. Mirrors SbIsUnavailableError's
+    precedent (HyperVBackend.ps1) of classifying on exception shape/code, not message text alone.
+
+    This covers HOST-write failures during Inputs population AND HOST-side ENOSPC creating either data
+    disk (NewOutputVhdx, both INPUT and OUTPUT). A GUEST filling the OUTPUT disk DURING its own run is a
+    live/run-time concern this function cannot observe (no live channel once sealed) and is NOT modelled
+    here — see Wait-WorkloadComplete / Read-WorkloadResult for the guest-side completion/classification
+    path.
 
     EVERYTHING touches Hyper-V / the host disk through the backend (HyperVBackend.ps1) — this
     file NEVER calls a raw New-VHD / Format-Volume / Add-VMHardDiskDrive cmdlet. Dot-source this
@@ -85,6 +102,46 @@ function New-WorkloadDisks {
     $fs       = if ($Profile.ContainsKey('FileSystem'))  { [string]$Profile['FileSystem']  } else { 'exFAT' }
     $inLabel  = if ($Profile.ContainsKey('InputLabel'))  { [string]$Profile['InputLabel']  } else { 'INPUT' }
     $outLabel = if ($Profile.ContainsKey('OutputLabel')) { [string]$Profile['OutputLabel'] } else { 'OUTPUT' }
+
+    # DiskFull classification (I2b, FAIL-CLOSED — review Critical fix). LOCALE-INDEPENDENT: keys
+    # primarily on the caught exception's HResult matching Win32 ERROR_DISK_FULL (0x80070070 /
+    # -2147024784) or ERROR_HANDLE_DISK_FULL (0x80070027 / -2147024857) — the same codes a real
+    # disk-full System.IO.IOException carries on Windows (LIVE-ONLY-UNPROVEN: not exercised against a
+    # real host-disk-full write in this mock-green pass, but HResult-based matching is correct by
+    # construction and does not depend on message wording/locale). Falls back to the prior English-
+    # only message pattern only when the HResult doesn't match (e.g. a non-.NET or wrapped exception).
+    # Mirrors SbIsUnavailableError's precedent (HyperVBackend.ps1) of classifying on exception
+    # shape/code, not message text alone.
+    $ERROR_DISK_FULL        = -2147024784   # 0x80070070
+    $ERROR_HANDLE_DISK_FULL = -2147024857   # 0x80070027
+    $isDiskFullError = {
+        param($ErrorRecord)
+        if ($null -eq $ErrorRecord) { return $false }
+        $ex = $ErrorRecord.Exception
+        if ($null -eq $ex) { return $false }
+        $hresultMatch = $false
+        try {
+            # HResult is present on every System.Exception; guard with try/catch anyway in case a
+            # non-.NET wrapper doesn't expose it cleanly under StrictMode.
+            $hresultMatch = ($ex.HResult -eq $ERROR_DISK_FULL) -or ($ex.HResult -eq $ERROR_HANDLE_DISK_FULL)
+        } catch { $hresultMatch = $false }
+        if ($hresultMatch) { return $true }
+        return ([string]$ex.Message -match '(?i)ENOSPC|disk full|not enough space')
+    }.GetNewClosure()
+
+    # FAIL-CLOSED helper: stamp the DiskFull sentinel on the descriptor (diagnostics survive even
+    # though the function never returns normally) then RE-THROW a distinctly-classified error. NEVER
+    # `return $Descriptor` here — a swallow-and-continue would let the orchestrator proceed to
+    # Lock-Sandbox/Assert-Sealed/VM-start with a missing/partial workload disk (Assert-Sealed does not
+    # check for a null OutputDiskPath). The re-thrown error is caught by Invoke-Voidseal.ps1's existing
+    # outer lifecycle try/catch, which aborts the run and tears down — no new orchestrator wiring needed.
+    $failClosedDiskFull = {
+        param([string] $Reason, $ErrorRecord)
+        $Descriptor.WorkloadDiskStatus = 'DiskFull'
+        $Descriptor.WorkloadDiskStatusReason = $Reason
+        $inner = if ($ErrorRecord -and $ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { '' }
+        throw "New-WorkloadDisks: DiskFull — $Reason ($inner)"
+    }.GetNewClosure()
 
     # Profile-driven disk sizes (I2b) — default to the prior hardcoded 1GB when the profile declares
     # neither key, so every existing profile (firefox/ralph/builder — none declare these keys) is
@@ -128,7 +185,18 @@ function New-WorkloadDisks {
     # Effect-only backend calls are suppressed ($null = ...) so a real-backend emission can't leak into
     # this function's return stream (output-stream-pollution discipline). The record happens right after
     # CREATE (before populate/attach) so even a populate/attach throw leaves the disk recorded for teardown.
-    $null = & $Backend.NewOutputVhdx @{ Path = $inPath; Label = $inLabel; FileSystem = $fs; SizeBytes = $inSizeBytes }
+    # CREATE-path ENOSPC coverage (review Critical #3): the preflight above makes an ENOSPC HERE unlikely
+    # in practice, but wrapping is defense-in-depth — a disk-full creating the INPUT .vhdx itself must
+    # classify + fail closed exactly like the populate-time write, not propagate as a generic throw.
+    try {
+        $null = & $Backend.NewOutputVhdx @{ Path = $inPath; Label = $inLabel; FileSystem = $fs; SizeBytes = $inSizeBytes }
+    }
+    catch {
+        if (& $isDiskFullError $_) {
+            & $failClosedDiskFull "host-side disk-full creating the INPUT disk ($inPath)" $_
+        }
+        throw
+    }
     $Descriptor.InputDiskPath = $inPath
     & $appendCreated $inPath
     if ($Profile.ContainsKey('Inputs') -and $Profile['Inputs'] -is [System.Collections.IDictionary]) {
@@ -141,18 +209,16 @@ function New-WorkloadDisks {
                 # unrolls a 0-length byte[] arg to $null, so a genuinely-empty binary Input would throw
                 # a confusing "required argument missing" through WriteVhdxFileBytes. No shipped profile
                 # emits an empty binary Input; skip it here (documented no-op) rather than let that
-                # happen. ENOSPC sentinel: a host-side disk-full write during this populate is caught
-                # and classified as DiskFull below, not left as an undifferentiated propagated throw.
+                # happen. ENOSPC sentinel: a host-side disk-full write during this populate is caught,
+                # classified DiskFull, and RE-THROWN below — fail-closed, never a swallow-and-continue.
                 if ($v.Length -eq 0) { continue }
                 try {
                     $null = & $Backend.WriteVhdxFileBytes @{ Path = $inPath; InnerPath = [string]$k; Bytes = $v }
                 }
                 catch {
-                    if ([string]$_.Exception.Message -match '(?i)ENOSPC|disk full|not enough space') {
-                        $Descriptor.WorkloadDiskStatus = 'DiskFull'
-                        $Descriptor.WorkloadDiskStatusReason =
-                            "host-side ENOSPC writing Input '$k' onto the INPUT disk ($inPath): $($_.Exception.Message)"
-                        return $Descriptor
+                    if (& $isDiskFullError $_) {
+                        & $failClosedDiskFull `
+                            "host-side disk-full writing Input '$k' onto the INPUT disk ($inPath)" $_
                     }
                     throw
                 }
@@ -173,7 +239,19 @@ function New-WorkloadDisks {
     $isProcessor  = ($Profile['Network'] -eq 'None') -and $Profile.ContainsKey('ScreenConfig')
     $wantsOutbox  = $Profile.ContainsKey('OutboxOutput') -and [bool]$Profile['OutboxOutput']
     $outFs = if ($isProcessor -or $wantsOutbox) { 'Raw' } else { $fs }
-    $null = & $Backend.NewOutputVhdx @{ Path = $outPath; Label = $outLabel; FileSystem = $outFs; SizeBytes = $outSizeBytes }
+    # CREATE-path ENOSPC coverage (review Critical #3): the OUTPUT .vhdx create is the other host-write
+    # the free-space preflight is meant to make unreachable in practice; wrap for defense-in-depth so a
+    # disk-full here classifies + fails closed the same way, rather than a generic throw with the INPUT
+    # disk already created+recorded+attached but the OUTPUT missing.
+    try {
+        $null = & $Backend.NewOutputVhdx @{ Path = $outPath; Label = $outLabel; FileSystem = $outFs; SizeBytes = $outSizeBytes }
+    }
+    catch {
+        if (& $isDiskFullError $_) {
+            & $failClosedDiskFull "host-side disk-full creating the OUTPUT disk ($outPath)" $_
+        }
+        throw
+    }
     $Descriptor.OutputDiskPath = $outPath
     & $appendCreated $outPath
     $null = & $Backend.AddHardDiskDrive @{ VMName = $name; Path = $outPath }

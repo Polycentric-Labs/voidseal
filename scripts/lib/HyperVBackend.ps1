@@ -1553,13 +1553,23 @@ $script:SbCopyFakeVM = {
     abort. Teardown (Remove-Sandbox) uses RemoveVM/RemoveVHD, NOT RemoveHardDiskDrive, so this seam
     affects only the orchestrator's explicit detach — teardown still completes (DESTROYED).
 .PARAMETER SimulateWriteEnospc
-    Make WriteVhdxFileBytes THROW an ENOSPC-signature error (message contains 'ENOSPC' / 'disk full') —
-    modelling a HOST-side write that hits host-disk-full mid-populate (e.g. a race where free space was
-    consumed between the New-WorkloadDisks preflight and the actual write). Mirrors -SimulateGuestCommand-
-    Failure's shape: a fake-only simulation switch on the EXISTING method, NOT a new backend method (no
-    manifest change). New-WorkloadDisks catches this signature and classifies a distinct DiskFull outcome
-    rather than letting it propagate as an undifferentiated throw. A GUEST filling the OUTPUT disk during
-    its own run is a separate, live-only/run-time concern this seam does NOT model (see Workload.ps1).
+    Make WriteVhdxFileBytes THROW a System.IO.IOException carrying the Win32 ERROR_DISK_FULL HResult
+    (0x80070070 / -2147024784) — modelling a HOST-side write that hits host-disk-full mid-populate
+    (e.g. a race where free space was consumed between the New-WorkloadDisks preflight and the actual
+    write). Mirrors -SimulateGuestCommandFailure's shape: a fake-only simulation switch on the EXISTING
+    method, NOT a new backend method (no manifest change). New-WorkloadDisks classifies this HResult (or
+    the message-pattern fallback) as a distinct DiskFull outcome, records the sentinel on the descriptor,
+    and RE-THROWS (fail-closed — a partial-write disk-full must abort the run, never swallow-and-
+    continue with a missing OUTPUT disk). A GUEST filling the OUTPUT disk during its own run is a
+    separate, live-only/run-time concern this seam does NOT model (see Workload.ps1).
+.PARAMETER SimulateCreateEnospc
+    Make NewOutputVhdx THROW a System.IO.IOException carrying the Win32 ERROR_DISK_FULL HResult on its
+    FIRST call (the INPUT disk create in New-WorkloadDisks) — modelling a HOST-side disk-full CREATING a
+    data disk, distinct from -SimulateWriteEnospc (which models a disk-full POPULATING an already-
+    created disk). Exercises the review-fix OUTPUT-create-path/INPUT-create-path defense-in-depth
+    coverage in New-WorkloadDisks (both NewOutputVhdx call sites are wrapped with the same DiskFull
+    classify-then-rethrow). Thrown BEFORE any state write, same discipline as SimulateSecondNewOutput-
+    VhdxError. A fake-only simulation switch on the EXISTING method — no manifest change.
 #>
 function New-FakeHyperVBackend {
     [CmdletBinding()]
@@ -1578,7 +1588,8 @@ function New-FakeHyperVBackend {
         [byte[]] $SimulateDepsImageBlob,
         [int] $SimulateDetachSettleLag = 0,
         [switch] $SimulateDetachError,
-        [switch] $SimulateWriteEnospc
+        [switch] $SimulateWriteEnospc,
+        [switch] $SimulateCreateEnospc
     )
 
     # Hoist shared helpers into factory-locals so the method closures capture them
@@ -1621,6 +1632,9 @@ function New-FakeHyperVBackend {
     $detachThrows      = $SimulateDetachError.IsPresent
     # Captured by the WriteVhdxFileBytes closure: model a host-side disk-full write (I2b ENOSPC sentinel).
     $writeEnospc       = $SimulateWriteEnospc.IsPresent
+    # Captured by the NewOutputVhdx closure: model a host-side disk-full CREATE (review-fix OUTPUT/INPUT
+    # create-path coverage) — distinct from $writeEnospc, which models a disk-full POPULATE.
+    $createEnospc      = $SimulateCreateEnospc.IsPresent
 
     # ---- in-memory state (captured by every method closure) --------------
     $state = @{
@@ -1965,6 +1979,15 @@ function New-FakeHyperVBackend {
         if ($secondVhdxThrows -and $newOutputVhdxCalls[0] -eq 2) {
             throw "HyperVBackend(fake).NewOutputVhdx: simulated OUTPUT-disk creation failure (SimulateSecondNewOutputVhdxError) — the 2nd NewOutputVhdx call (the OUTPUT data disk) fails after the INPUT disk was already created+recorded."
         }
+        # SimulateCreateEnospc: throw on the 1st call (the INPUT disk in New-WorkloadDisks) BEFORE any
+        # state write — modelling a host-side disk-full CREATING a data disk (review-fix create-path
+        # coverage). A real System.IO.IOException carrying ERROR_DISK_FULL, same as SimulateWriteEnospc.
+        if ($createEnospc -and $newOutputVhdxCalls[0] -eq 1) {
+            $ioEx = [System.IO.IOException]::new(
+                "HyperVBackend(fake).NewOutputVhdx: simulated ENOSPC (disk full) creating '$path' (SimulateCreateEnospc).")
+            $ioEx.HResult = -2147024784   # 0x80070070 ERROR_DISK_FULL
+            throw $ioEx
+        }
         # SHARED fake≠real guard (same helper the real backend calls): reject a bad FileSystem /
         # over-length Label EARLY and store the NORMALIZED filesystem casing — so a test that
         # passed a value live Format-Volume would reject (e.g. 'ext4') fails here too, closing the
@@ -2039,10 +2062,16 @@ function New-FakeHyperVBackend {
         $bytes = [byte[]](& $AssertArg $P 'Bytes' 'WriteVhdxFileBytes')
         # SimulateWriteEnospc (I2b): model a host-side disk-full write BEFORE any state mutation —
         # the real Mount-VHD/WriteAllBytes path would fail before the bytes land, so the fake must
-        # not record a partial/successful write either. Message carries 'ENOSPC' so the caller's
-        # ENOSPC-signature classifier (Workload.ps1) recognizes it.
+        # not record a partial/successful write either. Throws a REAL System.IO.IOException carrying
+        # the Win32 ERROR_DISK_FULL HResult (0x80070070) — the SAME locale-independent signal a real
+        # disk-full [System.IO.File]::WriteAllBytes throws on Windows — so the caller's classifier
+        # (Workload.ps1's DiskFull HResult match) exercises the HResult path, not only the message
+        # fallback. The message still carries 'ENOSPC' as a belt-and-braces fallback signature.
         if ($writeEnospc) {
-            throw "HyperVBackend(fake).WriteVhdxFileBytes: simulated ENOSPC (disk full) writing '$inner' onto '$path' (SimulateWriteEnospc)."
+            $ioEx = [System.IO.IOException]::new(
+                "HyperVBackend(fake).WriteVhdxFileBytes: simulated ENOSPC (disk full) writing '$inner' onto '$path' (SimulateWriteEnospc).")
+            $ioEx.HResult = -2147024784   # 0x80070070 ERROR_DISK_FULL
+            throw $ioEx
         }
         if (-not $state.VHDs.ContainsKey($path)) { throw "WriteVhdxFileBytes: VHD '$path' does not exist (create it first)." }
         if (-not $state.VHDs[$path].ContainsKey('Files')) { $state.VHDs[$path]['Files'] = @{} }
