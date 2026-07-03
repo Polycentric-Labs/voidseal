@@ -1147,6 +1147,60 @@ Describe 'Fake backend — disk operations' {
         $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-mut.vhdx'; InnerPath='m.bin' }
         $got[0] | Should -Be 0x11 -Because 'the fake must store a copy, not a reference to the caller''s array'
     }
+    It 'fake ReadVhdxFileBytes returns a fresh copy on each read (mutating a returned array does not corrupt a later read) — ULTRACODE fake≠real gate regression' {
+        # This is the READ-side aliasing gap (distinct from the WRITE-side copy test above): the fake's
+        # store previously handed back the LIVE stored reference (`return ,$v`), so a caller mutating its
+        # own read result would silently corrupt every subsequent read of the same key — a divergence the
+        # real backend can never exhibit (ReadAllBytes allocates a fresh byte[] every call; the filesystem
+        # is the immutability boundary). Fixed via copy-on-read in ReadVhdxFileBytes.
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-alias.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $bytes = [byte[]]@(0x01,0x02,0x03)
+        & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-alias.vhdx'; InnerPath='a.bin'; Bytes=$bytes }
+        $first = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-alias.vhdx'; InnerPath='a.bin' }
+        $first[0] = 0xEE   # mutate the CALLER's copy of the read result
+        $second = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-alias.vhdx'; InnerPath='a.bin' }
+        $second[0] | Should -Be 0x01 -Because 'ReadVhdxFileBytes must hand out a fresh copy each call, not a live alias into the fake''s own store'
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$second, [byte[]]@(0x01,0x02,0x03)) | Should -BeTrue
+    }
+    # NOTE (found while adding the above regressions, OUT OF SCOPE for this task's 3 fixes): a
+    # WriteVhdxFileBytes round-trip of a genuine 0-LENGTH byte[] payload currently throws
+    # ArgumentNullException, because $script:SbAssertArg's `return $P[$Key]` (HyperVBackend.ps1:259,
+    # no leading comma) unrolls a 0-length array argument to $null across ITS OWN `&`-invocation
+    # boundary, before WriteVhdxFileBytes's `[byte[]](& $AssertArg ...)` cast ever sees it — `[byte[]]
+    # $null` stays $null, and `[System.Array]::Copy($null, ...)` throws. This reproduces identically
+    # on the REAL and FAKE write paths (both share the `[byte[]](& $AssertArg $P 'Bytes'
+    # 'WriteVhdxFileBytes')` hoist), so it is fake≠real-PARITY-PRESERVING, not a divergence — and it
+    # sits in $AssertArg / the WRITE path, not the READ-side array-unrolling bug this task fixes.
+    # Flagging for a follow-up task rather than fixing here (fixing $AssertArg's return shape is a
+    # broader change touching every method that takes an array-typed arg).
+    It 'REAL byte-return composition-analog: a return crossing the exact two `&`-boundary shape (& $InvokeOp { return ,,$x }) yields an intact [byte[]] for 0/1/N bytes, while a single comma through the SAME shape does not — ULTRACODE fake≠real gate regression' {
+        # HyperVBackend.ps1's REAL ReadVhdxFileBytes/ReadVhdxRawRegion route their byte[] return through
+        # $InvokeOp (`try { return (& $Operation) } catch {...}`), a scriptblock invoked via `&` — a SECOND
+        # `&`-boundary on top of the inner operation block's own `return`. $InvokeOp is a local closure
+        # inside New-RealHyperVBackend (not exported), so it cannot be driven directly without live
+        # Mount-VHD/Hyper-V (LIVE-ONLY-UNPROVEN, matching this file's existing pattern for other real-only
+        # methods, e.g. ReadVhdxRawRegion's qemu-img path). This test reconstructs the IDENTICAL
+        # two-boundary composition in isolation and empirically pins the array-unrolling contract that
+        # both real fixes rely on, so a future edit that collapses back to a single comma fails loudly.
+        $invokeOp = {
+            param([scriptblock] $Operation)
+            try { return (& $Operation) }
+            catch { throw }
+        }.GetNewClosure()
+
+        foreach ($n in 0, 1, 4) {
+            $payload = [byte[]]::new($n)
+            for ($i = 0; $i -lt $n; $i++) { $payload[$i] = [byte](($i + 1) % 256) }
+
+            $doubleComma = & $invokeOp { return ,,$payload }.GetNewClosure()
+            ($doubleComma -is [byte[]]) | Should -BeTrue -Because "n=$n through the double-`&` boundary must survive as [byte[]] with a double leading comma"
+            $doubleComma.Count | Should -Be $n
+
+            $singleComma = & $invokeOp { return ,$payload }.GetNewClosure()
+            ($singleComma -is [byte[]]) | Should -BeFalse -Because "n=$n through the SAME double-`&` boundary with only a SINGLE comma must NOT survive as [byte[]] (proves the double comma is load-bearing, not redundant)"
+        }
+    }
 
     It 'AddHardDiskDrive then RemoveHardDiskDrive adjusts the VM disk list' {
         & $script:B.NewVHD @{ Path = 'C:\vhd\d.vhdx'; SizeBytes = 40GB }

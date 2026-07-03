@@ -1106,10 +1106,16 @@ function New-RealHyperVBackend {
     }.GetNewClosure()
 
     # Mount READ-WRITE (mirrors ReadVhdxFile's rationale — a read-only mount often doesn't
-    # auto-assign a drive letter on Windows). Returns a byte[] (NOT a string): the leading comma on
-    # both `return` statements is REQUIRED — without it PowerShell unrolls a 1-element (or even
-    # multi-element, in some pipeline contexts) array return to a scalar, which would silently
-    # corrupt a single-byte payload into a bare [byte].
+    # auto-assign a drive letter on Windows). Returns a byte[] (NOT a string): the DOUBLE leading
+    # comma on the byte[] `return` below is REQUIRED, not a typo. This return crosses TWO scriptblock
+    # `&`-invocation boundaries before it reaches the caller: (1) the inner `Test-Path {...}` block's
+    # own `return`, unrolled once by (2) `$InvokeOp`'s `try { return (& $Operation) }` wrapper. A
+    # SINGLE leading comma survives only ONE unroll — empirically verified (pwsh, this exact
+    # composition): a single comma through this two-boundary path yields `$null` for a 0-byte
+    # payload, a bare `System.Byte` scalar for 1 byte, and `System.Object[]` for N bytes — NEVER an
+    # intact `[byte[]]`. The DOUBLE comma survives both boundaries and yields `[byte[]]` of the
+    # correct Count for 0/1/N. (The FAKE below has only ONE `&` boundary — its single comma is
+    # correct; do NOT "fix" it to match this method. See the FAKE's own comment.)
     $b.ReadVhdxFileBytes = {
         param([System.Collections.IDictionary] $P)
         $path  = & $AssertArg $P 'Path' 'ReadVhdxFileBytes'
@@ -1119,7 +1125,7 @@ function New-RealHyperVBackend {
             try {
                 $letter = & $ResolveVol $img 'ReadVhdxFileBytes'
                 $fp = "{0}:\{1}" -f $letter, $inner
-                if (Test-Path -LiteralPath $fp) { return ,[System.IO.File]::ReadAllBytes($fp) }
+                if (Test-Path -LiteralPath $fp) { return ,,[System.IO.File]::ReadAllBytes($fp) }
                 return $null
             }
             finally {
@@ -1193,7 +1199,13 @@ function New-RealHyperVBackend {
                             $read += $n
                         }
                     }
-                    return ,$buf   # unary comma: return the byte[] as ONE array (PS unrolls a bare array)
+                    return ,,$buf   # DOUBLE comma: this return crosses TWO `&` boundaries (this block's own
+                    # return, then $InvokeOp's `return (& $Operation)`) — a single comma survives only ONE
+                    # unroll and would hand the caller a scalar/Object[] instead of an intact [byte[]] (same
+                    # empirically-verified trap as ReadVhdxFileBytes above; see its comment for the pwsh
+                    # evidence). Its two live consumers (Invoke-Voidseal.ps1) already wrap the result in
+                    # `[byte[]](...)`, so this fix is inert for them today (a [byte[]]->[byte[]] cast is a
+                    # no-op) but closes the latent gap before anything reads this return unwrapped.
                 }
                 finally { $fsr.Dispose() }
             }
@@ -2034,12 +2046,25 @@ function New-FakeHyperVBackend {
         $state.CallLog.Add(@{ Op = 'ReadVhdxFileBytes'; Path = $path; InnerPath = $inner })
         if ($state.VHDs[$path].ContainsKey('Files') -and $state.VHDs[$path]['Files'].ContainsKey($inner)) {
             $v = $state.VHDs[$path]['Files'][$inner]
-            # Leading comma on every return below: without it PowerShell unrolls a 1-element (or
-            # even multi-element, in some pipeline contexts) array to a scalar, silently corrupting
-            # a single-byte payload into a bare [byte] — the same trap the real method's comment warns
-            # about, and the reason the round-trip test explicitly covers a 1-byte payload.
-            if ($v -is [byte[]]) { return ,$v }
-            return ,([System.Text.Encoding]::UTF8.GetBytes([string]$v))   # a string-written file read as bytes (honest cross-read)
+            # SINGLE leading comma on every return below (this method has only ONE `&`-invocation
+            # boundary between here and the caller — unlike the REAL method's TWO-boundary
+            # `& $InvokeOp` composition, which needs a DOUBLE comma; see the REAL method's comment).
+            # Without the comma PowerShell unrolls a 1-element (or even multi-element, in some
+            # pipeline contexts) array to a scalar, silently corrupting a single-byte payload into a
+            # bare [byte] — the reason the round-trip test explicitly covers a 1-byte payload.
+            #
+            # Copy-on-read: $v is the LIVE reference stored in $state's own hashtable. The real
+            # ReadAllBytes allocates a FRESH byte[] on every call (the filesystem is the immutability
+            # boundary), so a caller that reads twice and mutates the first result must NOT see that
+            # mutation reflected in the second read. Returning $v directly would hand out a mutable
+            # alias into the fake's own store — copy defensively so the fake matches that real
+            # per-call-fresh-allocation behavior (verified by the read-aliasing-independence test).
+            if ($v -is [byte[]]) {
+                $out = [byte[]]::new($v.Length)
+                [System.Array]::Copy($v, $out, $v.Length)
+                return ,$out
+            }
+            return ,([System.Text.Encoding]::UTF8.GetBytes([string]$v))   # a string-written file read as bytes (honest cross-read; already a fresh allocation)
         }
         return $null
     }.GetNewClosure()
