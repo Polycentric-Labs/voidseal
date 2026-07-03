@@ -526,15 +526,15 @@ function Invoke-Voidseal {
             $descriptor = New-WorkloadDisks -Descriptor $descriptor -Profile $resolved `
                 -StorageRoot $diskStorageRoot -Backend $Backend
             $report.Descriptor = $descriptor
-            # FOLLOW-UP (I2b): New-WorkloadDisks can return early with
-            # $descriptor.WorkloadDiskStatus='DiskFull' on a classified HOST-side ENOSPC writing an
-            # Input (the OUTPUT disk is then never created — OutputDiskPath stays $null). This
-            # orchestrator does not yet branch on that sentinel — a DiskFull descriptor currently falls
-            # through to the seed-disk/seal steps below, which will fail their own way (e.g. Assert-
-            # Sealed refusing an unattached/absent OUTPUT disk) rather than aborting cleanly with a
-            # named .Error here. Scoped out of I2b (CORE only wired the classification at the Workload
-            # layer, mock-green + tested there); wiring an explicit abort-with-teardown branch here is
-            # the natural next step but needs its own lifecycle-level test, not a same-pass add-on.
+            # I2b ENOSPC (FAIL-CLOSED): on a classified HOST-side ENOSPC writing an Input, New-WorkloadDisks
+            # stamps $descriptor.WorkloadDiskStatus='DiskFull' (diagnostic) then RE-THROWS a classified error
+            # — it does NOT return a DiskFull descriptor and fall through. The throw propagates to this
+            # cmdlet's OUTER lifecycle catch, which records the failure (.Error) and runs teardown, so a
+            # DiskFull ABORTS fail-closed BEFORE the seed-disk/seal/run steps below — the sandbox never seals
+            # or runs against a partial INPUT / absent OUTPUT disk. No orchestrator-side sentinel branch is
+            # needed here; the existing lifecycle-abort machinery handles it (same path as SimulateStartVMError
+            # et al.). Follow-up (tracked): a lifecycle-level test asserting a DiskFull throw never reaches
+            # Assert-Sealed. (Real host-disk-full HResult classification is LIVE-ONLY-UNPROVEN until Phase 6.)
 
             # RC6: the CIDATA seed DATA DISK — built from the resolved profile's Entrypoint (the disk-mode
             # runner) and recorded on the descriptor (SeedDiskPath + CreatedDisks) so it survives the seal
