@@ -424,6 +424,37 @@ function Invoke-Voidseal {
     $resultInnerName   = [string](Get-WorkloadField -Workload $Workload -Name 'ResultInnerName'   -Default 'result.html')
     $sentinelInnerName = [string](Get-WorkloadField -Workload $Workload -Name 'SentinelInnerName' -Default 'result.exitcode')
 
+    # --- D (structural C1 no-mount): refuse a Disk-mode profile that would reach the legacy
+    # Read-WorkloadResult -> ReadVhdxFile -> Mount-VHD host-mount branch (~:684 below) -----------------
+    # A PROCESSOR (Network='None' + ScreenConfig) or an OutboxOutput profile (firefox) never reaches
+    # that branch — both are gated onto the user-space outbox read (Read-OutboxToGateInput ->
+    # ReadVhdxRawRegion, never Mount-VHD; see the $usesOutbox gate at ~:671).
+    #
+    # NO BUILDER CARVE-OUT (deliberate, Step-1 finding): the builder (EgressMode='SquidSniProxy') has
+    # its OWN, entirely separate orchestrator (Invoke-BuilderVM, BuilderVM.ps1) — it never calls
+    # Invoke-Voidseal at all, and never calls Read-WorkloadResult; it hashes its OUTPUT disk whole-file
+    # via GetVhdxImageHash and never mounts it. Nothing in Invoke-Voidseal.ps1 or any test/caller ever
+    # legitimately passes a builder-shaped profile to Invoke-Voidseal — the only place 'builder' is
+    # referenced here is a PROCESSOR attaching a builder-PRODUCED, hash-VERIFIED deps disk (a different
+    # concept). So a builder-shaped profile arriving at Invoke-Voidseal is ALWAYS a caller misroute
+    # (should have called Invoke-BuilderVM), never a legitimate flow — carving it out here would silently
+    # let a misrouted builder profile fall through to the host-mount branch, reopening the exact P0 this
+    # validator exists to close. Refuse it the same as any other non-outbox, non-processor Disk profile.
+    #
+    # Compute the SAME markers Invoke-Voidseal.ps1:~671 computes (mirrored here, at the earliest point
+    # they are available — BEFORE any provisioning/backend call) and refuse fail-closed. No shipped
+    # profile hits this today; this closes the seam so a future Disk-mode profile (or a misrouted
+    # builder profile) cannot silently re-open the host-mount hole.
+    $isProcessorProfilePreflight = ($resolved['Network'] -eq 'None') -and $resolved.ContainsKey('ScreenConfig')
+    $wantsOutboxOutputPreflight  = $resolved.ContainsKey('OutboxOutput') -and [bool]$resolved['OutboxOutput']
+    if ($workloadMode -eq 'Disk' -and -not $isProcessorProfilePreflight -and -not $wantsOutboxOutputPreflight) {
+        throw ("Invoke-Voidseal: REFUSING a Disk-mode workload that is neither a processor (Network='None'+ScreenConfig) " +
+               "nor an OutboxOutput profile — it would reach the legacy host-mount result path (Read-WorkloadResult -> " +
+               "Mount-VHD on a guest-written FS = the C1 P0). A Disk-mode workload MUST use the user-space outbox read " +
+               "(OutboxOutput/ScreenConfig). The builder profile is not exempt here — it has its own orchestrator " +
+               "(Invoke-BuilderVM) and must never be passed to Invoke-Voidseal directly. Fail closed.")
+    }
+
     # --- the report, built up as we traverse ----------------------------
     $states     = [System.Collections.Generic.List[string]]::new()
     $report = [pscustomobject]@{
