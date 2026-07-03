@@ -897,6 +897,27 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report.Released | Should -BeNullOrEmpty -Because 'a missing-hash abort is fail-closed — nothing is released (symmetry with DENY-on-deps-mismatch)'
     }
 
+    It 'I1 DENY-on-differencing-deps: a DEPS disk that is a DIFFERENCING disk (container-swap / attacker-parent) is REFUSED before attach' {
+        # Arrange: a deps disk whose GetVHDInfo reports Differencing=$true + a ParentPath (footer/parent-
+        # locator rewrite — a container-swap attack that pulls real blocks from an attacker-controlled
+        # parent at attach time). Seed via the fake's real NewVHD seam (-Differencing/-ParentPath), the
+        # same idiom the sibling DENY-on-deps-mismatch/DENY-on-missing-deps-hash tests use to seed a
+        # normal deps disk — NewVHD requires -Dynamic for a Differencing disk (real New-VHD constraint).
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $diffDepsDisk = Join-Path $script:TmpRoot ("deps-diff-{0}.vhdx" -f ([guid]::NewGuid().ToString('N')))
+        & $b.NewVHD @{ Path = $diffDepsDisk; SizeBytes = 1GB; Differencing = $true; ParentPath = 'C:\atk\parent.vhdx'; Dynamic = $true }
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $diffDepsDisk; DepsImageHash = ('0' * 64) } `
+            -Name 'sbx-proc-depsdiff' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        # Assert: aborted BEFORE the seal, differencing/parent named in the failure, nothing released.
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'a differencing/parent-bearing deps disk aborts BEFORE the seal'
+        $report.Error | Should -Match '(?i)differencing|parent' -Because 'the abort names the differencing/parent-bearing deps disk'
+        $report.Released | Should -BeNullOrEmpty -Because 'a differencing-deps abort is fail-closed — nothing is released'
+    }
+
     # ---- whole-branch-review Fix B: the C2.6 runs/day rate cap is now WIRED into the orchestrator's
     # sole Invoke-SensitivityGate call (processor gate only) — these two tests prove it is actually
     # consulted on a real processor run, not merely available-but-dark. ----

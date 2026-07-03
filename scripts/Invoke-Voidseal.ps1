@@ -549,6 +549,18 @@ function Invoke-Voidseal {
             $depsDiskPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
             if ([string]::IsNullOrWhiteSpace($depsDiskPath) -and $resolved.ContainsKey('DepsDiskPath')) { $depsDiskPath = [string]$resolved['DepsDiskPath'] }
             if ($resolved['Network'] -eq 'None' -and -not [string]::IsNullOrWhiteSpace($depsDiskPath)) {
+                # I1 — STRUCTURE-BEFORE-HASH: a container-swap can rewrite a fixed disk's footer/parent-locator so it
+                # becomes a DIFFERENCING disk pointing at an attacker-controlled parent (which supplies the real blocks
+                # at attach time). Refuse ANY differencing / parent-bearing deps disk BEFORE trusting it — GetVHDInfo
+                # already surfaces these fields (they were never checked). Fail closed; the whole-image hash alone does
+                # not model an attacker who controls both child and parent.
+                $depsInfo = & $Backend.GetVHDInfo @{ Path = $depsDiskPath }
+                if ($null -eq $depsInfo) {
+                    throw "Invoke-Voidseal: '$Name' DEPS disk ('$depsDiskPath') is unreadable via GetVHDInfo — refusing to attach an unverifiable dependency disk. Failing closed."
+                }
+                if ([bool]$depsInfo.Differencing -or -not [string]::IsNullOrWhiteSpace([string]$depsInfo.ParentPath)) {
+                    throw "Invoke-Voidseal: '$Name' DEPS disk ('$depsDiskPath') is a DIFFERENCING disk (Differencing=$($depsInfo.Differencing), ParentPath='$($depsInfo.ParentPath)'). A dependency disk MUST be a self-contained fixed/dynamic VHDX — a differencing child pulls blocks from an external parent the host cannot verify. Refusing to attach; failing closed."
+                }
                 # PHASE 3 — VERIFY-BEFORE-ATTACH (supply-chain integrity; Pass-5 + Pass-4 P1 "offline != trustworthy").
                 # The expected whole-image hash comes from the TRUSTED caller (who ran the builder + captured its
                 # WholeImageHash) via -Workload.DepsImageHash (fallback: the resolved profile). Re-hash deps.vhdx in
