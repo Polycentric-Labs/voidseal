@@ -2048,4 +2048,67 @@ Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-moun
         # The user-space mechanism is still present (positive assertion).
         $src | Should -Match 'qemu-img'
     }
+    It 'SECURITY: the REAL ReadVhdxRawRegion resolves qemu-img through Resolve-QemuImg (version-floor + pin), not a bare Get-Command' {
+        # I5a: a bare `Get-Command qemu-img` had no version floor and no binary pin, so ANY qemu-img on
+        # PATH (however stale or substituted) would run against untrusted guest bytes. The real backend
+        # must resolve through the testable, fail-closed helper instead.
+        $real = New-RealHyperVBackend
+        $src  = $real.ReadVhdxRawRegion.ToString()
+        $src | Should -Match 'Resolve-QemuImg' -Because 'the real resolve must route through the version-floor + pin helper, not a bare Get-Command'
+    }
+}
+
+# ===========================================================================
+#  Resolve-QemuImg (I5a) — version-floor (patch-currency) + optional SHA-256 pin
+# ===========================================================================
+#  Finding I5 (part a): the real ReadVhdxRawRegion ran qemu-img against an UNTRUSTED guest VHDX in the
+#  host operator's session with NO version floor and NO binary pin — a stale or substituted qemu-img on
+#  PATH would parse attacker-controlled bytes with no floor at all. This helper factors the resolve into
+#  a pure, unit-testable seam: Get-QemuImgPath / Get-QemuImgVersion / Get-FileSha256 are thin wrappers
+#  (over Get-Command qemu-img / `& qemu-img --version` / Get-FileHash) that Resolve-QemuImg calls, so
+#  tests can Mock them directly (dot-sourced Pester Mock, no -ModuleName — matches this file's idiom).
+#
+#  FLOOR FRAMING (load-bearing, do not weaken): the MinVersion floor is a PATCH-CURRENCY check, not a
+#  CVE-derived gate. The only real qemu VHDX-parser CVE found under verification is CVE-2014-0148 (a DoS,
+#  fixed at QEMU 2.0) — nowhere near a modern floor. The floor exists so the resolver runs a CURRENTLY
+#  PATCHED qemu (re-resolve the current stable at ship time), not because a specific CVE is fixed at that
+#  version. Do not cite a CVE as the floor's justification.
+Describe 'Resolve-QemuImg (I5 version-floor + SHA-256 pin)' {
+    It 'fails closed when qemu-img version is below the floor' {
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-QemuImgVersion { '1.7.0' }   # below floor 8.2.0
+        { Resolve-QemuImg -MinVersion '8.2.0' } | Should -Throw -ExpectedMessage '*below the required floor*'
+    }
+    It 'fails closed when qemu-img is not found on PATH' {
+        Mock Get-QemuImgPath { $null }
+        { Resolve-QemuImg -MinVersion '8.2.0' } | Should -Throw -ExpectedMessage '*qemu-img not found*'
+    }
+    It 'passes when version meets the floor and no pin is supplied' {
+        Mock Get-QemuImgVersion { '9.1.0' }
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
+    }
+    It 'passes when version EXACTLY equals the floor (boundary, no pin)' {
+        Mock Get-QemuImgVersion { '8.2.0' }
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
+    }
+    It 'passes when version meets the floor AND the pinned SHA-256 matches (case-insensitive)' {
+        Mock Get-QemuImgVersion { '9.1.0' }
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256     { 'A' * 64 }
+        Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a' * 64) | Should -Be 'C:\qemu\qemu-img.exe'
+    }
+    It 'fails closed when the pinned SHA-256 does not match' {
+        Mock Get-QemuImgVersion { '9.1.0' }; Mock Get-QemuImgPath { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256 { 'deadbeef' }
+        { Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a'*64) } | Should -Throw -ExpectedMessage '*hash mismatch*'
+    }
+    It 'does NOT hash the binary at all when no pin is supplied (Get-FileSha256 not called)' {
+        Mock Get-QemuImgVersion { '9.1.0' }
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256     { 'should-not-be-called' }
+        Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
+        Should -Invoke Get-FileSha256 -Times 0
+    }
 }

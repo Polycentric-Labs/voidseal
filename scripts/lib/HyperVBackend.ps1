@@ -66,6 +66,14 @@ $script:HyperVUnavailablePrefix =
 # so the Sealer must explicitly turn them off and Assert-Sealed must host-verify they are).
 $script:HostChannelNames = @('Clipboard', 'Shares', 'GuestServices', 'EnhancedSession')
 
+# qemu-img resolve floor for ReadVhdxRawRegion (I5a): PATCH-CURRENCY, not CVE-derived — see the
+# Resolve-QemuImg comment below for the full rationale. Re-resolve the current stable qemu-img
+# release and bump this at ship time; it is a currency check, re-validated periodically.
+# No pin by default (version-floor only) — set $script:QemuImgPinnedSha256 to enforce an exact,
+# provenance-pinned binary (recommended: an MSYS2 mingw-w64-x86_64-qemu build's SHA-256).
+$script:QemuImgMinVersion   = '8.2.0'
+$script:QemuImgPinnedSha256 = $null
+
 # --------------------------------------------------------------------------
 # Method manifest — SINGLE SOURCE OF TRUTH for the backend surface.
 # --------------------------------------------------------------------------
@@ -496,6 +504,100 @@ $script:SbResolveVolumeLetter = {
         throw "${Context}: mounted VHD's volume did not surface a valid drive letter (A-Z) within the retry window."
     }
     return [string]$letter
+}
+
+# --------------------------------------------------------------------------
+# Resolve-QemuImg (I5a) — version-floor (patch-currency) + optional SHA-256 pin
+# --------------------------------------------------------------------------
+# ReadVhdxRawRegion (REAL only, below) runs qemu-img to parse an UNTRUSTED guest VHDX in the host
+# operator's own session. A bare `Get-Command qemu-img` had no version floor and no binary pin — ANY
+# qemu-img found on PATH, however stale or substituted, would parse attacker-controlled bytes. This
+# helper resolves qemu-img through a fail-closed gate instead.
+#
+# FLOOR FRAMING (load-bearing — do not weaken or re-justify with a CVE): MinVersion is a
+# PATCH-CURRENCY check, not a CVE-derived gate. Verification found exactly one real qemu VHDX-parser
+# CVE — CVE-2014-0148, a DoS fixed at QEMU 2.0 — which is far below any reasonable modern floor and is
+# NOT why this floor exists. The floor exists so the resolver runs a CURRENTLY PATCHED qemu-img; the
+# default below is a conservative recent-stable snapshot, not a claim that a specific CVE is fixed at
+# exactly that version. Re-resolve the current stable qemu-img release at ship time and bump the
+# configured floor accordingly — this is a currency check, re-validated periodically, not a one-time
+# CVE patch gate.
+#
+# PIN CAVEAT (weilnetz Windows build): the weilnetz-built qemu-img.exe commonly used on Windows carries
+# an EXPIRED Authenticode certificate, so `Get-AuthenticodeSignature ... .Status -eq 'Valid'` would fail
+# closed on a perfectly good, unmodified binary. Do NOT gate on Authenticode validity here — the pinned
+# SHA-256 (below) is the control for this binary's provenance. Signature-validity gating is viable only
+# for an MSYS2-packaged qemu-img (a currently-valid chain), not the weilnetz build.
+#
+# Seams below (Get-QemuImgPath / Get-QemuImgVersion / Get-FileSha256) are thin one-line wrappers over
+# Get-Command / `& qemu-img --version` / Get-FileHash so Pester can `Mock` them directly (dot-sourced,
+# no -ModuleName — matches this file's existing test idiom); Resolve-QemuImg contains all the actual
+# fail-closed logic and is itself fully unit-testable through those seams.
+
+<#
+.SYNOPSIS
+    Seam: resolve qemu-img's path on PATH, or $null if absent. Thin wrapper over Get-Command.
+#>
+function Get-QemuImgPath {
+    $cmd = Get-Command qemu-img -ErrorAction SilentlyContinue
+    if ($null -eq $cmd) { return $null }
+    return $cmd.Source
+}
+
+<#
+.SYNOPSIS
+    Seam: return qemu-img's reported version string (e.g. '9.1.0'). Thin wrapper over `qemu-img --version`.
+#>
+function Get-QemuImgVersion {
+    param([Parameter(Mandatory)] [string] $Path)
+    # "qemu-img version 9.1.0 (qemu-img-win-x64-9.1.0-0)" (or similar) on the first line of stdout.
+    $out = & $Path '--version' 2>&1
+    $line = ([string]($out | Select-Object -First 1))
+    if ($line -match '(?i)version\s+(\d+(?:\.\d+){1,3})') { return $Matches[1] }
+    throw "Get-QemuImgVersion: could not parse a version number out of qemu-img --version output: '$line'"
+}
+
+<#
+.SYNOPSIS
+    Seam: return a file's SHA-256 hex digest (lowercase). Thin wrapper over Get-FileHash.
+#>
+function Get-FileSha256 {
+    param([Parameter(Mandatory)] [string] $Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+<#
+.SYNOPSIS
+    Resolve a fail-closed, version-floored, optionally SHA-256-pinned path to qemu-img.
+
+.DESCRIPTION
+    Used by the REAL ReadVhdxRawRegion before it parses an untrusted guest VHDX. Fails closed
+    (throws) if: qemu-img is not found on PATH; its reported version is below -MinVersion (a
+    patch-currency floor — see the file-level comment above this function, NOT a CVE-derived
+    gate); or -PinnedSha256 is supplied and the resolved binary's SHA-256 does not match it.
+    Returns the resolved qemu-img path on success.
+#>
+function Resolve-QemuImg {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $MinVersion,
+        [string] $PinnedSha256
+    )
+    $path = Get-QemuImgPath
+    if (-not $path) {
+        throw "Resolve-QemuImg: qemu-img not found on PATH — the user-space read needs qemu-img (host attach of an untrusted disk is FORBIDDEN). Failing closed."
+    }
+    $ver = Get-QemuImgVersion -Path $path
+    if ([version]$ver -lt [version]$MinVersion) {
+        throw "Resolve-QemuImg: qemu-img $ver is below the required floor $MinVersion (patch-currency: run a currently-patched qemu-img, re-resolved at ship time — not a specific-CVE gate). Failing closed."
+    }
+    if ($PinnedSha256) {
+        $actual = Get-FileSha256 -Path $path
+        if ($actual -ne $PinnedSha256.ToLowerInvariant()) {
+            throw "Resolve-QemuImg: qemu-img SHA-256 hash mismatch (got $actual, pinned $PinnedSha256) — refusing an unpinned/substituted parser binary. Failing closed."
+        }
+    }
+    return $path
 }
 
 # ==========================================================================
@@ -1157,10 +1259,13 @@ function New-RealHyperVBackend {
             if ($length -gt [int]::MaxValue -or $offset -gt [int]::MaxValue) {
                 throw "ReadVhdxRawRegion: Offset/Length exceeds the supported 2GB single-read limit ($offset/$length) — failing closed."
             }
-            $qemu = Get-Command qemu-img -ErrorAction SilentlyContinue
-            if ($null -eq $qemu) {
-                throw "ReadVhdxRawRegion: qemu-img not found on PATH. The user-space OUTPUT read needs qemu-img (host attach of an untrusted guest disk is FORBIDDEN — host attach kernel-parses attacker bytes; Pass-5). Install qemu-img and retry. Failing closed."
-            }
+            # I5a: resolve through the fail-closed, version-floored (patch-currency, not CVE-derived —
+            # see Resolve-QemuImg's comment), optionally SHA-256-pinned helper instead of a bare
+            # Get-Command — an unfloored/unpinned qemu-img would parse these UNTRUSTED guest bytes
+            # with no assurance it is a currently-patched, provenance-verified binary. Absent pin
+            # (the default) = version-floor only. Preserves the prior "qemu-img not found" message
+            # inside the helper.
+            $qemuPath = Resolve-QemuImg -MinVersion $script:QemuImgMinVersion -PinnedSha256 $script:QemuImgPinnedSha256
             $tmpRaw = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "voidseal-outbox-$([System.IO.Path]::GetRandomFileName()).raw")
             try {
                 # RC8 (detach settle-lag): Remove-VMHardDiskDrive/Stop-VM returning does NOT guarantee the
@@ -1174,7 +1279,7 @@ function New-RealHyperVBackend {
                 & $LockRetry -Operation {
                     # -f vhdx pins the input format (never auto-probe an attacker-influenced header into a
                     # surprising driver); -O raw flattens to logical-block order. '--' ends option parsing.
-                    $out = & $qemu.Source convert -f vhdx -O raw -- $path $tmpRaw 2>&1
+                    $out = & $qemuPath convert -f vhdx -O raw -- $path $tmpRaw 2>&1
                     if ($LASTEXITCODE -ne 0) {
                         $detail = ([string]($out -join "`n")).Trim()
                         throw "ReadVhdxRawRegion: qemu-img convert failed (exit $LASTEXITCODE) for '$path' — the VHDX may still be attached/locked (detach first) or be malformed. qemu-img output: $detail"
