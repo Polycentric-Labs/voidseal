@@ -58,6 +58,58 @@ If the host is below the floor, **stop** and patch before running any tier.
 - Stage workload assets (the pinned Ralph repo ISO, the organizer ISO) at the host paths the
   profiles' `StageAssets` reference, with the SHA pinned (Ralph has no tags — pin a commit SHA).
 
+### 0.4 Builder deps: what is (and isn't) verified
+
+The `builder` profile (Phase 2+) fetches pip wheels, apt `.deb`s, and Hugging Face models into a
+`deps.vhdx` that a downstream Tier-1 `processor` run attaches. Two **different** integrity
+properties are in play here — do not conflate them:
+
+- **Whole-image hash (`DepsImageHash`, `GetVhdxImageHash`)** — this is **tamper-evidence of the
+  deps hand-off**, i.e. proof that the `deps.vhdx` a processor VM attaches is byte-identical to
+  what the builder emitted. It catches substitution/corruption in the host-side hand-off between
+  the builder run and the processor run. **It says nothing about whether the packages/models
+  inside the disk are what upstream actually published** — that's a separate, per-fetcher
+  question (below).
+- **Per-fetcher upstream provenance** — established (or not) at *fetch* time, inside
+  `guest/fetch_deps.py`:
+  - **apt** is authenticated by default — `apt-get download` verifies each `.deb` against the
+    Debian archive's GPG-signed `Release`/`Packages` metadata (dpkg/APT signature verification).
+    No extra wiring needed.
+  - **pip** enforces per-package hashes **only** when driven by a hashed requirements file. A
+    bare `pip download --require-hashes <packages>` with no `-r <file>` is a **no-op** — pip has
+    nothing to check hashes *against*. `fetch_deps.py`'s `build_commands` now **rejects**
+    `Pip.RequireHashes=True` unless `Pip.RequirementsFile` is also set (`ValueError` at plan/build
+    time, not a silent pass-through). The lockfile itself is **minted by the operator/build step**,
+    not by `fetch_deps.py`:
+
+    ```bash
+    # Operator step (NOT run inside the guest / fetch_deps.py). Produces a requirements.txt
+    # carrying --hash=sha256:... for every pinned package AND its full transitive closure.
+    pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+    ```
+
+    This gives **reproducibility against a defined input** (the lockfile you compiled and
+    reviewed) — it is **not** cryptographic proof of upstream authorship the way a signed
+    artifact would be; a compromised PyPI package present when you ran `pip-compile` is hashed
+    faithfully, not detected.
+  - **Hugging Face** models are pinned with `--revision <full-40-char-commit-sha>`
+    (`HuggingFace.Revision` in the DepsSpec) so the fetch is an immutable snapshot rather than
+    "whatever `main` currently resolves to". This does not by itself verify the *content* —
+    it verifies you got the *exact commit* you reviewed/pinned, and that a later force-push to
+    `main` cannot silently swap what gets fetched.
+  - **PEP 740 attestations** (the newer cryptographic-provenance mechanism for PyPI) are **not
+    universal**: as of this writing `transformers` and `numpy` publish PEP 740 attestations,
+    **`torch` does not**. Do not assume attestation coverage across a dependency set without
+    checking package-by-package.
+- **Net effect:** the whole-image hash + per-fetcher pinning together give you "the processor got
+  exactly what the builder fetched, and the builder fetched exactly the pinned/hashed inputs you
+  reviewed" — a defined, reproducible, tamper-evident chain. They do **not** give you upstream
+  cryptographic authenticity for every artifact (pip in particular is reproducibility, not
+  provenance, unless every package in the closure separately ships PEP 740).
+
+See `profiles/builder.psd1`'s `DepsSpec` for the `RequirementsFile` / `Revision` keys in
+practice, and `guest/fetch_deps.py` for the enforcement.
+
 ---
 
 ## 1. Provision → run → teardown walkthrough

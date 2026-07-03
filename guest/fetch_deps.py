@@ -12,19 +12,34 @@ def build_commands(spec, out_dir):
     pip = spec.get("Pip")
     if pip:
         argv = ["pip", "download", "-d", str(out / "pip")]
-        if pip.get("Platform"):     argv += ["--platform", pip["Platform"]]
-        if pip.get("OnlyBinary"):   argv += ["--only-binary=:all:"]
-        if pip.get("RequireHashes"): argv += ["--require-hashes"]
-        argv += list(pip.get("Packages", []))
+        if pip.get("Platform"):    argv += ["--platform", pip["Platform"]]
+        if pip.get("OnlyBinary"):  argv += ["--only-binary=:all:"]
+        if pip.get("RequireHashes"):
+            # --require-hashes is a NO-OP unless it's driving a hashed lockfile: pip only enforces
+            # hashes when EVERY requirement in the resolved set carries a --hash, which only a
+            # `pip-compile --generate-hashes` requirements file provides. Appending it after bare
+            # package names (the old behavior) enforced NOTHING — fail closed instead.
+            reqfile = pip.get("RequirementsFile")
+            if not reqfile:
+                raise ValueError("Pip.RequireHashes=True requires a Pip.RequirementsFile (a pip-compile "
+                                 "--generate-hashes lockfile); --require-hashes is a no-op without -r. "
+                                 "Provide the hashed requirements file or set RequireHashes=False.")
+            argv += ["--require-hashes", "-r", reqfile]         # hashed lockfile drives the closure
+        else:
+            argv += list(pip.get("Packages", []))               # unhashed: bare names (dev/preview only)
         cmds.append(("pip", argv))
     apt = spec.get("Apt")
     if apt:
         cmds.append(("apt", ["apt-get", "download"] + list(apt.get("Packages", []))))   # writes .deb into CWD (main cds to out/apt)
     hf = spec.get("HuggingFace")
     if hf:
+        rev = hf.get("Revision")
         for model in hf.get("Models", []):
-            cmds.append(("hf", ["huggingface-cli", "download", model,
-                                "--local-dir", str(out / "hf" / model.replace("/", "__"))]))
+            argv = ["huggingface-cli", "download", model,
+                    "--local-dir", str(out / "hf" / model.replace("/", "__"))]
+            if rev:
+                argv += ["--revision", rev]                     # full commit SHA -> immutable snapshot
+            cmds.append(("hf", argv))
     return cmds
 
 def write_manifest(out_dir, manifest_path=None):

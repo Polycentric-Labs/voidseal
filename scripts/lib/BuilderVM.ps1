@@ -201,7 +201,17 @@ function Invoke-BuilderVM {
         }
         $states.Add('DETACHED')
 
-        # --- WHOLE-IMAGE HASH (no mount): the Phase-3 supply-chain integrity artifact ---
+        # --- WHOLE-IMAGE HASH (no mount): tamper-evidence of the deps hand-off (NOT upstream
+        # authenticity) --- this hash proves the deps.vhdx the processor attaches is BYTE-IDENTICAL
+        # to what the builder emitted (detects tamper/substitution in the host<->processor hand-off,
+        # C2-regen's DEPS-disk-integrity check). It says NOTHING about whether the packages/models
+        # INSIDE the disk are what upstream actually published — that provenance is established (or
+        # not) per-fetcher at fetch time: apt is authenticated by default (dpkg/APT signature
+        # verification against the Debian archive keyring); pip enforces per-package hashes only when
+        # driven by a `pip-compile --generate-hashes` lockfile (Pip.RequirementsFile — see
+        # guest/fetch_deps.py); HF pins an exact --revision commit SHA (immutable snapshot, not
+        # "whatever main resolves to today"). See docs/operator-runbook.md for the full breakdown.
+        # --- Phase-3 artifact ---
         $outputPath = [string]$descriptor.OutputDiskPath
         if ([string]::IsNullOrWhiteSpace($outputPath)) {
             throw "Invoke-BuilderVM: descriptor has no OutputDiskPath after disk creation."

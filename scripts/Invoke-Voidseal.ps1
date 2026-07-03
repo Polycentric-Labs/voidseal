@@ -570,13 +570,19 @@ function Invoke-Voidseal {
                 if ([bool]$depsInfo.Differencing -or -not [string]::IsNullOrWhiteSpace([string]$depsInfo.ParentPath)) {
                     throw "Invoke-Voidseal: '$Name' DEPS disk ('$depsDiskPath') is a DIFFERENCING disk (Differencing=$($depsInfo.Differencing), ParentPath='$($depsInfo.ParentPath)'). A dependency disk MUST be a self-contained fixed/dynamic VHDX — a differencing child pulls blocks from an external parent the host cannot verify. Refusing to attach; failing closed."
                 }
-                # PHASE 3 — VERIFY-BEFORE-ATTACH (supply-chain integrity; Pass-5 + Pass-4 P1 "offline != trustworthy").
-                # The expected whole-image hash comes from the TRUSTED caller (who ran the builder + captured its
-                # WholeImageHash) via -Workload.DepsImageHash (fallback: the resolved profile). Re-hash deps.vhdx in
-                # USER-SPACE (GetVhdxImageHash — raw bytes, NEVER Mount-VHD) while it is still DETACHED (before this
-                # AddHardDiskDrive), and REFUSE on a missing OR mismatched hash — fail-closed: no unverified or
-                # tampered/substituted dependency disk ever attaches. (Live: GetVhdxImageHash is qemu-img-free
-                # streaming SHA-256 — re-resolve at fire; the mock fake returns SHA-256 of the recorded deps bytes.)
+                # PHASE 3 — VERIFY-BEFORE-ATTACH (tamper-evidence of the deps hand-off, NOT upstream
+                # supply-chain authenticity; Pass-5 + Pass-4 P1 "offline != trustworthy"; I3 reframe).
+                # This proves deps.vhdx is byte-identical to what the builder emitted (host<->processor
+                # hand-off integrity) — it says nothing about whether the packages/models INSIDE the
+                # disk are what upstream published (see guest/fetch_deps.py + docs/operator-runbook.md
+                # for the per-fetcher provenance story: apt signature verification, pip hashed-lockfile,
+                # HF --revision pin). The expected whole-image hash comes from the TRUSTED caller (who
+                # ran the builder + captured its WholeImageHash) via -Workload.DepsImageHash (fallback:
+                # the resolved profile). Re-hash deps.vhdx in USER-SPACE (GetVhdxImageHash — raw bytes,
+                # NEVER Mount-VHD) while it is still DETACHED (before this AddHardDiskDrive), and REFUSE
+                # on a missing OR mismatched hash — fail-closed: no unverified or tampered/substituted
+                # dependency disk ever attaches. (Live: GetVhdxImageHash is qemu-img-free streaming
+                # SHA-256 — re-resolve at fire; the mock fake returns SHA-256 of the recorded deps bytes.)
                 $expectedHash = [string](Get-WorkloadField -Workload $Workload -Name 'DepsImageHash')
                 if ([string]::IsNullOrWhiteSpace($expectedHash) -and $resolved.ContainsKey('DepsImageHash')) { $expectedHash = [string]$resolved['DepsImageHash'] }
                 if ([string]::IsNullOrWhiteSpace($expectedHash)) {

@@ -1,16 +1,38 @@
-import sys, json, pathlib, hashlib, subprocess
+import sys, json, pathlib, hashlib, subprocess, pytest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "guest"))
 import fetch_deps  # guest/fetch_deps.py
 
 def test_build_commands_pip_has_cross_target_flags():
-    spec = {"Pip": {"Packages": ["urllib3"], "Platform": "manylinux2014_x86_64", "OnlyBinary": True, "RequireHashes": True}}
+    spec = {"Pip": {"Packages": ["urllib3"], "Platform": "manylinux2014_x86_64", "OnlyBinary": True,
+                    "RequireHashes": True, "RequirementsFile": "requirements.txt"}}
     cmds = {f: c for f, c in fetch_deps.build_commands(spec, "/out")}
     pip = cmds["pip"]
     assert pip[:2] == ["pip", "download"]
     assert "--platform" in pip and "manylinux2014_x86_64" in pip
     assert "--only-binary=:all:" in pip and "--require-hashes" in pip
-    assert "urllib3" in pip
+    assert "-r" in pip and "requirements.txt" in pip
+
+def test_require_hashes_requires_a_requirements_file():
+    # RequireHashes with a RequirementsFile -> pip download -r <file> --require-hashes (NO bare names)
+    spec = {"Pip": {"RequireHashes": True, "RequirementsFile": "requirements.txt", "Packages": ["urllib3"]}}
+    cmds = dict((f, c) for f, c in fetch_deps.build_commands(spec, "/mnt/out"))
+    pip = cmds["pip"]
+    assert "--require-hashes" in pip
+    assert "-r" in pip and "requirements.txt" in pip           # the lockfile is passed
+    assert "urllib3" not in pip                                 # bare names NOT appended in hashed mode
+
+def test_require_hashes_without_reqfile_is_a_hard_error():
+    # RequireHashes WITHOUT a RequirementsFile must FAIL (the old no-op is now rejected)
+    spec = {"Pip": {"RequireHashes": True, "Packages": ["urllib3"]}}
+    with pytest.raises(ValueError, match="RequireHashes.*RequirementsFile"):
+        fetch_deps.build_commands(spec, "/mnt/out")
+
+def test_hf_revision_is_pinned():
+    spec = {"HuggingFace": {"Models": ["hf-internal-testing/tiny-random-gpt2"], "Revision": "a"*40}}
+    cmds = dict((f, c) for f, c in fetch_deps.build_commands(spec, "/mnt/out"))
+    hf = cmds["hf"]
+    assert "--revision" in hf and ("a"*40) in hf
 
 def test_build_commands_apt_and_hf():
     spec = {"Apt": {"Packages": ["jq"]}, "HuggingFace": {"Models": ["hf-internal-testing/tiny-random-gpt2"]}}
@@ -27,7 +49,8 @@ def test_write_manifest_has_per_file_sha256(tmp_path):
     assert by["apt/jq.deb"]["size"] == 3
 
 def test_plan_mode_prints_commands_without_executing(tmp_path):
-    spec = {"Pip": {"Packages": ["urllib3"], "Platform": "manylinux2014_x86_64", "OnlyBinary": True, "RequireHashes": True}}
+    spec = {"Pip": {"Packages": ["urllib3"], "Platform": "manylinux2014_x86_64", "OnlyBinary": True,
+                    "RequireHashes": True, "RequirementsFile": "requirements.txt"}}
     sp = tmp_path / "spec.json"; sp.write_text(json.dumps(spec))
     out = tmp_path / "out"
     r = subprocess.run([sys.executable, str(ROOT / "guest" / "fetch_deps.py"),

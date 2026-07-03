@@ -36,15 +36,33 @@
     # stack (Tika/spaCy/Presidio/datasketch) only AFTER the live round-trip is green. NO Github fetcher
     # for MVFR (jq comes from apt) -> github hosts are NOT required by the derived-per-fetcher check.
     # >>> RE-CONFIRM the exact HF id 'hf-internal-testing/tiny-random-gpt2' at fire (Phase 6). <<<
+    #
+    # I3 (fetch_deps.py hardening): RequireHashes now REJECTS at build_commands()-time unless paired
+    # with a RequirementsFile — the old "--require-hashes appended after bare package names" wiring
+    # was a NO-OP (pip only enforces hashes when EVERY resolved requirement carries one, which only a
+    # requirements file can do). RequirementsFile is a `pip-compile --generate-hashes` LOCKFILE minted
+    # by the operator/build step (documented in docs/operator-runbook.md) — fetch_deps.py never
+    # generates hashes itself, it only consumes a pre-hashed lockfile. The file need not exist on disk
+    # for --plan / build_commands (pure, no execution, no file I/O on the reqfile path); the operator
+    # supplies the real requirements.txt alongside the deps-spec.json at Phase 6 fire time.
+    # HuggingFace.Revision pins the exact commit SHA so the fetch is an immutable snapshot, not
+    # "whatever main currently resolves to". The value below is the REAL current main-branch commit
+    # SHA of hf-internal-testing/tiny-random-gpt2 as of 2026-07-02 (confirmed live via
+    # https://huggingface.co/api/models/hf-internal-testing/tiny-random-gpt2 -> "sha" field) —
+    # >>> RE-CONFIRM it has not moved at fire (Phase 6); HF orgs can force-push a ref. <<<
     DepsSpec = @{
         Pip = @{
-            Packages      = @('urllib3')
-            Platform      = 'manylinux2014_x86_64'   # cross-target the AIR-GAPPED processor, not the builder
-            OnlyBinary    = $true                    # pip --only-binary=:all:
-            RequireHashes = $true                    # pip --require-hashes (abort if any transitive dep lacks a hash)
+            Packages          = @('urllib3')          # informational only when RequirementsFile is set (see fetch_deps.py)
+            Platform          = 'manylinux2014_x86_64' # cross-target the AIR-GAPPED processor, not the builder
+            OnlyBinary        = $true                  # pip --only-binary=:all:
+            RequireHashes     = $true                  # pip --require-hashes -- REQUIRES RequirementsFile (see above)
+            RequirementsFile  = 'requirements.txt'      # pip-compile --generate-hashes lockfile, operator-supplied at fire
         }
         Apt         = @{ Packages = @('jq') }
-        HuggingFace = @{ Models   = @('hf-internal-testing/tiny-random-gpt2') }
+        HuggingFace = @{
+            Models   = @('hf-internal-testing/tiny-random-gpt2')
+            Revision = '71034c5d8bde858ff824298bdedc65515b97d2b9'   # full 40-char commit SHA, confirmed live (see above)
+        }
     }
 
     # Disk-mode entrypoint — the dep-fetch runner the seed injects (2.2 finalizes the exact call +
