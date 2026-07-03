@@ -625,6 +625,11 @@ function New-RealHyperVBackend {
     $FirmwareRetry = $script:SbInvokeFirmwareWithRetry   # RC5: Secure-Boot template-enumeration retry
     $LockRetry     = $script:SbInvokeWithLockRetry       # RC8: detach settle-lag sharing-violation retry
     $unavailPrefix = $script:HyperVUnavailablePrefix
+    # I5a fix: same closure-capture rule as every other value here — a $script: READ inside a
+    # .GetNewClosure()'d body does NOT resolve to the top-level script scope (it comes back empty/
+    # $null at call time), so ReadVhdxRawRegion must capture these by value too, not read them live.
+    $QemuMinVer    = $script:QemuImgMinVersion
+    $QemuPin       = $script:QemuImgPinnedSha256
 
     # Run a real Hyper-V op; convert an availability/permission failure into the single
     # clear fail-closed exception, leave any other error untouched. Local closure so it
@@ -1264,8 +1269,11 @@ function New-RealHyperVBackend {
             # Get-Command — an unfloored/unpinned qemu-img would parse these UNTRUSTED guest bytes
             # with no assurance it is a currently-patched, provenance-verified binary. Absent pin
             # (the default) = version-floor only. Preserves the prior "qemu-img not found" message
-            # inside the helper.
-            $qemuPath = Resolve-QemuImg -MinVersion $script:QemuImgMinVersion -PinnedSha256 $script:QemuImgPinnedSha256
+            # inside the helper. MUST reference the factory-locals ($QemuMinVer/$QemuPin) captured
+            # above, NOT $script:QemuImgMinVersion/$script:QemuImgPinnedSha256 directly — this body
+            # runs inside .GetNewClosure()'d $InvokeOp, and a $script: READ here resolves EMPTY at
+            # call time (same rule as every other hoisted value in this factory; was the I5a bug).
+            $qemuPath = Resolve-QemuImg -MinVersion $QemuMinVer -PinnedSha256 $QemuPin
             $tmpRaw = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "voidseal-outbox-$([System.IO.Path]::GetRandomFileName()).raw")
             try {
                 # RC8 (detach settle-lag): Remove-VMHardDiskDrive/Stop-VM returning does NOT guarantee the

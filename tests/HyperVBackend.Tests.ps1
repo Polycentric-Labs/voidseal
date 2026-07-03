@@ -2056,6 +2056,42 @@ Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-moun
         $src  = $real.ReadVhdxRawRegion.ToString()
         $src | Should -Match 'Resolve-QemuImg' -Because 'the real resolve must route through the version-floor + pin helper, not a bare Get-Command'
     }
+    It 'SECURITY (review Critical, I5a wiring, out-of-process): the REAL ReadVhdxRawRegion ACTUALLY INVOKES Resolve-QemuImg with the configured floor propagated through the closure (not a string match)' {
+        # The string-match test above only proves the SOURCE TEXT contains "Resolve-QemuImg" — it
+        # would stay green even if the call read $script:QemuImgMinVersion directly (which resolves
+        # EMPTY inside a .GetNewClosure()'d body, per this file's own closure-capture rule at
+        # ~line 240) instead of a properly-hoisted factory-local. That exact regression shipped once:
+        # a live run got -MinVersion '' -> ParameterBindingValidationException, misroutable through
+        # $InvokeOp's SbIsUnavailableError path into a MISLEADING "Hyper-V unavailable" message.
+        #
+        # WHY OUT-OF-PROCESS (mirrors 'Real backend — builds the right cmdlet params' above): verified
+        # empirically in this task that an in-process Pester Mock of Get-QemuImgPath/Get-QemuImgVersion
+        # does NOT intercept ReadVhdxRawRegion's closure at all here — ANY .GetNewClosure()'d scriptblock
+        # invoked from inside a Pester It/Describe body fails to resolve a bare-name call to a dot-sourced
+        # function (CommandNotFoundException: 'Resolve-QemuImg' is not recognized), reproduced even with
+        # zero Mocks active and even via a trivial ad-hoc closure unrelated to New-RealHyperVBackend. That
+        # is a Pester dynamic-module scoping fact of this closure pattern, not something the I5a hoist
+        # fixes or should paper over. The harness below shadows the qemu seams AND dot-sources the lib in
+        # the SAME top-level child-process scope (exactly Invoke-RealBackendCapture.ps1's proven pattern),
+        # so the REAL closure body executes for real and the assertion is on its actual thrown message —
+        # proving the configured floor value reached Resolve-QemuImg, not just that the source text
+        # mentions it.
+        $harness = Join-Path $PSScriptRoot 'fixtures/Invoke-RealReadVhdxRawRegionQemuFloor.ps1'
+        Test-Path $harness | Should -BeTrue -Because 'the out-of-process qemu-floor-wiring harness must exist'
+
+        $pwsh = (Get-Process -Id $PID).Path   # the exact pwsh running these tests
+        if ([string]::IsNullOrWhiteSpace($pwsh)) { $pwsh = 'pwsh' }
+        # '1.0.0' is deliberately BELOW $script:QemuImgMinVersion (8.2.0, the shipped default floor).
+        $raw = & $pwsh -NoProfile -File $harness -LibPath $script:LibPath -StubVersion '1.0.0' 2>&1
+        $rawText = ($raw | Out-String).Trim()
+        $jsonLine = ($rawText -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        $jsonLine | Should -Not -BeNullOrEmpty -Because "the harness must emit JSON; got: $rawText"
+        $cap = $jsonLine | ConvertFrom-Json
+
+        $cap.err | Should -Not -BeNullOrEmpty -Because 'a below-floor qemu-img version must fail closed'
+        $cap.err | Should -Match 'below the required floor' -Because 'the specific Resolve-QemuImg floor error must surface, not a ParameterBindingValidationException (empty -MinVersion) or a mislabeled "Hyper-V unavailable"'
+        $cap.err | Should -Match '8\.2\.0' -Because 'the CONFIGURED floor value must have propagated through the closure to Resolve-QemuImg, proving the hoist (not a $script: read that resolves empty)'
+    }
 }
 
 # ===========================================================================
