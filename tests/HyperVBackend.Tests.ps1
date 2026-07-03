@@ -2092,6 +2092,65 @@ Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-moun
         $cap.err | Should -Match 'below the required floor' -Because 'the specific Resolve-QemuImg floor error must surface, not a ParameterBindingValidationException (empty -MinVersion) or a mislabeled "Hyper-V unavailable"'
         $cap.err | Should -Match '8\.2\.0' -Because 'the CONFIGURED floor value must have propagated through the closure to Resolve-QemuImg, proving the hoist (not a $script: read that resolves empty)'
     }
+    It 'SECURITY (I5b): the REAL ReadVhdxRawRegion routes the qemu convert through the Invoke-ConfinedQemu confinement seam, never a bare native call (AST, non-vacuous)' {
+        # Finding I5 (part b): the qemu-img convert of an untrusted OUTPUT disk runs directly in the host
+        # operator's session. Route it through a single confinement seam (Invoke-ConfinedQemu) so the REAL
+        # mechanism (Tier-0/1 restricted-token/Job-Object shim, Tier-2/3 Windows Sandbox) is pluggable and
+        # built/live-tested at Phase 6 — the seam ships now. An AST walk over CommandAst nodes binds the
+        # ACTUAL invoked command name, so a rationale comment mentioning "convert" in prose cannot false-trip
+        # this (a substring match would), and a future impl that calls the native exe under a different
+        # variable name / a raw '&' invocation outside the seam WOULD be caught.
+        $real = New-RealHyperVBackend
+        $src  = $real.ReadVhdxRawRegion.ToString()
+        $ast  = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+
+        # Positive: Invoke-ConfinedQemu IS invoked as a command inside the real body.
+        $cmds = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $cmdNames = $cmds | ForEach-Object { $_.GetCommandName() } | Where-Object { $null -ne $_ }
+        $cmdNames | Should -Contain 'Invoke-ConfinedQemu' -Because 'the qemu-img convert must be routed through the confinement seam, not invoked directly'
+
+        # Negative: no bare native invocation of the resolved qemu path (`& $qemuPath ...` / `& $qemu... convert`)
+        # anywhere in the real body — every native exec must go through the seam. A CommandAst with a $null
+        # command name is a dynamic invocation (`& $something ...`); assert none of those dynamic-invocation
+        # source spans mention 'convert' outside of Invoke-ConfinedQemu's own argument list.
+        $dynamicConvertCalls = $cmds | Where-Object {
+            $null -eq $_.GetCommandName() -and $_.Extent.Text -match 'convert' -and $_.Extent.Text -notmatch 'Invoke-ConfinedQemu'
+        }
+        $dynamicConvertCalls | Should -BeNullOrEmpty -Because 'every native qemu-img convert invocation must go through Invoke-ConfinedQemu, never a bare dynamic call'
+
+        # NON-VACUOUS CONTROL (mirrors the C1 no-Mount-VHD canary's own self-check): prove this AST technique
+        # WOULD catch a bare `& $qemuPath convert ...` if one existed, by running the identical check against
+        # a synthetic snippet that intentionally bypasses the seam.
+        $bypassSrc = @'
+$out = & $qemuPath convert -f vhdx -O raw -- $path $tmpRaw 2>&1
+'@
+        $bypassAst = [System.Management.Automation.Language.Parser]::ParseInput($bypassSrc, [ref]$null, [ref]$null)
+        $bypassCmds = $bypassAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $bypassDynamicConvertCalls = $bypassCmds | Where-Object {
+            $null -eq $_.GetCommandName() -and $_.Extent.Text -match 'convert' -and $_.Extent.Text -notmatch 'Invoke-ConfinedQemu'
+        }
+        $bypassDynamicConvertCalls | Should -Not -BeNullOrEmpty -Because 'the canary must be non-vacuous: a bare seam-bypassing convert call must be DETECTED by this exact technique, proving it is not silently passing everything'
+    }
+    It 'SECURITY (I5b, out-of-process): the REAL ReadVhdxRawRegion ACTUALLY INVOKES Invoke-ConfinedQemu at runtime (not just a string/AST match)' {
+        # The AST test above proves the SOURCE routes through the seam. Confirm the seam is also REACHED at
+        # runtime, mirroring the I5a qemu-floor-wiring harness pattern (Invoke-RealReadVhdxRawRegionQemuFloor.ps1):
+        # shadow the qemu seams AND dot-source the lib in the SAME top-level child-process scope so the real
+        # .GetNewClosure()'d body executes for real, then assert Invoke-ConfinedQemu was actually called.
+        $harness = Join-Path $PSScriptRoot 'fixtures/Invoke-RealReadVhdxRawRegionConfinedQemu.ps1'
+        Test-Path $harness | Should -BeTrue -Because 'the out-of-process Invoke-ConfinedQemu runtime-routing harness must exist'
+
+        $pwsh = (Get-Process -Id $PID).Path   # the exact pwsh running these tests
+        if ([string]::IsNullOrWhiteSpace($pwsh)) { $pwsh = 'pwsh' }
+        $raw = & $pwsh -NoProfile -File $harness -LibPath $script:LibPath 2>&1
+        $rawText = ($raw | Out-String).Trim()
+        $jsonLine = ($rawText -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        $jsonLine | Should -Not -BeNullOrEmpty -Because "the harness must emit JSON; got: $rawText"
+        $cap = $jsonLine | ConvertFrom-Json
+
+        $cap.invoked | Should -BeTrue -Because 'Invoke-ConfinedQemu must actually be called by the real ReadVhdxRawRegion closure at runtime, proving the seam is reached (not just present in source)'
+        $cap.qemuPath | Should -Be 'C:\stub\qemu-img.exe' -Because 'the resolved qemu-img path must be passed through to the seam'
+        ($cap.arguments -join ',') | Should -Match 'convert' -Because 'the convert subcommand must be passed as an Argument through the seam, not invoked directly'
+    }
 }
 
 # ===========================================================================

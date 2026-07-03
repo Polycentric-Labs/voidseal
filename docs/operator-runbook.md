@@ -138,6 +138,18 @@ innerName→content hashtable. Since C1.4, `firefox` opts into the shared user-s
 plus `run_disk_workload.py` + its `outbox.py` dependency (the shared in-guest outbox producer the
 seed's disk-mode runner invokes after the organizer writes `result.html` into staging):
 
+> **Operator note — the qemu-img raw read.** `ReadVhdxRawRegion` avoids a kernel filesystem mount of the
+> guest-written OUTPUT disk by running `qemu-img convert -f vhdx -O raw` offline instead. That trades a
+> kernel-parse risk for a different one: `qemu-img`'s own VHDX parser now runs against those same untrusted
+> bytes, in **your** (the operator's) session. The only catalogued QEMU VHDX-parser CVE is
+> **CVE-2014-0148** (a DoS, fixed at QEMU 2.0) — there is no catalogued RCE here. The real concern is the
+> **undiscovered-bug class**: an unpatched memory-safety bug in an offline parser handling adversarial
+> input. Mitigated today by a patch-currency version floor + optional SHA-256 pin (`Resolve-QemuImg`) and a
+> confinement seam every convert call is routed through (`Invoke-ConfinedQemu`) — but that seam's v1 is a
+> **pass-through** (LIVE-ONLY-UNPROVEN); the real confinement (restricted-token/Job-Object shim for
+> Tier-0/1, Windows Sandbox for Tier-2/3) is wired and live-tested at Phase 6, not yet. See `SECURITY.md`
+> §"The qemu-img raw read" for the full writeup.
+
 ```powershell
 # Populate the INPUT-disk inputs from the host files — the organizer + sample profile (the
 # workload) and run_disk_workload.py + outbox.py (the shared outbox producer, C1.3/C1.4).

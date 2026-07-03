@@ -134,6 +134,41 @@ producer (never a kernel filesystem mount of guest-written bytes — see `docs/o
 outbox transport detail), with no sensitivity gate in the path. Firefox's containment guarantee is the
 seal + disk-passing mechanism above, not the regenerator described in this section.
 
+## The qemu-img raw read: an undiscovered-bug-class risk, not a catalogued RCE
+
+The user-space outbox read (`ReadVhdxRawRegion`, `scripts/lib/HyperVBackend.ps1`) never `Mount-VHD`s the
+guest-written OUTPUT disk (Pass-5: even a read-only host attach runs `partmgr.sys` + filesystem-recognizer
+parses against attacker-controlled bytes). Instead it runs `qemu-img convert -f vhdx -O raw` offline against
+the detached `.vhdx`, then reads the flattened raw bytes with a plain `FileStream`. This closes the
+kernel-filesystem-parse risk, but it opens a different one: **`qemu-img`'s own VHDX parser now runs against
+those same untrusted bytes, in the host operator's own session.**
+
+**Be precise about what this risk is.** The only catalogued QEMU VHDX-parser CVE is **CVE-2014-0148**
+(a heap-overflow **denial-of-service** in the VHDX image-parsing code, fixed at **QEMU 2.0**) — over a
+decade old and far below any reasonable modern floor. Framing the current risk as "the qemu-img convert is
+vulnerable to a known RCE" would be a **fabricated claim**: no such catalogued RCE exists for the modern
+VHDX parser. The real concern is the **undiscovered-bug class**: any offline file-format parser handling
+adversary-controlled input can contain an unpatched memory-safety bug, and `qemu-img convert` runs with the
+full privileges of whoever invokes it — here, the host operator.
+
+**Mitigations, in place today or planned:**
+
+- **A patch-currency version floor** (`Resolve-QemuImg`, `-MinVersion`) — **not** a CVE-derived gate (see
+  that function's own header comment, which is explicit on this point). The floor exists so the resolver
+  runs a *currently patched* `qemu-img`, re-resolved and bumped periodically; it is not a claim that a
+  specific CVE is fixed at exactly that version.
+- **A SHA-256 pin of the qemu-img binary** (`Resolve-QemuImg -PinnedSha256`, optional) — refuses to run an
+  unpinned or substituted parser binary when a pin is configured.
+- **Per-tier confinement of the convert itself** (`Invoke-ConfinedQemu`, `scripts/lib/HyperVBackend.ps1`) —
+  every native `qemu-img convert` invocation is routed through a single confinement seam rather than called
+  directly. **v1 (shipped) is a pass-through** — the seam exists and every call site is routed through it
+  (AST-pinned by test, non-vacuously), but the actual confinement mechanism is **not yet wired**: a
+  restricted-token/Job-Object shim for Tier-0/1 (drop privileges + cap resources on the child `qemu-img`
+  process) or a Windows Sandbox for Tier-2/3 (full OS-level confinement for the disposable/detonation
+  tiers). **The real confinement mechanism is built and live-proven at Phase 6** — until then, treat the
+  convert step as running with full host-operator privileges, mitigated only by the version floor and
+  binary pin above.
+
 ## Status / honesty
 
 - The Tier-0/1 engine is **mock-proven** (400+ tests against the fake backend). A live end-to-end

@@ -600,6 +600,54 @@ function Resolve-QemuImg {
     return $path
 }
 
+# --------------------------------------------------------------------------
+# Invoke-ConfinedQemu (I5b) — the qemu-img CONFINEMENT SEAM
+# --------------------------------------------------------------------------
+# Finding I5 (part b): the qemu-img convert of an UNTRUSTED guest-produced OUTPUT disk (ReadVhdxRawRegion,
+# below) runs directly in the HOST OPERATOR'S OWN SESSION. Resolve-QemuImg (I5a) fail-closed-resolves a
+# version-floored, provenance-pinned qemu-img binary, but even a currently-patched, correctly-pinned
+# qemu-img is still parsing attacker-influenced bytes with the operator's own privileges. This function is
+# the single CHOKEPOINT every native qemu-img invocation must route through, so the REAL confinement
+# mechanism can be swapped in behind one seam without touching every call site.
+#
+# PHASE-6 TODO: v1 body below is a direct pass-through (LIVE-ONLY-UNPROVEN — no live confinement yet). The
+# real mechanism is a restricted-token / Job-Object native shim for Tier-0/1 (drop privileges + cap
+# resources on the child qemu-img process) or a Windows Sandbox (.wsb) for Tier-2/3 (full OS-level
+# confinement for the disposable/detonation tiers) — see _dev/labcoat/PassB-ClientHVPrimitives/
+# PASSB-SYNTHESIS.md §Q4 for the full mechanism comparison. That mechanism is built and LIVE-TESTED at
+# Phase 6, Allen's explicit choice (ship the seam now; wire the real confinement then) — do not silently
+# "upgrade" this function without a live test proving the confined child still produces correct output.
+#
+# Deliberately a PLAIN FUNCTION (like Resolve-QemuImg above), called by BARE NAME from inside
+# ReadVhdxRawRegion's .GetNewClosure()'d body — that resolves fine (see New-RealHyperVBackend's own
+# closure-capture note). Everything it needs comes in as PARAMETERS, never a $script: variable read: a
+# $script:-prefixed variable READ inside a .GetNewClosure()'d closure resolves EMPTY at call time (the I5a
+# regression, fixed by hoisting to factory-locals) — so if this ever needs config, hoist it to a
+# factory-local first and pass it as a parameter, exactly like $QemuMinVer/$QemuPin already are.
+<#
+.SYNOPSIS
+    CONFINEMENT SEAM for native qemu-img invocation — the single chokepoint the real backend's qemu-img
+    calls must route through, so the real confinement mechanism (Phase 6) is pluggable in one place.
+
+.DESCRIPTION
+    v1 = a direct pass-through that runs the resolved qemu-img binary with the given arguments and returns
+    its combined stdout+stderr (LIVE-ONLY-UNPROVEN; no live confinement yet — see the file-level comment
+    above for the Phase-6 plan: a restricted-token/Job-Object shim for Tier-0/1, Windows Sandbox for
+    Tier-2/3). Never reads $script: state — everything arrives as a parameter so this stays safe to call
+    from inside a .GetNewClosure()'d body.
+#>
+function Invoke-ConfinedQemu {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]   $QemuPath,
+        [Parameter(Mandatory)] [string[]] $Arguments
+    )
+    # PHASE-6 TODO: wrap this invocation in a restricted-token/Job-Object shim (Tier-0/1) or run it inside
+    # a Windows Sandbox (Tier-2/3) instead of directly in the host operator's session. See
+    # _dev/labcoat/PassB-ClientHVPrimitives/PASSB-SYNTHESIS.md §Q4. v1 = direct exec (LIVE-ONLY-UNPROVEN).
+    return (& $QemuPath @Arguments 2>&1)
+}
+
 # ==========================================================================
 #  REAL BACKEND
 # ==========================================================================
@@ -1287,7 +1335,10 @@ function New-RealHyperVBackend {
                 & $LockRetry -Operation {
                     # -f vhdx pins the input format (never auto-probe an attacker-influenced header into a
                     # surprising driver); -O raw flattens to logical-block order. '--' ends option parsing.
-                    $out = & $qemuPath convert -f vhdx -O raw -- $path $tmpRaw 2>&1
+                    # I5b: route the native invocation through the Invoke-ConfinedQemu CONFINEMENT SEAM
+                    # (never a bare `& $qemuPath convert ...`) — see that function's header comment for the
+                    # Phase-6 plan (restricted-token/Job-Object shim Tier-0/1, Windows Sandbox Tier-2/3).
+                    $out = Invoke-ConfinedQemu -QemuPath $qemuPath -Arguments @('convert', '-f', 'vhdx', '-O', 'raw', '--', $path, $tmpRaw)
                     if ($LASTEXITCODE -ne 0) {
                         $detail = ([string]($out -join "`n")).Trim()
                         throw "ReadVhdxRawRegion: qemu-img convert failed (exit $LASTEXITCODE) for '$path' — the VHDX may still be attached/locked (detach first) or be malformed. qemu-img output: $detail"
