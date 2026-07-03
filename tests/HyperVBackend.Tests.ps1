@@ -63,7 +63,7 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             # host channels (the seal surface)
             'SetHostChannel', 'GetHostChannels'
             # disk
-            'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'ReadVhdxRawRegion', 'GetVhdxImageHash', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
+            'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'ReadVhdxRawRegion', 'GetVhdxImageHash', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
             # switch / network
             'NewSwitch', 'GetSwitch', 'RemoveSwitch', 'ConnectNetworkAdapter', 'RemoveNetworkAdapter', 'GetNetworkAdapter'
             # checkpoint
@@ -169,7 +169,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
             InvokeGuestCommand = 'VMName'
             SetHostChannel = 'VMName'; GetHostChannels = 'VMName'
-            NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; ReadVhdxRawRegion = 'Path'; GetVhdxImageHash = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'
+            NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; WriteVhdxFileBytes = 'Path'; ReadVhdxFileBytes = 'Path'; ReadVhdxRawRegion = 'Path'; GetVhdxImageHash = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'
             AddHardDiskDrive = 'VMName'; RemoveHardDiskDrive = 'VMName'; SetDvdDrive = 'VMName'; RemoveDvdDrive = 'VMName'; GetDvdDrives = 'VMName'
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
@@ -1084,6 +1084,68 @@ Describe 'Fake backend — disk operations' {
         $m = Get-HyperVBackendMethodManifest
         $m.Keys | Should -Contain 'WriteVhdxFile'
         $m.Keys | Should -Contain 'ReadVhdxFile'
+    }
+
+    # ---- I2a: byte-transfer variants (the string path corrupts 0x00/0x80-0xFF; see WriteVhdxFile) ----
+    It 'manifest documents WriteVhdxFileBytes and ReadVhdxFileBytes' {
+        $m = Get-HyperVBackendMethodManifest
+        $m.Keys | Should -Contain 'WriteVhdxFileBytes'
+        $m['WriteVhdxFileBytes'] | Should -Contain 'Path'
+        $m['WriteVhdxFileBytes'] | Should -Contain 'InnerPath'
+        $m['WriteVhdxFileBytes'] | Should -Contain 'Bytes'
+        $m.Keys | Should -Contain 'ReadVhdxFileBytes'
+        $m['ReadVhdxFileBytes'] | Should -Contain 'Path'
+        $m['ReadVhdxFileBytes'] | Should -Contain 'InnerPath'
+    }
+    It 'fake WriteVhdxFileBytes then ReadVhdxFileBytes round-trips arbitrary bytes incl. 0x00 and 0x80-0xFF (string path would corrupt these)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-in.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $bytes = [byte[]]@(0x00,0x01,0x7F,0x80,0xFE,0xFF,0x00,0xAA)
+        & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-in.vhdx'; InnerPath='blob.bin'; Bytes=$bytes }
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-in.vhdx'; InnerPath='blob.bin' }
+        ,$got | Should -Not -BeNullOrEmpty
+        $got | Should -BeOfType [byte]
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$got, $bytes) | Should -BeTrue
+    }
+    It 'fake WriteVhdxFileBytes then ReadVhdxFileBytes round-trips a single-byte payload without array-unrolling to a scalar' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-one.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $bytes = [byte[]]@(0x2A)
+        & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-one.vhdx'; InnerPath='one.bin'; Bytes=$bytes }
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-one.vhdx'; InnerPath='one.bin' }
+        , $got | Should -Not -BeNullOrEmpty
+        ($got -is [byte[]]) | Should -BeTrue -Because 'a leading-comma return must prevent PowerShell from unrolling a 1-element array to a scalar'
+        $got.Length | Should -Be 1
+        $got[0] | Should -Be 0x2A
+    }
+    It 'fake ReadVhdxFileBytes returns $null for an absent inner file' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-missing.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        (& $b.ReadVhdxFileBytes @{ Path='C:\t\bin-missing.vhdx'; InnerPath='missing.bin' }) | Should -Be $null
+    }
+    It 'fake WriteVhdxFileBytes throws for a VHD that does not exist' {
+        $b = New-FakeHyperVBackend
+        { & $b.WriteVhdxFileBytes @{ Path='C:\t\ghost.vhdx'; InnerPath='a'; Bytes=[byte[]]@(1,2,3) } } | Should -Throw -ExpectedMessage '*does not exist*'
+    }
+    It 'fake ReadVhdxFileBytes throws for a VHD that does not exist' {
+        $b = New-FakeHyperVBackend
+        { & $b.ReadVhdxFileBytes @{ Path='C:\t\ghost2.vhdx'; InnerPath='a' } } | Should -Throw -ExpectedMessage '*does not exist*'
+    }
+    It 'fake ReadVhdxFileBytes on a file written via the STRING WriteVhdxFile returns its UTF-8 bytes (honest cross-read, not a fake shortcut)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-cross.vhdx'; Label='INPUT'; FileSystem='exFAT'; SizeBytes=64MB }
+        & $b.WriteVhdxFile @{ Path='C:\t\bin-cross.vhdx'; InnerPath='sample.json'; Content='{"x":1}' }
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-cross.vhdx'; InnerPath='sample.json' }
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$got, [System.Text.Encoding]::UTF8.GetBytes('{"x":1}')) | Should -BeTrue
+    }
+    It 'fake WriteVhdxFileBytes stores an immutable copy (mutating the caller''s array after the call does not affect stored bytes)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-mut.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $bytes = [byte[]]@(0x11,0x22,0x33)
+        & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-mut.vhdx'; InnerPath='m.bin'; Bytes=$bytes }
+        $bytes[0] = 0xFF
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-mut.vhdx'; InnerPath='m.bin' }
+        $got[0] | Should -Be 0x11 -Because 'the fake must store a copy, not a reference to the caller''s array'
     }
 
     It 'AddHardDiskDrive then RemoveHardDiskDrive adjusts the VM disk list' {

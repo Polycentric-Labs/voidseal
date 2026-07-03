@@ -155,6 +155,14 @@ function Get-HyperVBackendMethodManifest {
         NewOutputVhdx        = @('Path', 'Label', 'FileSystem', 'SizeBytes')  # create + host-format a data VHDX
         WriteVhdxFile        = @('Path', 'InnerPath', 'Content')   # host writes one file onto a VHDX (rw)
         ReadVhdxFile         = @('Path', 'InnerPath')              # host reads one file from a VHDX (ro) -> string or $null
+        # Byte-clean siblings of WriteVhdxFile/ReadVhdxFile (I2a). WriteVhdxFile/ReadVhdxFile go through
+        # Set-Content/Get-Content -Encoding utf8, which silently corrupts binary content (0x00, 0x80-0xFF,
+        # SQLite/mozLz4/tarball/model-weight payloads) via UTF-8 recode. These methods do raw byte I/O
+        # (WriteAllBytes/ReadAllBytes) so the Workload data path (I2b) can move binary transfers off the
+        # string cast. Added per the WriteVhdxFile/ReadVhdxFile addendum precedent (manifest + both
+        # factories + parity/drift tests). Interface: ReadVhdxFileBytes -> [byte[]] or $null.
+        WriteVhdxFileBytes   = @('Path', 'InnerPath', 'Bytes')     # host writes one file as RAW BYTES onto a VHDX (rw)
+        ReadVhdxFileBytes    = @('Path', 'InnerPath')              # host reads one file as RAW BYTES from a VHDX (ro) -> byte[] or $null
         # Read a raw byte range from a FIXED VHDX's payload in USER-SPACE (qemu-img convert -O raw +
         # file-slice). NEVER Mount-VHD / Add-VMHardDiskDrive — host attach kernel-parses attacker FS
         # bytes (Pass-5). The host reads the in-guest "outbox" (guest/outbox.py) off the DETACHED OUTPUT
@@ -1074,6 +1082,53 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
+    # Byte-clean siblings of WriteVhdxFile/ReadVhdxFile (I2a). Mirror the same Mount/ResolveVol/
+    # finally-Dismount structure EXACTLY, but do raw byte I/O — NO Set-Content/Get-Content -Encoding
+    # utf8 recode, which is what silently corrupts binary content (0x00, 0x80-0xFF, SQLite/mozLz4/
+    # tarball/model-weight payloads) on the string path. Hoist every $P read into locals BEFORE
+    # $InvokeOp (see NewVHD note).
+    $b.WriteVhdxFileBytes = {
+        param([System.Collections.IDictionary] $P)
+        $path  = & $AssertArg $P 'Path' 'WriteVhdxFileBytes'
+        $inner = & $AssertArg $P 'InnerPath' 'WriteVhdxFileBytes'
+        $bytes = [byte[]](& $AssertArg $P 'Bytes' 'WriteVhdxFileBytes')
+        & $InvokeOp {
+            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            try {
+                $letter = & $ResolveVol $img 'WriteVhdxFileBytes'
+                [System.IO.File]::WriteAllBytes(("{0}:\{1}" -f $letter, $inner), $bytes)   # raw bytes, NO utf8 recode
+            }
+            finally {
+                try { Dismount-VHD -Path $path -ErrorAction Stop }
+                catch { Write-Warning "WriteVhdxFileBytes: host VHDX '$path' did not dismount cleanly ($($_.Exception.Message)); it may remain locked for the next host operation." }
+            }
+        }
+    }.GetNewClosure()
+
+    # Mount READ-WRITE (mirrors ReadVhdxFile's rationale — a read-only mount often doesn't
+    # auto-assign a drive letter on Windows). Returns a byte[] (NOT a string): the leading comma on
+    # both `return` statements is REQUIRED — without it PowerShell unrolls a 1-element (or even
+    # multi-element, in some pipeline contexts) array return to a scalar, which would silently
+    # corrupt a single-byte payload into a bare [byte].
+    $b.ReadVhdxFileBytes = {
+        param([System.Collections.IDictionary] $P)
+        $path  = & $AssertArg $P 'Path' 'ReadVhdxFileBytes'
+        $inner = & $AssertArg $P 'InnerPath' 'ReadVhdxFileBytes'
+        & $InvokeOp {
+            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            try {
+                $letter = & $ResolveVol $img 'ReadVhdxFileBytes'
+                $fp = "{0}:\{1}" -f $letter, $inner
+                if (Test-Path -LiteralPath $fp) { return ,[System.IO.File]::ReadAllBytes($fp) }
+                return $null
+            }
+            finally {
+                try { Dismount-VHD -Path $path -ErrorAction Stop }
+                catch { Write-Warning "ReadVhdxFileBytes: host VHDX '$path' did not dismount cleanly ($($_.Exception.Message)); it may remain locked for the next host operation." }
+            }
+        }
+    }.GetNewClosure()
+
     # Read a raw byte range from a FIXED VHDX's payload WITHOUT attaching/mounting it. qemu-img does the
     # VHDX -> logical-block translation (so a logical Offset == the byte offset in the flat raw output);
     # we then seek/read the requested slice. NEVER Mount-VHD: even -ReadOnly host-attach runs partmgr.sys
@@ -1939,6 +1994,52 @@ function New-FakeHyperVBackend {
         $state.CallLog.Add(@{ Op = 'ReadVhdxFile'; Path = $path; InnerPath = $inner })
         if ($state.VHDs[$path].ContainsKey('Files') -and $state.VHDs[$path]['Files'].ContainsKey($inner)) {
             return $state.VHDs[$path]['Files'][$inner]
+        }
+        return $null
+    }.GetNewClosure()
+
+    # Byte-clean siblings of WriteVhdxFile/ReadVhdxFile (I2a). Share the SAME 'Files' sub-hashtable
+    # (keyed by inner path) as the string methods — a byte write/read and a string write/read of the
+    # SAME InnerPath key hit the SAME slot, exactly like the real backend where both mount the same
+    # formatted volume. Store a byte[] COPY (not a reference to the caller's array) so a caller
+    # mutating its buffer after the call cannot retroactively corrupt what's "on disk".
+    #
+    # fake≠real honesty note: the real path round-trips exact bytes via WriteAllBytes/ReadAllBytes;
+    # the fake stores a byte[] copy — behaviorally equivalent (same bytes back out). The ONE modeled
+    # divergence: a file written via the STRING WriteVhdxFile then read via ReadVhdxFileBytes returns
+    # UTF-8 bytes of the stored string. This is HONEST, not a fake shortcut — the real Set-Content
+    # -Encoding utf8 write followed by a real ReadAllBytes would produce exactly those bytes.
+    $b.WriteVhdxFileBytes = {
+        param([System.Collections.IDictionary] $P)
+        $path  = & $AssertArg $P 'Path' 'WriteVhdxFileBytes'
+        $inner = & $AssertArg $P 'InnerPath' 'WriteVhdxFileBytes'
+        $bytes = [byte[]](& $AssertArg $P 'Bytes' 'WriteVhdxFileBytes')
+        if (-not $state.VHDs.ContainsKey($path)) { throw "WriteVhdxFileBytes: VHD '$path' does not exist (create it first)." }
+        if (-not $state.VHDs[$path].ContainsKey('Files')) { $state.VHDs[$path]['Files'] = @{} }
+        $copy = [byte[]]::new($bytes.Length); [System.Array]::Copy($bytes, $copy, $bytes.Length)   # store an immutable copy
+        $state.VHDs[$path]['Files'][$inner] = $copy
+        # Log the host write so a test can prove what was written onto a disk even AFTER teardown
+        # deletes the disk from the store — mirrors the WriteVhdxFile logging precedent. ByteLen (not
+        # the raw bytes) keeps the log readable for large payloads; fake-only bookkeeping, not a
+        # contract op.
+        $state.CallLog.Add(@{ Op = 'WriteVhdxFileBytes'; Path = $path; InnerPath = $inner; ByteLen = $bytes.Length })
+    }.GetNewClosure()
+
+    $b.ReadVhdxFileBytes = {
+        param([System.Collections.IDictionary] $P)
+        $path  = & $AssertArg $P 'Path' 'ReadVhdxFileBytes'
+        $inner = & $AssertArg $P 'InnerPath' 'ReadVhdxFileBytes'
+        if (-not $state.VHDs.ContainsKey($path)) { throw "ReadVhdxFileBytes: VHD '$path' does not exist." }
+        # Log the host read so a test can prove detach (RemoveHardDiskDrive) precedes it.
+        $state.CallLog.Add(@{ Op = 'ReadVhdxFileBytes'; Path = $path; InnerPath = $inner })
+        if ($state.VHDs[$path].ContainsKey('Files') -and $state.VHDs[$path]['Files'].ContainsKey($inner)) {
+            $v = $state.VHDs[$path]['Files'][$inner]
+            # Leading comma on every return below: without it PowerShell unrolls a 1-element (or
+            # even multi-element, in some pipeline contexts) array to a scalar, silently corrupting
+            # a single-byte payload into a bare [byte] — the same trap the real method's comment warns
+            # about, and the reason the round-trip test explicitly covers a 1-byte payload.
+            if ($v -is [byte[]]) { return ,$v }
+            return ,([System.Text.Encoding]::UTF8.GetBytes([string]$v))   # a string-written file read as bytes (honest cross-read)
         }
         return $null
     }.GetNewClosure()
