@@ -1552,6 +1552,14 @@ $script:SbCopyFakeVM = {
     Failed run (with the host read SKIPPED), NOT propagated to the outer catch as a lifecycle .Error
     abort. Teardown (Remove-Sandbox) uses RemoveVM/RemoveVHD, NOT RemoveHardDiskDrive, so this seam
     affects only the orchestrator's explicit detach — teardown still completes (DESTROYED).
+.PARAMETER SimulateWriteEnospc
+    Make WriteVhdxFileBytes THROW an ENOSPC-signature error (message contains 'ENOSPC' / 'disk full') —
+    modelling a HOST-side write that hits host-disk-full mid-populate (e.g. a race where free space was
+    consumed between the New-WorkloadDisks preflight and the actual write). Mirrors -SimulateGuestCommand-
+    Failure's shape: a fake-only simulation switch on the EXISTING method, NOT a new backend method (no
+    manifest change). New-WorkloadDisks catches this signature and classifies a distinct DiskFull outcome
+    rather than letting it propagate as an undifferentiated throw. A GUEST filling the OUTPUT disk during
+    its own run is a separate, live-only/run-time concern this seam does NOT model (see Workload.ps1).
 #>
 function New-FakeHyperVBackend {
     [CmdletBinding()]
@@ -1569,7 +1577,8 @@ function New-FakeHyperVBackend {
         [byte[]] $SimulateOutboxBlob,
         [byte[]] $SimulateDepsImageBlob,
         [int] $SimulateDetachSettleLag = 0,
-        [switch] $SimulateDetachError
+        [switch] $SimulateDetachError,
+        [switch] $SimulateWriteEnospc
     )
 
     # Hoist shared helpers into factory-locals so the method closures capture them
@@ -1610,6 +1619,8 @@ function New-FakeHyperVBackend {
     # Captured by the RemoveHardDiskDrive closure: model a transient detach failure so the orchestrator's
     # detach try/catch (Failed run, host read skipped — NOT a lifecycle abort) is unit-testable.
     $detachThrows      = $SimulateDetachError.IsPresent
+    # Captured by the WriteVhdxFileBytes closure: model a host-side disk-full write (I2b ENOSPC sentinel).
+    $writeEnospc       = $SimulateWriteEnospc.IsPresent
 
     # ---- in-memory state (captured by every method closure) --------------
     $state = @{
@@ -2026,6 +2037,13 @@ function New-FakeHyperVBackend {
         $path  = & $AssertArg $P 'Path' 'WriteVhdxFileBytes'
         $inner = & $AssertArg $P 'InnerPath' 'WriteVhdxFileBytes'
         $bytes = [byte[]](& $AssertArg $P 'Bytes' 'WriteVhdxFileBytes')
+        # SimulateWriteEnospc (I2b): model a host-side disk-full write BEFORE any state mutation —
+        # the real Mount-VHD/WriteAllBytes path would fail before the bytes land, so the fake must
+        # not record a partial/successful write either. Message carries 'ENOSPC' so the caller's
+        # ENOSPC-signature classifier (Workload.ps1) recognizes it.
+        if ($writeEnospc) {
+            throw "HyperVBackend(fake).WriteVhdxFileBytes: simulated ENOSPC (disk full) writing '$inner' onto '$path' (SimulateWriteEnospc)."
+        }
         if (-not $state.VHDs.ContainsKey($path)) { throw "WriteVhdxFileBytes: VHD '$path' does not exist (create it first)." }
         if (-not $state.VHDs[$path].ContainsKey('Files')) { $state.VHDs[$path]['Files'] = @{} }
         $copy = [byte[]]::new($bytes.Length); [System.Array]::Copy($bytes, $copy, $bytes.Length)   # store an immutable copy

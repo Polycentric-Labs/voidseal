@@ -125,6 +125,169 @@ Describe 'New-WorkloadDisks' {
     }
 }
 
+# ===========================================================================
+#  I2b — binary Input byte-path + profile-driven disk sizes + workload-disk
+#  free-space preflight (retire hardcoded 1GB/utf8 string-cast on Inputs).
+# ===========================================================================
+#  Finding I2 (part b): New-WorkloadDisks populated the INPUT disk by STRING-CASTING every
+#  profile Input value (WriteVhdxFile Content=[string]$v) — a [byte[]] Input got its .ToString()
+#  ("System.Byte[]"), not its bytes: silent binary corruption. Disk sizes were also hardcoded
+#  1GB regardless of profile. Task 5 added WriteVhdxFileBytes/ReadVhdxFileBytes (byte-clean
+#  backend methods, manifest+real+fake). This section pins: (1) a [byte[]] Input routes through
+#  WriteVhdxFileBytes and round-trips exactly; a [string]] Input still routes through the string
+#  WriteVhdxFile (unchanged); (2) InputDiskSizeBytes/OutputDiskSizeBytes profile keys are honored,
+#  defaulting to 1GB when absent (existing profiles unaffected); (3) the INPUT+OUTPUT disk budget
+#  is preflighted against host free space (Test-HostFreeSpace, Provisioner.ps1/I6b) BEFORE either
+#  disk is created — an output disk is a direct guest fill vector, same class of risk I6b closed
+#  for the system disk.
+Describe 'New-WorkloadDisks — binary Input byte-path (I2b)' {
+
+    It 'writes a binary Input onto the INPUT disk via the byte path (no utf8 corruption)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='bin1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'bin1' -Tier 0
+        $bytes = [byte[]]@(0x00, 0x80, 0xFF, 0x01, 0x02)
+        $prof = @{ Name='bin1'; Inputs = @{ 'blob.bin' = $bytes }; FileSystem = 'exFAT' }
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\bin1' -Backend $b
+
+        # The byte-path method was actually called (not the string WriteVhdxFile) for this key.
+        $calls = @($b.FakeCallLog | Where-Object { $_.Op -eq 'WriteVhdxFileBytes' -and $_.InnerPath -eq 'blob.bin' })
+        $calls | Should -Not -BeNullOrEmpty -Because 'a [byte[]] Input must route through WriteVhdxFileBytes, not the string WriteVhdxFile'
+
+        # No string WriteVhdxFile call was made for the SAME key (no dual-write / no fallback corruption).
+        $stringCalls = @($b.FakeCallLog | Where-Object { $_.Op -eq 'WriteVhdxFile' -and $_.InnerPath -eq 'blob.bin' })
+        $stringCalls.Count | Should -Be 0 -Because 'a binary Input must not ALSO be string-cast onto the disk'
+
+        # Round-trips exactly through ReadVhdxFileBytes (SequenceEqual — Should -Be does not do
+        # element-wise array compare; mirrors the HyperVBackend.Tests.ps1 byte round-trip idiom).
+        $roundTrip = & $b.ReadVhdxFileBytes @{ Path = $d2.InputDiskPath; InnerPath = 'blob.bin' }
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$roundTrip, $bytes) | Should -BeTrue
+    }
+
+    It 'still writes a STRING Input via the string WriteVhdxFile path (text profiles unchanged)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='str1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'str1' -Tier 0
+        $prof = @{ Name='str1'; Inputs = @{ 'organize.py' = 'print(1)' }; FileSystem = 'exFAT' }
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\str1' -Backend $b
+        (& $b.ReadVhdxFile @{ Path = $d2.InputDiskPath; InnerPath = 'organize.py' }) | Should -Be 'print(1)'
+        $byteCalls = @($b.FakeCallLog | Where-Object { $_.Op -eq 'WriteVhdxFileBytes' -and $_.InnerPath -eq 'organize.py' })
+        $byteCalls.Count | Should -Be 0 -Because 'a [string] Input must not route through the byte path'
+    }
+
+    It 'handles a mixed profile (string + binary Inputs) — each routes through its own path' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='mix1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'mix1' -Tier 0
+        $prof = @{ Name='mix1'; Inputs = @{ 'a.txt' = 'hello'; 'b.bin' = [byte[]]@(0x10, 0x20) }; FileSystem = 'exFAT' }
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\mix1' -Backend $b
+        (& $b.ReadVhdxFile @{ Path = $d2.InputDiskPath; InnerPath = 'a.txt' }) | Should -Be 'hello'
+        $rt = & $b.ReadVhdxFileBytes @{ Path = $d2.InputDiskPath; InnerPath = 'b.bin' }
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$rt, [byte[]]@(0x10, 0x20)) | Should -BeTrue
+    }
+
+    It 'skips an EMPTY byte[] Input rather than breaking on the $SbAssertArg 0-length-unroll bug' {
+        # KNOWN pre-existing bug (Task-5 gate): $SbAssertArg's `return $P[$Key]` unrolls a 0-length
+        # byte[] arg to $null on BOTH real and fake (parity-preserving, not a fake≠real divergence).
+        # New-WorkloadDisks must not let an empty binary Input silently corrupt/throw — it skips it
+        # (documented no-op) rather than calling WriteVhdxFileBytes with an arg that would collapse.
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='empty1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'empty1' -Tier 0
+        $prof = @{ Name='empty1'; Inputs = @{ 'empty.bin' = [byte[]]@() }; FileSystem = 'exFAT' }
+        { New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\empty1' -Backend $b } | Should -Not -Throw
+        $calls = @($b.FakeCallLog | Where-Object { $_.InnerPath -eq 'empty.bin' })
+        $calls.Count | Should -Be 0 -Because 'an empty byte[] Input is skipped, not passed through the broken empty-arg path'
+    }
+}
+
+Describe 'New-WorkloadDisks — profile-driven disk sizes (I2b)' {
+
+    It 'honors a profile-declared INPUT disk size (not the hardcoded 1GB)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='insz1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'insz1' -Tier 0
+        $prof = @{ Name='insz1'; InputDiskSizeBytes = 4GB; FileSystem = 'exFAT' }
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\insz1' -Backend $b
+        (& $b.GetVHDInfo @{ Path = $d2.InputDiskPath }).SizeBytes | Should -Be 4GB
+    }
+
+    It 'honors a profile-declared OUTPUT disk size (not the hardcoded 1GB)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='outsz1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'outsz1' -Tier 0
+        $prof = @{ Name='outsz1'; OutputDiskSizeBytes = 8GB; FileSystem = 'exFAT' }
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\outsz1' -Backend $b
+        (& $b.GetVHDInfo @{ Path = $d2.OutputDiskPath }).SizeBytes | Should -Be 8GB
+    }
+
+    It 'defaults BOTH disk sizes to 1GB when the profile declares neither key (existing profiles unchanged)' {
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='defsz1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'defsz1' -Tier 0
+        $prof = @{ Name='defsz1'; FileSystem = 'exFAT' }   # no *DiskSizeBytes keys
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\defsz1' -Backend $b
+        (& $b.GetVHDInfo @{ Path = $d2.InputDiskPath }).SizeBytes  | Should -Be 1GB
+        (& $b.GetVHDInfo @{ Path = $d2.OutputDiskPath }).SizeBytes | Should -Be 1GB
+    }
+}
+
+Describe 'New-WorkloadDisks — workload-disk host-free-space preflight (I2b, folds I6b coverage)' {
+
+    It 'refuses BEFORE creating either data disk when the INPUT+OUTPUT budget exceeds host free space' {
+        # Reuses Test-HostFreeSpace (Provisioner.ps1, I6b) — mock Get-Volume (the cmdlet it calls),
+        # mirroring the Provisioner.Tests.ps1 idiom (dot-sourced file, not a module -> plain Mock).
+        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 500MB } }
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='nospace1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'nospace1' -Tier 0
+        $prof = @{ Name='nospace1'; InputDiskSizeBytes = 4GB; OutputDiskSizeBytes = 4GB; FileSystem = 'exFAT' }
+        { New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\nospace1' -Backend $b } |
+            Should -Throw -ExpectedMessage '*insufficient host free space*'
+        # No disk was created — the preflight ran BEFORE any NewOutputVhdx call.
+        (& $b.GetVHDInfo @{ Path = (Join-Path 'C:\s\nospace1' 'nospace1-input.vhdx') })  | Should -BeNullOrEmpty
+        (& $b.GetVHDInfo @{ Path = (Join-Path 'C:\s\nospace1' 'nospace1-output.vhdx') }) | Should -BeNullOrEmpty
+    }
+
+    It 'provisions normally when host free space comfortably covers the summed INPUT+OUTPUT budget' {
+        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 50GB } }
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='hasspace1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'hasspace1' -Tier 0
+        $prof = @{ Name='hasspace1'; InputDiskSizeBytes = 1GB; OutputDiskSizeBytes = 1GB; FileSystem = 'exFAT' }
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\hasspace1' -Backend $b
+        $d2.InputDiskPath  | Should -Not -BeNullOrEmpty
+        $d2.OutputDiskPath | Should -Not -BeNullOrEmpty
+    }
+
+    It 'the real (unmocked) preflight passes on a real dev/CI volume for the default 1GB+1GB budget' {
+        # No Get-Volume mock: proves the wiring doesn't break the ordinary happy path against the
+        # REAL host volume backing the test's StorageRoot (any dev/CI box has GB+ free on C:).
+        $b = New-FakeHyperVBackend
+        $null = & $b.NewVM @{ Name='realspace1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'realspace1' -Tier 0
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile @{ Name='realspace1' } -StorageRoot 'C:\s\realspace1' -Backend $b
+        $d2.InputDiskPath  | Should -Not -BeNullOrEmpty
+        $d2.OutputDiskPath | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'New-WorkloadDisks — ENOSPC sentinel on a binary Input write (I2b stretch)' {
+
+    It 'classifies a simulated disk-full byte write as DiskFull, not a generic throw/silent success' {
+        # SimulateWriteEnospc (fake-only switch, mirrors -SimulateGuestCommandFailure's shape — no new
+        # backend method) makes WriteVhdxFileBytes throw an ENOSPC-signature error. New-WorkloadDisks
+        # catches it and returns a distinct DiskFull classification rather than letting a bare throw
+        # propagate as an undifferentiated failure, and rather than a silently-succeeding no-op.
+        $b = New-FakeHyperVBackend -SimulateWriteEnospc
+        $null = & $b.NewVM @{ Name='enospc1'; Generation=2 }
+        $d = New-SandboxDescriptor -Name 'enospc1' -Tier 0
+        $prof = @{ Name='enospc1'; Inputs = @{ 'blob.bin' = [byte[]]@(0x01, 0x02, 0x03) }; FileSystem = 'exFAT' }
+        $result = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\enospc1' -Backend $b
+        $result.WorkloadDiskStatus | Should -Be 'DiskFull' -Because 'a disk-full byte write must be classified distinctly, not a generic failure'
+    }
+}
+
 Describe 'New-WorkloadDisks — outbox-producing non-processor gets a Raw OUTPUT (C1)' {
   BeforeAll {
     . "$PSScriptRoot/../scripts/lib/HyperVBackend.ps1"

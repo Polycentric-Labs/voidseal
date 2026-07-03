@@ -9,8 +9,9 @@
         New-WorkloadDisks -Descriptor <descriptor> -Profile <hashtable> -StorageRoot <dir> [-Backend]
 
       * INPUT disk  — created + host-formatted (NewOutputVhdx), then POPULATED from the profile's
-        `Inputs` map (innerPath -> content) via WriteVhdxFile, so the guest boots with its seed/
-        input files already on a mountable, host-readable volume. Labelled INPUT by default.
+        `Inputs` map (innerPath -> content) via WriteVhdxFile (string content) or WriteVhdxFileBytes
+        ([byte[]] content — I2b), so the guest boots with its seed/input files already on a
+        mountable, host-readable volume. Labelled INPUT by default.
       * OUTPUT disk — created + host-formatted (NewOutputVhdx), left EMPTY; the guest writes its
         results here and the host reads them back off the named OUTPUT volume after the seal.
 
@@ -18,6 +19,36 @@
     host-truth scan records them as known data disks (Assert-Sealed accepts recorded data disks).
     The descriptor's InputDiskPath / OutputDiskPath fields carry the paths the Runner reads results
     from and the Reaper cleans up.
+
+    BYTE-CLEAN INPUTS (I2b): the pre-Task-5 shape STRING-CAST every Input value (WriteVhdxFile
+    Content=[string]$v), which silently corrupted a [byte[]] Input to its .ToString() representation
+    ("System.Byte[]") instead of its actual bytes. New-WorkloadDisks now branches on the Input
+    VALUE's runtime type: a [byte[]] value routes through the byte-clean WriteVhdxFileBytes (Task 5);
+    a [string] value keeps using the string WriteVhdxFile (text profiles unchanged, zero behavior
+    change). An EMPTY [byte[]] Input is SKIPPED (not written) — $SbAssertArg's `return $P[$Key]`
+    unrolls a 0-length byte[] arg to $null (a pre-existing bug on BOTH the real and fake backend,
+    parity-preserving, flagged by the Task-5 gate), so passing one through would throw a confusing
+    "required argument missing" rather than doing anything useful; no shipped profile emits an empty
+    binary Input, so skipping is a safe, documented no-op rather than a silent corruption risk.
+
+    DISK SIZES (I2b): INPUT/OUTPUT disk sizes were hardcoded to 1GB regardless of profile. They are
+    now read from the profile's InputDiskSizeBytes / OutputDiskSizeBytes keys, each DEFAULTING to
+    1GB when the key is absent — so every existing profile (which declares neither key) is unaffected.
+
+    HOST-FREE-SPACE PREFLIGHT (I2b, folds I6b coverage): Provisioner.ps1's Test-HostFreeSpace (I6b)
+    originally guarded only the SYSTEM disk. An OUTPUT disk is a DIRECT guest fill vector (the guest
+    writes its result there), so New-WorkloadDisks now calls Test-HostFreeSpace with the SUMMED
+    INPUT+OUTPUT disk budget, measured against the volume hosting $StorageRoot, BEFORE either data
+    disk is created — fail-closed, mirroring the Provisioner's system-disk preflight exactly (same
+    helper, same fixed 1GB headroom default).
+
+    ENOSPC SENTINEL (I2b, stretch): a HOST-side disk-full write during Inputs population (e.g. a race
+    where free space was consumed between the preflight above and the actual write) is classified as
+    a distinct DiskFull outcome (a $Descriptor.WorkloadDiskStatus='DiskFull' + a captured Reason)
+    rather than an undifferentiated propagated throw. This covers the HOST-write case only; a GUEST
+    filling the OUTPUT disk DURING its own run is a live/run-time concern this function cannot observe
+    (no live channel once sealed) and is NOT modelled here — see Wait-WorkloadComplete / Read-
+    WorkloadResult for the guest-side completion/classification path.
 
     EVERYTHING touches Hyper-V / the host disk through the backend (HyperVBackend.ps1) — this
     file NEVER calls a raw New-VHD / Format-Volume / Add-VMHardDiskDrive cmdlet. Dot-source this
@@ -55,8 +86,24 @@ function New-WorkloadDisks {
     $inLabel  = if ($Profile.ContainsKey('InputLabel'))  { [string]$Profile['InputLabel']  } else { 'INPUT' }
     $outLabel = if ($Profile.ContainsKey('OutputLabel')) { [string]$Profile['OutputLabel'] } else { 'OUTPUT' }
 
+    # Profile-driven disk sizes (I2b) — default to the prior hardcoded 1GB when the profile declares
+    # neither key, so every existing profile (firefox/ralph/builder — none declare these keys) is
+    # unaffected. $null/absent both fall through to the default via ContainsKey (not a bare index),
+    # matching the FileSystem/label defaulting idiom immediately above.
+    $inSizeBytes  = if ($Profile.ContainsKey('InputDiskSizeBytes'))  { [long]$Profile['InputDiskSizeBytes']  } else { 1GB }
+    $outSizeBytes = if ($Profile.ContainsKey('OutputDiskSizeBytes')) { [long]$Profile['OutputDiskSizeBytes'] } else { 1GB }
+
     $inPath  = Join-Path $StorageRoot ("{0}-input.vhdx"  -f $name)
     $outPath = Join-Path $StorageRoot ("{0}-output.vhdx" -f $name)
+
+    # --- workload-disk host-free-space preflight (I2b; folds I6b coverage; fail-closed, BEFORE any
+    # creation) --------------------------------------------------------------------------------------
+    # I6b added Test-HostFreeSpace (Provisioner.ps1) for the SYSTEM disk only. An OUTPUT disk is a
+    # DIRECT guest fill vector (the guest writes its result there) — same class of host-disk-
+    # exhaustion risk I6b closed for the system disk. Reuse the SAME helper with the SUMMED INPUT+
+    # OUTPUT budget, measured against the volume hosting $StorageRoot (the same root both data disks
+    # land on), before either NewOutputVhdx call — so a refusal here leaves NEITHER disk created.
+    $null = Test-HostFreeSpace -Path $StorageRoot -RequiredBytes ($inSizeBytes + $outSizeBytes)
 
     # INCREMENTAL-RECORD INVARIANT (orphan-window fix): each data disk is recorded on the descriptor
     # — its path field AND a deduped append to CreatedDisks — IMMEDIATELY after it is CREATED, before
@@ -81,12 +128,38 @@ function New-WorkloadDisks {
     # Effect-only backend calls are suppressed ($null = ...) so a real-backend emission can't leak into
     # this function's return stream (output-stream-pollution discipline). The record happens right after
     # CREATE (before populate/attach) so even a populate/attach throw leaves the disk recorded for teardown.
-    $null = & $Backend.NewOutputVhdx @{ Path = $inPath; Label = $inLabel; FileSystem = $fs; SizeBytes = 1GB }
+    $null = & $Backend.NewOutputVhdx @{ Path = $inPath; Label = $inLabel; FileSystem = $fs; SizeBytes = $inSizeBytes }
     $Descriptor.InputDiskPath = $inPath
     & $appendCreated $inPath
     if ($Profile.ContainsKey('Inputs') -and $Profile['Inputs'] -is [System.Collections.IDictionary]) {
         foreach ($k in @($Profile['Inputs'].Keys)) {
-            $null = & $Backend.WriteVhdxFile @{ Path = $inPath; InnerPath = [string]$k; Content = [string]$Profile['Inputs'][$k] }
+            $v = $Profile['Inputs'][$k]
+            if ($v -is [byte[]]) {
+                # Byte-clean path (I2b/Task 5): a [byte[]] Input must NEVER be string-cast (silent
+                # binary corruption — WriteVhdxFile Content=[string]$v would yield "System.Byte[]").
+                # KNOWN pre-existing bug (Task-5 gate, both real+fake, parity-preserving): $SbAssertArg
+                # unrolls a 0-length byte[] arg to $null, so a genuinely-empty binary Input would throw
+                # a confusing "required argument missing" through WriteVhdxFileBytes. No shipped profile
+                # emits an empty binary Input; skip it here (documented no-op) rather than let that
+                # happen. ENOSPC sentinel: a host-side disk-full write during this populate is caught
+                # and classified as DiskFull below, not left as an undifferentiated propagated throw.
+                if ($v.Length -eq 0) { continue }
+                try {
+                    $null = & $Backend.WriteVhdxFileBytes @{ Path = $inPath; InnerPath = [string]$k; Bytes = $v }
+                }
+                catch {
+                    if ([string]$_.Exception.Message -match '(?i)ENOSPC|disk full|not enough space') {
+                        $Descriptor.WorkloadDiskStatus = 'DiskFull'
+                        $Descriptor.WorkloadDiskStatusReason =
+                            "host-side ENOSPC writing Input '$k' onto the INPUT disk ($inPath): $($_.Exception.Message)"
+                        return $Descriptor
+                    }
+                    throw
+                }
+            }
+            else {
+                $null = & $Backend.WriteVhdxFile @{ Path = $inPath; InnerPath = [string]$k; Content = [string]$v }
+            }
         }
     }
     $null = & $Backend.AddHardDiskDrive @{ VMName = $name; Path = $inPath }
@@ -100,7 +173,7 @@ function New-WorkloadDisks {
     $isProcessor  = ($Profile['Network'] -eq 'None') -and $Profile.ContainsKey('ScreenConfig')
     $wantsOutbox  = $Profile.ContainsKey('OutboxOutput') -and [bool]$Profile['OutboxOutput']
     $outFs = if ($isProcessor -or $wantsOutbox) { 'Raw' } else { $fs }
-    $null = & $Backend.NewOutputVhdx @{ Path = $outPath; Label = $outLabel; FileSystem = $outFs; SizeBytes = 1GB }
+    $null = & $Backend.NewOutputVhdx @{ Path = $outPath; Label = $outLabel; FileSystem = $outFs; SizeBytes = $outSizeBytes }
     $Descriptor.OutputDiskPath = $outPath
     & $appendCreated $outPath
     $null = & $Backend.AddHardDiskDrive @{ VMName = $name; Path = $outPath }

@@ -257,7 +257,9 @@ function New-SandboxDescriptor {
         [int]      $ProcessorCount = 0,
         [bool]     $NestedVirt = $false,
         [string]   $State = 'Off',
-        [bool]     $AutomaticCheckpointsEnabled = $false
+        [bool]     $AutomaticCheckpointsEnabled = $false,
+        [string]   $WorkloadDiskStatus       = $null,   # I2b: non-$null only on a HOST-side workload-disk write failure (e.g. 'DiskFull')
+        [string]   $WorkloadDiskStatusReason = $null     # I2b: human-readable detail paired with WorkloadDiskStatus
     )
     return [pscustomobject]@{
         Name                         = $Name
@@ -283,6 +285,11 @@ function New-SandboxDescriptor {
         # calls the backend's SetAutomaticCheckpoints (Enabled=$false) at provision time, so this field
         # records the state actually applied to the VM, not just intent.
         AutomaticCheckpointsEnabled  = $AutomaticCheckpointsEnabled
+        # I2b ENOSPC sentinel: New-WorkloadDisks sets these on a classified HOST-side disk-full write
+        # during Inputs population (distinct from a generic propagated throw). $null/$null in the
+        # ordinary (non-full) case — every existing caller is unaffected.
+        WorkloadDiskStatus           = $WorkloadDiskStatus
+        WorkloadDiskStatusReason     = $WorkloadDiskStatusReason
     }
 }
 
