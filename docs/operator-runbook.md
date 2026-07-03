@@ -193,6 +193,24 @@ $report.SealVerdict   # MUST be $true — the loop only runs on a sealed VM
 $report.RunResult.ExitCode
 ```
 
+> **Operator note — what `SealVerdict = $true` guarantees for Tier-1, and what it doesn't.** A Tier-1
+> VM legitimately keeps its NIC (net-restricted, not no-net), so the seal can't certify "no network" the
+> way it does at Tier ≥ 2. What it certifies instead: `Assert-Sealed` reads the NIC's vSwitch from the
+> **host** and refuses to certify unless that switch is an isolated **Internal** vSwitch — never an
+> unfiltered External switch, never the non-configurable Default Switch. That's a real, host-verified
+> guarantee that the guest's only possible route off-box is the host-controlled gateway on that Internal
+> switch. It is **not** a guarantee that egress is filtered — nothing today inspects or restricts what
+> crosses that gateway once traffic is on it.
+>
+> The in-guest controls (the builder profile's iptables default-DROP-plus-allowlist, the in-guest Squid
+> SNI proxy) are **not** a containment boundary: a compromised or adversarial guest with code-execution
+> can flush its own `iptables` rules or kill its own Squid — you cannot have the untrusted principal police
+> itself. Treat them as defense-in-depth, not as what stands between an exfiltrating workload and the
+> internet. The layer that WOULD make that guarantee — a host-run transparent Squid SNI-splice proxy plus
+> host-side NAT (`New-NetNat`) and a host default-DROP policy on the gateway interface, so filtering
+> happens from a position the guest cannot reach — is the **Phase-6-live** work, not yet built. Until then,
+> a "sealed" Tier-1 VM is isolation-verified, not egress-filtered; see `SECURITY.md` for the full writeup.
+
 ### 1.3 Reading the report
 
 `Invoke-Voidseal` returns a structured report (never throws on a *lifecycle* failure — it

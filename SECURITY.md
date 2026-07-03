@@ -13,9 +13,15 @@ structurally small.
 The core control is the **host-verified, fail-closed seal gate** (`Assert-Sealed`): after isolation is
 cut, the **host** (never the guest's self-report) certifies the VM has no network adapter, no credential
 volume, no residual transfer medium, and no live host↔guest channel — and the workload is structurally
-unreachable unless that certification returns true. Higher tiers additionally **starve** the guest of
-network and credentials at load time (refused if a Tier ≥ 2 profile declares any), and route hostile
-output through a one-way cold-disk quarantine boundary rather than a trusting host read.
+unreachable unless that certification returns true. For a Tier-1 VM, which legitimately keeps a NIC
+(net-restricted, not no-net), the seal instead certifies that NIC's vSwitch is an isolated **Internal**
+switch — never an unfiltered External or the non-configurable Default Switch — so the guest's only
+possible route off-box is the host-controlled gateway on that Internal switch. That is a host-verified
+**switch-isolation** guarantee (reachability), not a claim about which domains/IPs the guest can reach
+once on that route — see "Tier-1 egress" below for why the two are not the same thing. Higher tiers
+additionally **starve** the guest of network and credentials at load time (refused if a Tier ≥ 2 profile
+declares any), and route hostile output through a one-way cold-disk quarantine boundary rather than a
+trusting host read.
 
 ## Release path (processor tier): policy-enforced release, not an information barrier
 
@@ -176,8 +182,25 @@ full privileges of whoever invokes it — here, the host operator.
 - **Tier 2/3 (disposable no-net / air-gapped detonation) and the cold-VHDX→quarantine extraction are
   scaffold-only** in v1 (the quarantine sink throws `NotImplemented`). No live malware or untrusted-plugin
   detonation should be run until verified isolation is in place.
-- Tier-1 egress is an **in-guest** control (acceptable for Tier-1's trusted workloads); it is not a
-  host-enforced firewall in v1.
+- **Tier-1 egress filtering is in-guest today, and an in-guest control is not a containment boundary.**
+  The builder seed's iptables default-DROP-plus-allowlist and the in-guest Squid SNI proxy run *inside*
+  the VM whose workload they're supposed to constrain. A guest with code-execution can flush its own
+  `iptables` rules or kill its own Squid process — the untrusted principal cannot be trusted to police
+  itself, by construction. Treat these in-guest rules as defense-in-depth (they raise the bar for an
+  unsophisticated or non-adversarial workload) — not as the security boundary.
+  - **What IS host-verified today: switch isolation, not egress filtering.** `Assert-Sealed` verifies
+    (from the host, never the guest's self-report) that a Tier-1 VM's NIC sits on an isolated **Internal**
+    vSwitch rather than an External or Default switch. That is a genuine host-enforced guarantee that the
+    guest's only possible network path leaves through the host-controlled gateway on that Internal
+    switch — an unfiltered External/Default switch is refused, fail-closed. It says nothing about *which*
+    destinations are reachable through that gateway; today, nothing on the host filters what crosses it.
+  - **Egress filtering at the host is the Phase-6-live layer, not yet built.** The planned control is a
+    host-run transparent Squid SNI-splice proxy plus a host-side NAT (`New-NetNat`) and a host default-DROP
+    policy on the Internal switch's gateway interface — i.e. the same allow-only-what's-needed filtering
+    the in-guest layer attempts today, but enforced from a position the guest cannot reach or disable.
+    Until that lands, **do not read "the seal is host-verified" as "Tier-1 egress is filtered."** The seal
+    verifies isolation (the guest can only reach the host gateway); it does not yet verify filtering (what
+    the host gateway then permits through).
 
 Do not rely on Voidseal as your sole boundary for genuinely hostile code until the higher tiers are
 completed and you have independently verified the isolation on your host.
