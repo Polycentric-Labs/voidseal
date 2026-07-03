@@ -125,7 +125,9 @@ function Get-HyperVBackendMethodManifest {
         # seam so the FAKE can simulate it (record the command + return canned output) and the build
         # stays unit-testable without a live VM. Follows the RemoveVHD / RemoveSwitch / SetHostChannel
         # addendum precedent (manifest + both factories + parity/drift tests).
-        # Returns @{ ExitCode = <int>; Stdout = <string>; Stderr = <string> }.
+        # Returns @{ ExitCode = <int>; Stdout = <string>; Stderr = <string>; TimedOut = <bool> }.
+        # TimedOut=$true is a REPORTED outcome (not a thrown error) when the deadline elapses without
+        # the guest completing (I6a) — see the real/fake InvokeGuestCommand closures for the contract.
         InvokeGuestCommand   = @('VMName', 'Command', 'TimeoutSeconds')
 
         # ---- host channels (SEAL surface) ----
@@ -722,6 +724,20 @@ function New-RealHyperVBackend {
     # the FAKE carries the Runner's behavioral assertions). Fails closed through $InvokeOp like the
     # rest of the real backend. The guest is presumed to have serial-getty@ttyS0 + autologin per the
     # cloud-init recipe; if the pipe is unreachable this throws a clear error rather than hanging.
+    #
+    # TimedOut contract (I6a): the return carries TimedOut=$false on a normal completion (the RC
+    # marker was seen) and TimedOut=$true when the deadline elapsed without seeing it — a REPORTED
+    # outcome (not a thrown error), so Start-SandboxWorkload/Invoke-Voidseal's Serial branch can
+    # force-stop + record a Failed run instead of the timeout surfacing as an uncaught lifecycle
+    # exception. LIVE-ONLY-UNPROVEN (Phase 6): the loop below only re-checks the deadline BETWEEN
+    # $reader.ReadLine() calls. StreamReader.ReadLine() on a NamedPipeClientStream has no per-call
+    # timeout of its own, so a guest that goes completely silent (sends no further line data at all,
+    # e.g. a truly hung kernel) leaves ReadLine() blocked indefinitely and the deadline is NOT
+    # actually enforced in that case — only a guest that keeps streaming partial output without ever
+    # emitting the RC marker is caught by this loop. A fully honest real-side enforcement would need
+    # an outer job-race (background job + Wait-Job -Timeout) around the whole pipe read, which is
+    # deliberately NOT built this round (see task-2-report.md FIX PASS notes). TODO(Phase 6): prove/
+    # harden this against a live silent-hang guest, or add the outer job-race if it does not hold.
     $b.InvokeGuestCommand = {
         param([System.Collections.IDictionary] $P)
         $vm      = & $AssertArg $P 'VMName'  'InvokeGuestCommand'
@@ -747,7 +763,8 @@ function New-RealHyperVBackend {
                 # Send the command + an RC sentinel so we can parse the exit code out of the stream.
                 $writer.WriteLine("{0}; echo `"{1}:`$?`"" -f $command, $marker)
 
-                # Read until we see the RC marker or the timeout elapses.
+                # Read until we see the RC marker or the timeout elapses (see the LIVE-ONLY-UNPROVEN
+                # note above: the deadline is only re-checked between ReadLine() calls).
                 $sb       = [System.Text.StringBuilder]::new()
                 $exitCode = $null
                 $deadline = (Get-Date).AddSeconds($timeout)
@@ -761,9 +778,17 @@ function New-RealHyperVBackend {
                     [void]$sb.AppendLine($line)
                 }
                 if ($null -eq $exitCode) {
-                    throw "InvokeGuestCommand: timed out after ${timeout}s waiting for the guest to complete '$command' on COM1 pipe '$pipeName' (no '$marker' marker seen)."
+                    # I6a: report a TIMED-OUT outcome rather than throwing, so a hung Serial-mode
+                    # guest command is a REPORTED run result the orchestrator can act on (force-stop +
+                    # Failed) — mirroring Wait-WorkloadComplete's own TimedOut convention (Workload.ps1).
+                    return @{
+                        ExitCode = -1
+                        Stdout   = $sb.ToString()
+                        Stderr   = "InvokeGuestCommand: timed out after ${timeout}s waiting for the guest to complete '$command' on COM1 pipe '$pipeName' (no '$marker' marker seen)."
+                        TimedOut = $true
+                    }
                 }
-                return @{ ExitCode = $exitCode; Stdout = $sb.ToString(); Stderr = '' }
+                return @{ ExitCode = $exitCode; Stdout = $sb.ToString(); Stderr = ''; TimedOut = $false }
             }
             finally {
                 if ($null -ne $reader) { $reader.Dispose() }
@@ -1400,6 +1425,17 @@ $script:SbCopyFakeVM = {
     Make InvokeGuestCommand return a NON-ZERO ExitCode (simulating a guest workload that exited
     with failure). Used to exercise the Runner's "a non-zero guest exit is a RUN OUTCOME reported
     on the result, not a thrown error" path.
+.PARAMETER SimulateGuestCommandTimeout
+    Make InvokeGuestCommand return TimedOut=$true (ExitCode=124, mirroring the shell convention for
+    a timed-out command) — simulating a guest command that never completes before the caller's
+    deadline (a hung Serial-mode workload). Used to exercise I6a: Invoke-Voidseal's Serial branch
+    must force-stop the VM and record a Failed run when the guest command it dispatched reports
+    TimedOut, rather than only enforcing a tautological pre-dispatch check. The boot-readiness PROBE
+    command ('true', Wait-GuestBootReady's default) is deliberately EXEMPTED so the simulated guest
+    still boots normally and the hang is isolated to the workload entrypoint dispatch — modelling a
+    guest that came up fine but hung mid-workload, not a guest that never became boot-ready (that is
+    the separate D5-C scenario). Mirrors -SimulateGuestCommandFailure's shape (a fake-only simulation
+    switch on the existing method — NOT a new backend method, so no manifest change).
 .PARAMETER SimulateStartVMError
     Make StartVM THROW (simulating a VM that won't boot). Used to exercise the Invoke-Voidseal
     orchestrator's teardown-on-mid-flow-failure path: the VM provisions + seals + passes the gate,
@@ -1457,6 +1493,7 @@ function New-FakeHyperVBackend {
         [switch] $SimulateUnavailable,
         [switch] $SimulateChannelReadError,
         [switch] $SimulateGuestCommandFailure,
+        [switch] $SimulateGuestCommandTimeout,
         [switch] $SimulateStartVMError,
         [switch] $SimulateNeverOff,
         [switch] $SimulateSelfPowerOff,
@@ -1479,6 +1516,7 @@ function New-FakeHyperVBackend {
     $channelReadThrows = $SimulateChannelReadError.IsPresent
     # Captured by the relevant method closures (see param help) — test-only failure seams.
     $guestCmdFails     = $SimulateGuestCommandFailure.IsPresent
+    $guestCmdTimesOut  = $SimulateGuestCommandTimeout.IsPresent
     $startVmThrows     = $SimulateStartVMError.IsPresent
     # Captured by the GetVM closure: model a guest that never powers itself off (the timeout branch
     # of the self-power-off completion model — Wait-WorkloadComplete).
@@ -1758,7 +1796,14 @@ function New-FakeHyperVBackend {
     # (so a Runner test can assert the right entrypoint was sent) and RETURN canned output. The
     # default canned result is a success (ExitCode 0); -SimulateGuestCommandFailure flips it to a
     # non-zero exit so the Runner's "non-zero exit is a reported run outcome, not a throw" path is
-    # testable. Requires VMName + Command (mirrors the real AssertArg wiring) and throws on a
+    # testable. -SimulateGuestCommandTimeout (I6a) models a guest that boots fine (its
+    # boot-readiness PROBE — Wait-GuestBootReady's default 'true' — still succeeds) but then HANGS on
+    # the actual workload entrypoint: any command other than the literal boot-probe 'true' reports
+    # TimedOut=$true. This is deliberate, not incidental — if the timeout switch made EVERY command
+    # (including the probe) time out, Start-SandboxWorkload would never get past boot-readiness and
+    # would return the boot-timeout shape instead of ever dispatching/reporting on the entrypoint,
+    # which would test the wrong code path (D5-C's boot-readiness scenario, not I6a's workload-hang
+    # scenario). Requires VMName + Command (mirrors the real AssertArg wiring) and throws on a
     # missing VM (a Runner targeting a ghost VM is a caller bug we must surface).
     $b.InvokeGuestCommand = {
         param([System.Collections.IDictionary] $P)
@@ -1766,10 +1811,14 @@ function New-FakeHyperVBackend {
         $command = & $AssertArg $P 'Command' 'InvokeGuestCommand'
         [void](& $GetArg $P 'TimeoutSeconds' 300)   # accepted + ignored by the fake (documented arg)
         $vm.GuestCommands.Add([string]$command)
-        if ($guestCmdFails) {
-            return @{ ExitCode = 1; Stdout = ''; Stderr = "fake: simulated guest command failure for '$command'." }
+        if ($guestCmdTimesOut -and [string]$command -ne 'true') {
+            # ExitCode 124 mirrors the shell convention for a command killed by `timeout`(1).
+            return @{ ExitCode = 124; Stdout = ''; Stderr = 'fake: simulated guest command timeout'; TimedOut = $true }
         }
-        return @{ ExitCode = 0; Stdout = "fake: ran '$command'."; Stderr = '' }
+        if ($guestCmdFails) {
+            return @{ ExitCode = 1; Stdout = ''; Stderr = "fake: simulated guest command failure for '$command'."; TimedOut = $false }
+        }
+        return @{ ExitCode = 0; Stdout = "fake: ran '$command'."; Stderr = ''; TimedOut = $false }
     }.GetNewClosure()
 
     # ---- host channels (SEAL surface) ----

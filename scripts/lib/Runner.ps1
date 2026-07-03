@@ -42,13 +42,19 @@
         presumed-hostile tier via the trusting path would defeat the whole containment model.
 
     BACKEND ADDENDUM:
-      * InvokeGuestCommand @{ VMName; Command; TimeoutSeconds } -> @{ ExitCode; Stdout; Stderr } —
-        added to the backend (manifest + both factories + parity/drift tests). The backend previously had no
-        way to deliver a command to a Linux guest + read its result; the Runner must NOT open the
-        COM1 named pipe / drive the serial console with a raw cmdlet. Real backend = a best-effort
-        named-pipe serial client (exercised live in the operator-run smoke test, not in a non-elevated
-        session); fake = records the command + returns canned output. Follows the RemoveVHD /
-        RemoveSwitch / SetHostChannel addendum precedent. See HyperVBackend.ps1.
+      * InvokeGuestCommand @{ VMName; Command; TimeoutSeconds } ->
+        @{ ExitCode; Stdout; Stderr; TimedOut } — added to the backend (manifest + both factories +
+        parity/drift tests). The backend previously had no way to deliver a command to a Linux guest +
+        read its result; the Runner must NOT open the COM1 named pipe / drive the serial console with
+        a raw cmdlet. Real backend = a best-effort named-pipe serial client (exercised live in the
+        operator-run smoke test, not in a non-elevated session); fake = records the command + returns
+        canned output. Follows the RemoveVHD / RemoveSwitch / SetHostChannel addendum precedent. See
+        HyperVBackend.ps1. TimedOut=$true (I6a) is a REPORTED outcome — Start-SandboxWorkload carries
+        it onto its returned run-result so Invoke-Voidseal's Serial branch can force-stop + record a
+        Failed run when the dispatched guest command hit its deadline, instead of the hang either
+        surfacing as an uncaught exception or (worse) going undetected. See the real InvokeGuestCommand
+        closure's LIVE-ONLY-UNPROVEN note: the real timeout re-check only fires between pipe reads, so
+        a guest that goes fully silent is not honestly guaranteed to trip it live.
 #>
 
 Set-StrictMode -Version Latest
@@ -345,6 +351,10 @@ function Start-SandboxWorkload {
     $exitCode = [int]$(if ($isDict -and $invoke.Contains('ExitCode')) { $invoke['ExitCode'] } else { -1 })
     $stdout   = [string]$(if ($isDict -and $invoke.Contains('Stdout')) { $invoke['Stdout'] } else { '' })
     $stderr   = [string]$(if ($isDict -and $invoke.Contains('Stderr')) { $invoke['Stderr'] } else { '' })
+    # I6a: TimedOut is a REPORTED outcome (not a thrown error) — a malformed/legacy result without the
+    # key is treated as NOT timed out (fail-closed would over-trigger force-stops on unrelated faults;
+    # the ExitCode/Stderr above already carry a malformed-result failure signal).
+    $timedOut = [bool]$(if ($isDict -and $invoke.Contains('TimedOut')) { $invoke['TimedOut'] } else { $false })
 
     # --- 3. ARM host-side capture: write run metadata out-of-band --------
     # P8: capture is host-side, NEVER trusting the guest to self-report. The captured stdout/stderr
@@ -370,6 +380,7 @@ function Start-SandboxWorkload {
         ExitCode       = $exitCode
         Stdout         = $stdout
         Stderr         = $stderr
+        TimedOut       = $timedOut   # I6a: the guest command reported a deadline trip (Serial-mode force-stop signal)
         BootWaitStatus = [string]$boot['Status']   # the boot-readiness outcome (the guest WAS ready here)
         StartedAt      = $startedAt
         EndedAt        = $endedAt

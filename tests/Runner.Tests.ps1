@@ -125,7 +125,7 @@ Describe 'Backend addendum — InvokeGuestCommand (the COM1 serial seam) is in t
             Should -Throw -ExpectedMessage '*ghost*'
     }
 
-    It 'the FAKE InvokeGuestCommand returns a structured result (ExitCode / Stdout / Stderr) and records the command' {
+    It 'the FAKE InvokeGuestCommand returns a structured result (ExitCode / Stdout / Stderr / TimedOut) and records the command' {
         $fake = New-FakeHyperVBackend
         & $fake.NewVM @{ Name = 'vm-cmd'; Generation = 2 }
         $res = & $fake.InvokeGuestCommand @{ VMName = 'vm-cmd'; Command = 'ralph_loop.sh' }
@@ -133,10 +133,20 @@ Describe 'Backend addendum — InvokeGuestCommand (the COM1 serial seam) is in t
         $res.ContainsKey('ExitCode') | Should -BeTrue
         $res.ContainsKey('Stdout')   | Should -BeTrue
         $res.ContainsKey('Stderr')   | Should -BeTrue
+        $res.ContainsKey('TimedOut') | Should -BeTrue -Because 'I6a: TimedOut is part of the InvokeGuestCommand return contract (real+fake lockstep)'
         $res.ExitCode | Should -Be 0 -Because 'the default canned result is a success'
+        $res.TimedOut | Should -BeFalse -Because 'the default canned result did not time out'
         # The fake records the delivered command so a test can assert the Runner sent the right one.
         $vm = & $fake.GetVM @{ Name = 'vm-cmd' }
         @($vm.GuestCommands) | Should -Contain 'ralph_loop.sh' -Because 'the fake records what was sent over the serial seam'
+    }
+
+    It 'the FAKE InvokeGuestCommand can be forced to TimedOut=$true (SimulateGuestCommandTimeout, I6a)' {
+        $timedOut = New-FakeHyperVBackend -SimulateGuestCommandTimeout
+        & $timedOut.NewVM @{ Name = 'vm-hang'; Generation = 2 }
+        $res = & $timedOut.InvokeGuestCommand @{ VMName = 'vm-hang'; Command = 'sleep 999' }
+        $res.TimedOut | Should -BeTrue -Because 'the timeout-simulating fake reports a hung guest command'
+        $res.ExitCode | Should -Not -Be 0 -Because 'a timed-out command never reports a success exit code'
     }
 
     It 'the FAKE InvokeGuestCommand can be forced to a non-zero exit (SimulateGuestCommandFailure)' {
@@ -182,6 +192,17 @@ Describe 'Start-SandboxWorkload — runs the workload over the serial seam + rec
         $result.PSObject.Properties.Name | Should -Contain 'CapturePath' -Because 'the run-result must point at the host-side capture artifact'
         $result.PSObject.Properties.Name | Should -Contain 'StartedAt'
         $result.PSObject.Properties.Name | Should -Contain 'EndedAt'
+        $result.PSObject.Properties.Name | Should -Contain 'TimedOut' -Because 'I6a: the run-result must carry the backend-reported TimedOut outcome'
+        $result.TimedOut | Should -BeFalse -Because 'the fake canned result did not time out'
+    }
+
+    It 'PROPAGATES a backend-reported guest-command timeout onto the run-result (I6a, TimedOut=$true)' {
+        $timeoutBackend = New-FakeHyperVBackend -SimulateGuestCommandTimeout
+        $desc2 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-run-hang' -Backend $timeoutBackend
+        Lock-Sandbox -Descriptor $desc2 -Backend $timeoutBackend
+        $result = Start-SandboxWorkload -Descriptor $desc2 -Entrypoint 'bash ralph_loop.sh' -ArtifactRoot $script:ArtRoot -Backend $timeoutBackend
+        $result.TimedOut | Should -BeTrue -Because 'the backend reported the guest command timed out'
+        $result.ExitCode | Should -Not -Be 0 -Because 'a timed-out command never reports a success exit code'
     }
 
     It 'ARMS host-side capture: writes a run-metadata artifact under the artifact root' {

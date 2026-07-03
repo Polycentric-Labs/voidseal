@@ -1396,55 +1396,64 @@ Describe 'Invoke-Voidseal — a guest-command failure during boot-readiness is a
 # ===========================================================================
 #  Disk mode already force-stops a hung guest on an OVERALL wall-clock deadline
 #  (Wait-WorkloadComplete -TimeoutSeconds $WorkloadTimeoutSeconds, Invoke-Voidseal.ps1:620-621).
-#  Serial mode had NO overall deadline — only Start-SandboxWorkload's PER-COMMAND TimeoutSeconds
-#  (Runner.ps1:245, default 300), which the FAKE backend's InvokeGuestCommand never actually
-#  honors anyway (it always returns synchronously; the fake has no seam to model a guest command
-#  that blocks past a timeout). So the only place a SERIAL overall deadline can be enforced —
-#  and the only place it is testable without a real blocking primitive — is a PRE-DISPATCH check
-#  in the Serial branch, mirroring Wait-WorkloadComplete's own 0-deadline idiom: with
-#  -WorkloadTimeoutSeconds 0, `(Get-Date).AddSeconds(0)` is a deadline already at-or-before "now",
-#  so the check trips on the FIRST (only) evaluation — no Start-Sleep, no InvokeGuestCommand ever
-#  dispatched. This is the serial analogue of "one instant poll then trip the deadline."
-Describe 'Invoke-Voidseal — I6a: SERIAL mode overall wall-clock DENY (force-stop + Failed on deadline)' {
+#  Serial mode's real mechanism (FIX PASS, superseding a REJECTED placebo — see task-2-report.md):
+#  $WorkloadTimeoutSeconds is passed straight through as Start-SandboxWorkload's -TimeoutSeconds,
+#  the OUTER bound of the single serial guest-command dispatch (Runner.ps1:339,
+#  InvokeGuestCommand). When that guest command reports TimedOut=$true — a REPORTED outcome from
+#  InvokeGuestCommand's TimedOut contract, not a thrown error — Invoke-Voidseal's Serial branch
+#  force-stops the VM and records a Failed RunResult (Invoke-Voidseal.ps1's Serial else-branch).
+#  A PRIOR implementation compared (Get-Date) against (Get-Date).AddSeconds($WorkloadTimeoutSeconds)
+#  BEFORE ever dispatching the guest command: that comparison is tautologically false for any
+#  positive N (both Get-Date calls execute within the same instant), so it NEVER fired in real
+#  operation (default 600s) — it only "passed" because the REJECTED test injected 0. That
+#  pre-dispatch guard + its 0-deadline test are REMOVED here; the fake has no seam to model a real
+#  elapsed-time trip (InvokeGuestCommand always returns synchronously), so the deterministic way to
+#  exercise the REAL mechanism is the fake's -SimulateGuestCommandTimeout switch (mirrors
+#  -SimulateGuestCommandFailure), which makes the dispatched guest command itself report
+#  TimedOut=$true — proving the OBSERVABLE I6a outcome (Failed run + force-stop), not a clock race.
+Describe 'Invoke-Voidseal — I6a: SERIAL mode overall wall-clock DENY (force-stop + Failed on guest-command timeout)' {
 
     BeforeEach {
-        $script:SerialDdlB = New-FakeHyperVBackend
+        $script:SerialDdlB    = New-FakeHyperVBackend
+        $script:SerialTimeoutB = New-FakeHyperVBackend -SimulateGuestCommandTimeout
         $script:Workload = & $script:NewWorkload -Tag 'serialddl'
         $script:Art  = Join-Path $script:TmpRoot ("art-sddl-{0}"  -f ([guid]::NewGuid().ToString('N')))
         $script:Dest = Join-Path $script:TmpRoot ("dest-sddl-{0}" -f ([guid]::NewGuid().ToString('N')))
     }
 
-    It 'Serial mode force-stops + fails a workload that exceeds the overall wall-clock deadline (WorkloadTimeoutSeconds 0)' {
+    It 'Serial mode force-stops + fails a workload whose guest command exceeds the overall wall-clock deadline (SimulateGuestCommandTimeout)' {
         $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
             -Name 'sbx-i6-serialddl' -ArtifactRoot $script:Art -Destination $script:Dest `
-            -BootWaitSeconds 0 -BootPollDelaySeconds 0 -WorkloadTimeoutSeconds 0 -Backend $script:SerialDdlB
+            -BootWaitSeconds 0 -BootPollDelaySeconds 0 -WorkloadTimeoutSeconds 5 -Backend $script:SerialTimeoutB
 
         $report.RunResult | Should -Not -BeNullOrEmpty
-        $report.RunResult.Status | Should -Be 'Failed' -Because 'the overall deadline tripped before/at dispatch — this is a reported Failed run'
+        $report.RunResult.Status | Should -Be 'Failed' -Because 'the dispatched guest command reported TimedOut=$true — this is a reported Failed run'
         $report.RunResult.ExitCode | Should -Be -1
         $report.RunResult.Reason | Should -Match '(?i)deadline|wall-clock|timed out'
-        # No lifecycle .Error: a deadline trip is a REPORTED run outcome (mirrors the Disk-mode
-        # 'boot/workload timed out' path), not a thrown mid-flow abort.
-        $report.Error | Should -BeNullOrEmpty -Because 'a serial overall-deadline trip is a reported Failed run, not a lifecycle .Error'
+        # No lifecycle .Error: a guest-command timeout is a REPORTED run outcome (mirrors the
+        # Disk-mode 'boot/workload timed out' path), not a thrown mid-flow abort.
+        $report.Error | Should -BeNullOrEmpty -Because 'a serial guest-command timeout is a reported Failed run, not a lifecycle .Error'
+        # The run must NOT report success — the primary I6a regression this guards against.
+        $report.RunResult.Status | Should -Not -Be 'Success'
     }
 
-    It 'force-stops the VM on the Serial overall-deadline trip (State Off, mirroring Disk-mode Wait-WorkloadComplete)' {
+    It 'force-stops the VM on the Serial guest-command timeout (no orphan, mirroring Disk-mode Wait-WorkloadComplete)' {
         Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
             -Name 'sbx-i6-serialddl2' -ArtifactRoot $script:Art -Destination $script:Dest `
-            -BootWaitSeconds 0 -BootPollDelaySeconds 0 -WorkloadTimeoutSeconds 0 -Backend $script:SerialDdlB | Out-Null
+            -BootWaitSeconds 0 -BootPollDelaySeconds 0 -WorkloadTimeoutSeconds 5 -Backend $script:SerialTimeoutB | Out-Null
         # Teardown always removes the VM in the end, so we cannot observe post-teardown State directly;
         # instead prove the force-stop fired via the SAME signal the Disk-mode sibling test uses one
         # layer down (Workload.Tests.ps1:272-283): the VM is gone afterwards (no orphan), and no
-        # lifecycle .Error was recorded (a deadline trip is a REPORTED run outcome, not a thrown abort).
-        (& $script:SerialDdlB.GetVM @{ Name = 'sbx-i6-serialddl2' }) |
-            Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM on a serial overall-deadline trip'
+        # lifecycle .Error was recorded (a timeout trip is a REPORTED run outcome, not a thrown abort).
+        (& $script:SerialTimeoutB.GetVM @{ Name = 'sbx-i6-serialddl2' }) |
+            Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM on a serial guest-command timeout'
     }
 
-    It 'does NOT trip the deadline with the default WorkloadTimeoutSeconds (Serial happy path unaffected)' {
+    It 'does NOT trip the deadline when the guest command completes normally (Serial happy path unaffected)' {
         $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
             -Name 'sbx-i6-serialok' -ArtifactRoot $script:Art -Destination $script:Dest `
             -BootWaitSeconds 0 -BootPollDelaySeconds 0 -Backend $script:SerialDdlB
-        $report.RunResult.ExitCode | Should -Be 0 -Because 'a default (non-zero) overall deadline must not trip a normal in-mock-instant serial run'
+        $report.RunResult.ExitCode | Should -Be 0 -Because 'a normal (non-timed-out) guest command must not trip the I6a force-stop path'
         $report.RunResult.Entrypoint | Should -Be 'bash run.sh'
     }
 }

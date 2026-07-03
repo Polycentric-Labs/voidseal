@@ -324,12 +324,17 @@ function Get-WorkloadField {
 .PARAMETER WorkloadTimeoutSeconds
     (Optional) the OVERALL wall-clock deadline for the workload run. In Disk mode the guest runs its
     boot workload then powers ITSELF off; the host polls VM State until Off or this deadline fires
-    (Wait-WorkloadComplete force-stops a hung guest on timeout). In Serial mode (I6a) this is a
-    pre-dispatch guard around Start-SandboxWorkload's per-command delivery: on trip the VM is
-    force-stopped and the run is recorded Failed BEFORE the entrypoint is ever delivered over the
-    serial seam — the outer bound, distinct from Start-SandboxWorkload's inner per-command
-    TimeoutSeconds (Runner.ps1, default 300). Default 600. Tests inject 0 (one instant check then trip
-    the deadline, in both modes) so they never sleep.
+    (Wait-WorkloadComplete force-stops a hung guest on timeout). In Serial mode (I6a) this value IS
+    passed as Start-SandboxWorkload's -TimeoutSeconds — the single serial guest-command dispatch's own
+    deadline — so it bounds the ACTUAL delivered command, not a pre-dispatch clock check. When that
+    guest command reports TimedOut=$true (the guest hung and never completed in time — a REPORTED
+    outcome from InvokeGuestCommand, not a thrown error), Invoke-Voidseal force-stops the VM and
+    records a Failed RunResult, mirroring the Disk-mode timeout shape. Default 600. Tests use the fake
+    backend's -SimulateGuestCommandTimeout switch (not a 0 value) to exercise this deterministically,
+    since a real elapsed-time trip cannot be forced instantaneously through a mock without a live
+    blocking primitive. NOTE (LIVE-ONLY-UNPROVEN, Phase 6): the real InvokeGuestCommand's timeout
+    re-check only fires between pipe reads, so a guest that goes fully silent is not guaranteed to trip
+    it live — see HyperVBackend.ps1's InvokeGuestCommand closure for the detailed caveat.
 .PARAMETER RateLedgerPath
     (Optional) host-side path to the C2.6 runs/day release-rate JSON ledger (ReleaseGovernor.ps1).
     ONLY consulted for a PROCESSOR profile (Network='None' + ScreenConfig) — a transport-only
@@ -752,29 +757,40 @@ function Invoke-Voidseal {
             if (-not [string]::IsNullOrWhiteSpace($entrypoint)) {
                 # I6a: the OVERALL wall-clock DENY (Disk-mode parity). Disk mode already force-stops a
                 # hung guest on an overall deadline (Wait-WorkloadComplete -TimeoutSeconds
-                # $WorkloadTimeoutSeconds, above). Serial mode previously had NO overall deadline — only
-                # Start-SandboxWorkload's PER-COMMAND TimeoutSeconds (Runner.ps1, inner bound, unchanged).
-                # $WorkloadTimeoutSeconds is the OUTER bound: mirror Wait-WorkloadComplete's own deadline
-                # idiom EXACTLY — (Get-Date).AddSeconds($WorkloadTimeoutSeconds) — so WorkloadTimeoutSeconds
-                # 0 trips on this single instant check (deadline is already at-or-before "now"), never
-                # sleeps, and NEVER dispatches the entrypoint. This is a pre-dispatch guard (not a poll
-                # loop) because the serial run is one InvokeGuestCommand call, not a pollable VM state.
-                $serialDeadline = (Get-Date).AddSeconds($WorkloadTimeoutSeconds)
-                if ((Get-Date) -ge $serialDeadline) {
+                # $WorkloadTimeoutSeconds, above). Serial mode's real mechanism: $WorkloadTimeoutSeconds
+                # is passed as the OUTER bound (-TimeoutSeconds) of the single serial guest-command run
+                # (Start-SandboxWorkload -> InvokeGuestCommand). When that guest command reports
+                # TimedOut=$true (the guest hung and never completed before the deadline — a REPORTED
+                # outcome, not a thrown error; see InvokeGuestCommand's TimedOut contract in
+                # HyperVBackend.ps1/Runner.ps1), the host force-stops the VM and records a Failed run.
+                # A PRIOR version of this guard compared (Get-Date) against (Get-Date).AddSeconds(N)
+                # BEFORE ever dispatching the command — that is tautologically false for any positive N
+                # (both calls execute within the same instant) and so never fired in real operation; it
+                # was removed as a placebo. This is now a real DENY: it enforces on the ACTUAL guest
+                # command's reported timeout, not a pre-dispatch clock comparison.
+                $runResult = Start-SandboxWorkload -Descriptor $descriptor -Entrypoint $entrypoint `
+                    -ArtifactRoot $ArtifactRoot -BootWaitSeconds $BootWaitSeconds `
+                    -BootPollDelaySeconds $BootPollDelaySeconds -TimeoutSeconds $WorkloadTimeoutSeconds `
+                    -Backend $Backend
+                $report.RunResult = $runResult
+                $states.Add('RUNNING')
+
+                $serialTimedOut = [bool]$(
+                    if ($null -ne $runResult -and $null -ne $runResult.PSObject.Properties['TimedOut']) {
+                        $runResult.TimedOut
+                    } else { $false }
+                )
+                if ($serialTimedOut) {
+                    # The guest command itself reported the deadline trip. Force-stop (defense-in-depth —
+                    # Remove-Sandbox's teardown would stop it anyway, but this makes the DENY explicit and
+                    # immediate rather than deferred to the finally block) and overwrite the raw Runner
+                    # result with the same Failed RunResult shape the Disk-mode timeout path uses.
                     $null = & $Backend.StopVM @{ Name = $Name; Force = $true }
-                    $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = 'serial workload exceeded overall wall-clock deadline' }
-                    $states.Add('RUNNING')
+                    $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = 'serial workload exceeded the overall wall-clock deadline (guest command timed out)' }
+                    # No CAPTURED/EXTRACTED on a timeout trip: nothing was captured/extracted — the
+                    # entrypoint's guest command never completed, so there is no result to export.
                 }
                 else {
-                    # RUNNING: start the sealed VM, WAIT for boot-readiness (the first command must not race
-                    # cloud-init), deliver the entrypoint over the serial seam, and arm capture. The boot-wait is
-                    # injectable (tests pass 0 so they never sleep the real ~60s).
-                    $runResult = Start-SandboxWorkload -Descriptor $descriptor -Entrypoint $entrypoint `
-                        -ArtifactRoot $ArtifactRoot -BootWaitSeconds $BootWaitSeconds `
-                        -BootPollDelaySeconds $BootPollDelaySeconds -Backend $Backend
-                    $report.RunResult = $runResult
-                    $states.Add('RUNNING')
-
                     # CAPTURED: the run-result + its out-of-band capture artifact are now recorded.
                     $states.Add('CAPTURED')
 
