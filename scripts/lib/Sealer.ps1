@@ -597,6 +597,9 @@ function Lock-Sandbox {
       * Tier >= 2: GetNetworkAdapter MUST be empty (no NIC = no live egress route). A Tier-1 VM
         legitimately keeps its NIC, so the NIC check is tier-gated; the media + channel checks
         apply to every tier.
+      * Tier == 1 (non-processor): every NIC MUST be on an isolated Internal vSwitch (I4) — its
+        SwitchType is host-verified via GetSwitch. An External or Default (or unresolvable)
+        switch bypasses the host-controlled egress chokepoint and is refused, fail-closed.
       * no import DVD/ISO attached (a live read-only-but-present host<->guest medium).
       * no transfer/import VHD recorded on the descriptor still attached.
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.
@@ -681,6 +684,33 @@ function Assert-Sealed {
             }
             throw ("Assert-Sealed: REFUSING to certify Tier-$tier VM '$vmName' SEALED — $($nics.Count) network " +
                    "adapter(s) still attached. A Tier>=2 VM MUST have NO NIC (no live egress route). Fail closed.")
+        }
+    }
+
+    # --- Tier 1 (net-restricted, non-processor): the NIC MUST be on the ISOLATED Internal vSwitch (I4) ---
+    # A Tier-1 VM legitimately HAS a NIC (net-restricted, not no-net), but its egress must ride the HOST
+    # chokepoint — an Internal vSwitch whose gateway the host controls (Pass A Q2). An External switch bypasses
+    # the host TCP/IP stack (unfiltered egress); the Default Switch is ICS/non-configurable. On anything but an
+    # Internal switch the seal would be a LIE about Tier-1 containment. Verify each NIC's switch is
+    # SwitchType='Internal', fail closed otherwise. (Egress FILTERING via host Squid/NAT/default-DROP is the
+    # Phase-6-live layer; this asserts switch ISOLATION only — the VM can reach only the host gateway.)
+    if ($tier -eq 1 -and -not $isProcessor) {
+        $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
+        foreach ($nic in $nics) {
+            $switchName = [string]$nic.SwitchName
+            if ([string]::IsNullOrWhiteSpace($switchName)) {
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED — a network adapter is not " +
+                       "on any vSwitch (no SwitchName). A Tier-1 NIC MUST be on an isolated Internal vSwitch " +
+                       "(host-controlled egress chokepoint). Fail closed.")
+            }
+            $sw = & $Backend.GetSwitch @{ Name = $switchName }
+            if ($null -eq $sw -or [string]$sw.SwitchType -ne 'Internal') {
+                $gotType = if ($null -eq $sw) { '(switch not found on host)' } else { [string]$sw.SwitchType }
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED — its NIC is on switch " +
+                       "'$switchName' (SwitchType=$gotType), not an isolated Internal vSwitch. A Tier-1 VM's egress " +
+                       "MUST ride the host-controlled Internal-switch gateway, never an External/Default switch " +
+                       "(which bypasses the host stack). Fail closed.")
+            }
         }
     }
 

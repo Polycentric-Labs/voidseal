@@ -525,6 +525,85 @@ Describe 'Assert-Sealed — Tier-1 certifies the net-restricted seal WITHOUT req
 }
 
 # ===========================================================================
+#  Assert-Sealed — I4: a Tier-1 NIC MUST be on the ISOLATED Internal vSwitch
+# ===========================================================================
+#  Finding I4: Assert-Sealed verified Tier>=2/processor VMs have NO NIC, but for a Tier-1
+#  (net-restricted, non-processor) VM that legitimately HAS a NIC, it did NOT verify WHICH
+#  switch the NIC is on. A Tier-1 VM on an unfiltered External/Default switch would seal
+#  clean while its egress bypasses the host chokepoint entirely. Real Tier-1 provisioning
+#  (New-SandboxVM/Provisioner.ps1, Substrate='HyperV-Gen2') always wires an Internal switch,
+#  so these tests simulate a MISCONFIGURED/tampered NIC (re-pointed at a different switch
+#  after provisioning) to prove the gate now catches what provisioning alone does not.
+# ===========================================================================
+Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSwitch' {
+
+    It 'Tier-1: certifies when the NIC is on an isolated Internal vSwitch (the normal/provisioned case)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-internal'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        $nic = @(& $b.GetNetworkAdapter @{ VMName = 'sbx-i4-internal' })[0]
+        (& $b.GetSwitch @{ Name = $nic.SwitchName }).SwitchType |
+            Should -Be 'Internal' -Because 'precondition: real Tier-1 provisioning always wires an Internal switch'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Not -Throw -Because 'a Tier-1 NIC on an isolated Internal vSwitch is exactly the required posture'
+        Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
+    }
+
+    It 'Tier-1: REFUSES when the NIC is on an External switch (egress bypasses the host stack)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-external'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        # Simulate tamper/misconfiguration: strip the provisioned NIC and re-attach one on an
+        # External switch (an unfiltered egress path that bypasses the host TCP/IP stack).
+        & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-external' }
+        & $b.NewSwitch @{ Name = 'ext-sw'; SwitchType = 'External'; NetAdapterName = 'Ethernet' }
+        & $b.ConnectNetworkAdapter @{ VMName = 'sbx-i4-external'; SwitchName = 'ext-sw' }
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*Internal*' -Because 'an External switch bypasses the host-controlled egress chokepoint; the seal must refuse'
+    }
+
+    It 'Tier-1: REFUSES when the NIC is on the Default Switch / an unresolvable switch' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-default'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        # The Default Switch is Hyper-V's non-configurable ICS switch — it is never created via
+        # NewSwitch, so GetSwitch cannot resolve it (mirrors a real host: no matching VMSwitch
+        # object under host control). Re-point the NIC's SwitchName directly to model this.
+        & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-default' }
+        $vm = & $b.GetVM @{ Name = 'sbx-i4-default' }
+        $vm.NetworkAdapters.Add(@{ SwitchName = 'Default Switch'; Name = 'Network Adapter' })
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*Internal*' -Because 'the Default Switch is ICS/non-configurable and not host-verifiable as Internal; fail closed'
+    }
+
+    It 'Tier-1: REFUSES when a NIC has no resolvable SwitchName (blank)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-noswitch'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-noswitch' }
+        $vm = & $b.GetVM @{ Name = 'sbx-i4-noswitch' }
+        $vm.NetworkAdapters.Add(@{ SwitchName = ''; Name = 'Network Adapter' })
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*Internal*' -Because 'a NIC not attached to any resolvable vSwitch cannot be verified isolated; fail closed'
+    }
+
+    It 'Tier>=2/processor (no-NIC) regression: the switch-isolation check does not fire when there is no NIC' {
+        # Regression guard: the I4 block is gated on ($tier -eq 1 -and -not $isProcessor). A
+        # Tier>=2 VM (or any processor) has already been refused/certified by the earlier
+        # no-NIC block before this code path is ever reached; prove the addition does not
+        # change that outcome for a correctly-sealed Tier-2 VM (no NIC at all).
+        $sb = & $script:NewTestSandbox -Profile $script:Tier2 -Name 'sbx-i4-tier2ok'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        (& $b.GetNetworkAdapter @{ VMName = 'sbx-i4-tier2ok' }).Count |
+            Should -Be 0 -Because 'precondition: a Tier>=2 seal has no NIC at all'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Not -Throw -Because 'the I4 switch-isolation check is Tier-1-only and must not affect a no-NIC Tier>=2 VM'
+        Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
+    }
+}
+
+# ===========================================================================
 #  Assert-Sealed — recorded workload data disks: the gate ACCEPTS a
 #  data disk whose path is RECORDED on the descriptor (InputDiskPath/OutputDiskPath)
 #  — an EXPECTED disk, not a residual — while STILL refusing an UNRECORDED attached
