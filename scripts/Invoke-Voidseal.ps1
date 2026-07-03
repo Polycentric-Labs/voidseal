@@ -322,10 +322,14 @@ function Get-WorkloadField {
     Also reused as the POLL cadence for the Disk-mode completion wait (Wait-WorkloadComplete) — how
     long between VM-State polls while waiting for the guest to self-power-off (tests inject 0).
 .PARAMETER WorkloadTimeoutSeconds
-    (Optional, Disk mode) the wall-clock deadline for the self-power-off completion wait. In Disk
-    mode the guest runs its boot workload then powers ITSELF off; the host polls VM State until Off or
-    this deadline fires (Wait-WorkloadComplete force-stops a hung guest on timeout). Default 600. Tests
-    inject 0 (one instant poll then trip the deadline) so they never sleep. Unused by Serial mode.
+    (Optional) the OVERALL wall-clock deadline for the workload run. In Disk mode the guest runs its
+    boot workload then powers ITSELF off; the host polls VM State until Off or this deadline fires
+    (Wait-WorkloadComplete force-stops a hung guest on timeout). In Serial mode (I6a) this is a
+    pre-dispatch guard around Start-SandboxWorkload's per-command delivery: on trip the VM is
+    force-stopped and the run is recorded Failed BEFORE the entrypoint is ever delivered over the
+    serial seam — the outer bound, distinct from Start-SandboxWorkload's inner per-command
+    TimeoutSeconds (Runner.ps1, default 300). Default 600. Tests inject 0 (one instant check then trip
+    the deadline, in both modes) so they never sleep.
 .PARAMETER RateLedgerPath
     (Optional) host-side path to the C2.6 runs/day release-rate JSON ledger (ReleaseGovernor.ps1).
     ONLY consulted for a PROCESSOR profile (Network='None' + ScreenConfig) — a transport-only
@@ -746,25 +750,42 @@ function Invoke-Voidseal {
         else {
             # SERIAL MODE (default): RUNNING/CAPTURED/EXTRACTED only when there is an entrypoint to deliver.
             if (-not [string]::IsNullOrWhiteSpace($entrypoint)) {
-                # RUNNING: start the sealed VM, WAIT for boot-readiness (the first command must not race
-                # cloud-init), deliver the entrypoint over the serial seam, and arm capture. The boot-wait is
-                # injectable (tests pass 0 so they never sleep the real ~60s).
-                $runResult = Start-SandboxWorkload -Descriptor $descriptor -Entrypoint $entrypoint `
-                    -ArtifactRoot $ArtifactRoot -BootWaitSeconds $BootWaitSeconds `
-                    -BootPollDelaySeconds $BootPollDelaySeconds -Backend $Backend
-                $report.RunResult = $runResult
-                $states.Add('RUNNING')
+                # I6a: the OVERALL wall-clock DENY (Disk-mode parity). Disk mode already force-stops a
+                # hung guest on an overall deadline (Wait-WorkloadComplete -TimeoutSeconds
+                # $WorkloadTimeoutSeconds, above). Serial mode previously had NO overall deadline — only
+                # Start-SandboxWorkload's PER-COMMAND TimeoutSeconds (Runner.ps1, inner bound, unchanged).
+                # $WorkloadTimeoutSeconds is the OUTER bound: mirror Wait-WorkloadComplete's own deadline
+                # idiom EXACTLY — (Get-Date).AddSeconds($WorkloadTimeoutSeconds) — so WorkloadTimeoutSeconds
+                # 0 trips on this single instant check (deadline is already at-or-before "now"), never
+                # sleeps, and NEVER dispatches the entrypoint. This is a pre-dispatch guard (not a poll
+                # loop) because the serial run is one InvokeGuestCommand call, not a pollable VM state.
+                $serialDeadline = (Get-Date).AddSeconds($WorkloadTimeoutSeconds)
+                if ((Get-Date) -ge $serialDeadline) {
+                    $null = & $Backend.StopVM @{ Name = $Name; Force = $true }
+                    $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = 'serial workload exceeded overall wall-clock deadline' }
+                    $states.Add('RUNNING')
+                }
+                else {
+                    # RUNNING: start the sealed VM, WAIT for boot-readiness (the first command must not race
+                    # cloud-init), deliver the entrypoint over the serial seam, and arm capture. The boot-wait is
+                    # injectable (tests pass 0 so they never sleep the real ~60s).
+                    $runResult = Start-SandboxWorkload -Descriptor $descriptor -Entrypoint $entrypoint `
+                        -ArtifactRoot $ArtifactRoot -BootWaitSeconds $BootWaitSeconds `
+                        -BootPollDelaySeconds $BootPollDelaySeconds -Backend $Backend
+                    $report.RunResult = $runResult
+                    $states.Add('RUNNING')
 
-                # CAPTURED: the run-result + its out-of-band capture artifact are now recorded.
-                $states.Add('CAPTURED')
+                    # CAPTURED: the run-result + its out-of-band capture artifact are now recorded.
+                    $states.Add('CAPTURED')
 
-                # EXTRACTED: one-way OUT. Tier 0/1 reads the emitted result; Tier >= 2 routes to the
-                # quarantine stub (which THROWS — so a hostile-tier extraction aborts here, by design).
-                if (-not [string]::IsNullOrWhiteSpace($resultPath)) {
-                    $extracted = Export-SandboxArtifact -Descriptor $descriptor -ResultPath $resultPath `
-                        -Destination $Destination -Backend $Backend
-                    $report.ExtractedArtifact = $extracted
-                    $states.Add('EXTRACTED')
+                    # EXTRACTED: one-way OUT. Tier 0/1 reads the emitted result; Tier >= 2 routes to the
+                    # quarantine stub (which THROWS — so a hostile-tier extraction aborts here, by design).
+                    if (-not [string]::IsNullOrWhiteSpace($resultPath)) {
+                        $extracted = Export-SandboxArtifact -Descriptor $descriptor -ResultPath $resultPath `
+                            -Destination $Destination -Backend $Backend
+                        $report.ExtractedArtifact = $extracted
+                        $states.Add('EXTRACTED')
+                    }
                 }
             }
         }
