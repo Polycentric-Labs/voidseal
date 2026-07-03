@@ -548,6 +548,85 @@ Describe 'New-SandboxVM — sparse-parent preflight (fail closed before any crea
 }
 
 # ===========================================================================
+#  Test-HostFreeSpace — I6b host-free-space preflight (pure host-FS, no Hyper-V)
+# ===========================================================================
+#  Finding I6b: the engine had ZERO host-free-space preflight — a guest fork-bomb/fill can balloon
+#  a dynamic VHDX toward its max, exhausting host disk, with nothing gating it. Test-HostFreeSpace is
+#  a mockable helper (like Test-IsSparseFile) that measures the volume HOSTING a given path via
+#  Get-Volume -FilePath and fails closed BEFORE any disk is created when free space cannot cover the
+#  required budget + a fixed headroom. Provisioner.ps1 is dot-sourced (not module-imported) in this
+#  file, so — mirroring the Test-IsSparseFile idiom above — mock the cmdlet the helper calls
+#  (Get-Volume) with a plain `Mock Get-Volume { ... }`, NOT `-ModuleName`.
+Describe 'Test-HostFreeSpace (I6b host-free-space preflight)' {
+
+    It 'refuses when free space is below required budget + headroom' {
+        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 500MB } }
+        { Test-HostFreeSpace -Path 'D:\vm\out.vhdx' -RequiredBytes 2GB } |
+            Should -Throw -ExpectedMessage '*insufficient host free space*'
+    }
+
+    It 'passes when free space covers required budget + headroom' {
+        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 50GB } }
+        Test-HostFreeSpace -Path 'D:\vm\out.vhdx' -RequiredBytes 2GB | Should -BeTrue
+    }
+
+    It 'refuses when free space covers the raw budget but not the headroom on top of it' {
+        # 2GB required + 1GB default headroom = 3GB needed; 2.5GB free should still refuse.
+        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 2.5GB } }
+        { Test-HostFreeSpace -Path 'D:\vm\out.vhdx' -RequiredBytes 2GB } |
+            Should -Throw -ExpectedMessage '*insufficient host free space*'
+    }
+
+    It 'the thrown message names the path and the byte figures (actionable)' {
+        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 500MB } }
+        $msg = $null
+        try { Test-HostFreeSpace -Path 'D:\vm\out.vhdx' -RequiredBytes 2GB } catch { $msg = $_.Exception.Message }
+        $msg | Should -Not -BeNullOrEmpty
+        $msg | Should -Match ([regex]::Escape('D:\vm\out.vhdx')) -Because 'the message must name the offending path'
+        $msg | Should -Match '(?i)insufficient host free space'
+    }
+
+    It 'honors a caller-supplied -HeadroomBytes override' {
+        # 2GB required + 0 headroom = 2GB needed; 2GB free exactly should pass.
+        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 2GB } }
+        Test-HostFreeSpace -Path 'D:\vm\out.vhdx' -RequiredBytes 2GB -HeadroomBytes 0 | Should -BeTrue
+    }
+}
+
+# ===========================================================================
+#  New-SandboxVM — I6b host-free-space preflight wired BEFORE system-disk creation
+# ===========================================================================
+Describe 'New-SandboxVM — host-free-space preflight (I6b) runs before any disk is created' {
+
+    It 'refuses to provision (no VM, no disk) when the storage volume is reported as full' {
+        # Force Test-HostFreeSpace to refuse regardless of the real host's actual free space, so this
+        # test is deterministic on any CI/dev box. Mocking the higher-level helper (not Get-Volume
+        # directly) keeps this test coupled to the Provisioner's contract with Test-HostFreeSpace,
+        # not to Get-Volume's shape.
+        Mock Test-HostFreeSpace { throw "Test-HostFreeSpace: insufficient host free space on the volume hosting 'x' — need 999 bytes but only 1 free. Fail closed." }
+
+        $b = New-FakeHyperVBackend
+        $msg = $null
+        try { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-nospace' -Backend $b } catch { $msg = $_.Exception.Message }
+
+        $msg | Should -Not -BeNullOrEmpty -Because 'insufficient host free space must fail closed'
+        $msg | Should -Match '(?i)insufficient host free space'
+        (& $b.GetVM @{ Name = 'sbx-nospace' }) | Should -BeNullOrEmpty -Because 'the preflight must run BEFORE any VM is created'
+    }
+
+    It 'provisions normally when host free space is ample (the real, unmocked preflight passes on a real dev/CI volume)' {
+        # No mock here: New-SandboxVM must call the REAL Test-HostFreeSpace against the REAL storage
+        # root (Get-SandboxStorageRoot -> $env:ProgramData or TEMP), which lives on a real, resolvable
+        # host volume with GB+ free in any dev/CI environment. This proves the preflight is wired
+        # without breaking the ordinary happy path.
+        $b = New-FakeHyperVBackend
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-hasspace' -Backend $b
+        $desc | Should -Not -BeNullOrEmpty
+        (& $b.GetVM @{ Name = 'sbx-hasspace' }) | Should -Not -BeNullOrEmpty -Because 'ample free space must not block provisioning'
+    }
+}
+
+# ===========================================================================
 #  Reaper — Checkpoint-Sandbox / Restore-Sandbox roundtrip
 # ===========================================================================
 Describe 'Reaper — Checkpoint-Sandbox / Restore-Sandbox roundtrip' {

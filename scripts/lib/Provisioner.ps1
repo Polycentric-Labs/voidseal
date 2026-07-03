@@ -128,6 +128,43 @@ function Test-IsSparseFile {
 
 <#
 .SYNOPSIS
+    Pure host-FS free-space preflight (no Hyper-V call). Refuses fail-closed BEFORE any disk
+    creation when the volume hosting a VHDX cannot hold the required budget + headroom.
+.DESCRIPTION
+    Finding I6b: the engine had ZERO host-free-space preflight — a guest fork-bomb/fill can
+    balloon a dynamic VHDX toward its max, exhausting host disk, with nothing gating it.
+    Measures the volume HOSTING -Path (not necessarily C:) via `Get-Volume -FilePath`, so it
+    is correct regardless of which drive the sandbox storage root lives on. Split into its own
+    (mockable) function — like Test-IsSparseFile — so it is unit-testable without needing a
+    real near-full volume: tests `Mock Get-Volume { ... }`.
+
+    -Path need not exist yet (the caller invokes this BEFORE the disk is created); only the
+    volume it resolves onto must exist. An unresolvable volume (bad/disconnected drive letter)
+    is itself fail-closed: Get-Volume's own error propagates via -ErrorAction Stop rather than
+    being swallowed, since silently skipping the check on an unresolvable volume would be a
+    fail-OPEN containment hole.
+#>
+function Test-HostFreeSpace {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [long]   $RequiredBytes,
+        [long] $HeadroomBytes = 1GB   # fixed safety margin above the summed disk budgets
+    )
+    $vol = Get-Volume -FilePath $Path -ErrorAction Stop   # maps the .vhdx path to its hosting volume
+    $free = [long]$vol.SizeRemaining
+    $need = $RequiredBytes + $HeadroomBytes
+    if ($free -lt $need) {
+        throw ("Test-HostFreeSpace: insufficient host free space on the volume hosting '$Path' — " +
+               "need $need bytes (budget $RequiredBytes + headroom $HeadroomBytes) but only $free free. " +
+               "Free space or choose another storage root. Failing closed BEFORE disk creation.")
+    }
+    return $true
+}
+
+<#
+.SYNOPSIS
     Parse a human memory string ('4GB', '512MB', '2 GB') OR a raw byte count into bytes.
 .DESCRIPTION
     Tier profiles store Memory as a string ('4GB'); PowerShell's own 4GB literals are
@@ -349,6 +386,23 @@ function New-SandboxVM {
     $storageRoot = Get-SandboxStorageRoot -Name $Name
     $systemDisk  = Join-Path $storageRoot ("{0}-system.vhdx" -f $Name)
     $comPipe     = "\\.\pipe\{0}-com1" -f $Name
+
+    # --- host-free-space preflight (I6b; fail-closed; pure host-FS, BEFORE any creation) --
+    # A guest fork-bomb/fill can balloon a dynamic VHDX toward its max with nothing gating host
+    # disk exhaustion. Budget = the system disk's worst-case size: for a DIFFERENCING child, its
+    # PARENT's on-disk size is the conservative bound (the child grows toward the parent's data,
+    # and a bad/sparse parent was already rejected above so the parent's Length is a real number
+    # here); for a fresh disk, the full requested $SystemDiskSizeBytes (a dynamic disk's worst
+    # case at CREATE time, since currentFileSize≈0). Measures the volume hosting $storageRoot —
+    # the REAL sandbox storage root every provision uses (ProgramData or TEMP), not a caller-
+    # supplied path — so this never depends on a test's fake VM name resolving to a real drive.
+    $requiredBytes = if (-not [string]::IsNullOrWhiteSpace($ParentDiskPath)) {
+        (Get-Item -LiteralPath $ParentDiskPath).Length
+    }
+    else {
+        $SystemDiskSizeBytes
+    }
+    $null = Test-HostFreeSpace -Path $storageRoot -RequiredBytes $requiredBytes
 
     # --- artifact tracking for mid-provision ROLLBACK ---------------------
     # If ANY creation step below throws, the catch best-effort tears down EXACTLY what was
