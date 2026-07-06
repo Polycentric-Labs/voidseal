@@ -15,10 +15,14 @@ cut, the **host** (never the guest's self-report) certifies the VM has no networ
 volume, no residual transfer medium, and no live host↔guest channel — and the workload is structurally
 unreachable unless that certification returns true. For a Tier-1 VM, which legitimately keeps a NIC
 (net-restricted, not no-net), the seal instead certifies that NIC's vSwitch is an isolated **Internal**
-switch — never an unfiltered External or the non-configurable Default Switch — so the guest's only
-possible route off-box is the host-controlled gateway on that Internal switch. That is a host-verified
-**switch-isolation** guarantee (reachability), not a claim about which domains/IPs the guest can reach
-once on that route — see "Tier-1 egress" below for why the two are not the same thing. Higher tiers
+switch — never an unfiltered External or Private switch — so the guest's only possible route off-box is
+the host-controlled gateway on that Internal switch. That is a host-verified **switch-isolation**
+guarantee (reachability) for a **purpose-built** Internal switch, not a claim about which domains/IPs the
+guest can reach once on that route — see "Tier-1 egress" below for why the two are not the same thing.
+**Caveat:** the built-in "Default Switch" is itself `SwitchType=Internal` (it is Hyper-V's ICS/internet-
+connected switch, not a purpose-built isolated one), so this SwitchType check alone cannot distinguish or
+refuse it — real Tier-1 provisioning uses a purpose-built Internal switch, and an explicit by-name refusal
+of the Default Switch is Phase-6-live (see "Tier-1 egress" below). Higher tiers
 additionally **starve** the guest of network and credentials at load time (refused if a Tier ≥ 2 profile
 declares any), and route hostile output through a one-way cold-disk quarantine boundary rather than a
 trusting host read.
@@ -190,10 +194,15 @@ full privileges of whoever invokes it — here, the host operator.
   unsophisticated or non-adversarial workload) — not as the security boundary.
   - **What IS host-verified today: switch isolation, not egress filtering.** `Assert-Sealed` verifies
     (from the host, never the guest's self-report) that a Tier-1 VM's NIC sits on an isolated **Internal**
-    vSwitch rather than an External or Default switch. That is a genuine host-enforced guarantee that the
+    vSwitch rather than an External or Private switch. That is a genuine host-enforced guarantee that the
     guest's only possible network path leaves through the host-controlled gateway on that Internal
-    switch — an unfiltered External/Default switch is refused, fail-closed. It says nothing about *which*
+    switch — an unfiltered External/Private switch is refused, fail-closed. It says nothing about *which*
     destinations are reachable through that gateway; today, nothing on the host filters what crosses it.
+    **Caveat:** the built-in "Default Switch" is itself `SwitchType=Internal` (Hyper-V's ICS/internet-
+    connected switch), so this check cannot distinguish it from a purpose-built isolated Internal switch —
+    it would certify a Default-Switch-connected NIC as sealed. Real Tier-1 provisioning uses a purpose-
+    built Internal switch, never the Default Switch; an explicit by-name refusal of the Default Switch is
+    Phase-6-live, tracked alongside the egress-filtering layer below.
   - **Egress filtering at the host is the Phase-6-live layer, not yet built.** The planned control is a
     host-run transparent Squid SNI-splice proxy plus a host-side NAT (`New-NetNat`) and a host default-DROP
     policy on the Internal switch's gateway interface — i.e. the same allow-only-what's-needed filtering

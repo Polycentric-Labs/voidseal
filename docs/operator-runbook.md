@@ -197,10 +197,14 @@ $report.RunResult.ExitCode
 > VM legitimately keeps its NIC (net-restricted, not no-net), so the seal can't certify "no network" the
 > way it does at Tier ≥ 2. What it certifies instead: `Assert-Sealed` reads the NIC's vSwitch from the
 > **host** and refuses to certify unless that switch is an isolated **Internal** vSwitch — never an
-> unfiltered External switch, never the non-configurable Default Switch. That's a real, host-verified
-> guarantee that the guest's only possible route off-box is the host-controlled gateway on that Internal
-> switch. It is **not** a guarantee that egress is filtered — nothing today inspects or restricts what
-> crosses that gateway once traffic is on it.
+> unfiltered External or Private switch. That's a real, host-verified guarantee that the guest's only
+> possible route off-box is the host-controlled gateway on that Internal switch — **for a purpose-built
+> Internal switch.** It is **not** a guarantee that egress is filtered — nothing today inspects or
+> restricts what crosses that gateway once traffic is on it. **It also does not, today, refuse the
+> built-in "Default Switch" by name:** the Default Switch is itself `SwitchType=Internal` (Hyper-V's
+> ICS/internet-connected switch), so this check cannot distinguish it from a purpose-built isolated
+> Internal switch. Real Tier-1 provisioning uses a purpose-built Internal switch, never the Default
+> Switch; an explicit by-name refusal of the Default Switch is Phase-6-live.
 >
 > The in-guest controls (the builder profile's iptables default-DROP-plus-allowlist, the in-guest Squid
 > SNI proxy) are **not** a containment boundary: a compromised or adversarial guest with code-execution

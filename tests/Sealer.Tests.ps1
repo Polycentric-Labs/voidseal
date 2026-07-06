@@ -562,18 +562,23 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
             Should -Throw -ExpectedMessage '*Internal*' -Because 'an External switch bypasses the host-controlled egress chokepoint; the seal must refuse'
     }
 
-    It 'Tier-1: REFUSES when the NIC is on the Default Switch / an unresolvable switch' {
-        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-default'
+    It 'Tier-1: REFUSES when the NIC is on an unresolvable switch name (no matching VMSwitch on host)' {
+        # NOTE (accuracy, whole-branch review): this models an UNREGISTERED/unresolvable switch name
+        # (GetSwitch -> $null), NOT the real built-in "Default Switch" — on a real host the Default
+        # Switch resolves via Get-VMSwitch with SwitchType=Internal (it is Hyper-V's ICS/internet-
+        # connected switch), so today's SwitchType-only check would CERTIFY a Default-Switch-connected
+        # NIC, not refuse it. The string 'Default Switch' below is used only as a plausible-looking name
+        # that this fake backend has never registered via NewSwitch — it stands in for any name with no
+        # host-side VMSwitch object, mirroring a real unresolvable-switch host state. An explicit by-NAME
+        # refusal of the actual Default Switch is Phase-6-live (see progress.md §Track).
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-unresolvable'
         $b = $sb.Backend; $d = $sb.Desc
         Lock-Sandbox -Descriptor $d -Backend $b
-        # The Default Switch is Hyper-V's non-configurable ICS switch — it is never created via
-        # NewSwitch, so GetSwitch cannot resolve it (mirrors a real host: no matching VMSwitch
-        # object under host control). Re-point the NIC's SwitchName directly to model this.
-        & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-default' }
-        $vm = & $b.GetVM @{ Name = 'sbx-i4-default' }
+        & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-unresolvable' }
+        $vm = & $b.GetVM @{ Name = 'sbx-i4-unresolvable' }
         $vm.NetworkAdapters.Add(@{ SwitchName = 'Default Switch'; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Internal*' -Because 'the Default Switch is ICS/non-configurable and not host-verifiable as Internal; fail closed'
+            Should -Throw -ExpectedMessage '*Internal*' -Because 'a NIC on a switch name with no resolvable host VMSwitch object cannot be verified isolated; fail closed'
     }
 
     It 'Tier-1: REFUSES when a NIC has no resolvable SwitchName (blank)' {

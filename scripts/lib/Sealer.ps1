@@ -598,8 +598,11 @@ function Lock-Sandbox {
         legitimately keeps its NIC, so the NIC check is tier-gated; the media + channel checks
         apply to every tier.
       * Tier == 1 (non-processor): every NIC MUST be on an isolated Internal vSwitch (I4) — its
-        SwitchType is host-verified via GetSwitch. An External or Default (or unresolvable)
-        switch bypasses the host-controlled egress chokepoint and is refused, fail-closed.
+        SwitchType is host-verified via GetSwitch. An External, Private, or unresolvable switch
+        bypasses the host-controlled egress chokepoint and is refused, fail-closed. NOTE: the
+        built-in Default Switch is itself SwitchType=Internal (ICS/internet-connected), so this
+        check does NOT distinguish/refuse it by type alone — an explicit by-name refusal is
+        Phase-6-live (see SECURITY.md).
       * no import DVD/ISO attached (a live read-only-but-present host<->guest medium).
       * no transfer/import VHD recorded on the descriptor still attached.
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.
@@ -690,10 +693,15 @@ function Assert-Sealed {
     # --- Tier 1 (net-restricted, non-processor): the NIC MUST be on the ISOLATED Internal vSwitch (I4) ---
     # A Tier-1 VM legitimately HAS a NIC (net-restricted, not no-net), but its egress must ride the HOST
     # chokepoint — an Internal vSwitch whose gateway the host controls (Pass A Q2). An External switch bypasses
-    # the host TCP/IP stack (unfiltered egress); the Default Switch is ICS/non-configurable. On anything but an
-    # Internal switch the seal would be a LIE about Tier-1 containment. Verify each NIC's switch is
-    # SwitchType='Internal', fail closed otherwise. (Egress FILTERING via host Squid/NAT/default-DROP is the
-    # Phase-6-live layer; this asserts switch ISOLATION only — the VM can reach only the host gateway.)
+    # the host TCP/IP stack (unfiltered egress) and is refused. NOTE (accuracy, whole-branch review): the
+    # built-in "Default Switch" is ITSELF SwitchType='Internal' (it is Hyper-V's ICS/internet-connected
+    # switch, confirmed on real hardware) — so this SwitchType-based check does NOT distinguish it from a
+    # purpose-built isolated Internal switch and would CERTIFY a Default-Switch-connected NIC as sealed.
+    # Real Tier-1 provisioning uses a purpose-built Internal switch (never the Default Switch); an explicit
+    # by-NAME refusal of the Default Switch, plus host egress filtering, is Phase-6-live (see §Track in
+    # progress.md). Verify each NIC's switch is SwitchType='Internal', fail closed on External/Private/
+    # unresolvable. (Egress FILTERING via host Squid/NAT/default-DROP is also Phase-6-live; this asserts
+    # switch ISOLATION only — the VM can reach only the host gateway of whatever Internal switch it's on.)
     if ($tier -eq 1 -and -not $isProcessor) {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
         foreach ($nic in $nics) {
@@ -708,7 +716,7 @@ function Assert-Sealed {
                 $gotType = if ($null -eq $sw) { '(switch not found on host)' } else { [string]$sw.SwitchType }
                 throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED — its NIC is on switch " +
                        "'$switchName' (SwitchType=$gotType), not an isolated Internal vSwitch. A Tier-1 VM's egress " +
-                       "MUST ride the host-controlled Internal-switch gateway, never an External/Default switch " +
+                       "MUST ride the host-controlled Internal-switch gateway, never an External or Private switch " +
                        "(which bypasses the host stack). Fail closed.")
             }
         }
