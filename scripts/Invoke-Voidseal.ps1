@@ -564,8 +564,9 @@ function Invoke-Voidseal {
             # DiskFull ABORTS fail-closed BEFORE the seed-disk/seal/run steps below — the sandbox never seals
             # or runs against a partial INPUT / absent OUTPUT disk. No orchestrator-side sentinel branch is
             # needed here; the existing lifecycle-abort machinery handles it (same path as SimulateStartVMError
-            # et al.). Follow-up (tracked): a lifecycle-level test asserting a DiskFull throw never reaches
-            # Assert-Sealed. (Real host-disk-full HResult classification is LIVE-ONLY-UNPROVEN until Phase 6.)
+            # et al.). This crossing ("a DiskFull throw never reaches Assert-Sealed") is pinned by the I2b
+            # lifecycle-abort tests in InvokeVoidseal.Tests.ps1 (~:1024, :1046). (Real host-disk-full HResult
+            # classification is LIVE-ONLY-UNPROVEN until Phase 6.)
 
             # RC6: the CIDATA seed DATA DISK — built from the resolved profile's Entrypoint (the disk-mode
             # runner) and recorded on the descriptor (SeedDiskPath + CreatedDisks) so it survives the seal

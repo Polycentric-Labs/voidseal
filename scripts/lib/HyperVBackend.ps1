@@ -1842,8 +1842,9 @@ function New-FakeHyperVBackend {
         Available   = -not $SimulateUnavailable.IsPresent
         # Cross-cutting CALL LOG that survives RemoveVM (the VM record is gone after teardown, so a
         # test that needs to prove detach/read ordering after a full Invoke-Voidseal run reads it here).
-        # Each entry: @{ Op=<method>; Path=<path>; VMName=<vm> }. Appended by RemoveHardDiskDrive (the
-        # detach) and ReadVhdxFile (the host read) so a test can assert detach-precedes-read ordering.
+        # Each entry: @{ Op=<method>; Path=<path>; VMName=<vm> }. Appended by the instrumented method
+        # closures — grep `CallLog.Add` for the current set — so a test can assert invocation-reached /
+        # ordering facts (e.g. detach-precedes-read, or a lifecycle abort never reaching StartVM).
         CallLog     = [System.Collections.Generic.List[object]]::new()
     }
 

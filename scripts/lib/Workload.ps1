@@ -25,11 +25,12 @@
     ("System.Byte[]") instead of its actual bytes. New-WorkloadDisks now branches on the Input
     VALUE's runtime type: a [byte[]] value routes through the byte-clean WriteVhdxFileBytes (Task 5);
     a [string] value keeps using the string WriteVhdxFile (text profiles unchanged, zero behavior
-    change). An EMPTY [byte[]] Input is SKIPPED (not written) — $SbAssertArg's `return $P[$Key]`
-    unrolls a 0-length byte[] arg to $null (a pre-existing bug on BOTH the real and fake backend,
-    parity-preserving, flagged by the Task-5 gate), so passing one through would throw a confusing
-    "required argument missing" rather than doing anything useful; no shipped profile emits an empty
-    binary Input, so skipping is a safe, documented no-op rather than a silent corruption risk.
+    change). An EMPTY [byte[]] Input is now WRITTEN as an empty inner file, same as any other
+    [byte[]] Input — no skip, no special-casing. $SbAssertArg's leading-comma `return ,$P[$Key]`
+    (F2 fix, HyperVBackend.ps1 — see its header comment for the empirically-verified `&`-boundary-
+    unroll mechanics) preserves a 0-length [byte[]] arg's shape across the single `&`-invocation
+    boundary instead of unrolling it to $null, so the byte-clean WriteVhdxFileBytes path receives
+    the genuine empty array and writes it through end-to-end, shape intact.
 
     DISK SIZES (I2b): INPUT/OUTPUT disk sizes were hardcoded to 1GB regardless of profile. They are
     now read from the profile's InputDiskSizeBytes / OutputDiskSizeBytes keys, each DEFAULTING to
