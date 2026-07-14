@@ -978,6 +978,24 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report.Released | Should -BeNullOrEmpty -Because 'a missing-hash abort is fail-closed — nothing is released (symmetry with DENY-on-deps-mismatch)'
     }
 
+    It 'DENY-on-deps-unreadable: a deps disk path GetVHDInfo cannot read (never registered on the backend) is REFUSED before attach (I1 follow-up)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        # A plausible DepsDiskPath that is NEVER registered in the fake's VHD state (no NewVHD call) —
+        # GetVHDInfo (HyperVBackend.ps1) returns $null for any unknown path, modelling a deps hand-off
+        # naming a disk the host cannot actually read. A DepsImageHash IS supplied (per the task brief) so
+        # the refusal under test — the null-GetVHDInfo refusal (Invoke-Voidseal.ps1:606-609) — fires, not
+        # the sibling DENY-on-missing-deps-hash refusal above.
+        $unreadableDepsDisk = Join-Path $script:TmpRoot ("deps-unregistered-{0}.vhdx" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $unreadableDepsDisk; DepsImageHash = ('0' * 64) } `
+            -Name 'sbx-proc-depsunreadable' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'an unreadable (never-registered) deps disk aborts BEFORE the seal'
+        $report.Error | Should -Match '(?i)unreadable via GetVHDInfo' -Because 'the abort names the specific GetVHDInfo-unreadable refusal, not a generic throw'
+        $report.Released | Should -BeNullOrEmpty -Because 'an unreadable-deps abort is fail-closed — nothing is released (symmetry with the sibling DENY tests)'
+        (& $b.GetVM @{ Name = 'sbx-proc-depsunreadable' }) | Should -BeNullOrEmpty -Because 'teardown must still run cleanly — no orphaned VM'
+    }
+
     It 'I1 DENY-on-differencing-deps: a DEPS disk that is a DIFFERENCING disk (container-swap / attacker-parent) is REFUSED before attach' {
         # Arrange: a deps disk whose GetVHDInfo reports Differencing=$true + a ParentPath (footer/parent-
         # locator rewrite — a container-swap attack that pulls real blocks from an attacker-controlled
@@ -997,6 +1015,53 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         @($report.States) | Should -Not -Contain 'SEALED' -Because 'a differencing/parent-bearing deps disk aborts BEFORE the seal'
         $report.Error | Should -Match '(?i)differencing|parent' -Because 'the abort names the differencing/parent-bearing deps disk'
         $report.Released | Should -BeNullOrEmpty -Because 'a differencing-deps abort is fail-closed — nothing is released'
+    }
+
+    # ---- I2b follow-up: a host-side ENOSPC during New-WorkloadDisks must abort the WHOLE
+    # Invoke-Voidseal run PRE-SEAL ("a DiskFull throw never reaches Assert-Sealed"). Previously this
+    # crossing was only argued structurally (via the SimulateStartVMError analogue); these tests drive
+    # it directly. ----
+    It 'I2b lifecycle abort: a host-side ENOSPC (SimulateWriteEnospc) during New-WorkloadDisks Inputs-populate aborts the WHOLE run PRE-SEAL, with clean teardown' {
+        # A Disk-mode processor-profile COPY whose Inputs carries a NON-empty [byte[]] value, so the
+        # populate path deterministically routes through WriteVhdxFileBytes (the byte-clean I2b path,
+        # Workload.ps1) — the ENOSPC throw lands on the New-WorkloadDisks-wrapped classify-then-rethrow
+        # site ("writing Input '<k>' onto the INPUT disk"), never a generic/unclassified throw.
+        $diskFullProfile = @{} + $script:Proc
+        $diskFullProfile['Inputs'] = @{ 'seed.bin' = [byte[]](1, 2, 3, 4) }
+        Assert-TierProfileValid -Profile $diskFullProfile -Context 'TEST Tier-0 processor DiskFull fixture'
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWriteEnospc
+        $report = Invoke-Voidseal -Tier 0 -Profile $diskFullProfile `
+            -Name 'sbx-proc-diskfull' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Error | Should -Match '(?i)DiskFull' -Because 'a host-side ENOSPC populating the INPUT disk must classify DiskFull, never a generic/unclassified throw'
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'the DiskFull throw fires inside New-WorkloadDisks, strictly BEFORE Lock-Sandbox/Assert-Sealed'
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'a pre-seal abort must never reach the workload-run state'
+        $report.SealVerdict | Should -Not -Be $true -Because 'Assert-Sealed never ran on this aborted deploy'
+        (& $b.GetVM @{ Name = 'sbx-proc-diskfull' }) | Should -BeNullOrEmpty -Because 'teardown must still run cleanly on a DiskFull abort — no orphaned VM'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0 -Because 'the run aborted before ever reaching StartVM — RUNNING was never entered'
+    }
+
+    It 'I2b lifecycle abort (CreateEnospc variant): a host-side ENOSPC (SimulateCreateEnospc) creating the INPUT disk in New-WorkloadDisks ALSO aborts PRE-SEAL with the same DiskFull classification' {
+        # VERIFICATION (per the task brief's precondition): in the FULL Disk-mode lifecycle, NewOutputVhdx
+        # is called ONLY from Workload.ps1 (New-WorkloadDisks: INPUT then OUTPUT; New-WorkloadSeedDisk:
+        # CIDATA — which runs only AFTER New-WorkloadDisks, and only when an Entrypoint is set). So the
+        # backend's FIRST NewOutputVhdx call in ANY Disk-mode lifecycle is unambiguously New-WorkloadDisks'
+        # INPUT-disk create — the SAME classify-then-rethrow site the populate-path It above exercises —
+        # never an earlier unwrapped call site. (Confirmed: no other production file ever calls
+        # `& $Backend.NewOutputVhdx`.) This It proves that verified landing site directly.
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateCreateEnospc
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Name 'sbx-proc-createenospc' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Error | Should -Match '(?i)DiskFull' -Because 'a host-side ENOSPC creating the INPUT disk must classify DiskFull, never a generic/unclassified throw'
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'the DiskFull throw fires inside New-WorkloadDisks, strictly BEFORE Lock-Sandbox/Assert-Sealed'
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'a pre-seal abort must never reach the workload-run state'
+        $report.SealVerdict | Should -Not -Be $true -Because 'Assert-Sealed never ran on this aborted deploy'
+        (& $b.GetVM @{ Name = 'sbx-proc-createenospc' }) | Should -BeNullOrEmpty -Because 'teardown must still run cleanly on a DiskFull abort — no orphaned VM'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0 -Because 'the run aborted before ever reaching StartVM — RUNNING was never entered'
     }
 
     # ---- whole-branch-review Fix B: the C2.6 runs/day rate cap is now WIRED into the orchestrator's
