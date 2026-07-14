@@ -272,6 +272,14 @@ Describe 'Fake backend — VM lifecycle' {
         (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
     }
 
+    It 'StartVM logs exactly one Op=StartVM CallLog entry for the started VM (positive control — pins the invocation-was-reached instrumentation used by the I2b lifecycle-abort tests'' zero-StartVM-entries assertions)' {
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $script:B.StartVM @{ Name = 'vm1' }
+        $entries = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' })
+        $entries.Count | Should -Be 1 -Because 'StartVM must log its own invocation exactly once — otherwise a lifecycle test asserting zero StartVM CallLog entries would pass vacuously regardless of whether StartVM ran'
+        $entries[0].VMName | Should -Be 'vm1'
+    }
+
     It 'RemoveVM removes the VM but does NOT delete its VHDX records (caller cleans disks)' {
         & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
         & $script:B.NewVHD @{ Path = 'C:\vhd\vm1.vhdx'; SizeBytes = 40GB }
