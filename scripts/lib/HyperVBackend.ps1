@@ -2587,6 +2587,12 @@ function New-FakeHyperVBackend {
         param([System.Collections.IDictionary] $P)
         # SEAL: strip every NIC.
         $vm = & $requireVM (& $GetArg $P 'VMName') 'RemoveNetworkAdapter'
+        # Log the invocation so a test can prove RemoveNetworkAdapter was actually REACHED (e.g. a
+        # no-seal test asserting ZERO RemoveNetworkAdapter entries is otherwise vacuous — it would pass
+        # whether or not this closure ever ran). Mirrors the StartVM / RemoveHardDiskDrive precedent —
+        # the entry means "RemoveNetworkAdapter was INVOKED"; this closure has no simulated-failure
+        # branch, so there is no throw to log before.
+        $state.CallLog.Add(@{ Op = 'RemoveNetworkAdapter'; Path = $null; VMName = $vm.Name })
         $vm.NetworkAdapters = [System.Collections.Generic.List[object]]::new()
     }.GetNewClosure()
 

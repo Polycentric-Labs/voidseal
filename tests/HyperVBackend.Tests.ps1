@@ -280,6 +280,14 @@ Describe 'Fake backend — VM lifecycle' {
         $entries[0].VMName | Should -Be 'vm1'
     }
 
+    It 'RemoveNetworkAdapter logs exactly one Op=RemoveNetworkAdapter CallLog entry for the VM (positive control — pins the invocation-was-reached instrumentation used by the builder no-seal tests'' zero-RemoveNetworkAdapter-entries assertions)' {
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        $entries = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' })
+        $entries.Count | Should -Be 1 -Because 'RemoveNetworkAdapter must log its own invocation exactly once — otherwise a test asserting zero RemoveNetworkAdapter CallLog entries would pass vacuously regardless of whether RemoveNetworkAdapter ran'
+        $entries[0].VMName | Should -Be 'vm1'
+    }
+
     It 'RemoveVM removes the VM but does NOT delete its VHDX records (caller cleans disks)' {
         & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
         & $script:B.NewVHD @{ Path = 'C:\vhd\vm1.vhdx'; SizeBytes = 40GB }
