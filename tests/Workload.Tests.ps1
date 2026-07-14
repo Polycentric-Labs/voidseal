@@ -186,18 +186,21 @@ Describe 'New-WorkloadDisks — binary Input byte-path (I2b)' {
         [System.Linq.Enumerable]::SequenceEqual([byte[]]$rt, [byte[]]@(0x10, 0x20)) | Should -BeTrue
     }
 
-    It 'skips an EMPTY byte[] Input rather than breaking on the $SbAssertArg 0-length-unroll bug' {
-        # KNOWN pre-existing bug (Task-5 gate): $SbAssertArg's `return $P[$Key]` unrolls a 0-length
-        # byte[] arg to $null on BOTH real and fake (parity-preserving, not a fake≠real divergence).
-        # New-WorkloadDisks must not let an empty binary Input silently corrupt/throw — it skips it
-        # (documented no-op) rather than calling WriteVhdxFileBytes with an arg that would collapse.
+    It 'writes an EMPTY byte[] Input as an empty file (F2: $SbAssertArg shape fix — no more length-0 skip)' {
+        # F2 fix: $SbAssertArg now comma-wraps its return (HyperVBackend.ps1), so a genuinely-empty
+        # [byte[]] Input survives the WriteVhdxFileBytes round-trip shape-intact. The prior length-0
+        # skip guard (a documented no-op papering over the $SbAssertArg unroll bug) is REMOVED — an
+        # empty binary Input is now WRITTEN as an empty inner file, same as any other byte[] Input.
         $b = New-FakeHyperVBackend
         $null = & $b.NewVM @{ Name='empty1'; Generation=2 }
         $d = New-SandboxDescriptor -Name 'empty1' -Tier 0
         $prof = @{ Name='empty1'; Inputs = @{ 'empty.bin' = [byte[]]@() }; FileSystem = 'exFAT' }
-        { New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\empty1' -Backend $b } | Should -Not -Throw
-        $calls = @($b.FakeCallLog | Where-Object { $_.InnerPath -eq 'empty.bin' })
-        $calls.Count | Should -Be 0 -Because 'an empty byte[] Input is skipped, not passed through the broken empty-arg path'
+        $d2 = New-WorkloadDisks -Descriptor $d -Profile $prof -StorageRoot 'C:\s\empty1' -Backend $b
+        $calls = @($b.FakeCallLog | Where-Object { $_.Op -eq 'WriteVhdxFileBytes' -and $_.InnerPath -eq 'empty.bin' })
+        $calls.Count | Should -Be 1 -Because 'an empty byte[] Input must be WRITTEN (not silently skipped) now that the shape survives the round trip'
+        $got = & $b.ReadVhdxFileBytes @{ Path = $d2.InputDiskPath; InnerPath = 'empty.bin' }
+        ($got -is [byte[]]) | Should -BeTrue -Because 'the written empty file must read back as an intact [byte[]], not $null'
+        $got.Length | Should -Be 0
     }
 }
 

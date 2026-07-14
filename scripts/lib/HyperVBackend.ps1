@@ -251,6 +251,19 @@ function Get-HyperVBackendMethodManifest {
 # the hashtable onto it.
 
 # Read an optional arg key (missing -> $Default). StrictMode-safe.
+# F2 AUDIT (2026-07-14): `return $P[$Key]` below crosses the SAME single `&`-invocation boundary as
+# $SbAssertArg (see its comment for the pipeline-unroll mechanism), so this helper carries the
+# identical latent hazard for an array-typed $Key. Audited every call site (`& $GetArg $P ...`, both
+# factories): every key ever read through THIS helper is a scalar (bool/int/string) at every actual
+# call site — most are immediately re-cast (`[bool](...)`, `[int](...)`), which happens to normalize
+# even a corrupted return back to a valid scalar anyway. The ONE manifest-declared array-typed key
+# reachable via $GetArg is SetFirmware's 'BootOrder' (@('VMName','EnableSecureBoot',
+# 'SecureBootTemplate','BootOrder')) — but NO caller (production or test) ever supplies it:
+# Provisioner.ps1's SetFirmware call passes only VMName/EnableSecureBoot/SecureBootTemplate. So the
+# hazard is CURRENTLY UNREACHABLE and this helper is left unfixed (comment-only) rather than
+# comma-wrapped preemptively. If BootOrder (or any future array-typed optional arg) is ever wired to
+# a real caller, apply the SAME `,$P[$Key]` fix here in lockstep, plus a direct helper test mirroring
+# $SbAssertArg's array-shape-preservation tests.
 $script:SbGetArg = {
     param([System.Collections.IDictionary] $P, [string] $Key, $Default = $null)
     if ($null -ne $P -and $P.Contains($Key)) { return $P[$Key] }
@@ -258,13 +271,25 @@ $script:SbGetArg = {
 }
 
 # Read a required arg key; throw a clear message naming the method + key if absent.
+# F2: the LEADING COMMA on the `return` below is REQUIRED — do NOT "simplify" it away. This
+# scriptblock is invoked across a SINGLE `&`-invocation boundary (`& $script:SbAssertArg $P 'Key'
+# 'Method'`), and PowerShell unrolls the pipeline output of an `&`-invoked scriptblock by one level:
+# an array-typed $P[$Key] loses its shape crossing that boundary — a 0-length [byte[]] unrolls to
+# $null, a 1-element [byte[]] collapses to a bare scalar [byte], and an n-element [byte[]]
+# re-collects as [object[]]. The comma wraps $P[$Key] in a 1-element outer array so the single
+# unroll at the `&` boundary strips exactly that wrapper and hands the caller back the ORIGINAL
+# array intact — same idiom as the double/single-comma returns on ReadVhdxFileBytes /
+# ReadVhdxRawRegion above (see their comments for the empirically-verified pwsh evidence; those
+# cross TWO `&` boundaries and need a DOUBLE comma, this helper crosses only ONE). Scalars/strings/
+# hashtables are unaffected: a 1-element array wrapping a non-array scalar unrolls right back to
+# that same scalar, and PowerShell never unrolls strings or IDictionary (Hashtable) objects.
 $script:SbAssertArg = {
     param([System.Collections.IDictionary] $P, [string] $Key, [string] $Method)
     if ($null -eq $P -or -not $P.Contains($Key) -or $null -eq $P[$Key] -or
         ($P[$Key] -is [string] -and [string]::IsNullOrWhiteSpace($P[$Key]))) {
         throw "HyperVBackend.${Method}: required argument '$Key' is missing."
     }
-    return $P[$Key]
+    return ,$P[$Key]
 }
 
 # Classify a caught Hyper-V error as the unavailable/insufficient-privilege case.

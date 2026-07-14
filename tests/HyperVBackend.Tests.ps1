@@ -1163,17 +1163,25 @@ Describe 'Fake backend — disk operations' {
         $second[0] | Should -Be 0x01 -Because 'ReadVhdxFileBytes must hand out a fresh copy each call, not a live alias into the fake''s own store'
         [System.Linq.Enumerable]::SequenceEqual([byte[]]$second, [byte[]]@(0x01,0x02,0x03)) | Should -BeTrue
     }
-    # NOTE (found while adding the above regressions, OUT OF SCOPE for this task's 3 fixes): a
-    # WriteVhdxFileBytes round-trip of a genuine 0-LENGTH byte[] payload currently throws
-    # ArgumentNullException, because $script:SbAssertArg's `return $P[$Key]` (HyperVBackend.ps1:259,
-    # no leading comma) unrolls a 0-length array argument to $null across ITS OWN `&`-invocation
-    # boundary, before WriteVhdxFileBytes's `[byte[]](& $AssertArg ...)` cast ever sees it — `[byte[]]
-    # $null` stays $null, and `[System.Array]::Copy($null, ...)` throws. This reproduces identically
-    # on the REAL and FAKE write paths (both share the `[byte[]](& $AssertArg $P 'Bytes'
-    # 'WriteVhdxFileBytes')` hoist), so it is fake≠real-PARITY-PRESERVING, not a divergence — and it
-    # sits in $AssertArg / the WRITE path, not the READ-side array-unrolling bug this task fixes.
-    # Flagging for a follow-up task rather than fixing here (fixing $AssertArg's return shape is a
-    # broader change touching every method that takes an array-typed arg).
+    # F2 FIX (follow-up task, closes the gap flagged above): a WriteVhdxFileBytes round-trip of a
+    # genuine 0-LENGTH byte[] payload used to throw ArgumentNullException, because
+    # $script:SbAssertArg's `return $P[$Key]` (no leading comma) unrolled a 0-length array argument
+    # to $null across ITS OWN `&`-invocation boundary, before WriteVhdxFileBytes's
+    # `[byte[]](& $AssertArg ...)` cast ever saw it. That reproduced identically on the REAL and
+    # FAKE write paths (both share the `[byte[]](& $AssertArg $P 'Bytes' 'WriteVhdxFileBytes')`
+    # hoist) — fake≠real-PARITY-PRESERVING, not a divergence. Fixed by comma-wrapping SbAssertArg's
+    # return (`return ,$P[$Key]`); see that scriptblock's header comment (HyperVBackend.ps1) and the
+    # direct helper coverage in the "$script:SbAssertArg — array shape preservation" Describe block
+    # below. This test proves the fix end-to-end through the fake's actual write/read path.
+    It 'fake WriteVhdxFileBytes with an empty [byte[]] payload writes an empty inner file (F2: $SbAssertArg 0-length shape fix)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-empty.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        { & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-empty.vhdx'; InnerPath='empty.bin'; Bytes=[byte[]]@() } } |
+            Should -Not -Throw -Because 'a genuinely-empty [byte[]] Bytes arg must not unroll to $null and trip the required-argument-missing throw'
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-empty.vhdx'; InnerPath='empty.bin' }
+        ($got -is [byte[]]) | Should -BeTrue -Because 'the round-tripped empty payload must come back as an intact [byte[]], not $null'
+        $got.Length | Should -Be 0
+    }
     It 'REAL byte-return composition-analog: a return crossing the exact two `&`-boundary shape (& $InvokeOp { return ,,$x }) yields an intact [byte[]] for 0/1/N bytes, while a single comma through the SAME shape does not — ULTRACODE fake≠real gate regression' {
         # HyperVBackend.ps1's REAL ReadVhdxFileBytes/ReadVhdxRawRegion route their byte[] return through
         # $InvokeOp (`try { return (& $Operation) } catch {...}`), a scriptblock invoked via `&` — a SECOND
@@ -1276,6 +1284,55 @@ Describe 'Fake backend — disk operations' {
     It 'RemoveVHD on an unknown path is an idempotent no-op (does not throw)' {
         { & $script:B.RemoveVHD @{ Path = 'C:\vhd\never.vhdx' } } |
             Should -Not -Throw -Because 'deleting an absent disk is a no-op, mirroring the real Test-Path guard'
+    }
+}
+
+# ===========================================================================
+#  $script:SbAssertArg — array shape preservation across the & boundary (F2)
+# ===========================================================================
+# The helper is shared by BOTH factories (hoisted into each factory's locals), so testing it
+# directly here — rather than only indirectly via a backend method — pins its contract once for
+# both. See the scriptblock's own header comment (HyperVBackend.ps1) for the pipeline-unroll
+# mechanism these tests exercise.
+Describe '$script:SbAssertArg — array shape preservation across the & boundary (F2)' {
+
+    It 'returns an intact 0-length [byte[]] for an empty array arg (not $null)' {
+        $got = & $script:SbAssertArg @{ Bytes = [byte[]]@() } 'Bytes' 'X'
+        ($got -is [byte[]]) | Should -BeTrue -Because 'a 0-length [byte[]] must survive the & boundary shape-intact, not unroll to $null'
+        $got.Length | Should -Be 0
+    }
+
+    It 'returns an intact 1-element [byte[]] (no collapse to a bare scalar [byte])' {
+        $got = & $script:SbAssertArg @{ Bytes = [byte[]]@(42) } 'Bytes' 'X'
+        ($got -is [byte[]]) | Should -BeTrue -Because 'a 1-element [byte[]] must not collapse to a scalar [byte] crossing the & boundary'
+        $got.Length | Should -Be 1
+        $got[0] | Should -Be 42
+    }
+
+    It 'returns an intact n-element [byte[]] with values preserved (no re-collection to [object[]])' {
+        $got = & $script:SbAssertArg @{ Bytes = [byte[]]@(1,2,3) } 'Bytes' 'X'
+        ($got -is [byte[]]) | Should -BeTrue -Because 'an n-element [byte[]] must not re-collect as [object[]] crossing the & boundary'
+        $got.Count | Should -Be 3
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$got, [byte[]]@(1,2,3)) | Should -BeTrue
+    }
+
+    It 'returns a plain [string] arg unchanged (shape guard: the fix must not disturb the scalar case)' {
+        $got = & $script:SbAssertArg @{ Name = 'vm1' } 'Name' 'X'
+        ($got -is [string]) | Should -BeTrue
+        $got | Should -Be 'vm1'
+    }
+
+    It 'returns a [hashtable] arg unchanged (shape guard: the fix must not disturb the dictionary case)' {
+        $inner = @{ a = 1; b = 2 }
+        $got = & $script:SbAssertArg @{ Cfg = $inner } 'Cfg' 'X'
+        ($got -is [hashtable]) | Should -BeTrue
+        $got.a | Should -Be 1
+        $got.b | Should -Be 2
+    }
+
+    It 'still throws the required-argument-missing message for an absent key (unchanged refusal)' {
+        { & $script:SbAssertArg @{ } 'Missing' 'SomeMethod' } |
+            Should -Throw -ExpectedMessage "*required argument 'Missing' is missing*"
     }
 }
 

@@ -205,13 +205,11 @@ function New-WorkloadDisks {
             if ($v -is [byte[]]) {
                 # Byte-clean path (I2b/Task 5): a [byte[]] Input must NEVER be string-cast (silent
                 # binary corruption — WriteVhdxFile Content=[string]$v would yield "System.Byte[]").
-                # KNOWN pre-existing bug (Task-5 gate, both real+fake, parity-preserving): $SbAssertArg
-                # unrolls a 0-length byte[] arg to $null, so a genuinely-empty binary Input would throw
-                # a confusing "required argument missing" through WriteVhdxFileBytes. No shipped profile
-                # emits an empty binary Input; skip it here (documented no-op) rather than let that
-                # happen. ENOSPC sentinel: a host-side disk-full write during this populate is caught,
-                # classified DiskFull, and RE-THROWN below — fail-closed, never a swallow-and-continue.
-                if ($v.Length -eq 0) { continue }
+                # F2 fix: $SbAssertArg now comma-wraps its return (HyperVBackend.ps1), so a
+                # genuinely-empty [byte[]] Input survives the WriteVhdxFileBytes round-trip
+                # shape-intact and is written as an empty inner file — no skip needed. ENOSPC
+                # sentinel: a host-side disk-full write during this populate is caught, classified
+                # DiskFull, and RE-THROWN below — fail-closed, never a swallow-and-continue.
                 try {
                     $null = & $Backend.WriteVhdxFileBytes @{ Path = $inPath; InnerPath = [string]$k; Bytes = $v }
                 }
