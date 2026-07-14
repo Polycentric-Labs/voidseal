@@ -1337,6 +1337,93 @@ Describe '$script:SbAssertArg — array shape preservation across the & boundary
 }
 
 # ===========================================================================
+#  $script:SbIsUnavailableError — name-scoped CommandNotFound classification (F3)
+# ===========================================================================
+# I5a lesson: EVERY real method's body runs inside $InvokeOp, which routes any caught error
+# through this classifier. A BLANKET "any CommandNotFoundException is Hyper-V unavailable"
+# branch would rebrand a closure-capture NameError (the I5a bug class — e.g. a renamed helper
+# called by bare name from inside a .GetNewClosure()'d body) as a misleading "Hyper-V
+# unavailable / insufficient privilege" message instead of surfacing the real
+# CommandNotFoundException. So the classifier must be scoped by the missing command's NAME:
+# only genuinely Hyper-V-cmdlet-shaped names (Get-VM, New-VHD, ...) classify as unavailable.
+# Tested directly here (like $script:SbAssertArg above) so the contract is pinned once,
+# independent of any one backend method's wiring.
+Describe '$script:SbIsUnavailableError — name-scoped CommandNotFound classification (F3)' {
+
+    BeforeAll {
+        # A minimal stand-in exception living in the SAME namespace prefix the classifier
+        # checks (Microsoft.HyperV.PowerShell*), so the tests below exercise the actual
+        # '-like' namespace match instead of assuming it. Avoids depending on the real Hyper-V
+        # module's internal VirtualizationException, which has no public constructor.
+        if (-not ('Microsoft.HyperV.PowerShell.VoidsealTestException' -as [type])) {
+            Add-Type -TypeDefinition @'
+namespace Microsoft.HyperV.PowerShell {
+    public class VoidsealTestException : System.Exception {
+        public VoidsealTestException(string message) : base(message) {}
+    }
+}
+'@
+        }
+    }
+
+    It 'classifies a REAL CommandNotFoundException for a Hyper-V-shaped VM cmdlet name as unavailable' {
+        $errorRecord = $null
+        try { & 'Get-VMAbsentZz9' } catch { $errorRecord = $_ }
+        $errorRecord.Exception | Should -BeOfType ([System.Management.Automation.CommandNotFoundException])
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue -Because 'Get-VM*-shaped missing commands are the Hyper-V-module-absent case'
+    }
+
+    It 'classifies a REAL CommandNotFoundException for a Hyper-V-shaped VHD cmdlet name as unavailable' {
+        $errorRecord = $null
+        try { & 'Mount-VHDAbsentZz9' } catch { $errorRecord = $_ }
+        $errorRecord.Exception | Should -BeOfType ([System.Management.Automation.CommandNotFoundException])
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue -Because 'Mount-VHD*-shaped missing commands are the Hyper-V-module-absent case'
+    }
+
+    It 'does NOT classify a REAL CommandNotFoundException for a non-Hyper-V helper name as unavailable (the I5a closure-NameError class)' {
+        $errorRecord = $null
+        try { & 'Invoke-ConfinedQemuAbsentZz9' } catch { $errorRecord = $_ }
+        $errorRecord.Exception | Should -BeOfType ([System.Management.Automation.CommandNotFoundException])
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeFalse -Because 'a renamed/missing non-Hyper-V helper called from inside a closure must surface as its real CommandNotFoundException, not a mislabeled "Hyper-V unavailable"'
+    }
+
+    It 'does NOT classify a REAL CommandNotFoundException for an arbitrary non-Hyper-V name as unavailable' {
+        $errorRecord = $null
+        try { & 'Format-ThingAbsentZz9' } catch { $errorRecord = $_ }
+        $errorRecord.Exception | Should -BeOfType ([System.Management.Automation.CommandNotFoundException])
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeFalse
+    }
+
+    It 'still classifies a Microsoft.HyperV.PowerShell*-namespace permission-denied error as unavailable (existing behavior preserved)' {
+        $ex = New-Object Microsoft.HyperV.PowerShell.VoidsealTestException('You do not have the required permission to complete this task.')
+        $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
+    }
+
+    It 'still classifies a Microsoft.HyperV.PowerShell*-namespace service-down error as unavailable (existing behavior preserved)' {
+        $ex = New-Object Microsoft.HyperV.PowerShell.VoidsealTestException('The Virtual Machine Management service is not running.')
+        $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
+    }
+
+    It 'still classifies generic permission phrasing from any exception layer as unavailable (existing behavior preserved)' {
+        $ex = New-Object System.Exception('Access is denied. Run as Administrator or join Hyper-V Administrators.')
+        $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
+    }
+
+    It 'still returns $false for an arbitrary unrelated exception (existing behavior preserved)' {
+        $ex = New-Object System.InvalidOperationException('the widget is jammed')
+        $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::InvalidOperation, $null)
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeFalse
+    }
+
+    It 'still returns $false for a $null ErrorRecord (existing behavior preserved)' {
+        (& $script:SbIsUnavailableError $null) | Should -BeFalse
+    }
+}
+
+# ===========================================================================
 #  FAKE backend — switch + network adapter (the seal seam)
 # ===========================================================================
 Describe 'Fake backend — switch + network adapter' {

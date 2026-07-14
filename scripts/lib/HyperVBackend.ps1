@@ -311,9 +311,18 @@ $script:SbIsUnavailableError = {
         if ($msg -match '(?i)(Hyper-V.*not (running|installed|enabled)|virtual machine management service)') { return $true }
     }
 
-    # CommandNotFound -> the Hyper-V PowerShell module/cmdlet isn't present at all.
+    # CommandNotFound -> the Hyper-V PowerShell module/cmdlet isn't present at all. Scoped by the
+    # missing command's NAME, not a blanket match on every CommandNotFoundException: $InvokeOp
+    # wraps EVERY real method's body in a .GetNewClosure()'d scriptblock, so a closure-capture
+    # NameError (I5a bug class — e.g. a renamed helper called by bare name from inside such a
+    # body) ALSO throws a CommandNotFoundException. A blanket match here would rebrand that real
+    # bug as a misleading "Hyper-V unavailable / insufficient privilege" message instead of
+    # surfacing it. Only names shaped like Hyper-V cmdlets (Get-VM, New-VHD, Add-VMHardDiskDrive,
+    # Mount-VHD, ...) classify as unavailable; anything else falls through so the real
+    # CommandNotFoundException propagates undisguised.
     if ($ErrorRecord.CategoryInfo -and $ErrorRecord.CategoryInfo.Category -eq 'ObjectNotFound' -and
-        $ex -is [System.Management.Automation.CommandNotFoundException]) { return $true }
+        $ex -is [System.Management.Automation.CommandNotFoundException] -and
+        $ex.CommandName -match '^\w+-(VM|VHD)') { return $true }
 
     # Generic permission / elevation phrasing from any layer.
     if ($msg -match '(?i)(do not have the required permission|requires elevation|access is denied|run as administrator|Hyper-V Administrators)') {
