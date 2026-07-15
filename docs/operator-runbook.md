@@ -200,11 +200,13 @@ $report.RunResult.ExitCode
 > unfiltered External or Private switch. That's a real, host-verified guarantee that the guest's only
 > possible route off-box is the host-controlled gateway on that Internal switch — **for a purpose-built
 > Internal switch.** It is **not** a guarantee that egress is filtered — nothing today inspects or
-> restricts what crosses that gateway once traffic is on it. **It also does not, today, refuse the
-> built-in "Default Switch" by name:** the Default Switch is itself `SwitchType=Internal` (Hyper-V's
-> ICS/internet-connected switch), so this check cannot distinguish it from a purpose-built isolated
-> Internal switch. Real Tier-1 provisioning uses a purpose-built Internal switch, never the Default
-> Switch; an explicit by-name refusal of the Default Switch is Phase-6-live.
+> restricts what crosses that gateway once traffic is on it. **It DOES, now, refuse the built-in
+> "Default Switch" by name:** the Default Switch is itself `SwitchType=Internal` (Hyper-V's
+> ICS/internet-connected switch), so the SwitchType check alone could not distinguish it from a
+> purpose-built isolated Internal switch — the seal now ALSO verifies the switch is not the Default
+> Switch, by name, and refuses it if it is. Real Tier-1 provisioning uses a purpose-built Internal
+> switch, never the Default Switch. This by-name refusal is a reachability/isolation control, not
+> egress filtering — see below.
 >
 > The in-guest controls (the builder profile's iptables default-DROP-plus-allowlist, the in-guest Squid
 > SNI proxy) are **not** a containment boundary: a compromised or adversarial guest with code-execution

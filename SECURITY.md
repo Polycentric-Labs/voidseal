@@ -20,9 +20,12 @@ the host-controlled gateway on that Internal switch. That is a host-verified **s
 guarantee (reachability) for a **purpose-built** Internal switch, not a claim about which domains/IPs the
 guest can reach once on that route — see "Tier-1 egress" below for why the two are not the same thing.
 **Caveat:** the built-in "Default Switch" is itself `SwitchType=Internal` (it is Hyper-V's ICS/internet-
-connected switch, not a purpose-built isolated one), so this SwitchType check alone cannot distinguish or
-refuse it — real Tier-1 provisioning uses a purpose-built Internal switch, and an explicit by-name refusal
-of the Default Switch is Phase-6-live (see "Tier-1 egress" below). Higher tiers
+connected switch, not a purpose-built isolated one), so the SwitchType check alone cannot distinguish it
+from a purpose-built isolated switch — but the seal now ALSO refuses it explicitly **by name**, so a
+Default-Switch-connected NIC is refused, not certified. Real Tier-1 provisioning uses a purpose-built
+Internal switch, never the Default Switch. Host egress **filtering** (Squid SNI-splice / `New-NetNat` /
+default-DROP) remains Phase-6-live (see "Tier-1 egress" below) — switch isolation and by-name refusal are
+reachability controls, not a claim that egress is filtered. Higher tiers
 additionally **starve** the guest of network and credentials at load time (refused if a Tier ≥ 2 profile
 declares any), and route hostile output through a one-way cold-disk quarantine boundary rather than a
 trusting host read.
@@ -199,10 +202,11 @@ full privileges of whoever invokes it — here, the host operator.
     switch — an unfiltered External/Private switch is refused, fail-closed. It says nothing about *which*
     destinations are reachable through that gateway; today, nothing on the host filters what crosses it.
     **Caveat:** the built-in "Default Switch" is itself `SwitchType=Internal` (Hyper-V's ICS/internet-
-    connected switch), so this check cannot distinguish it from a purpose-built isolated Internal switch —
-    it would certify a Default-Switch-connected NIC as sealed. Real Tier-1 provisioning uses a purpose-
-    built Internal switch, never the Default Switch; an explicit by-name refusal of the Default Switch is
-    Phase-6-live, tracked alongside the egress-filtering layer below.
+    connected switch), so the SwitchType check alone cannot distinguish it from a purpose-built isolated
+    Internal switch — but the seal now ALSO refuses it explicitly **by name** (host-verified, mock-tested),
+    so a Default-Switch-connected NIC is refused, not certified. Real Tier-1 provisioning uses a purpose-
+    built Internal switch, never the Default Switch. This is still a reachability/isolation control, not
+    egress filtering — see the next bullet.
   - **Egress filtering at the host is the Phase-6-live layer, not yet built.** The planned control is a
     host-run transparent Squid SNI-splice proxy plus a host-side NAT (`New-NetNat`) and a host default-DROP
     policy on the Internal switch's gateway interface — i.e. the same allow-only-what's-needed filtering

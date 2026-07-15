@@ -563,22 +563,36 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
     }
 
     It 'Tier-1: REFUSES when the NIC is on an unresolvable switch name (no matching VMSwitch on host)' {
-        # NOTE (accuracy, whole-branch review): this models an UNREGISTERED/unresolvable switch name
-        # (GetSwitch -> $null), NOT the real built-in "Default Switch" — on a real host the Default
-        # Switch resolves via Get-VMSwitch with SwitchType=Internal (it is Hyper-V's ICS/internet-
-        # connected switch), so today's SwitchType-only check would CERTIFY a Default-Switch-connected
-        # NIC, not refuse it. The string 'Default Switch' below is used only as a plausible-looking name
-        # that this fake backend has never registered via NewSwitch — it stands in for any name with no
-        # host-side VMSwitch object, mirroring a real unresolvable-switch host state. An explicit by-NAME
-        # refusal of the actual Default Switch is Phase-6-live (see progress.md §Track).
+        # Models an UNREGISTERED/unresolvable switch name (GetSwitch -> $null): a NIC bridged to a switch
+        # the host has no VMSwitch object for cannot be verified isolated, so the seal fails closed. Uses a
+        # name this fake backend never registered via NewSwitch. (The built-in "Default Switch" has its own
+        # dedicated by-NAME refusal test below — it is type-Internal, a different path.)
         $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-unresolvable'
         $b = $sb.Backend; $d = $sb.Desc
         Lock-Sandbox -Descriptor $d -Backend $b
         & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-unresolvable' }
         $vm = & $b.GetVM @{ Name = 'sbx-i4-unresolvable' }
-        $vm.NetworkAdapters.Add(@{ SwitchName = 'Default Switch'; Name = 'Network Adapter' })
+        $vm.NetworkAdapters.Add(@{ SwitchName = 'orphan-switch-zz9'; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
             Should -Throw -ExpectedMessage '*Internal*' -Because 'a NIC on a switch name with no resolvable host VMSwitch object cannot be verified isolated; fail closed'
+    }
+
+    It 'Tier-1: REFUSES when the NIC is on the built-in "Default Switch" (type-Internal but ICS/internet)' {
+        # The Default Switch is itself SwitchType=Internal (Hyper-V ICS, confirmed on real hardware —
+        # Pass A Q2), so the SwitchType check alone CERTIFIES it. Model it faithfully: register a switch
+        # NAMED 'Default Switch' with SwitchType=Internal, connect the NIC to it, and require Assert-Sealed
+        # to refuse it by NAME (not by type). A purpose-built isolated Internal switch (real name "<vm>-int")
+        # must still certify — covered by the happy-path Tier-1 seal test elsewhere in this file.
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-defaultswitch'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-defaultswitch' }
+        & $b.NewSwitch @{ Name = 'Default Switch'; SwitchType = 'Internal' }
+        $vm = & $b.GetVM @{ Name = 'sbx-i4-defaultswitch' }
+        $vm.NetworkAdapters.Add(@{ SwitchName = 'Default Switch'; Name = 'Network Adapter' })
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage '*Default Switch*' `
+                -Because 'the Default Switch is ICS/internet egress the host does not control; a Tier-1 seal must refuse it by name even though it reports type-Internal'
     }
 
     It 'Tier-1: REFUSES when a NIC has no resolvable SwitchName (blank)' {

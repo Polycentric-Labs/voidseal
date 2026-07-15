@@ -695,13 +695,13 @@ function Assert-Sealed {
     # chokepoint — an Internal vSwitch whose gateway the host controls (Pass A Q2). An External switch bypasses
     # the host TCP/IP stack (unfiltered egress) and is refused. NOTE (accuracy, whole-branch review): the
     # built-in "Default Switch" is ITSELF SwitchType='Internal' (it is Hyper-V's ICS/internet-connected
-    # switch, confirmed on real hardware) — so this SwitchType-based check does NOT distinguish it from a
-    # purpose-built isolated Internal switch and would CERTIFY a Default-Switch-connected NIC as sealed.
-    # Real Tier-1 provisioning uses a purpose-built Internal switch (never the Default Switch); an explicit
-    # by-NAME refusal of the Default Switch, plus host egress filtering, is Phase-6-live (see §Track in
-    # progress.md). Verify each NIC's switch is SwitchType='Internal', fail closed on External/Private/
-    # unresolvable. (Egress FILTERING via host Squid/NAT/default-DROP is also Phase-6-live; this asserts
-    # switch ISOLATION only — the VM can reach only the host gateway of whatever Internal switch it's on.)
+    # switch, confirmed on real hardware) — so the SwitchType-based check alone does NOT distinguish it from a
+    # purpose-built isolated Internal switch and would CERTIFY a Default-Switch-connected NIC as sealed. This
+    # seal now verifies BOTH: (a) the NIC's switch is SwitchType='Internal' (fail closed on External/Private/
+    # unresolvable), AND (b) that switch is NOT the built-in Default Switch, refused explicitly BY NAME below
+    # (Phase-6 §Track item 1 — now shipped; see the dedicated throw for the LIVE-only GUID-hardening note).
+    # Egress FILTERING via host Squid/NAT/default-DROP remains Phase-6-live; this asserts switch ISOLATION
+    # only — the VM can reach only the host gateway of whatever (non-Default) Internal switch it's on.
     if ($tier -eq 1 -and -not $isProcessor) {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
         foreach ($nic in $nics) {
@@ -718,6 +718,25 @@ function Assert-Sealed {
                        "'$switchName' (SwitchType=$gotType), not an isolated Internal vSwitch. A Tier-1 VM's egress " +
                        "MUST ride the host-controlled Internal-switch gateway, never an External or Private switch " +
                        "(which bypasses the host stack). Fail closed.")
+            }
+            # By-NAME refusal of the built-in "Default Switch" (Phase-6 §Track item 1 — now shipped). The
+            # SwitchType check above is necessary but NOT sufficient: the Default Switch is ITSELF
+            # SwitchType=Internal (Hyper-V's ICS/internet-connected switch — Pass A Q2, confirmed on real
+            # hardware), so a Default-Switch-connected NIC would PASS the type check and be certified. It gives
+            # unmediated ICS internet egress the host gateway does not control — the opposite of an isolated
+            # Tier-1 Internal switch. Real Tier-1 provisioning names its switch "<vm>-int" (Provisioner.ps1),
+            # never the Default Switch, so this cannot false-positive a legitimate seal. Case-insensitive on the
+            # well-known friendly name. LIVE Phase-6 HARDENING (tracked, not mock-modelable here): ALSO refuse by
+            # the immutable Default-Switch GUID c08cb7b8-9b3c-408e-8e30-5e16a3aeb444 — the friendly NAME can be
+            # LOCALIZED on non-English Windows, but the GUID is stable. The fake backend does not model a switch
+            # .Id, so the GUID check is a real-host-only addition; the name-based refusal is the mock-verifiable
+            # control this slice ships.
+            if ($switchName.Trim() -ieq 'Default Switch') {
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED — its NIC is on the built-in " +
+                       "'Default Switch'. That switch reports SwitchType=Internal, but it is Hyper-V's " +
+                       "ICS/internet-connected switch (unmediated egress the host gateway does not control), NOT an " +
+                       "isolated Tier-1 Internal vSwitch. A Tier-1 VM MUST ride a purpose-built isolated Internal " +
+                       "switch (host-controlled egress chokepoint). Fail closed.")
             }
         }
     }
