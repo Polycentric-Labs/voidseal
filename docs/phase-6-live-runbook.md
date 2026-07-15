@@ -5,7 +5,8 @@
 > in this document has been exercised on real Hyper-V. It consolidates the live-run design that is
 > currently scattered across three in-tree synthesis passes so the first live run has one sequence to
 > follow, not three docs to cross-reference. Sources cited inline; nothing here is invented — every cmdlet,
-> version, and CVE traces to one of:
+> version, and CVE traces to one of (**internal research notes — gitignored, not present in the public
+> repo; a reader outside this working tree cannot open these paths**):
 > - `_dev/labcoat/PassA-SecurityFrontier/PASSA-SYNTHESIS.md` §Q2 (host egress topology) and §Q3
 >   (SNI-splice residuals) — hereafter **Pass A**.
 > - `_dev/labcoat/PassB-ClientHVPrimitives/PASSB-SYNTHESIS.md` §Q4 (qemu-img confinement) — hereafter

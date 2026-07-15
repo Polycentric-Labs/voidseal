@@ -36,8 +36,9 @@
         3. turn OFF every host<->guest channel (clipboard / shares / guest-services /
            enhanced-session) via the backend's SetHostChannel,
         4. mark the descriptor State='Sealed'.
-      It does NOT power the VM on (the seal runs before first boot) and it does NOT touch the
-      egress allowlist — Tier-1 net-restriction is the in-guest nftables/allowlist concern,
+      It does NOT power the VM on (the seal runs before first boot) and it does NOT itself filter
+      egress — Tier-1 net-restriction relies on in-guest controls (Squid SNI proxy + allowlist) as
+      defense-in-depth today; host-side egress enforcement (Squid/NAT/default-DROP) is Phase-6-live,
       not this function's job. Tier-1 keeps its NIC; Tier >= 2 has it removed.
 
     THE GATE (Assert-Sealed; SCHEMA.md invariant 6 — the runtime pre-seal gate):
@@ -497,8 +498,9 @@ function Dismount-SandboxAsset {
       3. for a no-NIC tier (Tier >= 2): RemoveNetworkAdapter (remove, not disconnect),
       4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session),
       5. set the descriptor State = 'Sealed'.
-    It does NOT power the VM on, and does NOT manage the egress allowlist — Tier-1 net-restriction
-    is the in-guest nftables/allowlist concern, not this function's job. Tier-1 KEEPS its
+    It does NOT power the VM on, and does NOT itself filter egress — Tier-1 net-restriction today
+    relies on in-guest controls (Squid SNI proxy + allowlist) as defense-in-depth, not this
+    function's job; host-side egress enforcement is Phase-6-live. Tier-1 KEEPS its
     NIC; only Tier >= 2 is no-NIC. Generic over the tier so a future no-NIC profile seals correctly.
 .PARAMETER Descriptor
     The New-SandboxVM descriptor (consumed + updated; its Tier drives the NIC decision).
@@ -564,8 +566,8 @@ function Lock-Sandbox {
     }
 
     # --- 3. no-NIC tiers (Tier >= 2): remove the NIC entirely -------------
-    # Tier-1 is net-RESTRICTED, not no-net — its NIC stays (egress is the in-guest
-    # nftables/allowlist concern, not the seal). Generic over the tier.
+    # Tier-1 is net-RESTRICTED, not no-net — its NIC stays (egress control today is in-guest
+    # defense-in-depth, not the seal; host-side enforcement is Phase-6-live). Generic over the tier.
     if ($tier -ge 2) {
         $null = & $Backend.RemoveNetworkAdapter @{ VMName = $vmName }
     }
@@ -599,10 +601,13 @@ function Lock-Sandbox {
         apply to every tier.
       * Tier == 1 (non-processor): every NIC MUST be on an isolated Internal vSwitch (I4) — its
         SwitchType is host-verified via GetSwitch. An External, Private, or unresolvable switch
-        bypasses the host-controlled egress chokepoint and is refused, fail-closed. NOTE: the
-        built-in Default Switch is itself SwitchType=Internal (ICS/internet-connected), so this
-        check does NOT distinguish/refuse it by type alone — an explicit by-name refusal is
-        Phase-6-live (see SECURITY.md).
+        bypasses the host-controlled egress chokepoint and is refused, fail-closed. The
+        built-in Default Switch is itself SwitchType=Internal (ICS/internet-connected), so the
+        SwitchType check alone would certify it — an explicit by-NAME refusal of "Default Switch"
+        closes that gap (SHIPPED, mock-green). The name match is English-locale only; a GUID-based
+        refusal that also covers LOCALIZED (non-English) Default-Switch names is Phase-6-live (see
+        SECURITY.md). This is a switch-ISOLATION guarantee only — egress FILTERING is a separate,
+        still-Phase-6-live layer.
       * no import DVD/ISO attached (a live read-only-but-present host<->guest medium).
       * no transfer/import VHD recorded on the descriptor still attached.
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.

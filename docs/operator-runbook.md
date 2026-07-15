@@ -205,8 +205,11 @@ $report.RunResult.ExitCode
 > ICS/internet-connected switch), so the SwitchType check alone could not distinguish it from a
 > purpose-built isolated Internal switch — the seal now ALSO verifies the switch is not the Default
 > Switch, by name, and refuses it if it is. Real Tier-1 provisioning uses a purpose-built Internal
-> switch, never the Default Switch. This by-name refusal is a reachability/isolation control, not
-> egress filtering — see below.
+> switch, never the Default Switch. **This by-name match is the switch's ENGLISH friendly name**; on a
+> non-English/localized Windows host the friendly name differs, so the by-name refusal does not fire
+> there — the locale-independent guarantee is the immutable-GUID refusal
+> (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`), which is Phase-6-live, not yet shipped. This by-name refusal
+> is a reachability/isolation control, not egress filtering — see below.
 >
 > The in-guest controls (the builder profile's iptables default-DROP-plus-allowlist, the in-guest Squid
 > SNI proxy) are **not** a containment boundary: a compromised or adversarial guest with code-execution
