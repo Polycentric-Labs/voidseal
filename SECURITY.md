@@ -213,7 +213,8 @@ full privileges of whoever invokes it — here, the host operator.
     the in-guest layer attempts today, but enforced from a position the guest cannot reach or disable.
     Until that lands, **do not read "the seal is host-verified" as "Tier-1 egress is filtered."** The seal
     verifies isolation (the guest can only reach the host gateway); it does not yet verify filtering (what
-    the host gateway then permits through).
+    the host gateway then permits through). See `docs/phase-6-live-runbook.md` for the full prescribed live
+    sequence (host egress enforcement, qemu-img confinement, seal-time assertions to add live).
 
 Do not rely on Voidseal as your sole boundary for genuinely hostile code until the higher tiers are
 completed and you have independently verified the isolation on your host.
