@@ -129,8 +129,8 @@ convert` call is routed through it, AST-pinned by test, but nothing yet confines
 | Assertion | Status |
 |---|---|
 | Single-NIC invariant | live-only addition (not yet asserted) |
-| NIC's switch `SwitchType == Internal` | **SHIPPED, mock-green** — `Assert-Sealed`, `scripts/lib/Sealer.ps1:715` |
-| By-name refusal of the built-in "Default Switch" | **SHIPPED, mock-green, this slice** — `scripts/lib/Sealer.ps1:734` (commit `3c3a944`) |
+| NIC's switch `SwitchType == Internal` | **SHIPPED, mock-green** — `Assert-Sealed`, `scripts/lib/Sealer.ps1:720` |
+| By-name refusal of the built-in "Default Switch" | **SHIPPED, mock-green, this slice** — `scripts/lib/Sealer.ps1:739` (commit `3c3a944`) |
 | No-uplink (`NetAdapterInterfaceDescription == null`) | live-only addition (not yet asserted) |
 | Host-gateway-IP pin | live-only addition (not yet asserted) |
 | Firewall-baseline export/diff | live-only addition (not yet asserted) |
