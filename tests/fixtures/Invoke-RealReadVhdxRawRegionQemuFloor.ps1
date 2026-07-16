@@ -10,7 +10,9 @@
     top-level script scope (see the file's own closure-capture note, ~HyperVBackend.ps1:240) — it came
     back EMPTY at call time, so live it threw ParameterBindingValidationException on the Mandatory
     -MinVersion string param (or, depending on how that surfaces, got mislabeled "Hyper-V unavailable"
-    via SbIsUnavailableError's CommandNotFoundException branch). See tests/HyperVBackend.Tests.ps1
+    via SbIsUnavailableError's CommandNotFoundException branch) — that misroute is now CLOSED by the
+    F3 name-scoping (`^\w+-(VM|VHD)`-only): 'Resolve-QemuImg' isn't Hyper-V-cmdlet-shaped, so that
+    CommandNotFoundException now propagates raw and undisguised. See tests/HyperVBackend.Tests.ps1
     'ReadVhdxRawRegion — user-space raw read' Describe, the "review Critical, I5a wiring" It, for the
     full root-cause note.
 

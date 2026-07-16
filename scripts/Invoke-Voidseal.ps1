@@ -565,8 +565,9 @@ function Invoke-Voidseal {
             # or runs against a partial INPUT / absent OUTPUT disk. No orchestrator-side sentinel branch is
             # needed here; the existing lifecycle-abort machinery handles it (same path as SimulateStartVMError
             # et al.). This crossing ("a DiskFull throw never reaches Assert-Sealed") is pinned by the I2b
-            # lifecycle-abort tests in InvokeVoidseal.Tests.ps1 (~:1024, :1046). (Real host-disk-full HResult
-            # classification is LIVE-ONLY-UNPROVEN until Phase 6.)
+            # lifecycle-abort tests in InvokeVoidseal.Tests.ps1: the 'SimulateWriteEnospc' Inputs-populate
+            # It and the 'CreateEnospc variant' It (title-matched — It titles are the stable anchor; line
+            # numbers drift). (Real host-disk-full HResult classification is LIVE-ONLY-UNPROVEN until Phase 6.)
 
             # RC6: the CIDATA seed DATA DISK — built from the resolved profile's Entrypoint (the disk-mode
             # runner) and recorded on the descriptor (SeedDiskPath + CreatedDisks) so it survives the seal

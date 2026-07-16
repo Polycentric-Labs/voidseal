@@ -319,7 +319,10 @@ $script:SbIsUnavailableError = {
     # bug as a misleading "Hyper-V unavailable / insufficient privilege" message instead of
     # surfacing it. Only names shaped like Hyper-V cmdlets (Get-VM, New-VHD, Add-VMHardDiskDrive,
     # Mount-VHD, ...) classify as unavailable; anything else falls through so the real
-    # CommandNotFoundException propagates undisguised.
+    # CommandNotFoundException propagates undisguised. The narrowing also unmasks Storage/Net-
+    # module-missing errors: e.g. Get-Disk / Format-Volume inside $InvokeOp's NewOutputVhdx body
+    # now propagate raw CommandNotFound instead of being rebranded 'Hyper-V unavailable' — more
+    # diagnostic, still fail-closed (an error throws either way).
     if ($ErrorRecord.CategoryInfo -and $ErrorRecord.CategoryInfo.Category -eq 'ObjectNotFound' -and
         $ex -is [System.Management.Automation.CommandNotFoundException] -and
         $ex.CommandName -match '^\w+-(VM|VHD)') { return $true }
@@ -1947,9 +1950,10 @@ function New-FakeHyperVBackend {
         $vm = & $requireVM $name 'StartVM'
         # Log the invocation so a test can prove StartVM was actually REACHED (e.g. a lifecycle-abort
         # test asserting ZERO StartVM entries is otherwise vacuous — it would pass whether or not this
-        # closure ever ran). Logged BEFORE the SimulateStartVMError throw below: the point being pinned
-        # is "StartVM was INVOKED", which is true even on the simulated-boot-failure path — mirrors the
-        # RemoveHardDiskDrive precedent (logs before its own SimulateDetachError throw).
+        # closure ever ran). Logged AFTER $requireVM resolves and BEFORE the SimulateStartVMError throw
+        # below: the point being pinned is "StartVM was invoked against an existing VM", which is true
+        # even on the simulated-boot-failure path — mirrors the RemoveHardDiskDrive precedent (logs
+        # before its own SimulateDetachError throw).
         $state.CallLog.Add(@{ Op = 'StartVM'; Path = $null; VMName = $name })
         # Test-only seam: simulate a VM that refuses to boot, so the orchestrator's teardown-on-
         # mid-flow-failure path can be exercised (the VM exists + is sealed, then the launch throws).

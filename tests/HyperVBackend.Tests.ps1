@@ -2240,7 +2240,9 @@ Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-moun
         # EMPTY inside a .GetNewClosure()'d body, per this file's own closure-capture rule at
         # ~line 240) instead of a properly-hoisted factory-local. That exact regression shipped once:
         # a live run got -MinVersion '' -> ParameterBindingValidationException, misroutable through
-        # $InvokeOp's SbIsUnavailableError path into a MISLEADING "Hyper-V unavailable" message.
+        # $InvokeOp's SbIsUnavailableError path into a MISLEADING "Hyper-V unavailable" message (now
+        # closed by the F3 name-scoping — `^\w+-(VM|VHD)`-only — since 'Resolve-QemuImg' isn't
+        # Hyper-V-cmdlet-shaped, so that CommandNotFoundException now propagates raw and undisguised).
         #
         # WHY OUT-OF-PROCESS (mirrors 'Real backend — builds the right cmdlet params' above): verified
         # empirically in this task that an in-process Pester Mock of Get-QemuImgPath/Get-QemuImgVersion
