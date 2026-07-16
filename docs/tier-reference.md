@@ -73,7 +73,7 @@ row is green across P1–P10.** Use this as the sign-off checklist before trusti
 | # | Principle | Deployer control | T0 | T1 | T2 | T3 |
 |---|---|---|---|---|---|---|
 | **P1** | Supervise **capability**, not behavior | the tier model itself — match isolation strength to task risk | ✅ | ✅ | ✅ | ✅ |
-| **P2** | **Default-deny egress** | allowlist (T0/T1) / **no NIC** (T2/T3) | ✅ allowlist | ❌ not implemented (in-guest; declared only) | ✅ no NIC | ✅ no NIC |
+| **P2** | **Default-deny egress** | allowlist (T0/T1) / **no NIC** (T2/T3) | ✅ offline by default (no NIC — the Provisioner's switch/NIC block is HyperV-Gen2-substrate-gated; the declared host-proxy allowlist is **not yet implemented**, and tier0's `EgressAllowlist` is empty — opt-in net steps escalate to Tier 1) | ❌ not implemented (in-guest; declared only) | ✅ no NIC | ✅ no NIC |
 | **P3** | **Provenance proxy** (request attribution) | Phase-1B (v1 = FQDN + TLS-terminate; provenance deferred with credentials) | ➖ deferred | ➖ deferred | n/a (no egress) | n/a (no egress) |
 | **P4** | **Credentials out of env** | injected-at-proxy (T0) / starved (T2/T3); never `-e`, file bind-mount only | ✅ | ✅ default-none | ✅ none | ✅ none |
 | **P5** | **Least privilege** | non-root run-user, read-only code mounts, **secret-file refusal** | ✅ | ✅ | ✅ | ✅ |

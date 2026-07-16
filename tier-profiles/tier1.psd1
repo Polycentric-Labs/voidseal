@@ -2,9 +2,9 @@
     # Voidseal — Tier 1 isolation contract (net-restricted Hyper-V VM).
     # Declarative; consumed by the profile loader (Import-TierProfile).
     Tier            = 1
-    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress = credential-free in-guest nftables allowlist. Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
+    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress = in-guest allowlist DECLARED but NOT YET enforced (see docs/tier-reference.md Egress note). Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
     Substrate       = 'HyperV-Gen2'
-    Network         = 'Internal+Allowlist'      # Internal vSwitch + static host IP + in-guest nftables
+    Network         = 'Internal+Allowlist'      # Internal vSwitch + static host IP; in-guest egress enforcement NOT YET implemented (declared only)
     # HONESTY (2026-07-15): declarative only — validated for schema shape by ProfileLoader,
     # NOT enforced by any code path today (the ralph/Serial CIDATA seed ships zero
     # firewall/nftables content). The mechanism itself is design-invalidated for CDN-fronted
