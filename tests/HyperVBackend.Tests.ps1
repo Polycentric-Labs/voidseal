@@ -288,6 +288,14 @@ Describe 'Fake backend — VM lifecycle' {
         $entries[0].VMName | Should -Be 'vm1'
     }
 
+    It 'SetHostChannel logs exactly one Op=SetHostChannel CallLog entry for the VM (positive control — pins the invocation-was-reached instrumentation used by the builder no-seal tests'' zero-SetHostChannel-entries assertion)' {
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $script:B.SetHostChannel @{ VMName = 'vm1'; Channel = 'Clipboard'; Enabled = $false }
+        $entries = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'SetHostChannel' })
+        $entries.Count | Should -Be 1 -Because 'SetHostChannel must log its own invocation exactly once — otherwise a test asserting zero SetHostChannel CallLog entries would pass vacuously regardless of whether SetHostChannel ran'
+        $entries[0].VMName | Should -Be 'vm1'
+    }
+
     It 'RemoveVM removes the VM but does NOT delete its VHDX records (caller cleans disks)' {
         & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
         & $script:B.NewVHD @{ Path = 'C:\vhd\vm1.vhdx'; SizeBytes = 40GB }

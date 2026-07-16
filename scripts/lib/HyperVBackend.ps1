@@ -2122,6 +2122,13 @@ function New-FakeHyperVBackend {
     $b.SetHostChannel = {
         param([System.Collections.IDictionary] $P)
         $vm      = & $requireVM (& $GetArg $P 'VMName') 'SetHostChannel'
+        # Log the invocation so a test can prove SetHostChannel was actually REACHED (e.g. a no-seal
+        # test asserting ZERO SetHostChannel entries is otherwise vacuous — it would pass whether or
+        # not this closure ever ran). Mirrors the StartVM / RemoveNetworkAdapter precedent — the entry
+        # means "SetHostChannel was invoked against an existing VM"; logged before the unknown-channel
+        # validation throw below so the entry is present even on that failure path (this closure has
+        # no Simulate*-driven failure seam of its own).
+        $state.CallLog.Add(@{ Op = 'SetHostChannel'; Path = $null; VMName = $vm.Name })
         $channel = & $AssertArg $P 'Channel' 'SetHostChannel'
         if ($channelNames -notcontains $channel) {
             throw "HyperVBackend(fake).SetHostChannel: unknown channel '$channel' (expected one of: $($channelNames -join ', '))."

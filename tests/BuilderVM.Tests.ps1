@@ -107,10 +107,15 @@ Describe 'Invoke-BuilderVM — no seal (builder keeps NIC for the fetch)' {
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-noseal' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-ns.vhdx')
         $r.Status | Should -Be 'Success'
         # A sealed VM would have no network adapters; the builder KEEPS its NIC.
-        # The VM is torn down so we can't read it back — assert via CallLog: RemoveNetworkAdapter
-        # must NOT appear (the seal calls RemoveNetworkAdapter; the builder must not call Lock-Sandbox).
+        # The VM is torn down so we can't read it back — assert via CallLog. RemoveNetworkAdapter is
+        # gated behind Tier>=2 inside Lock-Sandbox (the builder is Tier-1), so a zero count here ALONE
+        # does not prove Lock-Sandbox was never called — a regression invoking Lock-Sandbox on this
+        # Tier-1 VM would still log zero RemoveNetworkAdapter entries. SetHostChannel is Lock-Sandbox's
+        # UNCONDITIONAL op (every tier, 4 channels) and is what actually pins the claim.
         $removeNicCalls = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' })
-        $removeNicCalls.Count | Should -Be 0 -Because 'the builder keeps its NIC — Lock-Sandbox must never be called'
+        $removeNicCalls.Count | Should -Be 0 -Because 'a sealed Tier>=2 VM would have its NIC removed; the builder is Tier-1 so this check alone does not discriminate Lock-Sandbox invocation'
+        $setChannelCalls = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'SetHostChannel' })
+        $setChannelCalls.Count | Should -Be 0 -Because 'SetHostChannel is Lock-Sandbox''s unconditional op across every tier — zero entries is what actually proves Lock-Sandbox was never called'
     }
 
     It 'the builder run does NOT record a SealVerdict (SealVerdict is not a builder output)' {
