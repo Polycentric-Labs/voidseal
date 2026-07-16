@@ -364,7 +364,7 @@ raw cmdlet). For reference, the equivalent raw Hyper-V calls are:
 # Gen2 VM (UEFI), Linux Secure Boot template, COM1 over a host named pipe.
 Set-VMFirmware -VMName $vm -SecureBootTemplate MicrosoftUEFICertificateAuthority
 Set-VMComPort  -VMName $vm -Number 1 -Path "\\.\pipe\$vm-com1"   # the serial command seam
-# (Tier 1: Internal vSwitch + in-guest nftables; Tier 2/3: NO NIC at all.)
+# (Tier 1: Internal vSwitch, NIC kept — in-guest egress enforcement NOT YET implemented; Tier 2/3: NO NIC at all.)
 ```
 
 The host reads/writes `\\.\pipe\<vm>-com1` with a pipe-aware serial client to drive the

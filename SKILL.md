@@ -40,15 +40,16 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 > provisions Tier 0 via the Hyper-V path; the Docker / `docker sbx` / sandbox-runtime substrate is a
 > planned future addition). Tier 2/3 are **scaffolded code paths validated with benign inputs only** —
 > no untrusted plugin or malware is run until you explicitly green-light verified isolation.
-> Credential-injecting host-Envoy is **deferred to Phase-1B** (v1 egress is a credential-FREE
-> FQDN/nftables allowlist).
+> Credential-injecting host-Envoy is **deferred to Phase-1B** (v1 Tier-1/ralph egress has NO
+> enforcement implemented yet — in-guest or host-side; the separate builder profile's
+> iptables+Squid is a different, one-shot mechanism, not wired to ralph).
 
 ## The tier model
 
 | Tier | Substrate | Network / egress | Credentials | Extraction | Lifecycle | v1 status |
 |---|---|---|---|---|---|---|
 | **0** | **Hyper-V path / lightweight guest** today (container runtime — Docker / devcontainer / `docker sbx` / sandbox-runtime — is **PLANNED, not yet built**) | host-proxy allowlist (default offline) | none | host reads result dir | `--rm` ephemeral (container tier, when built) | **validated (mock-backed; live run = the live smoke test, operator-run, elevated)** — `firefox` proof runs the Hyper-V path |
-| **1** | Hyper-V Gen2 VM | Internal switch + **in-guest nftables** FQDN allowlist (block QUIC/DoH/DoT); credential-FREE | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **validated (mock-backed; live run = the live smoke test, operator-run, elevated)** — `ralph` proof |
+| **1** | Hyper-V Gen2 VM | Internal switch (NIC kept); in-guest egress **NOT YET IMPLEMENTED** — `EgressMode='NftablesAllowlist'` is schema-declared only, zero enforcement | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal validated (mock-backed; live run = the live smoke test, operator-run, elevated); egress enforcement NOT IMPLEMENTED** — `ralph` proof |
 | **2** | Hyper-V VM, disposable | **no NIC** (structurally starved) | **none** (enforced) | **cold output-VHDX → quarantine VM → CDR → inert promote** | create → destroy | **scaffold / benign dry-run only** |
 | **3** | Hyper-V Gen2, **no NIC** + sinkhole VM | **structurally no egress** | **none** (enforced) | same as Tier 2, mandatory | detonate → wipe | **scaffold / benign dry-run only** |
 
@@ -111,7 +112,7 @@ mismatch is a caller error and throws). See the full parameter list in the
 
 | Profile | Tier | What it runs | Egress | Data |
 |---|---|---|---|---|
-| **`profiles/ralph.psd1`** | 1 | `bash ralph_loop.sh` (`frankbria/ralph-claude-code`, pinned by **commit SHA** — it's bash, has no tags). Drives the `claude` CLI ≥ 2.0.76 headless (`claude -p … --output-format json --allowedTools … --resume`; **no** `--dangerously-skip-permissions`). Bare Debian VM, no nested devcontainer; native bubblewrap for defense-in-depth. | inherits tier1's nftables FQDN allowlist (`api.anthropic.com`, `github.com`, npm, pypi …) + install-time origins | OAuth token via **read-only file bind-mount** — never `-e`, never embedded |
+| **`profiles/ralph.psd1`** | 1 | `bash ralph_loop.sh` (`frankbria/ralph-claude-code`, pinned by **commit SHA** — it's bash, has no tags). Drives the `claude` CLI ≥ 2.0.76 headless (`claude -p … --output-format json --allowedTools … --resume`; **no** `--dangerously-skip-permissions`). Bare Debian VM, no nested devcontainer; native bubblewrap for defense-in-depth. | inherits tier1's `EgressAllowlist` **declaration** (`api.anthropic.com`, `github.com`, npm, pypi …); no enforcement of it exists yet (the Serial seed ships no firewall config) | OAuth token via **read-only file bind-mount** — never `-e`, never embedded |
 | **`profiles/firefox.psd1`** | 0 | `organize_bookmarks.py` — dedupe + frecency-rank + auto-folder a Firefox profile, emit an importable `<!DOCTYPE NETSCAPE-Bookmark-file-1>` HTML file. Operates on a **COPY** (`places.sqlite` closed-copy + `bookmarkbackups/*.jsonlz4` via `lz4.block`), never mutates live, never reads `logins.json`/`key4.db`/`cookies.sqlite`. | **none** (offline; the lone optional dead-link check escalates to Tier 1) | **defaults to SYNTHETIC/sample data**; real profile data needs explicit per-task authorization |
 
 ## Safety invariants (load-time + runtime — fail closed)

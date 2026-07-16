@@ -301,8 +301,17 @@ Remove-Sandbox -Name '<the VM name from $report.Name, e.g. sbx-0-xxxxxxxx>' -Del
 
 ## 4. Milestone 2 — Ralph proof (Tier 1), LIVE
 
-**Proves milestone 5.** A net-**restricted** (not no-net) Gen2 VM that runs a
-**bounded** Ralph loop reaching `api.anthropic.com` through the in-guest nftables allowlist.
+> **⚠️ WARNING — in-guest egress is currently UNRESTRICTED.** Milestone 2 as originally
+> written presumed an in-guest nftables allowlist that does not exist in shipped code — the
+> ralph/Serial CIDATA seed ships zero firewall/nftables/iptables content, and the declared
+> `EgressMode='NftablesAllowlist'` in `tier-profiles/tier1.psd1` is schema-validated only,
+> never enforced (see [`tier-reference.md`](tier-reference.md)'s Egress note for the full gap
+> + the Pass-5 finding that invalidates the declared design). **Do NOT run untrusted/agent
+> workloads at Tier-1 live until an egress mechanism ships.**
+
+**Proves milestone 5 — reframed as net-reachable, NOT YET net-restricted.** A Gen2 VM that
+keeps its NIC (not no-net) and runs a **bounded** Ralph loop reaching `api.anthropic.com` —
+with no in-guest filter currently blocking any *other* destination either.
 
 ### 4.1 Pin the upstream SHA (placeholder in `ralph.psd1`)
 
@@ -353,11 +362,16 @@ $report.RunResult.ExitCode   # the Ralph loop's exit status over the serial seam
 $report.ExtractedArtifact    # the extracted workspace diff/output dir, copied to the host
 ```
 
-- The **net-restricted** VM keeps its NIC (Tier 1 is restricted, **not** no-NIC — only
-  Tier ≥ 2 removes the NIC). Egress is the **in-guest nftables allowlist** (`api.anthropic.com`
-  et al.). **Important:** `Lock-Sandbox` does **not** install the nftables rules — egress
-  restriction is an **in-guest** concern set up by the CIDATA seed / staging. The
-  seal removes host↔guest channels + detaches import media; the allowlist is the guest's job.
+- The VM (**net-reachable, NOT YET net-restricted**) keeps its NIC (Tier 1 is not no-NIC —
+  only Tier ≥ 2 removes the NIC). **Egress enforcement does not exist yet:** the ralph/Serial
+  CIDATA seed sets up **zero** firewall/nftables content (the Serial baseline template only
+  installs `bubblewrap` + `ca-certificates`), so nothing filters `api.anthropic.com` from any
+  other destination. `Lock-Sandbox` does **not** install egress rules either way — that was
+  never its job; it removes host↔guest channels + detaches import media, same as every tier.
+  The credible fix directions are a **Squid-based in-guest SNI redirect** (the approach the
+  separate builder profile already uses — static nftables/ipset allowlists don't survive CDN
+  IP rotation, per Pass-5) and/or **host-side enforcement** (see
+  [`phase-6-live-runbook.md`](phase-6-live-runbook.md)).
 - The Ralph loop is **bounded** — rate/iteration caps (`MAX_CALLS_PER_HOUR`,
   `CLAUDE_TIMEOUT_MINUTES`, etc.) are set via env in the **guest** (cloud-init / seed), not in
   the profile. Confirm your seed sets a small cap for the smoke test so it can't run away.
@@ -554,8 +568,9 @@ Remove-Sandbox -Name '<sbx-0-... from $report.Name>' -DeleteDisks
 ## 5. Per-tier seal verification
 
 The seal gate (`Assert-Sealed`) runs **inside** `Invoke-Voidseal` as a hard gate before
-RUNNING. You verify it certified by reading the report; for Tier 1 you also spot-check that
-egress is actually restricted.
+RUNNING. You verify it certified by reading the report; for Tier 1 you also spot-check the
+current (unrestricted) state of in-guest egress — see §5.2, a known gap, not a pass/fail
+config check.
 
 ### 5.1 Eyeball that the gate certified
 
@@ -570,25 +585,24 @@ $report.SealVerdict    # MUST be $true for BOTH milestones — the workload only
   operator-runbook troubleshooting table.
 - `States` should include `SEALED` on success; a seal-gate abort stops **before** `RUNNING`.
 
-### 5.2 Tier-1 egress is actually restricted (quick in-guest test)
+### 5.2 Tier-1 egress is a documented gap today (quick in-guest check)
 
-The seal does **not** enforce egress (5/§4.4) — the in-guest nftables allowlist does. Verify
-it from **inside** the guest over the serial console: a non-allowlisted host must be blocked
-while an allowlisted one is reachable.
+The seal does **not** enforce egress (§4.4) — and as of this writing, **nothing else does
+either**. This is a **gap check**, not a config check: run it to confirm the known gap
+exists, not to validate a working allowlist.
 
 ```text
 # In the guest serial console (the host drives \\.\pipe\<vm>-com1):
-#   allowlisted -> should connect:
 curl -sS -m 8 https://api.anthropic.com/ -o /dev/null ; echo "anthropic rc=$?"
-#   NOT allowlisted -> should FAIL (blocked by nftables default-deny):
 curl -sS -m 8 https://example.com/ -o /dev/null ; echo "example rc=$?"
 ```
 
-Expect a **non-zero / timeout** rc for `example.com` (blocked) and `rc=0` for
-`api.anthropic.com` (allowed). A reachable `example.com` means the in-guest allowlist isn't
-in force — fix the seed's nftables setup before trusting the tier. (This is an *in-guest*
-control and is bypassable by guest-root — acceptable for v1's trusted-workload Tier 1; host/
-hypervisor enforcement is the documented escalation, per tier-reference.md.)
+**Expect BOTH curls to succeed (`rc=0`) today** — that is the known, documented gap (no
+in-guest egress mechanism ships yet; see [`tier-reference.md`](tier-reference.md)'s Egress
+note), **not a configuration bug, and there is nothing here to "fix."** Do **not** proceed to
+a live untrusted/agent Ralph run until an egress mechanism ships (a Squid-based in-guest
+redirect and/or host-side enforcement — see
+[`phase-6-live-runbook.md`](phase-6-live-runbook.md)).
 
 ---
 
