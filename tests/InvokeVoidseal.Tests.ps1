@@ -991,6 +991,9 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
             -Name 'sbx-proc-depsunreadable' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
         @($report.States) | Should -Not -Contain 'SEALED' -Because 'an unreadable (never-registered) deps disk aborts BEFORE the seal'
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'a pre-seal abort must never reach the workload-run state'
+        $report.SealVerdict | Should -Not -Be $true -Because 'Assert-Sealed never ran on this aborted deploy'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0 -Because 'the run aborted before ever reaching StartVM — full parity with the sibling DiskFull DENY tests'
         $report.Error | Should -Match '(?i)unreadable via GetVHDInfo' -Because 'the abort names the specific GetVHDInfo-unreadable refusal, not a generic throw'
         $report.Released | Should -BeNullOrEmpty -Because 'an unreadable-deps abort is fail-closed — nothing is released (symmetry with the sibling DENY tests)'
         (& $b.GetVM @{ Name = 'sbx-proc-depsunreadable' }) | Should -BeNullOrEmpty -Because 'teardown must still run cleanly — no orphaned VM'

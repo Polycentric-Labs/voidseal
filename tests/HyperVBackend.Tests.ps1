@@ -1358,6 +1358,16 @@ Describe '$script:SbAssertArg — array shape preservation across the & boundary
         { & $script:SbAssertArg @{ } 'Missing' 'SomeMethod' } |
             Should -Throw -ExpectedMessage "*required argument 'Missing' is missing*"
     }
+
+    It 'still throws the required-argument-missing message for a present-but-$null value (unchanged refusal)' {
+        { & $script:SbAssertArg @{ Missing = $null } 'Missing' 'SomeMethod' } |
+            Should -Throw -ExpectedMessage "*required argument 'Missing' is missing*"
+    }
+
+    It 'still throws the required-argument-missing message for a whitespace-only string value (unchanged refusal)' {
+        { & $script:SbAssertArg @{ Missing = '   ' } 'Missing' 'SomeMethod' } |
+            Should -Throw -ExpectedMessage "*required argument 'Missing' is missing*"
+    }
 }
 
 # ===========================================================================

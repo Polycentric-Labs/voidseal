@@ -158,7 +158,7 @@ function Test-HostFreeSpace {
     if ($free -lt $need) {
         throw ("Test-HostFreeSpace: insufficient host free space on the volume hosting '$Path' — " +
                "need $need bytes (budget $RequiredBytes + headroom $HeadroomBytes) but only $free free. " +
-               "Free space or choose another storage root. Failing closed BEFORE disk creation.")
+               "Free up space or choose another storage root. Failing closed BEFORE disk creation.")
     }
     return $true
 }
