@@ -51,7 +51,7 @@ Describe 'Invoke-BuilderVM — Tier-1 builder orchestration (Phase 2.4)' {
         $ops = @($fake.FakeCallLog | Where-Object { $_.Op -in @('RemoveHardDiskDrive','GetVhdxImageHash') } | ForEach-Object { $_.Op })
         # TR-2: assert BOTH ops actually ran BEFORE the IndexOf ordering check — IndexOf returns -1 when an
         # op is absent, and `-1 -BeLessThan <positive>` is vacuously TRUE, so the ordering assertion alone
-        # would pass even if the detach never happened (mirror InvokeVoidseal.Tests.ps1:352-363).
+        # would pass even if the detach never happened (mirror InvokeVoidseal.Tests.ps1's 'attaches BOTH data disks before the seal' It).
         $ops | Should -Contain 'RemoveHardDiskDrive' -Because 'the OUTPUT/deps disk must be detached'
         $ops | Should -Contain 'GetVhdxImageHash'    -Because 'the whole-image hash must run'
         ($ops.IndexOf('RemoveHardDiskDrive')) | Should -BeLessThan ($ops.IndexOf('GetVhdxImageHash'))

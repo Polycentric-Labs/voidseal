@@ -85,9 +85,10 @@ in-guest layer).
 
 ## 3. qemu-img confinement shim
 
-*Source: Pass B §Q4. This is the real mechanism behind `Invoke-ConfinedQemu`
-(`scripts/lib/HyperVBackend.ps1:673`), which today is a v1 pass-through seam — every native `qemu-img
-convert` call is routed through it, AST-pinned by test, but nothing yet confines the child process.*
+*Source: Pass B §Q4. This is the real mechanism behind `Invoke-ConfinedQemu` (`scripts/lib/
+HyperVBackend.ps1`, the confinement seam — locate by function name; line numbers drift), which today is
+a v1 pass-through seam — every native `qemu-img convert` call is routed through it, AST-pinned by test,
+but nothing yet confines the child process.*
 
 - **Threat framing (honest, per Pass B):** of the ~12 CVE IDs the fleet initially attached to QEMU's VHDX
   parser, exactly one is genuine — **`CVE-2014-0148`**, and it is a **DoS** (crash/hang, missing BAT
@@ -97,7 +98,8 @@ convert` call is routed through it, AST-pinned by test, but nothing yet confines
 - **Version floor = patch-currency, not CVE-derived.** Re-resolve the current stable qemu-img at fire
   time; the floor's justification is "run a currently-patched build," not a specific VHDX-parser CVE fix
   (there is only the one, ancient, DoS fix).
-- **Pin qemu-img by SHA-256** (`Resolve-QemuImg -PinnedSha256`, `scripts/lib/HyperVBackend.ps1:614`).
+- **Pin qemu-img by SHA-256** (`Resolve-QemuImg -PinnedSha256`; `Resolve-QemuImg` (`scripts/lib/
+  HyperVBackend.ps1` — locate by function name; line numbers drift)).
   Pass B prefers **MSYS2 `mingw-w64-x86_64-qemu`** (SHA-256-published, GPG-DB-signed, hash-pinnable). The
   **weilnetz** Windows build is acceptable-by-hash but its Authenticode certificate is **EXPIRED** — do
   **NOT** gate on `Get-AuthenticodeSignature` reporting a `Valid` chain for that build; the SHA-256 pin is
@@ -129,8 +131,8 @@ convert` call is routed through it, AST-pinned by test, but nothing yet confines
 | Assertion | Status |
 |---|---|
 | Single-NIC invariant | live-only addition (not yet asserted) |
-| NIC's switch `SwitchType == Internal` | **SHIPPED, mock-green** — `Assert-Sealed`, `scripts/lib/Sealer.ps1:720` |
-| By-name refusal of the built-in "Default Switch" | **SHIPPED, mock-green, this slice** — `scripts/lib/Sealer.ps1:739` (commit `3c3a944`) |
+| NIC's switch `SwitchType == Internal` | **SHIPPED, mock-green** — `Assert-Sealed`'s `SwitchType -ne 'Internal'` refusal in `scripts/lib/Sealer.ps1`'s Tier-1 block — locate by predicate |
+| By-name refusal of the built-in "Default Switch" | **SHIPPED, mock-green, this slice** — `Assert-Sealed`'s `$switchName.Trim() -ieq 'Default Switch'` refusal in `scripts/lib/Sealer.ps1`'s Tier-1 block — locate by predicate (commit `3c3a944`) |
 | No-uplink (`NetAdapterInterfaceDescription == null`) | live-only addition (not yet asserted) |
 | Host-gateway-IP pin | live-only addition (not yet asserted) |
 | Firewall-baseline export/diff | live-only addition (not yet asserted) |

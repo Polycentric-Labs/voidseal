@@ -38,8 +38,8 @@ insider, and make the blast radius structurally small.
 
 | Tier | Boundary | Network | Credentials | Use |
 |---|---|---|---|---|
-| **0** | lightweight / offline (no-NIC VM in v1) | host-proxy, default-offline | none | trusted local workloads, file organizers |
-| **1** | net-restricted Hyper-V VM | allowlisted egress (in-guest) | scoped, on-demand | autonomous agent loops against a target repo |
+| **0** | lightweight / offline (no-NIC VM in v1) | default-offline (host-proxy allowlist declared, not yet implemented) | none | trusted local workloads, file organizers |
+| **1** | net-restricted Hyper-V VM | Internal-switch isolation (seal-verified); in-guest egress allowlist DECLARED, not yet enforced | scoped, on-demand | autonomous agent loops against a target repo |
 | **2** | disposable, **no NIC** | none (structurally starved) | none (refused at load) | untrusted code *(scaffold-only in v1)* |
 | **3** | air-gapped + sinkhole | none | none | malware detonation *(scaffold-only in v1)* |
 

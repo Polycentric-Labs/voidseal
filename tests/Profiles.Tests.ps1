@@ -174,7 +174,7 @@ Describe 'profiles/firefox.psd1 — loads + merges through Import-WorkloadProfil
         # C1.3 handoff: run_disk_workload.py is the shared in-guest outbox-producer template, delivered
         # the SAME way as organize_bookmarks.py — via InputFiles (raw .psd1 doc-only metadata; the
         # live-acceptance step folds these host paths into Inputs before deploy — see the InputFiles
-        # header comment in firefox.psd1 and Invoke-Voidseal.ps1:471). It imports outbox.py from its
+        # header comment in firefox.psd1 and Invoke-Voidseal.ps1's processor-gate wiring). It imports outbox.py from its
         # own directory (sys.path.insert(0, HERE)), so outbox.py must ride alongside it on the INPUT disk too.
         $raw = Import-PowerShellDataFile -LiteralPath $script:FirefoxPath
         $raw.InputFiles.ContainsKey('run_disk_workload.py') | Should -BeTrue -Because 'the seed runner invokes python3 /mnt/in/run_disk_workload.py (SeedBuilder.ps1 CidataOutboxDiskRunnerTemplate)'

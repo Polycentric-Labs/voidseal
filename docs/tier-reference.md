@@ -121,7 +121,7 @@ gate**. Output = a **signed, content-addressed behavior report**, diffable acros
 ## 4. Quick "which tier?" guide
 
 - **Trusted code/data, operating on copies, needs the net or not** → **Tier 0** (container, fast).
-- **An agent loop or organizer you trust, that needs a *restricted* allowlisted net** → **Tier 1** (net-restricted VM).
+- **An agent loop or organizer you trust, that needs a *restricted* allowlisted net** → **Tier 1** (net-restricted VM; egress allowlist declared, in-guest enforcement not yet shipped — see the Egress note above).
 - **A semi-trusted artifact you want to analyze with no net** → **Tier 2** (disposable no-net) — *scaffold only this round.*
 - **Presumed-hostile / malware, full airgap + detonation** → **Tier 3** — *scaffold only this round; live detonation is gated behind explicit operator approval + verified isolation.*
 

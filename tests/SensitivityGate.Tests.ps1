@@ -535,7 +535,7 @@ Describe 'Invoke-SensitivityGate — C2.4 regenerator core (schema validation + 
     $null = Invoke-SensitivityGate -StagingDir $script:regenStaging -OutputDir $output -VerdictsPath $vfile
 
     # The audit copy of the guest's raw verdicts.json lives under manifest/ (already the case
-    # pre-C2.4 at SensitivityGate.ps1:155) — assert it is NOT duplicated into released/.
+    # pre-C2.4, in SensitivityGate.ps1's release path) — assert it is NOT duplicated into released/.
     Test-Path (Join-Path $output 'manifest/verdicts.json') | Should -BeTrue -Because 'the guest verdicts.json audit copy must still exist under manifest/'
     Test-Path (Join-Path $output 'released/verdicts.json') | Should -BeFalse -Because 'the guest verdicts.json must NEVER appear on the released path'
   }

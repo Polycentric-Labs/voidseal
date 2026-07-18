@@ -780,7 +780,8 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         # The guest self-powered-off cleanly (SelfPowerOff) but produced NO outbox (its screener aborted;
         # producer fail-closed is locked separately by test_run_disk_workload.py:34). No SimulateOutboxBlob
         # -> the OUTPUT base region reads as ZEROS -> the orchestrator's 24-byte header magic check
-        # (Invoke-Voidseal.ps1:576) fails 'VSOUTBX1' -> gate catch -> nothing released.
+        # (Read-OutboxToGateInput's 24-byte header magic check in Invoke-Voidseal.ps1 — locate by the
+        # 'VSOUTBX1' literal) fails 'VSOUTBX1' -> gate catch -> nothing released.
         $b = New-FakeHyperVBackend -SimulateSelfPowerOff       # NOTE: no -SimulateOutboxBlob
         & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
         $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
@@ -800,7 +801,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
     }
 
     It '(a-verdict) an outbox whose verdicts are ALL non-SAFE -> the gate runs but releases NOTHING (Held, not Released)' {
-        # Distinct from the happy path (:642, which releases the two SAFE files): here EVERY staged file is
+        # Distinct from the happy path (the 'releases the SAFE candidates end-to-end' It, which releases the two SAFE files): here EVERY staged file is
         # non-SAFE, so the gate runs cleanly (GateRan=$true, no Error) yet Released is EMPTY and everything
         # is Held. Proves the screener-verdict fail-closed at the partition, separate from a parse failure.
         $allHeld = Join-Path $script:TmpRoot ("verdicts-allheld-{0}.json" -f ([guid]::NewGuid().ToString('N')))
@@ -837,7 +838,8 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
     It '(b) DENY-on-missing-verdicts: an outbox with candidates but NO verdicts.json -> read_outbox.py exits non-zero -> Released $null' {
         # write_outbox_from_dir always includes verdicts.json, so pack a LONE candidate directly with
         # pack_outbox to omit it. read_and_verify raises OutboxError('outbox missing verdicts.json') ->
-        # read_outbox.py exit != 0 -> the orchestrator throws (Invoke-Voidseal.ps1:605) -> gate catch.
+        # read_outbox.py exit != 0 -> the orchestrator throws (Read-OutboxToGateInput's non-zero-exit
+        # throw in Invoke-Voidseal.ps1 — locate by '$LASTEXITCODE -ne 0') -> gate catch.
         $blobFile = Join-Path $script:TmpRoot ("outbox-noverdicts-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
         & python -c "import sys; sys.path.insert(0, 'guest'); import outbox, pathlib; pathlib.Path(r'$blobFile').write_bytes(outbox.pack_outbox([('candidate.txt', b'hello world\n')]))"
         $LASTEXITCODE | Should -Be 0 -Because 'packing a lone candidate must succeed'
@@ -862,7 +864,8 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
     It '(d) DENY-on-oversize-header: an outbox header claiming count > MAX_ENTRIES -> the header bound check fails closed BEFORE a huge read' {
         # The disk-full / oversize analogue, testable WITHOUT a new backend switch: craft a valid-magic
         # 24-byte header whose entry_count exceeds MAX_ENTRIES (256). The orchestrator bounds count/total
-        # (Invoke-Voidseal.ps1:581) BEFORE computing $exact + issuing the full ReadVhdxRawRegion, so a
+        # (Read-OutboxToGateInput's count/total bound check in Invoke-Voidseal.ps1 — locate by
+        # 'count -gt 256') BEFORE computing $exact + issuing the full ReadVhdxRawRegion, so a
         # bogus/oversize length-prefix cannot drive an enormous read. (Windows is little-endian, matching
         # the outbox '<' format; the unit-level bound is covered by test_outbox.py's oversize/truncation.)
         $hdr = [byte[]]::new(24)
@@ -983,7 +986,8 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         # A plausible DepsDiskPath that is NEVER registered in the fake's VHD state (no NewVHD call) —
         # GetVHDInfo (HyperVBackend.ps1) returns $null for any unknown path, modelling a deps hand-off
         # naming a disk the host cannot actually read. A DepsImageHash IS supplied (per the task brief) so
-        # the refusal under test — the null-GetVHDInfo refusal (Invoke-Voidseal.ps1:606-609) — fires, not
+        # the refusal under test — the null-GetVHDInfo refusal (Invoke-Voidseal.ps1 — the 'unreadable via
+        # GetVHDInfo' throw) — fires, not
         # the sibling DENY-on-missing-deps-hash refusal above.
         $unreadableDepsDisk = Join-Path $script:TmpRoot ("deps-unregistered-{0}.vhdx" -f ([guid]::NewGuid().ToString('N')))
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
@@ -1192,12 +1196,12 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
     # -----------------------------------------------------------------------
     # Task 5.2 (c / M1) — processor DETACH FAILURE: the explicit M1 coverage item carried
     # from Phase 1. A VALID outbox proves the gate WOULD have released the SAFE candidates —
-    # but the post-run data-disk detach fails first (Invoke-Voidseal.ps1:515-522 sets
-    # $detachOk=$false and records a Failed RunResult), and the gate block at :566 is guarded
+    # but the post-run data-disk detach fails first (Invoke-Voidseal.ps1 — the data-disk detach
+    # try/catch that sets $detachOk=$false and records a Failed RunResult), and the gate block is guarded
     # by `$detachOk -and -not $wait.TimedOut` — so a failed detach means the gate NEVER runs,
     # even though the outbox on the (now-unreadable, still-attached-per-the-failed-detach)
     # OUTPUT disk was perfectly valid. This mirrors the existing NON-processor detach-failure
-    # test above (:439) but for a PROCESSOR, plus asserts the gate did not run.
+    # test above (the 'transient data-disk DETACH failure' It) but for a PROCESSOR, plus asserts the gate did not run.
     # -----------------------------------------------------------------------
     It '(c / M1) processor DETACH FAILURE: a VALID outbox proves the gate WOULD have released, but the failed detach skips the gate entirely (Failed run, no lifecycle abort, clean teardown)' {
         $blobFile = Join-Path $script:TmpRoot ("outbox-detachfail-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
@@ -1215,20 +1219,21 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
 
         $report.RunResult        | Should -Not -BeNullOrEmpty
-        $report.RunResult.Status | Should -Be 'Failed' -Because 'a data-disk detach failure is a Failed run (Invoke-Voidseal.ps1:521)'
+        $report.RunResult.Status | Should -Be 'Failed' -Because 'a data-disk detach failure is a Failed run (Invoke-Voidseal.ps1 — the detach-catch''s Failed RunResult)'
         $report.RunResult.Reason | Should -Match '(?i)detach' -Because 'the reason names the detach, pointing the operator host-side'
-        $report.Error            | Should -BeNullOrEmpty -Because 'a caught detach failure is NOT a lifecycle abort (mirrors the non-processor detach test at :439) — it is a Failed run, not an .Error'
+        $report.Error            | Should -BeNullOrEmpty -Because 'a caught detach failure is NOT a lifecycle abort (mirrors the non-processor ''transient data-disk DETACH failure'' It) — it is a Failed run, not an .Error'
         $report.Released         | Should -BeNullOrEmpty -Because 'the gate never ran, so nothing was released, even though the outbox was VALID'
         $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
         ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) |
-            Should -BeTrue -Because 'GateRan must NOT be stamped — the failed detach guards the gate block off ($detachOk at :566)'
-        @($report.States) | Should -Contain 'DESTROYED' -Because 'a detach failure does not set .Error, so DESTROYED is recorded as a traversed state (Invoke-Voidseal.ps1:678)'
+            Should -BeTrue -Because 'GateRan must NOT be stamped — the failed detach guards the gate block off (the $detachOk guard)'
+        @($report.States) | Should -Contain 'DESTROYED' -Because 'a detach failure does not set .Error, so DESTROYED is recorded as a traversed state (Invoke-Voidseal.ps1 — the teardown block''s ''if ($null -eq $report.Error)'' guard)'
         (& $b.GetVM @{ Name = 'sbx-proc-detachfail' }) | Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM even though the detach itself failed'
     }
 
     # -----------------------------------------------------------------------
-    # Task 5.2 (e) — VM won't boot: StartVM throws inside the try (Invoke-Voidseal.ps1:502) ->
-    # the outer catch (:656) records .Error and teardown runs. SEALED is reached (the seal
+    # Task 5.2 (e) — VM won't boot: StartVM throws inside the try (Invoke-Voidseal.ps1 — the Disk-mode
+    # '& $Backend.StartVM' call) ->
+    # the outer lifecycle catch records .Error and teardown runs. SEALED is reached (the seal
     # precedes StartVM) but RUNNING/the gate never are.
     # -----------------------------------------------------------------------
     It '(e) processor VM WON''T BOOT: StartVM throws -> lifecycle abort, SEALED reached but the gate never runs, clean teardown' {
@@ -1251,7 +1256,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
     # -----------------------------------------------------------------------
     # Task 5.2 (e) — backend unavailable: New-SandboxVM's TestAvailable preflight
-    # (Provisioner.ps1:299-303) refuses BEFORE any VM/disk is created, so provisioning itself
+    # (New-SandboxVM's TestAvailable preflight in Provisioner.ps1) refuses BEFORE any VM/disk is created, so provisioning itself
     # throws and the outer catch records it. No deps disk is needed here — the abort happens
     # before New-SandboxVM even returns, well before the disk-mode deps-attach block runs.
     # -----------------------------------------------------------------------
@@ -1271,11 +1276,11 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
     # -----------------------------------------------------------------------
     # Task 5.2 (e) — channel-read failure: Assert-Sealed's GetHostChannels throws
-    # (Sealer.ps1:844, unconditional for every tier/profile shape, including a processor) ->
-    # a genuine seal-gate abort, exactly like the existing sbx-disk-sealfail test (:428-437)
+    # (the '& $Backend.GetHostChannels' read in Assert-Sealed, Sealer.ps1 — unconditional for every tier/profile shape, including a processor) ->
+    # a genuine seal-gate abort, exactly like the existing sbx-disk-sealfail It (grep the VM name)
     # but confirmed here against the PROCESSOR fixture. Assert-Sealed is throw-only (no
-    # SealVerdict=$false return path reaches the report — see the belt-and-braces comment at
-    # Invoke-Voidseal.ps1:485-491), so $report.SealVerdict stays at its initial $false.
+    # SealVerdict=$false return path reaches the report — see the belt-and-braces comment (Invoke-
+    # Voidseal.ps1 — above the '-not $sealOk' throw), so $report.SealVerdict stays at its initial $false.
     # -----------------------------------------------------------------------
     It '(e) processor CHANNEL-READ FAILURE: Assert-Sealed''s host-channel read throws -> seal-stage abort, gate never runs, clean teardown' {
         $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateChannelReadError
@@ -1287,7 +1292,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
         $report.Released    | Should -BeNullOrEmpty -Because 'the gate never runs — the seal never certified'
         $report.SealVerdict | Should -BeFalse -Because 'Assert-Sealed is throw-only; it never returned a true verdict for this run'
-        $report.Error       | Should -Match '(?i)host-channel|channel' -Because 'the abort names the unreadable host channel (Sealer.ps1:852)'
+        $report.Error       | Should -Match '(?i)host-channel|channel' -Because 'the abort names the unreadable host channel (Assert-Sealed''s channel-read fail-closed path)'
         @($report.States)   | Should -Not -Contain 'SEALED'  -Because 'the seal gate threw before SEALED was recorded'
         @($report.States)   | Should -Not -Contain 'RUNNING' -Because 'a seal-gate failure must never reach the workload-run state'
         $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
@@ -1471,27 +1476,28 @@ function Read-OutboxToGateInput {
 #  D5-C: this is deliberately a SERIAL Tier-1 test, NOT a processor test — a Disk-mode processor
 #  has no live guest-command channel (its only "communication" is the OUTPUT outbox read post-
 #  detach), so -SimulateGuestCommandFailure has nothing to attach to there. The serial seam
-#  (Start-SandboxWorkload's boot-readiness probe, Runner.ps1:146-195) is the only place a guest-
+#  (Start-SandboxWorkload's boot-readiness probe, Wait-GuestBootReady in Runner.ps1) is the only place a guest-
 #  command fault is observable.
 #
 #  VERIFIED SHAPE (re-confirmed against the fake + Runner.ps1, not the brief's original guess):
 #  -SimulateGuestCommandFailure does NOT make InvokeGuestCommand THROW — it makes it RETURN a
-#  normal (non-throwing) @{ ExitCode = 1; ... } (HyperVBackend.ps1:1767-1769). Wait-GuestBootReady's
-#  probe (Runner.ps1:166-177) treats a non-zero probe exit exactly like "not ready yet" and retries
-#  to the deadline; a probe THROW would ALSO be caught and retried the same way (:179-182) — either
+#  normal (non-throwing) @{ ExitCode = 1; ... } (the fake InvokeGuestCommand's canned-failure result in
+#  HyperVBackend.ps1 — locate by SimulateGuestCommandFailure). Wait-GuestBootReady's
+#  probe (Wait-GuestBootReady's InvokeGuestCommand loop) treats a non-zero probe exit exactly like "not ready yet" and retries
+#  to the deadline; a probe THROW would ALSO be caught and retried the same way (its probe try/catch) — either
 #  shape lands on the same outcome. With -BootWaitSeconds 0 the deadline is met after exactly one
 #  attempt, so Wait-GuestBootReady returns Ready=$false immediately (no real sleep), and
-#  Start-SandboxWorkload (Runner.ps1:302-332) returns EARLY with a boot-timeout run-result
+#  Start-SandboxWorkload (its boot-timeout early-return branch in Runner.ps1) returns EARLY with a boot-timeout run-result
 #  (ExitCode=-1, BootWaitStatus set) WITHOUT ever delivering the entrypoint — this is a reported
-#  Failed run, NOT a thrown lifecycle abort. Invoke-Voidseal's serial branch (:636-639) assigns this
+#  Failed run, NOT a thrown lifecycle abort. Invoke-Voidseal's Serial else-branch assigns this
 #  run-result to $report.RunResult verbatim (a raw Runner pscustomobject: it carries ExitCode/
 #  BootWaitStatus, NOT a .Status property — unlike the Disk-mode RunResult hashtables elsewhere in
 #  this file). Under Set-StrictMode -Version Latest, reading a nonexistent .Status on this
 #  pscustomobject would THROW, so assertions below read ExitCode/BootWaitStatus, not .Status.
 #  EXTRACTED IS still reached (re-confirmed empirically, D5-D): the orchestrator's serial EXTRACTED
-#  gate (:647) checks only whether -Workload.ResultPath is non-blank — it does NOT consult
+#  gate (the Serial-branch ResultPath non-blank check) checks only whether -Workload.ResultPath is non-blank — it does NOT consult
 #  RunResult/ExitCode. $script:NewWorkload pre-stages its result file on the HOST independent of any
-#  guest activity, so Export-SandboxArtifact (Runner.ps1:491-493, which just requires -ResultPath to
+#  guest activity, so Export-SandboxArtifact (Runner.ps1, which just requires -ResultPath to
 #  exist) succeeds regardless of the boot-readiness timeout. Asserting "no EXTRACTED" would be a
 #  false claim the code cannot satisfy, so this test asserts the REAL fault signal instead —
 #  RunResult.ExitCode/BootWaitStatus, proving the boot-readiness probe genuinely never succeeded.
@@ -1515,16 +1521,17 @@ Describe 'Invoke-Voidseal — a guest-command failure during boot-readiness is a
             -Name 'sbx-guestcmdfail' -ArtifactRoot $script:Art -Destination $script:Dest `
             -BootWaitSeconds 0 -BootPollDelaySeconds 0 -Backend $script:BadGuestCmd -ErrorAction SilentlyContinue
 
-        $report.Error | Should -BeNullOrEmpty -Because 'a boot-readiness timeout is a REPORTED run outcome (Runner.ps1:302-332 returns, never throws) — not a lifecycle .Error'
+        $report.Error | Should -BeNullOrEmpty -Because 'a boot-readiness timeout is a REPORTED run outcome (the boot-timeout early-return branch returns, never throws) — not a lifecycle .Error'
 
         $report.RunResult | Should -Not -BeNullOrEmpty -Because 'Start-SandboxWorkload always returns a run-result, even on a boot-readiness timeout'
-        $report.RunResult.ExitCode | Should -Be -1 -Because 'a boot-readiness timeout reports ExitCode -1 (Runner.ps1:323), never a phantom success'
+        $report.RunResult.ExitCode | Should -Be -1 -Because 'a boot-readiness timeout reports ExitCode -1 (the boot-timeout RunResult), never a phantom success'
         $statusField = $report.RunResult.PSObject.Properties['BootWaitStatus']
         $statusField | Should -Not -BeNullOrEmpty -Because 'the serial run-result carries BootWaitStatus explaining why (no .Status field exists on this shape — StrictMode would throw reading it)'
         [string]$statusField.Value | Should -Match '(?i)not.*boot-ready|timeout|did not' -Because 'the boot-readiness result names the guest never coming up'
 
         # NOTE (re-confirmed empirically, D5-D): the orchestrator's serial EXTRACTED gate
-        # (Invoke-Voidseal.ps1:647) checks only whether -Workload.ResultPath is non-blank — it does
+        # (Invoke-Voidseal.ps1 — the Serial-branch ResultPath non-blank check) checks only whether
+        # -Workload.ResultPath is non-blank — it does
         # NOT consult RunResult/ExitCode. $script:NewWorkload pre-stages its result file on the HOST
         # independent of any guest activity (a test-harness artifact, not a guest-produced one), so
         # EXTRACTED IS reached and ExtractedArtifact IS set here even though the entrypoint was never
@@ -1544,11 +1551,12 @@ Describe 'Invoke-Voidseal — a guest-command failure during boot-readiness is a
 #  I6a — SERIAL mode overall wall-clock DENY (Disk-mode parity)
 # ===========================================================================
 #  Disk mode already force-stops a hung guest on an OVERALL wall-clock deadline
-#  (Wait-WorkloadComplete -TimeoutSeconds $WorkloadTimeoutSeconds, Invoke-Voidseal.ps1:620-621).
+#  (Wait-WorkloadComplete -TimeoutSeconds $WorkloadTimeoutSeconds, in Invoke-Voidseal.ps1's Disk-mode
+#  branch — locate by the Wait-WorkloadComplete call).
 #  Serial mode's real mechanism (FIX PASS, superseding a REJECTED placebo — see task-2-report.md):
 #  $WorkloadTimeoutSeconds is passed straight through as Start-SandboxWorkload's -TimeoutSeconds,
-#  the OUTER bound of the single serial guest-command dispatch (Runner.ps1:339,
-#  InvokeGuestCommand). When that guest command reports TimedOut=$true — a REPORTED outcome from
+#  the OUTER bound of the single serial guest-command dispatch (Start-SandboxWorkload's
+#  InvokeGuestCommand call). When that guest command reports TimedOut=$true — a REPORTED outcome from
 #  InvokeGuestCommand's TimedOut contract, not a thrown error — Invoke-Voidseal's Serial branch
 #  force-stops the VM and records a Failed RunResult (Invoke-Voidseal.ps1's Serial else-branch).
 #  A PRIOR implementation compared (Get-Date) against (Get-Date).AddSeconds($WorkloadTimeoutSeconds)
@@ -1592,7 +1600,7 @@ Describe 'Invoke-Voidseal — I6a: SERIAL mode overall wall-clock DENY (force-st
             -BootWaitSeconds 0 -BootPollDelaySeconds 0 -WorkloadTimeoutSeconds 5 -Backend $script:SerialTimeoutB | Out-Null
         # Teardown always removes the VM in the end, so we cannot observe post-teardown State directly;
         # instead prove the force-stop fired via the SAME signal the Disk-mode sibling test uses one
-        # layer down (Workload.Tests.ps1:272-283): the VM is gone afterwards (no orphan), and no
+        # layer down (Workload.Tests.ps1's teardown coverage): the VM is gone afterwards (no orphan), and no
         # lifecycle .Error was recorded (a timeout trip is a REPORTED run outcome, not a thrown abort).
         (& $script:SerialTimeoutB.GetVM @{ Name = 'sbx-i6-serialddl2' }) |
             Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM on a serial guest-command timeout'
