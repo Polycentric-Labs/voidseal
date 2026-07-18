@@ -13,7 +13,7 @@ rather than duplicating it.
 
 > [!IMPORTANT]
 > **Honesty up front (read this before you trust it with anything dangerous).**
-> - **Nothing has run a full live acceptance yet.** The Tier-0/1 engine is **mock-proven** (400+ Pester
+> - **Nothing has run a full live acceptance yet.** The Tier-0/1 engine is **mock-proven** (700+ Pester
 >   tests against a fake Hyper-V backend); the real end-to-end run is an operator-run, elevated step that
 >   is *pending* (see [`docs/live-smoke-test.md`](docs/live-smoke-test.md)).
 > - **Tier 2 and Tier 3 (disposable no-net / air-gapped detonation) are scaffold-only.** The
@@ -21,8 +21,10 @@ rather than duplicating it.
 >   untrusted-plugin detonation yet.**
 > - **Windows + Hyper-V only**, today. The "Tier-0 container" substrate is design-intent — v1 provisions
 >   Tier 0 as a no-NIC Hyper-V VM.
-> - Tier-1 egress is an *in-guest* control (fine for Tier-1's trusted workloads), not a host-enforced
->   firewall in v1.
+> - **Tier-1 has no egress enforcement yet.** The tier keeps its NIC (net-restricted, *not* no-net), but
+>   the in-guest allowlist it *declares* is **not implemented** in v1 — a live Tier-1 VM's egress is
+>   currently unrestricted in-guest. Don't run untrusted work at Tier-1 live until host-side enforcement
+>   ships (see the Egress note in [`docs/tier-reference.md`](docs/tier-reference.md)).
 
 ## What it is
 
