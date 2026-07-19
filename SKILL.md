@@ -31,7 +31,7 @@ assume the agent/code inside is a prompt-injectable insider; make the blast radi
 structurally small. Isolation strength is matched to the task's risk via the **tier axis**.
 
 > **Status (v1):** core engine + the Tier 0/1 Hyper-V provisioning paths built + tested. The whole
-> module is **mock-backed green (485 tests)**, AND the **Tier-0 `firefox` disk-mode round-trip is now
+> module is **mock-backed green (700+ tests)**, AND the **Tier-0 `firefox` disk-mode round-trip is now
 > LIVE-PROVEN on real Hyper-V** (2026-06-25 — Milestone 3: provision → host-verified seal gate →
 > disk-passing workload → host-read result → clean teardown, end to end; the first live run drove out
 > 7 real `fake≠real` host/Hyper-V gaps, all since fixed). The **Tier-1 `ralph` live run is still
