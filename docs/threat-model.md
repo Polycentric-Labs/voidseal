@@ -88,12 +88,12 @@ itself is patched.
 - **T0 — KNOWN LIMITATION, TRACKED, not a currently-certified guarantee.** `Assert-Sealed`'s NIC check only
   fires when the tier is ≥ 2 or the profile is a processor. A plain Tier-0 workload profile — `firefox.psd1`
   does not set `Network='None'` — is **not** covered by this check: the seal does not verify there is no
-  live NIC on a Tier-0, non-processor VM. In practice, `Provisioner.ps1` only creates a switch/NIC when a
-  profile's `Substrate` is `'HyperV-Gen2'`, and Tier 0's schema `Substrate` is `'Container'`, so no NIC
-  happens to be created for the shipped Tier-0 profile today — but that is a side effect of the
+  live NIC on a Tier-0, non-processor VM. In practice, `Provisioner.ps1` only creates a switch and *connects* the VM's adapter to it when a
+  profile's `Substrate` is `'HyperV-Gen2'`, and Tier 0's schema `Substrate` is `'Container'`, so the shipped Tier-0 VM's default adapter is left **switch-less**
+  (unconnected, no egress route) today, rather than removed — but that is a side effect of the
   container-substrate scope gap (`tier-reference.md`'s "Tier-0 substrate" accuracy note: the container
   runtime is design-intent, not wired), not a host-verified invariant. Nothing in `Assert-Sealed` would
-  catch a future Tier-0 code path that *did* wire a NIC.
+  catch a future Tier-0 code path that *did* connect that NIC to a switch.
 
 **Egress filtering (which destinations are reachable through an existing route).**
 - **T0 — KNOWN LIMITATION.** `tier0.psd1` declares `EgressMode='HostProxy'`, but per `tier-reference.md`'s
