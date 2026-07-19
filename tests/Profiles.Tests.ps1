@@ -25,10 +25,12 @@ BeforeAll {
     $script:ProfileDir  = Join-Path $script:SkillRoot 'profiles'
     $script:RalphPath   = Join-Path $script:ProfileDir 'ralph.psd1'
     $script:FirefoxPath = Join-Path $script:ProfileDir 'firefox.psd1'
+    $script:SkeletonPath = Join-Path $script:ProfileDir 'example-skeleton.psd1'
 
     Test-Path $script:LibPath     | Should -BeTrue -Because 'the loader must exist to test profiles through it'
     Test-Path $script:RalphPath   | Should -BeTrue -Because 'the ralph profile must exist'
     Test-Path $script:FirefoxPath | Should -BeTrue -Because 'the firefox profile must exist'
+    Test-Path $script:SkeletonPath | Should -BeTrue -Because 'the onboarding skeleton profile must exist'
     . $script:LibPath
 }
 
@@ -181,6 +183,44 @@ Describe 'profiles/firefox.psd1 — loads + merges through Import-WorkloadProfil
         $raw.InputFiles.ContainsKey('outbox.py') | Should -BeTrue -Because 'run_disk_workload.py imports outbox from its own directory — it must ride the INPUT disk alongside it'
         [string]$raw.InputFiles['run_disk_workload.py'] | Should -Match '(?i)run_disk_workload\.py$'
         [string]$raw.InputFiles['outbox.py'] | Should -Match '(?i)outbox\.py$'
+    }
+}
+
+Describe 'profiles/example-skeleton.psd1 — the onboarding skeleton loads clean (docs/authoring-a-workload-profile.md)' {
+
+    BeforeAll {
+        $script:Skeleton = Import-WorkloadProfile -Path $script:SkeletonPath -TierProfileDir $script:TierDir
+    }
+
+    It 'loads without throwing and is a hashtable' {
+        $script:Skeleton | Should -Not -BeNullOrEmpty
+        $script:Skeleton | Should -BeOfType [System.Collections.IDictionary]
+    }
+
+    It 'resolves to BaseTier 0 (Container, the lightweight/offline tier)' {
+        $script:Skeleton.Tier      | Should -Be 0
+        $script:Skeleton.BaseTier  | Should -Be 0
+        $script:Skeleton.Substrate | Should -Be 'Container'
+        $script:Skeleton.Name      | Should -Be 'example-skeleton'
+    }
+
+    It 'stays OFFLINE: the merged EgressAllowlist is empty (no ExtraAllowlist declared beyond @())' {
+        @($script:Skeleton.EgressAllowlist).Count | Should -Be 0 -Because 'the skeleton is a minimal offline example — no network by default'
+    }
+
+    It 'is a Serial-mode profile (WorkloadMode omitted -> not layered onto the merge)' {
+        $script:Skeleton.ContainsKey('WorkloadMode') | Should -BeFalse -Because 'the skeleton omits WorkloadMode, so it inherits the engine default (Serial)'
+    }
+
+    It 'declares no secret-shaped Mounts source' {
+        @($script:Skeleton.Mounts.Keys) | ForEach-Object {
+            Test-IsSecretPath -Path ([string]$_) | Should -BeFalse -Because "mount source '$_' must not be secret-shaped"
+        }
+    }
+
+    It 'is heavily commented with copy-editor EDIT markers' {
+        $raw = Get-Content -LiteralPath $script:SkeletonPath -Raw
+        (Select-String -InputObject $raw -Pattern '<-- EDIT' -AllMatches).Matches.Count | Should -BeGreaterThan 3 -Because 'every field a newcomer edits should carry an EDIT marker'
     }
 }
 

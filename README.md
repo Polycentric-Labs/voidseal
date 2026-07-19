@@ -88,8 +88,11 @@ Invoke-Voidseal -Tier 0 -Profile firefox -ParentDiskPath <golden.vhdx> -Destinat
 
 See [`docs/operator-runbook.md`](docs/operator-runbook.md) for the full provision → run → teardown walk,
 [`docs/tier-reference.md`](docs/tier-reference.md) for the per-tier containment rubric, and
-[`profiles/`](profiles/) for the two worked example profiles (`firefox` = Tier-0 bookmark organizer,
-`ralph` = Tier-1 net-restricted agent loop).
+[`profiles/`](profiles/) for the worked example profiles (`firefox` = Tier-0 bookmark organizer,
+`ralph` = Tier-1 net-restricted agent loop, `builder` = Tier-1 dependency fetcher).
+
+**Author your own workload** → [`docs/authoring-a-workload-profile.md`](docs/authoring-a-workload-profile.md)
+(the profile field contract + a minimal skeleton to copy, `profiles/example-skeleton.psd1`).
 
 ## Testing
 

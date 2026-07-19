@@ -5,6 +5,11 @@
 > handling, and how to run the tests. Companion to [`tier-reference.md`](tier-reference.md)
 > (the tier model + P1–P10 acceptance rubric) and the Claude-facing
 > [`../SKILL.md`](../SKILL.md).
+>
+> This runbook covers **running** a deploy (the two shipped example profiles, `firefox` and
+> `ralph`). To **author your own workload profile** instead, see
+> [`authoring-a-workload-profile.md`](authoring-a-workload-profile.md) (the field contract + a
+> minimal skeleton to copy) — then come back here for the run mechanics.
 
 ---
 
