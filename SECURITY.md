@@ -225,8 +225,30 @@ full privileges of whoever invokes it — here, the host operator.
 Do not rely on Voidseal as your sole boundary for genuinely hostile code until the higher tiers are
 completed and you have independently verified the isolation on your host.
 
+## Scope: what's a Voidseal bug vs. not
+
+Voidseal's security claim is narrow: the **host-verified, fail-closed `Assert-Sealed` gate** (described
+above) plus the tier isolation it verifies. What a workload *does once sealed and running* — whether its
+own logic is correct, whether an agent loop it drives goes off the rails — is the calling profile's own
+model, not something Voidseal guarantees; Voidseal supervises **capability**, never **behavior**, the same
+component-vs-product line bubblewrap draws for the low-level primitives it wraps rather than claiming to be
+a complete sandboxing product on its own.
+
+**[`docs/threat-model.md`](docs/threat-model.md)** is the full write-up: a gVisor-style
+attacker-prerequisite ladder (Remote → GuestUser → GuestRoot → MaliciousProfile → HostOperatorMisconfig →
+HostRoot) crossed with a per-tier table that classifies each threat class as **IN SCOPE** (a bug here is a
+Voidseal defect, traced to the exact gate in `Sealer.ps1` / `ProfileLoader.ps1`), **HOST MISCONFIG / OUT OF
+SCOPE**, or **KNOWN LIMITATION, TRACKED** — the Tier-1 egress gap worked through end-to-end as the
+centerpiece example — plus a maturity section (Tier 2/3 scaffold-only, no shipped tier file, no live run
+yet) kept deliberately separate from the scope question.
+
 ## Reporting a vulnerability
 
 Please open a GitHub issue for non-sensitive reports. For anything that could weaken containment in a way
 that shouldn't be public yet, contact the maintainer privately via the email on the GitHub profile rather
 than filing a public issue.
+
+**Please don't submit an AI-generated vulnerability report you haven't personally verified.** A
+plausible-sounding but unconfirmed model-generated claim about a security gap costs real maintainer time to
+triage and rule out — reproduce the issue yourself first, or clearly label the report as unverified and
+explain why you're surfacing it anyway.

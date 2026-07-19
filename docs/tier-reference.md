@@ -3,7 +3,9 @@
 > The risk-tier model + the Anthropic **P1–P10 containment principles** mapped to concrete
 > deployer controls, used as the **per-tier acceptance checklist** (per-tier controls + the
 > P1–P10 rubric). Companion to the
-> [`operator-runbook.md`](operator-runbook.md) and the Claude-facing [`../SKILL.md`](../SKILL.md).
+> [`operator-runbook.md`](operator-runbook.md), the Claude-facing [`../SKILL.md`](../SKILL.md), and
+> [`threat-model.md`](threat-model.md) (the per-tier IN SCOPE / HOST MISCONFIG / KNOWN LIMITATION
+> classification behind the "v1 status" column below).
 
 **Design north star (P1):** *supervise capability, not behavior.* Assume the agent/code
 inside the sandbox is a prompt-injectable insider; make the blast radius **structurally**
