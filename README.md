@@ -80,6 +80,13 @@ Requirements: Windows 10/11 Pro (Hyper-V), PowerShell 7, Pester 5; an elevated s
 Administrators` membership) to actually provision; a Debian-12 golden `.vhdx` + a cloud-init seed (see
 [`guest-images/debian-12-cloud.md`](guest-images/debian-12-cloud.md)).
 
+**Check prerequisites first** (a read-only, unelevated pass/fail table — Hyper-V eligibility is
+genuinely hard to self-check by reading docs):
+
+```powershell
+pwsh scripts/Test-VoidsealPrereqs.ps1
+```
+
 ```powershell
 # from the repo root, dot-source the engine and run the Tier-0 example workload
 . .\scripts\Invoke-Voidseal.ps1

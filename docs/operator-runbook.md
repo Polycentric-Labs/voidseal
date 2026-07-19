@@ -15,6 +15,24 @@
 
 ## 0. Preconditions (do these BEFORE any live run)
 
+**One-command check first.** Hyper-V eligibility (edition, feature-vs-service, elevation scope)
+is genuinely hard to self-check by reading prose — `scripts/Test-VoidsealPrereqs.ps1` converts
+every precondition below into a read-only, unelevated PASS/FAIL/WARN/UNKNOWN table plus an overall
+verdict:
+
+```powershell
+pwsh scripts/Test-VoidsealPrereqs.ps1
+# or, to also verify the golden parent disk:
+pwsh scripts/Test-VoidsealPrereqs.ps1 -ParentDiskPath <golden.vhdx>
+```
+
+It never creates/modifies a VM or setting, and never requires elevation to run — a check that
+needs rights it doesn't have (e.g. the Hyper-V optional-feature query) reports UNKNOWN with a note
+rather than a false PASS. Passing every row is **necessary, not sufficient** — the script prints a
+caveat block (nested virtualization, admin-rights scope, feature-vs-service, host-patch floors)
+after the table. The subsections below are the underlying preconditions it's built from, and the
+manual verification path if you want to check any of them by hand.
+
 ### 0.1 Elevation (mandatory for live runs)
 
 Live runs touch real Hyper-V and **require an elevated PowerShell session whose user is in
