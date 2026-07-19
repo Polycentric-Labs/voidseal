@@ -487,6 +487,150 @@ runcmd:
 '@
 
 # --------------------------------------------------------------------------
+# The SERIAL + InGuestSquid egress user-data (EG-2, ralph in-guest egress Option A). The serial-getty
+# AUTOLOGIN baseline (CidataSerialBaselineTemplate, above — ralph's ttyS0 command channel is
+# unchanged) COMPOSED WITH the builder's proven egress fragment (CidataBuilderRunnerTemplate, above:
+# IPv6-disable + Squid transparent domain-ACL + iptables default-DROP), ported for a Serial-mode
+# profile that declares EgressMode='InGuestSquid'. Single-quoted here-string: nothing is interpolated
+# by PowerShell ($TERM in the serial-getty line stays literal, same as the baseline). Only
+# __SQUID_ALLOWLIST_ACL__ is substituted (space-joined merged EgressAllowlist).
+#
+# THIS IS DEFENSE-IN-DEPTH, NOT A BOUNDARY (Pass A / Pass 5): a compromised/root guest can disable its
+# own iptables or kill its own Squid. The host-verified boundary is Phase-6 (host-side Internal
+# vSwitch + NAT + host default-DROP + host Squid SNI-splice, docs/phase-6-live-runbook.md). The mock
+# asserts SHAPE only (Squid ACL contains each allowlist domain; http_access deny all; iptables
+# default-DROP; IPv6 disabled) — real packet-drop is a Phase-6 live-validation item, same posture the
+# builder's own egress fragment already carries.
+# --------------------------------------------------------------------------
+$script:CidataSerialEgressTemplate = @'
+#cloud-config
+# Voidseal Tier-1 (ralph) serial-mode seed WITH in-guest egress (EG-2, Option A). Brings up the same
+# COM1 serial command channel as the bare serial baseline (AUTOLOGIN on ttyS0 — the Runner's serial
+# client does NOT authenticate) PLUS an in-guest iptables default-DROP + transparent Squid domain-ACL
+# over the profile's merged EgressAllowlist, ported from the builder's SquidSniProxy mechanism.
+#
+# DEFENSE-IN-DEPTH, NOT A BOUNDARY: a compromised/root guest can disable this. The host-verified
+# boundary is Phase-6 (host-side NAT/Squid/default-DROP). See docs/tier-reference.md.
+
+users:
+  - name: sandbox
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    lock_passwd: true          # no password login anywhere; serial console + key only
+
+# SEC-2/C3: disable IPv6 BEFORE the network comes up (bootcmd runs earlier than runcmd/network-config)
+# — ported verbatim from the builder's egress fragment. Primary control; the ip6tables default-DROP
+# in the lockdown script below is belt-and-braces.
+bootcmd:
+  - [ sysctl, -w, 'net.ipv6.conf.all.disable_ipv6=1' ]
+  - [ sysctl, -w, 'net.ipv6.conf.default.disable_ipv6=1' ]
+
+write_files:
+  # Serial console params so the kernel + grub talk over ttyS0 (the host pipe). (baseline)
+  - path: /etc/default/grub.d/99-serial.cfg
+    content: |
+      GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
+      GRUB_TERMINAL="console serial"
+      GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
+  # AUTOLOGIN on ttyS0 — the Runner expects an already-logged-in shell (no prompt). (baseline)
+  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin sandbox --keep-baud 115200,38400,9600 ttyS0 $TERM
+
+  - path: /etc/sysctl.d/99-voidseal-noipv6.conf
+    permissions: '0644'
+    content: |
+      # SEC-2/C3: IPv6 disabled for this Tier-1 in-guest egress control. Debian cloud images bring
+      # IPv6 up by default (SLAAC/DHCPv6); the lockdown below is otherwise IPv4-only and a semi-
+      # trusted agent could egress over IPv6 entirely unfiltered. bootcmd applies this at boot
+      # (before network-config); this file makes the setting persist/re-apply across `sysctl --system`.
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv6.conf.default.disable_ipv6 = 1
+
+  - path: /etc/squid/squid.conf
+    permissions: '0644'
+    content: |
+      # Voidseal Tier-1 in-guest transparent Squid proxy — intercept on 3129 (HTTP) + 3130 (HTTPS).
+      # DEFENSE-IN-DEPTH, NOT A BOUNDARY: a root guest can stop this service. LIVE-only (Phase 6):
+      # real ssl_bump/SNI peek + CDN-rotation resilience is unproven in mock tests.
+      http_port 3129 intercept
+      https_port 3130 intercept ssl-bump
+      acl allowed_domains dstdomain __SQUID_ALLOWLIST_ACL__
+      ssl_bump peek all
+      ssl_bump splice allowed_domains
+      ssl_bump terminate all
+      http_access allow allowed_domains
+      http_access deny all
+
+  # LIVE-ONLY (Phase 6): activation ORDERING vs pre-seal staging is unproven in mock. The lockdown
+  # must activate AFTER in-guest package install (deb.debian.org is intentionally NOT in the
+  # allowlist) and stay active through the sealed run. The mock asserts SHAPE only; the live
+  # ordering + real packet-drop are Phase-6 live-validation items (same posture as the builder runner).
+  - path: /usr/local/sbin/voidseal-egress-lockdown
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Voidseal Tier-1 (ralph) in-guest egress lockdown: iptables default-DROP OUTPUT with a minimal
+      # allow-list (loopback, established, DNS, HTTP/HTTPS transparently redirected to Squid's
+      # domain-ACL), ported verbatim from the builder's proven mechanism (SeedBuilder.ps1). Defense-
+      # in-depth only: a root guest can flush/disable this. FAIL-CLOSED: if this script errors
+      # partway, the OUTPUT policy stays DROP -> no egress -> fails closed, not open.
+      set +e
+      iptables -F OUTPUT 2>/dev/null
+      iptables -P OUTPUT DROP
+      iptables -A OUTPUT -o lo -j ACCEPT
+      iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+      iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+      iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
+      iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+      # Transparent-proxy REDIRECT of outbound 80/443 through Squid (domain-ACL gatekeeps the fetch);
+      # the owner-exclusion keeps Squid's OWN upstream egress from being re-redirected.
+      iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
+      iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
+      # IPv6 belt-and-braces: default-DROP OUTPUT over ip6tables too, guarded so a missing binary
+      # cannot abort this `set +e` script. No IPv6 egress ACCEPT is opened for 53/80/443.
+      if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -F OUTPUT 2>/dev/null
+        ip6tables -P OUTPUT DROP
+        ip6tables -A OUTPUT -o lo -j ACCEPT
+        ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+      fi
+
+  - path: /etc/systemd/system/voidseal-egress.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Voidseal Tier-1 in-guest egress lockdown (defense-in-depth, NOT a boundary)
+      After=network-online.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/voidseal-egress-lockdown
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - update-grub
+  - systemctl daemon-reload
+  - systemctl enable  serial-getty@ttyS0.service
+  - systemctl restart serial-getty@ttyS0.service
+  - [ apt-get, update ]
+  - [ apt-get, install, -y, squid, iptables ]
+  - [ apt-get, install, -y, bubblewrap, ca-certificates ]
+  - systemctl enable squid.service
+  - systemctl enable voidseal-egress.service
+
+# LIVE-ONLY (Phase 6): voidseal-egress.service is ENABLED here (applies on the NEXT boot / at the
+# sealed-run point) but deliberately NOT started inline in runcmd, so the default-DROP does not block
+# this guest's OWN pre-seal package install above (deb.debian.org is intentionally NOT in the
+# EgressAllowlist). The precise live activation trigger is a Phase-6 live-validation detail; the mock
+# asserts the seed SHAPE only.
+'@
+
+# --------------------------------------------------------------------------
 # Internal: normalize any line endings to LF (cloud-init runs an embedded /bin/sh script; a CRLF
 # there yields a `/bin/sh\r` bad-interpreter failure in the guest).
 # --------------------------------------------------------------------------
@@ -558,6 +702,23 @@ function New-CidataUserData {
             return (ConvertTo-LfText -Text $ud)
         }
         $ud = $script:CidataDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint)
+        return (ConvertTo-LfText -Text $ud)
+    }
+
+    # EG-2 (ralph in-guest egress, Option A): a Serial-mode profile that declares EgressMode=
+    # 'InGuestSquid' gets the serial baseline COMPOSED WITH the builder's proven egress fragment
+    # (iptables default-DROP + transparent Squid domain-ACL over EgressAllowlist). Defense-in-depth
+    # only — see CidataSerialEgressTemplate's header comment. Fail-closed on an empty allowlist,
+    # mirroring the builder's own SquidSniProxy refusal above.
+    if ($mode -ne 'Disk' -and $egressMode -eq 'InGuestSquid') {
+        $allowlist = Get-SeedProfileField -Profile $Profile -Name 'EgressAllowlist' -Default @()
+        if ($null -eq $allowlist -or @($allowlist).Count -eq 0) {
+            throw "New-CidataUserData: a Serial+InGuestSquid profile must have a non-empty EgressAllowlist (fail-closed)."
+        }
+        # SEC-1: each allowlist entry's charset is validated at LOAD time in Assert-TierProfileValid
+        # (ProfileLoader.ps1) before it ever reaches here — same discipline as the builder branch above.
+        $aclLine = (@($allowlist) -join ' ')
+        $ud = $script:CidataSerialEgressTemplate.Replace('__SQUID_ALLOWLIST_ACL__', $aclLine)
         return (ConvertTo-LfText -Text $ud)
     }
 

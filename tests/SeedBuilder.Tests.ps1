@@ -259,6 +259,61 @@ Describe 'New-CidataUserData — serial-mode baseline (no regression for ralph)'
     }
 }
 
+Describe 'New-CidataUserData — serial + InGuestSquid egress' {
+    BeforeAll {
+        # ralph-shaped Serial profile opting into the in-guest egress control (EG-2, Option A):
+        # WorkloadMode='Serial' (unchanged — ralph keeps its ttyS0 command channel) + EgressMode=
+        # 'InGuestSquid' + a representative merged EgressAllowlist (tier1 base + a stand-in for
+        # ExtraAllowlist domains).
+        $script:SerialEgressProfile = $script:SerialProfile.Clone()
+        $script:SerialEgressProfile['EgressMode']      = 'InGuestSquid'
+        $script:SerialEgressProfile['EgressAllowlist'] = @('api.anthropic.com', 'github.com', 'claude.ai', 'storage.googleapis.com')
+    }
+
+    It 'emits BOTH the serial-getty command channel AND the Squid egress fragment' {
+        $ud = New-CidataUserData -Profile $script:SerialEgressProfile
+        $ud | Should -BeLike '*serial-getty@ttyS0*' -Because 'ralph keeps its ttyS0 command channel even with in-guest egress'
+        $ud | Should -BeLike '*squid.conf*'         -Because 'InGuestSquid must ship the transparent Squid domain-ACL'
+        $ud | Should -Match 'http_access deny all'  -Because 'default-deny is the whole point of the domain-ACL'
+    }
+
+    It 'templates every merged allowlist domain into the Squid dstdomain ACL' {
+        $ud = New-CidataUserData -Profile $script:SerialEgressProfile
+        foreach ($d in $script:SerialEgressProfile.EgressAllowlist) {
+            $ud | Should -BeLike "*$d*" -Because "the dstdomain ACL must carry allowlist domain '$d'"
+        }
+    }
+
+    It 'carries the iptables default-DROP + IPv6-disable + transparent-proxy REDIRECT shape' {
+        $ud = New-CidataUserData -Profile $script:SerialEgressProfile
+        $ud | Should -Match 'iptables -P OUTPUT DROP'      -Because 'default-DROP OUTPUT is the egress-lockdown control'
+        $ud | Should -Match 'disable_ipv6'                 -Because 'IPv6 must be disabled — the lockdown is otherwise IPv4-only'
+        $ud | Should -Match 'REDIRECT --to-port 3129'      -Because 'HTTP must be transparently redirected to Squid'
+        $ud | Should -Match 'REDIRECT --to-port 3130'      -Because 'HTTPS must be transparently redirected to Squid'
+    }
+
+    It 'fully substitutes __SQUID_ALLOWLIST_ACL__ (no unsubstituted token remains)' {
+        $ud = New-CidataUserData -Profile $script:SerialEgressProfile
+        $ud | Should -Not -BeLike '*__SQUID_ALLOWLIST_ACL__*' -Because 'an unsubstituted placeholder means the ACL is malformed/empty'
+    }
+
+    It 'FAILS CLOSED on InGuestSquid with an empty EgressAllowlist' {
+        $bad = $script:SerialEgressProfile.Clone(); $bad['EgressAllowlist'] = @()
+        { New-CidataUserData -Profile $bad } | Should -Throw -Because 'InGuestSquid with nothing to allow must refuse, not silently ship a useless/broken ACL'
+    }
+
+    It 'REGRESSION: a plain serial profile (no InGuestSquid) still emits the bare baseline only' {
+        # The existing 'serial-mode baseline (no regression for ralph)' Describe covers the core
+        # baseline assertions; this adds the explicit negative checks for the egress fragment so a
+        # future change to the dispatch cannot silently leak the egress fragment onto every serial
+        # profile regardless of EgressMode.
+        $ud = New-CidataUserData -Profile $script:SerialProfile
+        $ud | Should -BeLike '*serial-getty@ttyS0*' -Because 'the bare serial baseline must still bring up the command channel'
+        $ud | Should -Not -BeLike '*squid.conf*'    -Because 'a plain serial profile must not get the egress fragment'
+        $ud | Should -Not -Match 'OUTPUT DROP'      -Because 'a plain serial profile must not get the iptables lockdown'
+    }
+}
+
 Describe 'New-CidataMetaData' {
     It 'emits instance-id and local-hostname' {
         $md = New-CidataMetaData
