@@ -9,10 +9,12 @@
     # iptables default-DROP + transparent Squid dstdomain ACL over EgressAllowlist, ported from
     # the builder's proven mechanism (SeedBuilder.ps1) — replacing the fabricated/schema-only
     # 'NftablesAllowlist' (design-invalidated by Pass-5, 2026-06-28: static nftables/ipset
-    # allowlists don't survive CDN IP rotation). NOT YET WIRED into New-CidataUserData's serial
-    # seed (that lands next); until then this still validates schema-only, same posture as
-    # before. Even once wired, this is NOT a boundary — a compromised/root guest can disable it —
-    # the host-verified boundary is Phase-6 (host-side NAT/Squid/default-DROP).
+    # allowlists don't survive CDN IP rotation). Now WIRED into New-CidataUserData's serial seed
+    # (CidataSerialEgressTemplate) — the in-guest Squid defense-in-depth control SHIPS, mock-
+    # asserted for SHAPE only (real packet-drop + the activation-timing ordering vs pre-seal
+    # package install are unproven until a live run). This is NOT a boundary — a compromised/
+    # root guest can disable it — the host-verified boundary is Phase-6 (host-side
+    # NAT/Squid/default-DROP).
     EgressMode      = 'InGuestSquid'             # v1 credential-FREE. Phase-1B: 'HostEnvoy' (deferred)
     EgressAllowlist = @(
         'api.anthropic.com',

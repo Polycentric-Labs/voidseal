@@ -21,10 +21,11 @@ rather than duplicating it.
 >   untrusted-plugin detonation yet.**
 > - **Windows + Hyper-V only**, today. The "Tier-0 container" substrate is design-intent — v1 provisions
 >   Tier 0 as a no-NIC Hyper-V VM.
-> - **Tier-1 has no egress enforcement yet.** The tier keeps its NIC (net-restricted, *not* no-net), but
->   the in-guest allowlist it *declares* is **not implemented** in v1 — a live Tier-1 VM's egress is
->   currently unrestricted in-guest. Don't run untrusted work at Tier-1 live until host-side enforcement
->   ships (see the Egress note in [`docs/tier-reference.md`](docs/tier-reference.md)).
+> - **Tier-1 ships an in-guest egress control (iptables default-DROP + Squid allowlist) as
+>   defense-in-depth**; it is mock-shape-asserted only, not yet exercised live, and NOT a boundary — a
+>   compromised/root guest can disable it. The host-enforced boundary is Phase-6. Don't rely on the
+>   in-guest layer against a hostile guest (see the Egress note in
+>   [`docs/tier-reference.md`](docs/tier-reference.md)).
 
 ## What it is
 
@@ -41,7 +42,7 @@ insider, and make the blast radius structurally small.
 | Tier | Boundary | Network | Credentials | Use |
 |---|---|---|---|---|
 | **0** | lightweight / offline (no-NIC VM in v1) | default-offline (host-proxy allowlist declared, not yet implemented) | none | trusted local workloads, file organizers |
-| **1** | net-restricted Hyper-V VM | Internal-switch isolation (seal-verified); in-guest egress allowlist DECLARED, not yet enforced | scoped, on-demand | autonomous agent loops against a target repo |
+| **1** | net-restricted Hyper-V VM | Internal-switch isolation (seal-verified); in-guest egress allowlist ships as defense-in-depth (iptables + Squid, mock-shape-asserted, not a boundary) | scoped, on-demand | autonomous agent loops against a target repo |
 | **2** | disposable, **no NIC** | none (structurally starved) | none (refused at load) | untrusted code *(scaffold-only in v1)* |
 | **3** | air-gapped + sinkhole | none | none | malware detonation *(scaffold-only in v1)* |
 
