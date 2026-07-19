@@ -49,6 +49,6 @@
 4. **VM-tier channels:** `Substrate -eq 'HyperV-Gen2'` ⇒ all `HostChannels` values `$false`.
 5. **Linux management:** a Linux `GuestImage` ⇒ `ManagementChannel -eq 'Com1Serial'` (not `PSDirect`).
 6. **Pre-seal gate (`Assert-Sealed`, runtime):** refuse to mark a Tier-3 VM SEALED if it detects any
-   attached secret volume, 1Password agent, live NIC, or non-empty egress route.
+   attached secret-shaped or unrecorded volume, live NIC, or non-empty egress route.
 
 Validation = a Pester test per invariant; a deliberately-violating fixture profile MUST fail closed.

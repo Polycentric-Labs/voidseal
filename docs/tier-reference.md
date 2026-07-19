@@ -67,7 +67,7 @@ from the host side:
   a sink that **throws**).
 - **Secret-file refusal** — no secret-shaped mount source, any tier.
 - **Pre-seal gate** — `Assert-Sealed` refuses to certify a Tier-3 VM if it detects a live
-  NIC, a secret volume, a 1Password agent, or a non-empty egress route.
+  NIC, a secret-shaped or unrecorded attached volume, or a non-empty egress route.
 
 ---
 
