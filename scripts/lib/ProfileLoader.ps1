@@ -44,7 +44,7 @@ $script:TierRequiredKeys = @(
 
 # Enum domains (SCHEMA.md type column).
 $script:Enum_Substrate         = @('Container', 'HyperV-Gen2')
-$script:Enum_EgressMode        = @('HostProxy', 'NftablesAllowlist', 'HostEnvoy', 'SquidSniProxy', 'None')
+$script:Enum_EgressMode        = @('HostProxy', 'InGuestSquid', 'HostEnvoy', 'SquidSniProxy', 'None')
 $script:Enum_Credentials       = @('None', 'ScopedOnDemand')
 $script:Enum_ManagementChannel = @('Com1Serial', 'PSDirect')
 $script:Enum_Extraction        = @('HostReadResultDir', 'ColdVHDX-Quarantine-CDR')

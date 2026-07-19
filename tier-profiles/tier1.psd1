@@ -2,16 +2,18 @@
     # Voidseal — Tier 1 isolation contract (net-restricted Hyper-V VM).
     # Declarative; consumed by the profile loader (Import-TierProfile).
     Tier            = 1
-    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress = in-guest allowlist DECLARED but NOT YET enforced (see docs/tier-reference.md Egress note). Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
+    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress = in-guest iptables default-DROP + transparent Squid domain-ACL (defense-in-depth, NOT a boundary; the host-verified boundary is Phase-6). Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
     Substrate       = 'HyperV-Gen2'
-    Network         = 'Internal+Allowlist'      # Internal vSwitch + static host IP; in-guest egress enforcement NOT YET implemented (declared only)
-    # HONESTY (2026-07-15): declarative only — validated for schema shape by ProfileLoader,
-    # NOT enforced by any code path today (the ralph/Serial CIDATA seed ships zero
-    # firewall/nftables content). The mechanism itself is design-invalidated for CDN-fronted
-    # hosts (Pass-5, 2026-06-28: static nftables/ipset allowlists don't survive CDN IP
-    # rotation); the replacement direction is a Squid-based in-guest redirect and/or
-    # host-side enforcement — see docs/tier-reference.md's Egress note.
-    EgressMode      = 'NftablesAllowlist'        # v1 credential-FREE. Phase-1B: 'HostEnvoy' (deferred)
+    Network         = 'Internal+Allowlist'      # Internal vSwitch + static host IP; in-guest egress is defense-in-depth only — the host-side boundary is Phase-6
+    # HONESTY (2026-07-18): EgressMode names the real mechanism this tier ships as — in-guest
+    # iptables default-DROP + transparent Squid dstdomain ACL over EgressAllowlist, ported from
+    # the builder's proven mechanism (SeedBuilder.ps1) — replacing the fabricated/schema-only
+    # 'NftablesAllowlist' (design-invalidated by Pass-5, 2026-06-28: static nftables/ipset
+    # allowlists don't survive CDN IP rotation). NOT YET WIRED into New-CidataUserData's serial
+    # seed (that lands next); until then this still validates schema-only, same posture as
+    # before. Even once wired, this is NOT a boundary — a compromised/root guest can disable it —
+    # the host-verified boundary is Phase-6 (host-side NAT/Squid/default-DROP).
+    EgressMode      = 'InGuestSquid'             # v1 credential-FREE. Phase-1B: 'HostEnvoy' (deferred)
     EgressAllowlist = @(
         'api.anthropic.com',
         'registry.npmjs.org',

@@ -78,7 +78,7 @@ BeforeAll {
             Description        = 'fixture tier 1'
             Substrate          = 'HyperV-Gen2'
             Network            = 'Internal+Allowlist'
-            EgressMode         = 'NftablesAllowlist'
+            EgressMode         = 'InGuestSquid'
             EgressAllowlist    = @('api.anthropic.com', 'github.com')
             BlockProtocols     = @('QUIC')
             Credentials        = 'ScopedOnDemand'
@@ -143,7 +143,7 @@ Describe 'Import-TierProfile — real example profiles' {
         $p                       | Should -Not -BeNullOrEmpty
         $p.Tier                  | Should -Be 1
         $p.Substrate             | Should -Be 'HyperV-Gen2'
-        $p.EgressMode            | Should -Be 'NftablesAllowlist'
+        $p.EgressMode            | Should -Be 'InGuestSquid'
         $p.ManagementChannel     | Should -Be 'Com1Serial'
         @($p.EgressAllowlist)    | Should -Contain 'api.anthropic.com'
         @($p.EgressAllowlist).Count | Should -BeGreaterThan 1
@@ -173,6 +173,17 @@ Describe 'Import-TierProfile — basic schema validation (invariant 6)' {
     It 'throws when an enum field is outside its allowed set (EgressMode)' {
         $h = script:Get-ValidTier1Hashtable
         $h.EgressMode = 'WideOpen'
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*EgressMode*'
+    }
+
+    It 'REJECTS the retired NftablesAllowlist EgressMode (fabricated/never-implemented; pins the retirement)' {
+        # NftablesAllowlist was schema-only and design-invalidated (Pass-5: static nftables can't
+        # runtime-FQDN-filter CDN-fronted hosts). It has been replaced by 'InGuestSquid'
+        # (real in-guest transparent-Squid domain-ACL). Nothing should be able to silently
+        # re-introduce the fabricated value via an unknown enum member.
+        $h = script:Get-ValidTier1Hashtable
+        $h.EgressMode = 'NftablesAllowlist'
         $path = script:New-Psd1File -Data $h
         { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*EgressMode*'
     }
@@ -407,7 +418,7 @@ Describe 'Invariant 2 — Tier >= 2 starvation' {
 
     It 'throws if Tier 2 has EgressMode other than None' {
         $h = script:Get-ValidTier2Hashtable
-        $h.EgressMode = 'NftablesAllowlist'
+        $h.EgressMode = 'InGuestSquid'
         $path = script:New-Psd1File -Data $h
         { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*Egress*'
     }
@@ -585,7 +596,7 @@ Describe 'Processor profile (Network=None) + DepsSpec/ScreenConfig' {
         { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Not -Throw
     }
     It 'REFUSES a Network=None profile that declares egress (EgressMode != None)' {
-        $p = script:New-ProcBase; $p.EgressMode='NftablesAllowlist'
+        $p = script:New-ProcBase; $p.EgressMode='InGuestSquid'
         { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Throw
     }
     It 'REFUSES a Network=None profile with a non-empty EgressAllowlist' {
@@ -632,7 +643,7 @@ Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
         # check must reject it before it ever reaches the seed. Direct Assert-TierProfileValid on a
         # network-tier hashtable (a .psd1 cannot even carry a literal newline-in-a-string cleanly).
         $bad = @{
-            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='NftablesAllowlist';
+            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='InGuestSquid';
             EgressAllowlist=@("pypi.org`nhttp_access allow all"); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
             HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
             Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
@@ -643,7 +654,7 @@ Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
     }
     It 'SEC-1: a clean hostname AND a leading-dot domain-suffix entry are ACCEPTED (the regex passes real allowlists)' {
         $ok = @{
-            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='NftablesAllowlist';
+            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='InGuestSquid';
             EgressAllowlist=@('cas-bridge.xethub.hf.co', '.hf.co', 'pypi.org'); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
             HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
             Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
