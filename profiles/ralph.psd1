@@ -30,7 +30,10 @@
 
     # ------------------------------------------------------------------
     # Guest packages staged BEFORE the seal (the tier's import-then-seal ritual
-    # pulls these over the still-open allowlist, then Lock-Sandbox cuts egress).
+    # pulls these over the still-open allowlist; then the seed's `voidseal-egress.service`
+    # default-DROP + Squid allowlist activates at the sealed-run boot (Lock-Sandbox cuts
+    # host<->guest channels + import media, not egress — that's the guest's in-guest
+    # defense-in-depth).
     # Ralph itself is bash; the runtime deps are git (clone the pinned repo),
     # jq (the loop pipes `claude --output-format json` through jq), ca-certificates
     # (TLS to api.anthropic.com), and bubblewrap (the native-bwrap defense-in-depth

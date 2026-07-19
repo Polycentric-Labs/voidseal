@@ -16,7 +16,7 @@ small. The tier you pick = how much capability you're willing to grant.
 | Tier | Use it for | Substrate | Network | Egress (v1) | Credentials | Extraction | Lifecycle | v1 status |
 |---|---|---|---|---|---|---|---|---|
 | **0** | trusted dev + productivity on copies (e.g. the Firefox organizer) | **Hyper-V path / lightweight guest** in v1 — container runtime (Docker / devcontainer / `docker sbx` / sandbox-runtime) is **PLANNED, not yet built** | host-proxy allowlist | host firewall / proxy (default **offline**) | injected at proxy (none by default) | host reads result dir | `--rm` per task (container tier, when built) | **validated (mock-backed; live run = the live smoke test, operator-run, elevated)** |
-| **1** | agent loops (Ralph), organizers, steady-state services | Hyper-V **Gen2 VM** | Internal switch (NIC kept; switch-isolation + Default-Switch by-name refusal are seal-verified) | **in-guest defense-in-depth SHIPS, NOT a boundary** — `EgressMode='InGuestSquid'`: iptables default-DROP OUTPUT + a transparent Squid `dstdomain` allowlist over `EgressAllowlist`, mock-asserted for SHAPE only; a compromised/root guest can disable it; the **host-verified boundary is Phase-6** | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal: validated (mock-backed; live run = the live smoke test, operator-run, elevated). Egress: in-guest defense-in-depth ships (mock-shape-asserted); NOT yet live-exercised — the enforced boundary is Phase-6 (host-side).** |
+| **1** | agent loops (Ralph), organizers, steady-state services | Hyper-V **Gen2 VM** | Internal switch (NIC kept; switch-isolation + Default-Switch by-name refusal are seal-verified) | **in-guest defense-in-depth SHIPS, NOT a boundary** — `EgressMode='InGuestSquid'`: iptables default-DROP OUTPUT + a transparent Squid `dstdomain` allowlist over `EgressAllowlist`, mock-asserted for SHAPE only; a compromised/root guest can disable it; the **host-verified boundary is Phase-6** | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal: validated (mock-backed; live run = the live smoke test, operator-run, elevated). Egress: in-guest defense-in-depth ships (mock-shape-asserted); NOT yet live-exercised — the host-verified boundary is Phase-6 (host-side).** |
 | **2** | disposable analysis of semi-trusted artifacts | Hyper-V VM, disposable | **Private switch, no NIC** | **none** | **none** (enforced) | **cold output-VHDX → quarantine VM → CDR → inert promote** | create → destroy | **scaffold / benign dry-run** |
 | **3** | airgapped detonation (eventually: malware) | Hyper-V Gen2, **no virtual NIC** + sinkhole VM | **structurally no egress** | **none** | **none** (enforced) | same as Tier 2, **mandatory** | detonate → wipe (revert between runs) | **scaffold / benign dry-run** |
 
@@ -39,8 +39,8 @@ mechanism that never had any code path behind it. That retirement wasn't just a 
 Pass-5 (2026-06-28) had already **design-invalidated** the nftables/ipset approach — a
 *static* FQDN allowlist doesn't survive CDN IP rotation (DNS is resolved once, at rule-load,
 and never re-resolved), and tier1's own allowlist targets CDN-fronted hosts
-(`api.anthropic.com`, `pypi.org`, `github.com`). Squid's `dstdomain` ACL re-resolves per
-connection, so it doesn't have that failure mode.
+(`api.anthropic.com`, `pypi.org`, `github.com`). Squid's `dstdomain` ACL matches the
+destination name per request, so CDN IP rotation behind that name is irrelevant to it.
 **This is defense-in-depth, NOT a boundary.** The mock suite asserts the seed's SHAPE only
 (the rendered Squid config text, the iptables rule text, the ACL substitution) — it does
 **not** prove real packet-drop, and the activation-timing ordering against the guest's own
@@ -127,7 +127,7 @@ gate**. Output = a **signed, content-addressed behavior report**, diffable acros
 ## 4. Quick "which tier?" guide
 
 - **Trusted code/data, operating on copies, needs the net or not** → **Tier 0** (container, fast).
-- **An agent loop or organizer you trust, that needs a *restricted* allowlisted net** → **Tier 1** (net-restricted VM; in-guest allowlist now ships as defense-in-depth, mock-shape-asserted — the enforced boundary is still Phase-6; see the Egress note above).
+- **An agent loop or organizer you trust, that needs a *restricted* allowlisted net** → **Tier 1** (net-restricted VM; in-guest allowlist now ships as defense-in-depth, mock-shape-asserted — the host-verified boundary is still Phase-6; see the Egress note above).
 - **A semi-trusted artifact you want to analyze with no net** → **Tier 2** (disposable no-net) — *scaffold only this round.*
 - **Presumed-hostile / malware, full airgap + detonation** → **Tier 3** — *scaffold only this round; live detonation is gated behind explicit operator approval + verified isolation.*
 

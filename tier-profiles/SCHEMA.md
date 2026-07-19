@@ -11,7 +11,7 @@
 | `Description` | string | human summary |
 | `Substrate` | `'Container'` \| `'HyperV-Gen2'` | what hosts the workload |
 | `Network` | string | network posture label |
-| `EgressMode` | `'HostProxy'`\|`'InGuestSquid'`\|`'HostEnvoy'`(Phase-1B)\|`'None'` | egress enforcement mechanism |
+| `EgressMode` | `'HostProxy'`\|`'InGuestSquid'`\|`'HostEnvoy'`(Phase-1B)\|`'SquidSniProxy'`(builder)\|`'None'` | egress enforcement mechanism |
 | `EgressAllowlist` | string[] | FQDNs permitted (empty = none) |
 | `BlockProtocols` | string[] | (opt) protocols force-blocked (QUIC/DoH/DoT) |
 | `Credentials` | `'None'`\|`'ScopedOnDemand'` | credential posture. **MUST be `'None'` for Tier ≥ 2** |

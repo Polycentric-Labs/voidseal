@@ -412,7 +412,7 @@ never assumes "Off == success".
 
 > **Why this exists:** Milestone 1 reached `INIT…DESTROYED` + `SealVerdict=True` but its
 > `bookmarks.html` was a stand-in because the serial command channel raced the boot. The
-> disk-passing model replaces that fragile handshake. The engine is **mock-proven (425 tests)**;
+> disk-passing model replaces that fragile handshake. The engine is **mock-proven (700+ tests)**;
 > this milestone is its first *live* exercise.
 
 ### 4A.1 Preconditions (mostly reuse Milestone-1 groundwork)
@@ -555,7 +555,7 @@ Whatever the outcome, **teardown still runs** (the `finally`), so you won't accu
 
 ### 4A.6 The live-only-unproven list (what this milestone is actually testing for the first time)
 
-The 425 mock tests prove the *host orchestration* + *classification* logic. These pieces run for
+The 700+ mock tests prove the *host orchestration* + *classification* logic. These pieces run for
 the **first time** on real hardware here — if something snags, it's most likely one of these,
 **not** a containment failure:
 

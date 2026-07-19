@@ -187,7 +187,7 @@ full privileges of whoever invokes it — here, the host operator.
 
 ## Status / honesty
 
-- The Tier-0/1 engine is **mock-proven** (400+ tests against the fake backend). A live end-to-end
+- The Tier-0/1 engine is **mock-proven** (700+ tests against the fake backend). A live end-to-end
   acceptance run on real Hyper-V is the operator's elevated step and is **not** yet certified here.
 - **Tier 2/3 (disposable no-net / air-gapped detonation) and the cold-VHDX→quarantine extraction are
   scaffold-only** in v1 (the quarantine sink throws `NotImplemented`). No live malware or untrusted-plugin

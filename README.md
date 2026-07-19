@@ -23,7 +23,7 @@ rather than duplicating it.
 >   Tier 0 as a no-NIC Hyper-V VM.
 > - **Tier-1 ships an in-guest egress control (iptables default-DROP + Squid allowlist) as
 >   defense-in-depth**; it is mock-shape-asserted only, not yet exercised live, and NOT a boundary — a
->   compromised/root guest can disable it. The host-enforced boundary is Phase-6. Don't rely on the
+>   compromised/root guest can disable it. The host-verified boundary is Phase-6. Don't rely on the
 >   in-guest layer against a hostile guest (see the Egress note in
 >   [`docs/tier-reference.md`](docs/tier-reference.md)).
 
