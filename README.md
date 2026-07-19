@@ -13,9 +13,12 @@ rather than duplicating it.
 
 > [!IMPORTANT]
 > **Honesty up front (read this before you trust it with anything dangerous).**
-> - **Nothing has run a full live acceptance yet.** The Tier-0/1 engine is **mock-proven** (700+ Pester
->   tests against a fake Hyper-V backend); the real end-to-end run is an operator-run, elevated step that
->   is *pending* (see [`docs/live-smoke-test.md`](docs/live-smoke-test.md)).
+> - **The Tier-0 disk round-trip is live-proven once; the full multi-tier acceptance is not.** The whole
+>   engine is **mock-proven** (700+ Pester tests against a fake Hyper-V backend), and the **Tier-0
+>   `firefox` disk-mode round-trip has run end-to-end on real Hyper-V** (Milestone 3, 2026-06-25 —
+>   provision → host-verified seal → disk-passing workload → host-read result → clean teardown). The
+>   **Tier-1 `ralph` live run is still pending**, and no tier above 0 has had a live acceptance yet
+>   (operator-run, elevated — see [`docs/live-smoke-test.md`](docs/live-smoke-test.md)).
 > - **Tier 2 and Tier 3 (disposable no-net / air-gapped detonation) are scaffold-only.** The
 >   cold-VHDX→quarantine extraction sink throws `NotImplemented` in v1. **Do not run live malware or
 >   untrusted-plugin detonation yet.**
@@ -88,10 +91,32 @@ pwsh scripts/Test-VoidsealPrereqs.ps1
 ```
 
 ```powershell
-# from the repo root, dot-source the engine and run the Tier-0 example workload
+# From the repo root, dot-source the engine, then run the Tier-0 example.
+# firefox is a Disk-mode profile: populate -Workload.Inputs with the organizer script + a
+# sample bookmark profile first (built from profiles/firefox.psd1's InputFiles — see
+# docs/live-smoke-test.md §4A for the walkthrough).
 . .\scripts\Invoke-Voidseal.ps1
-Invoke-Voidseal -Tier 0 -Profile firefox -ParentDiskPath <golden.vhdx> -Destination <out-dir>
+$report = Invoke-Voidseal -Tier 0 -Profile firefox `
+    -ParentDiskPath <golden.vhdx> -Destination <out-dir> -Workload @{ Inputs = $inputs }
 ```
+
+**Verify it worked.** `Invoke-Voidseal` returns a report object (it does not print progress). A clean run
+traverses the whole state machine, certifies the seal from the host, and tears down — expect:
+
+```powershell
+$report.States              # INIT PROVISIONED STAGED SEALED RUNNING CAPTURED EXTRACTED DESTROYED
+$report.SealVerdict         # True    — Assert-Sealed certified the VM (the workload runs ONLY if True)
+$report.RunResult.Status    # Success
+$report.RunResult.ExitCode  # 0
+$report.ExtractedArtifact   # <out-dir>\result.html  — a real, guest-generated Netscape-HTML file
+$report.Error               # $null   on full success
+$report.TeardownStatus      # OK (VM removed, created disks deleted)
+```
+
+That is the **Tier-0 `firefox` disk round-trip** success shape — live-proven on real Hyper-V (Milestone 3,
+2026-06-25). If `SealVerdict` is `False` the run **aborted before the workload ran** (the seal gate refused);
+`$report.Error` says why, and the VM is still torn down. The full walkthrough — building `$inputs` and a
+failure-triage table — is in [`docs/live-smoke-test.md`](docs/live-smoke-test.md) §4A.
 
 See [`docs/operator-runbook.md`](docs/operator-runbook.md) for the full provision → run → teardown walk,
 [`docs/tier-reference.md`](docs/tier-reference.md) for the per-tier containment rubric, and
