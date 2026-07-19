@@ -1,0 +1,9 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security / containment vulnerability report
+    url: https://github.com/Polycentric-Labs/voidseal/security/policy
+    about: >-
+      Do NOT file a public issue for anything that could weaken containment (a seal-gate bypass,
+      a tier-isolation escape, etc.). See SECURITY.md for the reporting channel — non-sensitive
+      reports can still be a normal GitHub issue; anything sensitive goes to the maintainer
+      privately first.
