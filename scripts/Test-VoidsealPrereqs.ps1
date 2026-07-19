@@ -255,8 +255,8 @@ function Test-VoidsealPrereqs {
         $msg = if ($lastErr) { $lastErr.Exception.Message } else { 'no matching feature name resolved' }
         return @{
             Status = 'UNKNOWN'
-            Detail = "Could not query the Hyper-V optional feature ($msg). This call " +
-                     're-run this checker in an ELEVATED session for a definitive answer, ' +
+            Detail = "Could not query the Hyper-V optional feature ($msg). This call commonly " +
+                     'needs elevation — re-run this checker in an ELEVATED session for a definitive answer, ' +
                      "or check manually: 'dism /online /get-featureinfo " +
                      "/featurename:Microsoft-Hyper-V-All'."
         }
@@ -366,7 +366,7 @@ function Get-VoidsealOverallVerdict {
         $names = ($criticalUnknowns | ForEach-Object { $_.Name }) -join '; '
         return "UNKNOWN — could not verify: $names (see the UNKNOWN rows' Detail for how to check by hand, often by re-running elevated)"
     }
-    return 'READY — every necessary check passed (see the caveat below: necessary, not sufficient)'
+    return 'READY — every runnable check passed (see the caveat below: necessary, not sufficient — and any WARN row, e.g. an unchecked golden disk, is not a pass)'
 }
 
 # --------------------------------------------------------------------------
