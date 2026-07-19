@@ -167,16 +167,26 @@ elevation (that is the live smoke test, operator-run, elevated).
 ## Repo layout
 
 ```
-voidseal/                            # the repo root IS the skill
-├── SKILL.md                         # this file — the Claude-facing entry point
+voidseal/                             # the repo root IS the skill
+├── SKILL.md                          # this file — the Claude-facing entry point
+├── README.md                         # project landing page + quick start
 ├── scripts/
 │   ├── Invoke-Voidseal.ps1           # top-level orchestrator (the entry surface)
-│   └── lib/*.ps1                    # HyperVBackend, ProfileLoader, Provisioner, Sealer, Runner
-├── tier-profiles/tier{0,1}.psd1     # isolation contracts (+ SCHEMA.md)
-├── profiles/{ralph,firefox}.psd1    # the two v1 workload profiles
-├── guest-images/debian-12-cloud.md  # cloud-init NoCloud recipe (a doc, not an image)
-├── tests/                           # Pester unit + e2e + invariant + profile tests
-└── docs/                            # operator runbook + tier reference
+│   ├── Test-VoidsealPrereqs.ps1      # read-only pass/fail prerequisite checker
+│   └── lib/*.ps1                     # the engine — HyperVBackend (real+fake), ProfileLoader,
+│                                     #   Provisioner, Sealer, Runner, Workload, SeedBuilder,
+│                                     #   BuilderVM, SensitivityGate, ReleaseGovernor
+├── guest/*.py                        # in-guest runner + outbox/screener (run INSIDE the sealed VM)
+├── host/read_outbox.py               # host-side fail-closed outbox reader
+├── tier-profiles/{tier0,tier1}.psd1  # isolation contracts (+ SCHEMA.md)
+├── profiles/*.psd1                   # workload profiles: ralph, firefox, builder, example-skeleton
+├── guest-images/debian-12-cloud.md   # cloud-init NoCloud recipe (a doc, not an image)
+├── docs/                             # runbooks, tier reference, threat model, authoring guide
+├── tests/                            # Pester + pytest (unit, e2e, invariant, profile)
+├── .github/                          # issue + PR templates, CI workflow
+├── AGENTS.md, CONTRIBUTING.md        # contributor + AI-agent guidance
+├── SECURITY.md, CODE_OF_CONDUCT.md   # scoped-claims disclosure + conduct
+└── CHANGELOG.md, LICENSE             # release notes + MIT
 ```
 
 > Tier 2/3 profile *files* are not shipped as defaults (the engine supports them, and the
