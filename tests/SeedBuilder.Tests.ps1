@@ -279,8 +279,13 @@ Describe 'New-CidataUserData — serial + InGuestSquid egress' {
 
     It 'templates every merged allowlist domain into the Squid dstdomain ACL' {
         $ud = New-CidataUserData -Profile $script:SerialEgressProfile
+        # Assert the domains land on the `acl allowed_domains dstdomain` line specifically (not merely
+        # somewhere in the seed) — so a future template edit that echoed a domain elsewhere can't make
+        # a missing-from-the-ACL regression pass silently.
+        $dstdomainLine = ($ud -split "`r?`n") | Where-Object { $_.Trim() -match '^acl allowed_domains dstdomain\b' }
+        $dstdomainLine | Should -Not -BeNullOrEmpty -Because 'the seed must carry the dstdomain ACL line'
         foreach ($d in $script:SerialEgressProfile.EgressAllowlist) {
-            $ud | Should -BeLike "*$d*" -Because "the dstdomain ACL must carry allowlist domain '$d'"
+            $dstdomainLine | Should -BeLike "*$d*" -Because "the dstdomain ACL line must carry allowlist domain '$d'"
         }
     }
 

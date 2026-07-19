@@ -579,6 +579,10 @@ write_files:
       # in-depth only: a root guest can flush/disable this. FAIL-CLOSED: if this script errors
       # partway, the OUTPUT policy stays DROP -> no egress -> fails closed, not open.
       set +e
+      # Belt-and-braces (mirrors the builder runner): ensure Squid is up before the REDIRECT rules
+      # point 80/443 at its ports. The unit's After=squid.service already orders this; the restart
+      # guards a squid that failed its own start. `|| true` keeps the fail-closed DROP path intact.
+      systemctl restart squid 2>/dev/null || true
       iptables -F OUTPUT 2>/dev/null
       iptables -P OUTPUT DROP
       iptables -A OUTPUT -o lo -j ACCEPT
@@ -605,7 +609,12 @@ write_files:
     content: |
       [Unit]
       Description=Voidseal Tier-1 in-guest egress lockdown (defense-in-depth, NOT a boundary)
-      After=network-online.target
+      # Match the builder unit's ordering: pull network-online into the boot transaction (After alone
+      # does NOT), and order AFTER squid.service so the REDIRECT-to-3129/3130 never goes live before
+      # Squid binds those ports (a too-early REDIRECT hits a closed port -> connection refused -> still
+      # fail-closed, but ordering after squid avoids the spurious refusal). Mirrors the builder unit.
+      After=network-online.target squid.service
+      Wants=network-online.target
       [Service]
       Type=oneshot
       ExecStart=/usr/local/sbin/voidseal-egress-lockdown
