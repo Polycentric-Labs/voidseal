@@ -172,6 +172,7 @@ voidseal/                             # the repo root IS the skill
 ├── README.md                         # project landing page + quick start
 ├── scripts/
 │   ├── Invoke-Voidseal.ps1           # top-level orchestrator (the entry surface)
+│   ├── Get-VoidsealGoldenImage.ps1   # fetch+verify+convert the pinned Debian golden .vhdx
 │   ├── Test-VoidsealPrereqs.ps1      # read-only pass/fail prerequisite checker
 │   └── lib/*.ps1                     # the engine — HyperVBackend (real+fake), ProfileLoader,
 │                                     #   Provisioner, Sealer, Runner, Workload, SeedBuilder,

@@ -90,6 +90,13 @@ genuinely hard to self-check by reading docs):
 pwsh scripts/Test-VoidsealPrereqs.ps1
 ```
 
+**Fetch the golden disk** (downloads the pinned Debian `genericcloud` image, verifies its SHA-512, and
+converts it to the golden VHDX — Debian cloud images are unsigned, so the TLS-sourced pin is the trust root):
+
+```powershell
+pwsh scripts/Get-VoidsealGoldenImage.ps1        # add -Plan first to preview the pinned URL + hash
+```
+
 ```powershell
 # From the repo root, dot-source the engine, then run the Tier-0 example.
 # firefox is a Disk-mode profile: populate -Workload.Inputs with the organizer script + a

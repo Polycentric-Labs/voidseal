@@ -20,6 +20,11 @@ sealed VM has no NIC and PowerShell Direct does not work against a Linux guest.
 
 ## 1. Get a Debian 12 cloud `.vhdx`
 
+> **Automated:** `pwsh scripts/Get-VoidsealGoldenImage.ps1` downloads the pinned Debian `genericcloud`
+> image, verifies it against a pinned SHA-512 (Debian cloud images are unsigned — the TLS-sourced pin is
+> the trust root), and `qemu-img`-converts it to the golden `.vhdx` for you. Run it with `-Plan` first to
+> preview the pinned URL + hash. The manual steps below are the fallback / what the helper does.
+
 Debian publishes official **genericcloud** images (cloud-init baked in, no interactive
 installer). They ship as `.qcow2`/`.raw`; Hyper-V needs **`.vhdx`**.
 

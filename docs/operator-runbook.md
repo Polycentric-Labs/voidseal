@@ -77,7 +77,9 @@ If the host is below the floor, **stop** and patch before running any tier.
 
 ### 0.3 Golden parent disk + workload assets
 
-- Build the Debian 12 golden `.vhdx` per [`../guest-images/debian-12-cloud.md`](../guest-images/debian-12-cloud.md).
+- Build the Debian 12 golden `.vhdx` — run `pwsh scripts/Get-VoidsealGoldenImage.ps1` (downloads the pinned
+  image, verifies its SHA-512, converts to VHDX; `-Plan` previews the pinned URL + hash), or follow
+  [`../guest-images/debian-12-cloud.md`](../guest-images/debian-12-cloud.md) by hand.
 - Stage workload assets (the pinned Ralph repo ISO, the organizer ISO) at the host paths the
   profiles' `StageAssets` reference, with the SHA pinned (Ralph has no tags — pin a commit SHA).
 
