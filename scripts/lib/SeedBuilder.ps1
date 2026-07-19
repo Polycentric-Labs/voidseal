@@ -663,6 +663,14 @@ function New-CidataUserData {
     $mode       = [string](Get-SeedProfileField -Profile $Profile -Name 'WorkloadMode'  -Default 'Serial')
     $egressMode = [string](Get-SeedProfileField -Profile $Profile -Name 'EgressMode'    -Default '')
 
+    # FAIL-CLOSED: 'InGuestSquid' is the SERIAL-seed's in-guest egress fragment (below); the Disk-mode
+    # branches below it have no idea EgressMode exists and would otherwise silently fall through to a
+    # plain disk runner with ZERO egress content for a profile that declared one — the exact
+    # "declared but unwired" class this batch retires. Refuse it explicitly instead.
+    if ($mode -eq 'Disk' -and $egressMode -eq 'InGuestSquid') {
+        throw "New-CidataUserData: 'InGuestSquid' is the SERIAL-seed in-guest egress; a Disk-mode egress profile uses the builder's 'SquidSniProxy' (which carries its DepsSpec rule)."
+    }
+
     if ($mode -eq 'Disk' -and $egressMode -eq 'SquidSniProxy') {
         # Builder path: network-enabled disk-mode seed with a transparent Squid SNI domain-ACL proxy.
         $entrypoint = [string](Get-SeedProfileField -Profile $Profile -Name 'Entrypoint' -Default '')

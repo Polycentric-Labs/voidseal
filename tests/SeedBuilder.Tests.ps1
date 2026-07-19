@@ -307,6 +307,11 @@ Describe 'New-CidataUserData — serial + InGuestSquid egress' {
         { New-CidataUserData -Profile $bad } | Should -Throw -Because 'InGuestSquid with nothing to allow must refuse, not silently ship a useless/broken ACL'
     }
 
+    It 'FAILS CLOSED on a Disk-mode profile declaring EgressMode=InGuestSquid (that combo is undefined)' {
+        $bad = $script:DiskProfile.Clone(); $bad['EgressMode'] = 'InGuestSquid'
+        { New-CidataUserData -Profile $bad } | Should -Throw -Because 'InGuestSquid is the SERIAL-seed in-guest egress; a Disk-mode egress profile must declare SquidSniProxy (the builder egress, which carries its DepsSpec rule) instead of silently falling through to the plain disk runner with no egress content'
+    }
+
     It 'REGRESSION: a plain serial profile (no InGuestSquid) still emits the bare baseline only' {
         # The existing 'serial-mode baseline (no regression for ralph)' Describe covers the core
         # baseline assertions; this adds the explicit negative checks for the egress fragment so a
