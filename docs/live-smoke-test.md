@@ -497,15 +497,23 @@ comments — those are the superseded serial/container-era mechanism; Disk mode 
 The firefox profile ships `Inputs = @{}` (empty by design — a `.psd1` can't cleanly inline a
 Python file). You inject the real inputs at deploy time via `-Workload.Inputs` (the engine
 folds this onto the resolved profile → `New-WorkloadDisks` writes them onto the INPUT disk).
-The map is `innerName -> CONTENT`:
+The map is `innerName -> CONTENT` — firefox needs **all four** inner-names (the organizer + sample,
+**plus the two in-guest outbox helpers** `run_disk_workload.py` + `outbox.py`):
 
 ```powershell
 $GoldenVhdx = 'C:\sandbox\golden\debian-12-cloud.vhdx'
 
-# Read the organizer script + the synthetic sample into an innerName -> content map.
+# firefox is an OutboxOutput profile: besides the organizer + sample, the in-guest outbox PRODUCER
+# (run_disk_workload.py) and its outbox.py dependency are invoked as /mnt/in/run_disk_workload.py,
+# so they MUST also ride the INPUT disk. Populate all FOUR inner-names (mirrors firefox.psd1's
+# InputFiles map, the source of truth). Omitting the two guest helpers -> the runner's
+# `python3 /mnt/in/run_disk_workload.py` cannot run -> no outbox is written -> the host read fails
+# closed with "OUTPUT outbox header missing/!magic".
 $inputs = @{
     'organize_bookmarks.py' = Get-Content -LiteralPath 'C:\sandbox\organizer-src\organize_bookmarks.py' -Raw
     'sample-bookmarks.json' = Get-Content -LiteralPath 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json' -Raw
+    'run_disk_workload.py'  = Get-Content -LiteralPath 'C:\sandbox\organizer-src\run_disk_workload.py'  -Raw
+    'outbox.py'             = Get-Content -LiteralPath 'C:\sandbox\organizer-src\outbox.py'             -Raw
 }
 
 . .\scripts\Invoke-Voidseal.ps1
