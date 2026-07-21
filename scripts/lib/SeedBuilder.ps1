@@ -220,6 +220,18 @@ write_files:
       # template (run_disk_workload.py --transport-only), which packs it into the outbox container
       # and writes it to the raw OUTPUT block device. No OUTPUT filesystem is ever mounted/formatted.
       set +e
+      # SERIAL DIAGNOSTICS (D4-D live-debug observability). Every fail-closed branch below is otherwise
+      # a SILENT `poweroff; exit 0`, and this runner's logs die with the ephemeral rootfs — so the raw-
+      # device path's first live test failed with zero guest-side signal. diag() narrates each decision
+      # to the serial console (this image boots console=ttyS0 -> host COM1 pipe) so a live capture pins
+      # the failing branch. STRUCTURAL ONLY: device nodes, mount y/n, the candidate list + count, the
+      # producer exit code, staging file COUNT, and the outbox's 8-byte container magic — NEVER staged
+      # file bytes. This runner is SHARED with the processor (screener-governed release); echoing
+      # candidate CONTENT here would be a covert guest->host channel bypassing the screener, so diag()
+      # is confined to control-flow facts. Never alters control flow: runs under `set +e`, writes to
+      # /dev/console (always present) and swallows any error.
+      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
+      diag "outbox-runner start"
       SBX_UID=$(id -u sandbox 2>/dev/null || echo 0)
       SBX_GID=$(id -g sandbox 2>/dev/null || echo 0)
       modprobe exfat 2>/dev/null   # host-pre-formatted INPUT is exFAT; in-kernel since 5.7.
@@ -230,7 +242,8 @@ write_files:
       # No INPUT -> the entrypoint (which lives on /mnt/in) AND the producer script cannot run. There
       # is no OUTPUT filesystem to record a determinate sentinel on, so simply power off (the host's
       # outbox read fails closed on a missing/empty raw region — same DENY-on-absence contract).
-      if ! mountpoint -q /mnt/in; then poweroff; exit 0; fi
+      if ! mountpoint -q /mnt/in; then diag "ABORT input-not-mounted (LABEL=INPUT did not mount at /mnt/in - exfat module missing on this kernel? label mismatch?)"; poweroff; exit 0; fi
+      diag "input_mounted=yes input_files=$(ls -1 /mnt/in 2>/dev/null | wc -l)"
       chown -R "$SBX_UID:$SBX_GID" /run/staging 2>/dev/null
       # --- Identify the raw OUTPUT block device structurally (no filesystem/label to mount by) ---
       # Candidates = every whole-disk block device MINUS the root/boot disk MINUS any exFAT/INPUT-
@@ -245,6 +258,10 @@ write_files:
       INPUT_SRC=$(blkid -L INPUT 2>/dev/null)
       INPUT_DISK=$(lsblk -no PKNAME "$INPUT_SRC" 2>/dev/null)
       [ -z "$INPUT_DISK" ] && [ -n "$INPUT_SRC" ] && INPUT_DISK=$(basename "$INPUT_SRC")
+      # Narrate the exclusion inputs + the RAW sd* enumeration — the exact fresh-image unknowns:
+      # does `blkid -L INPUT` resolve (so INPUT is excluded)? do the Hyper-V disks enumerate as sd*?
+      diag "root_src=$ROOT_SRC root_disk=$ROOT_DISK input_src=$INPUT_SRC input_disk=$INPUT_DISK"
+      diag "sysblock_sd=$(ls /sys/block 2>/dev/null | grep '^sd' | tr '\n' ' ')"
       OUT_CANDIDATES=""
       for d in /sys/block/sd*; do
         dev=$(basename "$d")
@@ -254,8 +271,10 @@ write_files:
       done
       OUT_CANDIDATES=$(echo "$OUT_CANDIDATES" | xargs)   # trim whitespace
       set -- $OUT_CANDIDATES
-      if [ "$#" -ne 1 ]; then poweroff; exit 0; fi
+      diag "out_candidates=[$OUT_CANDIDATES] count=$#"
+      if [ "$#" -ne 1 ]; then diag "ABORT output-candidates-not-1 (need exactly one leftover disk after excluding root+INPUT; got $#: [$OUT_CANDIDATES])"; poweroff; exit 0; fi
       OUTPUT_DEV="/dev/$1"
+      diag "output_dev=$OUTPUT_DEV"
       # Run the workload ONCE, into staging (not directly onto OUTPUT — there is no OUTPUT mount).
       # NOTE: run via sh -c '<entrypoint>', so the entrypoint must contain no single quote.
       if id -u sandbox >/dev/null 2>&1; then
@@ -263,11 +282,25 @@ write_files:
       else
         /bin/sh -c '__ENTRYPOINT__' > /run/stdout.log 2> /run/stderr.txt
       fi
+      erc=$?
+      # staging file COUNT only (never names/bytes) — did the entrypoint actually produce a result?
+      diag "entrypoint_rc=$erc staging_count=$(ls -1 /run/staging 2>/dev/null | wc -l)"
       # The shared outbox-producer template packs /run/staging into the outbox container and writes
       # it to the raw OUTPUT device. --transport-only: no screener invocation (LOCKED design) — a
       # well-formed placeholder verdicts.json rides the outbox so the host read path parses cleanly.
-      python3 /mnt/in/run_disk_workload.py --staging /run/staging --verdicts /run/verdicts.json --out "$OUTPUT_DEV" --transport-only
+      python3 /mnt/in/run_disk_workload.py --staging /run/staging --verdicts /run/verdicts.json --out "$OUTPUT_DEV" --transport-only 2> /run/producer.err
+      prc=$?
+      diag "producer_rc=$prc"
+      # The producer's stderr is FIXED structural strings (run_disk_workload/outbox raise SystemExit /
+      # OutboxError with constant messages + logical names, never candidate bytes), so a bounded tail is
+      # safe to surface and is the single most useful signal if the raw WRITE itself failed.
+      [ "$prc" -ne 0 ] && diag "producer_err=$(tail -c 400 /run/producer.err 2>/dev/null | tr '\n' '|')"
+      # Read back ONLY the outbox's 8-byte container magic from the chosen device (VSOUTBX1 = the
+      # pack_outbox header) — proves whether a valid outbox actually landed on OUTPUT_DEV (vs. nothing,
+      # or the wrong device). 8 bytes = magic only; no record table, no payload.
+      diag "output_head=$(dd if=$OUTPUT_DEV bs=8 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n') (want 56534f5554425831 = VSOUTBX1)"
       sync
+      diag "sync+poweroff"
       poweroff
 
   - path: /etc/systemd/system/vmdep-workload.service

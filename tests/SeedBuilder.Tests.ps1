@@ -233,6 +233,52 @@ Describe 'New-CidataUserData — OutboxOutput disk runner (C1.3, firefox transpo
         { New-CidataUserData -Profile $bad } | Should -Throw -Because 'an outbox runner with no command cannot produce a result'
     }
 
+    # --- serial diagnostics (live-debug observability; structural facts ONLY) --------------------
+    # The OutboxOutput raw-device path is LIVE-ONLY-unproven (D4-D): its first live test failed the
+    # outbox read and the runner was SILENT (every fail-closed branch is a bare `poweroff; exit 0`,
+    # and the producer's stdout/stderr die with the ephemeral rootfs). These assert the runner now
+    # narrates each decision point to the serial console (ttyS0 -> host COM1 pipe) so a live capture
+    # pins the failing branch. STRUCTURAL ONLY: device nodes, mount y/n, candidate list, count,
+    # producer rc, staging COUNT, the 8-byte container magic — NEVER candidate file bytes (the
+    # processor shares this runner; serial must not become a screener-bypass release channel).
+    It 'emits structural [voidseal-diag] serial markers (the silent runner gave the live run zero signal)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -Match '\[voidseal-diag\]' -Because 'a fail-closed poweroff must narrate WHY to the serial console, not vanish silently'
+    }
+
+    It 'narrates the raw-device identification (candidate list + chosen device) — the exact step under live debug' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        # Match the diag CALL site, not a bare shell var: OUT_CANDIDATES/OUTPUT_DEV already exist in
+        # the runner and -BeLike/-Match are case-insensitive, so assert the runner actually ECHOES them.
+        $ud | Should -Match 'diag "out_candidates' -Because 'the capture must SEE which block devices remained after excluding root+INPUT'
+        $ud | Should -Match 'diag "output_dev'      -Because 'and which device the runner chose to write the outbox to'
+    }
+
+    It 'echoes a distinct ABORT reason before each fail-closed poweroff' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -Match 'diag "ABORT' -Because 'each `poweroff; exit 0` guard must first echo its branch so the serial capture pins the cause'
+    }
+
+    It 'reports the outbox producer exit code (separates a pre-producer device-ID abort from a producer/raw-write failure)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -Match 'diag "producer_rc' -Because 'if the producer ran, its rc distinguishes a raw-device WRITE failure from a silent device-ID abort before it'
+    }
+
+    It 'diag markers are STRUCTURAL only — no candidate staging CONTENT is echoed to the console (shared runner: no screener-bypass side channel)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        # Filter the diag CALL SITES (`diag "..."`), which is where the echoed content is actually
+        # composed — NOT lines containing the literal 'voidseal-diag' (only the diag() DEFINITION
+        # carries that, so filtering on it would inspect one line and miss every call site).
+        $diagLines = @(($ud -split "`r?`n") | Where-Object { $_ -match 'diag "' })
+        $diagLines.Count | Should -BeGreaterThan 5 -Because 'every decision point (mount, exclusions, enumeration, candidates, chosen device, entrypoint, producer, magic) must be narrated'
+        # A diag line must never dump staging file BYTES to the console (that is the guest->host
+        # payload the screener governs). Reading the OUTPUT device's own 8-byte magic (dd if=OUTPUT_DEV)
+        # or LISTING/COUNTING staging names is structural and allowed; catting staging file bytes is not.
+        # Per-line: flag any diag line that BOTH names /run/staging AND uses a byte-dump tool.
+        $leaky = @($diagLines | Where-Object { $_ -match '/run/staging' -and $_ -match '\b(cat|head|tail|od|xxd|hexdump|dd|strings)\b' })
+        $leaky | Should -BeNullOrEmpty -Because 'the release boundary: serial narrates structure (device nodes/counts/rc/magic), never staged payload bytes'
+    }
+
     It 'a plain (non-OutboxOutput) Disk profile is UNCHANGED — still the direct exFAT result.html runner' {
         # Regression guard: C1.3 must not touch the existing non-outbox Disk-mode runner (a legacy
         # profile with WorkloadMode='Disk' and no OutboxOutput key keeps the old exFAT contract).
