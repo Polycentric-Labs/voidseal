@@ -174,8 +174,27 @@ function Assert-ImageVerified {
     Write-Host "SHA-512 verified against the pinned value ($($Plan.ExpectedSha512.Substring(0,16))...)."
 }
 
+function Clear-SparseFlag {
+    <# LIVE (Windows): clear the NTFS sparse attribute on the produced VHDX. Hyper-V REFUSES to create a
+       differencing child from a SPARSE parent (0xC03A001A: "the parent virtual disk must not be sparse"),
+       and `qemu-img convert -O vhdx` writes a sparse file on NTFS. This is a LIVE-ONLY fix — surfaced on
+       the first real provision (2026-07-19), invisible to the mock suite (a file's NTFS sparse flag is not
+       something the fake backend models). Verify + fail-closed: if the flag can't be cleared, refuse rather
+       than hand Hyper-V an unusable parent. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Path)
+    $null = & fsutil.exe sparse setflag "$Path" 0 2>&1
+    $q = (& fsutil.exe sparse queryflag "$Path" 2>&1) -join ' '
+    if ($q -notmatch 'NOT set as sparse') {
+        throw ("Get-VoidsealGoldenImage: could not clear the NTFS sparse flag on '$Path' — Hyper-V rejects a " +
+               "sparse differencing parent (0xC03A001A). Clear it by hand (fsutil sparse setflag '$Path' 0) or " +
+               "re-materialize with Convert-VHD -VHDType Dynamic. Failing closed.")
+    }
+}
+
 function Convert-QcowToVhdx {
-    <# LIVE: confined qemu-img convert qcow2 -> vhdx, atomic move into place. Returns OutputPath. #>
+    <# LIVE: confined qemu-img convert qcow2 -> vhdx, atomic move into place, clear the sparse flag.
+       Returns OutputPath. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string] $QcowPath,
@@ -194,6 +213,8 @@ function Convert-QcowToVhdx {
         throw "Get-VoidsealGoldenImage: qemu-img convert failed (exit $LASTEXITCODE). Failing closed."
     }
     Move-Item -LiteralPath $tmp -Destination $OutputPath -Force
+    # Hyper-V rejects a sparse differencing parent; qemu-img's output is sparse on NTFS (see Clear-SparseFlag).
+    Clear-SparseFlag -Path $OutputPath
     return $OutputPath
 }
 

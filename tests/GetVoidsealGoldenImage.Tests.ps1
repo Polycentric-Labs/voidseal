@@ -84,21 +84,26 @@ Describe 'Get-VoidsealGoldenImage orchestration (fail-closed seams)' {
         $r | Should -Be $out
         Should -Invoke Get-DebianImage -Times 0
     }
-    It 'routes the convert through Invoke-ConfinedQemu with a qcow2->vhdx arg vector' {
+    It 'routes the convert through Invoke-ConfinedQemu (qcow2->vhdx) then clears the sparse flag' {
         Mock Invoke-ConfinedQemu { $global:LASTEXITCODE = 0 }
         Mock Move-Item {}
+        Mock Clear-SparseFlag {}
         Convert-QcowToVhdx -QcowPath (Join-Path $TestDrive 'a.qcow2') `
                            -OutputPath (Join-Path $TestDrive 'b.vhdx') -QemuPath 'qemu-img' 6>$null
         Should -Invoke Invoke-ConfinedQemu -Times 1 -Exactly -ParameterFilter {
             $Arguments -contains 'convert' -and $Arguments -contains 'qcow2' -and
             $Arguments -contains 'vhdx'    -and $Arguments -contains '-O'
         }
+        # Hyper-V rejects a sparse differencing parent — the sparse flag MUST be cleared on the output.
+        Should -Invoke Clear-SparseFlag -Times 1 -Exactly -ParameterFilter { $Path -like '*b.vhdx' }
     }
-    It 'fails closed when the confined convert returns a non-zero exit code' {
+    It 'fails closed on a non-zero convert exit code — no move, no sparse-clear' {
         Mock Invoke-ConfinedQemu { $global:LASTEXITCODE = 1 }
         Mock Move-Item {}
+        Mock Clear-SparseFlag {}
         { Convert-QcowToVhdx -QcowPath (Join-Path $TestDrive 'a.qcow2') `
                              -OutputPath (Join-Path $TestDrive 'b.vhdx') -QemuPath 'qemu-img' 6>$null } |
             Should -Throw '*convert failed*'
+        Should -Invoke Clear-SparseFlag -Times 0        # fail-closed: never reached after a bad convert
     }
 }
