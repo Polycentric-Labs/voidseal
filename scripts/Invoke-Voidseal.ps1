@@ -428,7 +428,7 @@ function Invoke-Voidseal {
     # Read-WorkloadResult -> ReadVhdxFile -> Mount-VHD host-mount branch (~:684 below) -----------------
     # A PROCESSOR (Network='None' + ScreenConfig) or an OutboxOutput profile (firefox) never reaches
     # that branch — both are gated onto the user-space outbox read (Read-OutboxToGateInput ->
-    # ReadVhdxRawRegion, never Mount-VHD; see the $usesOutbox gate at ~:671).
+    # ReadVhdxRawRegion, never Mount-VHD; see the $usesOutbox gate in the post-detach read block).
     #
     # NO BUILDER CARVE-OUT (deliberate, Step-1 finding): the builder (EgressMode='SquidSniProxy') has
     # its OWN, entirely separate orchestrator (Invoke-BuilderVM, BuilderVM.ps1) — it never calls
@@ -441,13 +441,14 @@ function Invoke-Voidseal {
     # let a misrouted builder profile fall through to the host-mount branch, reopening the exact P0 this
     # validator exists to close. Refuse it the same as any other non-outbox, non-processor Disk profile.
     #
-    # Compute the SAME markers Invoke-Voidseal.ps1:~671 computes (mirrored here, at the earliest point
-    # they are available — BEFORE any provisioning/backend call) and refuse fail-closed. No shipped
-    # profile hits this today; this closes the seam so a future Disk-mode profile (or a misrouted
-    # builder profile) cannot silently re-open the host-mount hole.
-    $isProcessorProfilePreflight = ($resolved['Network'] -eq 'None') -and $resolved.ContainsKey('ScreenConfig')
-    $wantsOutboxOutputPreflight  = $resolved.ContainsKey('OutboxOutput') -and [bool]$resolved['OutboxOutput']
-    if ($workloadMode -eq 'Disk' -and -not $isProcessorProfilePreflight -and -not $wantsOutboxOutputPreflight) {
+    # This calls the SAME shared predicate (Test-UsesOutboxTransport, ProfileLoader.ps1) that the
+    # post-detach read block, Workload.ps1's OUTPUT-disk shape and SeedBuilder.ps1's runner selection
+    # all use — evaluated here at the earliest point it is available, BEFORE any provisioning/backend
+    # call — and refuses fail-closed. It was previously a hand-mirrored copy of that expression; the
+    # copies drifted (see the predicate-drift note on Test-UsesOutboxTransport), so they are now one.
+    # No shipped profile hits this today; it closes the seam so a future Disk-mode profile (or a
+    # misrouted builder profile) cannot silently re-open the host-mount hole.
+    if ($workloadMode -eq 'Disk' -and -not (Test-UsesOutboxTransport -Profile $resolved)) {
         throw ("Invoke-Voidseal: REFUSING a Disk-mode workload that is neither a processor (Network='None'+ScreenConfig) " +
                "nor an OutboxOutput profile — it would reach the legacy host-mount result path (Read-WorkloadResult -> " +
                "Mount-VHD on a guest-written FS = the C1 P0). A Disk-mode workload MUST use the user-space outbox read " +
@@ -699,9 +700,12 @@ function Invoke-Voidseal {
             # Read-WorkloadResult OFF for BOTH; their result comes from the shared post-detach outbox
             # block below (Read-OutboxToGateInput -> ReadVhdxRawRegion, never Mount-VHD). Only a legacy
             # non-outbox, non-processor profile keeps the Read-WorkloadResult host-mount path.
+            # $isProcessorProfile stays local: it distinguishes a SCREENED processor from a
+            # transport-only outbox profile further down. Whether the outbox is used AT ALL comes from
+            # the single shared predicate (ProfileLoader.ps1), so this can never disagree with the
+            # OUTPUT disk shape (Workload.ps1) or the in-guest runner (SeedBuilder.ps1).
             $isProcessorProfile = ($resolved['Network'] -eq 'None') -and $resolved.ContainsKey('ScreenConfig')
-            $wantsOutboxOutput  = $resolved.ContainsKey('OutboxOutput') -and [bool]$resolved['OutboxOutput']
-            $usesOutbox         = $isProcessorProfile -or $wantsOutboxOutput
+            $usesOutbox         = Test-UsesOutboxTransport -Profile $resolved
             if ($detachOk -and -not $wait.TimedOut) {
                 if ($usesOutbox) {
                     # Processor OR transport-only outbox: RunResult is derived from the shared outbox
@@ -738,7 +742,7 @@ function Invoke-Voidseal {
             # in USER-SPACE (Read-OutboxToGateInput: ReadVhdxRawRegion = qemu-img slice; NEVER Mount-VHD)
             # and parse it fail-closed (read_outbox.py). A PROCESSOR then runs the EXISTING sensitivity
             # gate, which partitions only auto-certified-SAFE artifacts into Released/Held. A
-            # TRANSPORT-ONLY profile ($wantsOutboxOutput -and -not $isProcessorProfile) is NOT screened —
+            # TRANSPORT-ONLY profile ($usesOutbox -and -not $isProcessorProfile) is NOT screened —
             # its sole candidate is materialized VERBATIM to $Destination as ExtractedArtifact (no
             # SAFE-partition; Released/Held stay $null). DENY-on-timeout/failed-run EXPLICIT: this block
             # runs ONLY after a clean detach AND a non-timed-out run — a timed-out/force-stopped guest

@@ -151,6 +151,57 @@ $script:SecretDirFilePairs = @(
     Operates on the path STRING only — never opens the file. Case-insensitive.
     Normalizes both '/' and '\' to '\' so POSIX and Windows paths are caught.
 #>
+# --------------------------------------------------------------------------
+# Test-UsesOutboxTransport — THE single predicate for "does this profile release its result
+# through the user-space OUTBOX (a Raw OUTPUT disk the host reads via ReadVhdxRawRegion) rather
+# than a host-mounted exFAT OUTPUT?"
+#
+# TRUE for a PROCESSOR (Network='None' AND a ScreenConfig — its release is screener-governed and
+# rides the outbox) OR any profile opting in with OutboxOutput=$true (firefox's transport-only
+# convergence). FALSE for a legacy non-outbox Disk profile, which keeps the direct exFAT
+# result.html contract.
+#
+# WHY THIS EXISTS — PREDICATE DRIFT (found 2026-07-21). This one truth was computed independently
+# in three places: Workload.ps1 (which filesystem the OUTPUT disk gets), SeedBuilder.ps1 (which
+# in-guest runner the seed carries), and Invoke-Voidseal.ps1 (the structural no-mount validator +
+# the post-detach read routing). SeedBuilder's copy keyed on OutboxOutput ALONE, so a PROCESSOR
+# without an explicit OutboxOutput=$true got a RAW OUTPUT disk AND the exFAT runner: the guest
+# would `mount LABEL=OUTPUT` against a disk with no filesystem, fail, and hit the runner's silent
+# poweroff guard — nothing written, and the host reporting "outbox header missing/!magic". That is
+# mock-invisible (the fake never boots a guest) and is the same bug class as the 2026-07-20
+# raw-device-ID defect and the C1.4 entrypoint defect: duplicated truth drifting apart. Every
+# caller now reads THIS function so the copies cannot diverge again.
+# --------------------------------------------------------------------------
+function Test-UsesOutboxTransport {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [AllowNull()] $Profile)
+
+    if ($null -eq $Profile) { return $false }
+
+    # Tolerant of BOTH shapes callers pass: an IDictionary (hashtable — the normal resolved
+    # profile) and a pscustomobject (imported data / some fixtures), mirroring Get-SeedProfileField.
+    $hasField = {
+        param($p, $name)
+        if ($p -is [System.Collections.IDictionary]) { return [bool]$p.Contains($name) }
+        return [bool]($null -ne $p.PSObject.Properties[$name])
+    }
+    $getField = {
+        param($p, $name)
+        if ($p -is [System.Collections.IDictionary]) {
+            if ($p.Contains($name)) { return $p[$name] }
+            return $null
+        }
+        $prop = $p.PSObject.Properties[$name]
+        if ($null -ne $prop) { return $prop.Value }
+        return $null
+    }
+
+    $isProcessor = ([string](& $getField $Profile 'Network') -eq 'None') -and (& $hasField $Profile 'ScreenConfig')
+    $wantsOutbox = (& $hasField $Profile 'OutboxOutput') -and [bool](& $getField $Profile 'OutboxOutput')
+    return [bool]($isProcessor -or $wantsOutbox)
+}
+
 function Test-IsSecretPath {
     [CmdletBinding()]
     [OutputType([bool])]

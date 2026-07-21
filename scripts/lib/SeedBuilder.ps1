@@ -760,8 +760,23 @@ function New-CidataUserData {
         # disk is Raw (no filesystem), so the entrypoint runs into a staging dir and the shared
         # outbox-producer template (run_disk_workload.py --transport-only) packs + writes the outbox.
         # Everything else (legacy non-outbox Disk profiles) keeps the direct exFAT result.html runner.
-        $wantsOutbox = [bool](Get-SeedProfileField -Profile $Profile -Name 'OutboxOutput' -Default $false)
-        if ($wantsOutbox) {
+        # Test-UsesOutboxTransport (ProfileLoader.ps1) is the SINGLE source of this truth, shared with
+        # Workload.ps1's Raw-OUTPUT selection and Invoke-Voidseal's structural validator. It is TRUE for
+        # a PROCESSOR (Network='None' + ScreenConfig) as well as an explicit OutboxOutput=$true — this
+        # used to key on OutboxOutput ALONE, which handed a processor a Raw OUTPUT disk AND the exFAT
+        # runner (see that function's predicate-drift note).
+        if (Test-UsesOutboxTransport -Profile $Profile) {
+            # FAIL-CLOSED (live 2026-07-21): the outbox runner creates ONLY /mnt/in and /run/staging —
+            # OUTPUT is Raw and is never mounted. An entrypoint aimed at /mnt/out cannot write its
+            # result, and fails in the worst possible way: rc=1 with EMPTY staging, so a structurally
+            # VALID but empty outbox ships and the failure reads as a transport fault rather than a
+            # workload one. Refuse to build that seed at all.
+            if ($entrypoint -match '/mnt/out') {
+                throw ("New-CidataUserData: this profile releases through the user-space outbox, so its OUTPUT disk is " +
+                       "Raw and /mnt/out is NEVER mounted - but its Entrypoint writes to '/mnt/out'. Write the result " +
+                       "into the staging dir instead (e.g. --out /run/staging/result.html); the in-guest producer packs " +
+                       "staging into the outbox. Fail closed.")
+            }
             $ud = $script:CidataOutboxDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint)
             return (ConvertTo-LfText -Text $ud)
         }

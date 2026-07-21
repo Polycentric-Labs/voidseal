@@ -702,3 +702,54 @@ Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
         { Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/firefox.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
     }
 }
+
+# ===========================================================================
+# Test-UsesOutboxTransport — THE single predicate for "does this profile release
+# its result through the user-space outbox (Raw OUTPUT) rather than a mounted exFAT
+# OUTPUT?". Workload.ps1 (disk shape), SeedBuilder.ps1 (in-guest runner) and
+# Invoke-Voidseal.ps1 (structural validator + read routing) ALL read this one
+# function. They used to compute it independently and drifted: SeedBuilder keyed on
+# OutboxOutput alone, so a PROCESSOR got a Raw OUTPUT disk AND the exFAT runner —
+# the guest would mount a filesystem that isn't there and fail closed silently.
+# ===========================================================================
+Describe 'Test-UsesOutboxTransport — the single outbox predicate' {
+
+    It 'is TRUE for a PROCESSOR (Network=None + ScreenConfig) even with NO OutboxOutput key' {
+        $p = @{ Name='proc'; WorkloadMode='Disk'; Network='None'; ScreenConfig=@{ mode='aggressive' } }
+        Test-UsesOutboxTransport -Profile $p | Should -BeTrue -Because 'a processor releases through the screener-governed outbox; its OUTPUT disk is Raw'
+    }
+
+    It 'is TRUE for an OutboxOutput profile (firefox) even with NO ScreenConfig' {
+        $p = @{ Name='firefox'; WorkloadMode='Disk'; OutboxOutput=$true }
+        Test-UsesOutboxTransport -Profile $p | Should -BeTrue -Because 'transport-only firefox opts into the same outbox transport'
+    }
+
+    It 'is FALSE for a legacy non-outbox Disk profile (keeps the direct exFAT result.html contract)' {
+        $p = @{ Name='legacy'; WorkloadMode='Disk'; Network='Internal' }
+        Test-UsesOutboxTransport -Profile $p | Should -BeFalse
+    }
+
+    It 'is FALSE when OutboxOutput is explicitly $false' {
+        $p = @{ Name='off'; WorkloadMode='Disk'; OutboxOutput=$false }
+        Test-UsesOutboxTransport -Profile $p | Should -BeFalse
+    }
+
+    It 'needs BOTH halves of the processor shape (Network=None alone is not a processor)' {
+        $p = @{ Name='half'; WorkloadMode='Disk'; Network='None' }
+        Test-UsesOutboxTransport -Profile $p | Should -BeFalse -Because 'a no-NIC profile without a ScreenConfig is not a processor'
+    }
+
+    It 'is FALSE for a null profile (fail-safe, no throw)' {
+        Test-UsesOutboxTransport -Profile $null | Should -BeFalse
+    }
+
+    It 'accepts a pscustomobject profile as well as a hashtable (both shapes callers pass)' {
+        $p = [pscustomobject]@{ Name='obj'; WorkloadMode='Disk'; OutboxOutput=$true }
+        Test-UsesOutboxTransport -Profile $p | Should -BeTrue
+    }
+
+    It 'agrees with the SHIPPED firefox profile (which is OutboxOutput transport-only)' {
+        $ff = Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/firefox.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles"
+        Test-UsesOutboxTransport -Profile $ff | Should -BeTrue
+    }
+}

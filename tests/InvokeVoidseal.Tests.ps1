@@ -529,7 +529,7 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
         $script:Tier0Seed['Inputs']       = @{}
         $script:Tier0Seed['FileSystem']   = 'exFAT'
         $script:Tier0Seed['OutboxOutput'] = $true   # D: a non-processor Disk-mode fixture MUST be outbox/processor/builder-shaped now (structural C1 no-mount)
-        $script:Tier0Seed['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+        $script:Tier0Seed['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
         $script:Tier0Seed['SeedIso']      = 'C:\sandbox\assets\cidata-seed.iso'   # declared; disk mode must NOT attach it as a DVD
         Assert-TierProfileValid -Profile $script:Tier0Seed -Context 'TEST Tier-0 Disk-mode seed fixture'
 
@@ -640,7 +640,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $script:Proc['EgressMode']      = 'None'             # processor rule: Network=None => EgressMode=None
         $script:Proc['EgressAllowlist'] = @()                # processor rule: empty allowlist
         $script:Proc['ScreenConfig']    = @{ mode = 'aggressive' }   # routes the post-detach gate
-        $script:Proc['Entrypoint']      = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+        $script:Proc['Entrypoint']      = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
         Assert-TierProfileValid -Profile $script:Proc -Context 'TEST Tier-0 processor fixture'
 
         # SimulateSelfPowerOff: the guest self-powers-off before the first poll, so Wait-WorkloadComplete
@@ -1325,7 +1325,7 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
         $script:Fx['Inputs']       = @{}
         $script:Fx['FileSystem']   = 'exFAT'
         $script:Fx['OutboxOutput'] = $true                # C1.1: Raw OUTPUT, no ScreenConfig -> transport-only
-        $script:Fx['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+        $script:Fx['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
         Assert-TierProfileValid -Profile $script:Fx -Context 'TEST Tier-0 firefox-outbox fixture'
 
         $script:FxArt  = Join-Path $script:TmpRoot ("art-fx-{0}"  -f ([guid]::NewGuid().ToString('N')))

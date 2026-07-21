@@ -235,9 +235,10 @@ function New-WorkloadDisks {
     # user-space outbox transport (OutboxOutput=$true — firefox post-C1 convergence). Either way the OUTPUT is
     # Raw (no host-mountable FS; offset 0 = the outbox the guest writes; host reads via ReadVhdxRawRegion,
     # NEVER Mount-VHD). Everything else (INPUT disks, legacy non-outbox non-processors) stays exFAT.
-    $isProcessor  = ($Profile['Network'] -eq 'None') -and $Profile.ContainsKey('ScreenConfig')
-    $wantsOutbox  = $Profile.ContainsKey('OutboxOutput') -and [bool]$Profile['OutboxOutput']
-    $outFs = if ($isProcessor -or $wantsOutbox) { 'Raw' } else { $fs }
+    # Test-UsesOutboxTransport (ProfileLoader.ps1) is the SINGLE source of this truth, shared with
+    # SeedBuilder's runner selection and Invoke-Voidseal's structural validator, so the OUTPUT disk
+    # SHAPE and the in-guest RUNNER can never disagree (see that function's predicate-drift note).
+    $outFs = if (Test-UsesOutboxTransport -Profile $Profile) { 'Raw' } else { $fs }
     # CREATE-path ENOSPC coverage (review Critical #3): the OUTPUT .vhdx create is the other host-write
     # the free-space preflight is meant to make unreachable in practice; wrap for defense-in-depth so a
     # disk-full here classifies + fails closed the same way, rather than a generic throw with the INPUT

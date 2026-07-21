@@ -301,6 +301,37 @@ Describe 'New-CidataUserData — OutboxOutput disk runner (C1.3, firefox transpo
         $ud | Should -BeLike '*LABEL=INPUT*'      -Because 'the INPUT disk is still MOUNTED by label — only the OUTPUT identification changed'
     }
 
+    # --- PREDICATE-DRIFT regression (found 2026-07-21) -------------------------------------------
+    # Workload.ps1 makes the OUTPUT disk Raw for `isProcessor -OR- wantsOutbox`, but this seed builder
+    # keyed on `wantsOutbox` ALONE. A PROCESSOR without OutboxOutput therefore got a RAW OUTPUT disk
+    # AND the exFAT runner, which would `mount LABEL=OUTPUT` against a disk with no filesystem, fail,
+    # and hit the silent poweroff guard -> no outbox -> "header missing/!magic". Exactly the bug class
+    # that produced the 2026-07-20 disk-ID defect and the C1.4 entrypoint defect: two copies of one
+    # truth drifting apart. Both now read the SINGLE shared Test-UsesOutboxTransport predicate.
+    It 'a PROCESSOR (Network=None + ScreenConfig, NO OutboxOutput key) ALSO gets the OutboxOutput runner' {
+        $proc = @{
+            Tier         = 0
+            Name         = 'proc-predicate'
+            WorkloadMode = 'Disk'
+            Network      = 'None'
+            ScreenConfig = @{ mode = 'aggressive' }
+            Entrypoint   = 'python3 /mnt/in/proc.py --out /run/staging/result.html'
+            SeedIso      = (Join-Path ([System.IO.Path]::GetTempPath()) ("vmdep-proc-{0}.iso" -f ([guid]::NewGuid().ToString('N'))))
+        }
+        $ud = New-CidataUserData -Profile $proc
+        $ud | Should -BeLike '*run_disk_workload.py*' -Because 'a processor releases through the SAME user-space outbox as an OutboxOutput profile — its OUTPUT disk is Raw'
+        $ud | Should -Not -BeLike '*LABEL=OUTPUT*'    -Because 'a Raw OUTPUT disk has no filesystem to mount; the exFAT runner would fail closed and write nothing'
+    }
+
+    It 'FAILS CLOSED when an outbox-transport entrypoint writes to /mnt/out (there is no such mount)' {
+        # The live 2026-07-21 defect in profile form: the outbox runner creates only /mnt/in and
+        # /run/staging, so an entrypoint aimed at /mnt/out cannot work — and fails in the worst way
+        # (rc=1, empty staging, a VALID but empty outbox), which reads as a transport fault.
+        $bad = $script:OutboxProfile.Clone()
+        $bad['Entrypoint'] = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+        { New-CidataUserData -Profile $bad } | Should -Throw -Because 'refuse at seed-build time rather than ship a runner whose entrypoint cannot write its result'
+    }
+
     It 'a plain (non-OutboxOutput) Disk profile is UNCHANGED — still the direct exFAT result.html runner' {
         # Regression guard: C1.3 must not touch the existing non-outbox Disk-mode runner (a legacy
         # profile with WorkloadMode='Disk' and no OutboxOutput key keeps the old exFAT contract).
