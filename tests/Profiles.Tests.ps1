@@ -125,15 +125,26 @@ Describe 'profiles/firefox.psd1 — loads + merges through Import-WorkloadProfil
         @($script:Firefox.EgressAllowlist).Count | Should -Be 0 -Because 'the organizer needs no network; the dead-link check escalates to Tier 1 instead'
     }
 
-    It 'is a Disk-mode profile whose entrypoint matches the engine contract (/mnt/in -> /mnt/out/result.html)' {
-        # Disk model: inputs ride the INPUT disk (guest /mnt/in), the result lands on the OUTPUT
-        # disk at the engine default inner-name result.html (Read-WorkloadResult -ResultInnerName).
-        # The OLD serial/container-era form (/opt/organizer + /mnt/firefox-profile + bookmarks.html)
-        # is superseded — asserting result.html here keeps profile + runner + engine consistent.
+    It 'is a Disk-mode + OutboxOutput profile whose entrypoint writes into the STAGING dir (/run/staging/result.html)' {
+        # Disk model: inputs ride the INPUT disk (guest /mnt/in). Because OutboxOutput=$true the
+        # OUTPUT disk is RAW and is NEVER mounted — SeedBuilder's CidataOutboxDiskRunnerTemplate
+        # creates only /mnt/in + /run/staging, runs the Entrypoint into staging, then hands staging
+        # to run_disk_workload.py, which packs the outbox onto the raw device. The inner-name stays
+        # result.html (what the host outbox read extracts as the transport-only artifact).
+        #
+        # LIVE 2026-07-21 — THIS TEST WAS PINNING THE BUG. It previously asserted the exFAT-era
+        # '/mnt/out/result.html', so the suite stayed GREEN while enforcing a contract the
+        # OutboxOutput runner cannot satisfy. The organizer auto-creates its --out parent, but the
+        # runner runs the entrypoint as the NON-ROOT sandbox user and /mnt is root-owned, so creating
+        # /mnt/out was denied: rc=1, staging stayed EMPTY, and the outbox shipped with only its
+        # placeholder verdicts.json ->
+        # "transport-only outbox has no 'result.html' candidate". C1.4 converged the transport but
+        # never moved the Entrypoint, and this assertion locked the stale path in place.
         $script:Firefox.WorkloadMode | Should -Be 'Disk' -Because 'firefox runs via the disk-passing model'
         $script:Firefox.Entrypoint   | Should -Match 'organize'
         $script:Firefox.Entrypoint   | Should -Match '/mnt/in'  -Because 'inputs arrive on the INPUT disk mounted at /mnt/in'
-        $script:Firefox.Entrypoint   | Should -Match '/mnt/out/result\.html' -Because 'the result inner-name MUST be result.html (the engine default)'
+        $script:Firefox.Entrypoint   | Should -Match '/run/staging/result\.html' -Because 'an OutboxOutput entrypoint writes into the staging dir the producer packs; the inner-name stays result.html'
+        $script:Firefox.Entrypoint   | Should -Not -Match '/mnt/out' -Because 'OUTPUT is Raw for an OutboxOutput profile — there is NO /mnt/out mount, so writing there aborts the workload'
         $script:Firefox.Entrypoint   | Should -Not -Match 'bookmarks\.html' -Because 'bookmarks.html was the serial/container-era inner name; the engine default is result.html'
     }
 

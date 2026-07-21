@@ -161,9 +161,10 @@ Describe 'New-CidataUserData — disk-mode runner' {
 Describe 'New-CidataUserData — OutboxOutput disk runner (C1.3, firefox transport-only outbox)' {
     BeforeAll {
         # The OutboxOutput convergence entrypoint shape: writes result.html into the STAGING dir
-        # (/run/staging), NOT onto a mounted /mnt/out (there is none — OUTPUT is Raw). The exact
-        # firefox.psd1 Entrypoint string is superseded by a later convergence task (C1.4); this fixture
-        # is representative of that eventual shape and is what the OutboxOutput runner packs -> outbox.
+        # (/run/staging), NOT onto a mounted /mnt/out (there is none — OUTPUT is Raw). This fixture
+        # now MATCHES the shipped firefox.psd1 Entrypoint: C1.4 converged the transport but left that
+        # string on the exFAT-era /mnt/out/result.html, which aborted the organizer live (rc=1, empty
+        # staging) until it was corrected 2026-07-21. Profiles.Tests.ps1 pins the shipped string.
         $script:OutboxEntrypoint = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
 
         # A firefox-shaped OutboxOutput Disk profile: WorkloadMode='Disk' + OutboxOutput=$true, no

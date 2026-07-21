@@ -48,7 +48,8 @@
     # onto the host-formatted INPUT-labelled volume via WriteVhdxFile, and the guest mounts that
     # volume read-only at /mnt/in. The Disk-model inputs are (a) the organizer script and (b) the
     # sample bookmark profile — both ride the INPUT disk; the Entrypoint below reads them from
-    # /mnt/in and writes the Netscape-HTML to /mnt/out/result.html (the engine's result inner-name).
+    # /mnt/in and writes the Netscape-HTML to /run/staging/result.html, which the in-guest producer
+    # packs into the outbox (OutboxOutput below; result.html stays the result inner-name).
     #
     # Inputs stays EMPTY here because a .psd1 is static data and inlining a whole Python file as a
     # here-string would be unreadable + brittle. INSTEAD the inputs are populated AT LIVE-RUN TIME
@@ -109,20 +110,30 @@
 
     # ------------------------------------------------------------------
     # Entrypoint (Disk model) — the organizer script + the sample profile both ride the INPUT
-    # data disk (mounted read-only at /mnt/in); the result is written to the OUTPUT data disk
-    # (mounted read-write at /mnt/out). The inner-name MUST be result.html — the engine default
-    # Read-WorkloadResult reads back (changing it would mean changing the orchestrator /
-    # Read-WorkloadResult -ResultInnerName defaults too). The seed builder injects this string in place
-    # of __ENTRYPOINT__ in the Disk-mode runner (guest-images/debian-12-cloud.md §2a). `--out
-    # /mnt/out/result.html` is the SOLE writer of result.html: the script writes the Netscape-HTML there
-    # itself, and the runner does NOT also redirect stdout into result.html (that double-write —
-    # shell `>` plus the script's --out on the same path — is undefined-order and could 0-byte/corrupt
-    # the file; the runner sends stdout/stderr to separate /mnt/out/{stdout.log,stderr.txt} logs).
-    # Operates on the read-only input copy at /mnt/in; emits to /mnt/out. NEVER mutates the input.
-    # (Superseded the serial/container-era form: /opt/organizer + /mnt/firefox-profile +
-    # /work/out/bookmarks.html — replaced by the INPUT/OUTPUT data disks for Disk mode.)
+    # data disk (mounted read-only at /mnt/in); the result is written into the in-guest STAGING dir
+    #
+    # C1.4 CORRECTION (live 2026-07-21) — OutboxOutput=$true means the OUTPUT disk is RAW and is
+    # NEVER mounted. SeedBuilder's CidataOutboxDiskRunnerTemplate creates only /mnt/in + /run/staging,
+    # runs this Entrypoint INTO /run/staging, then hands staging to run_disk_workload.py, which packs
+    # the outbox and writes it to the raw OUTPUT device. This string previously targeted the exFAT-era
+    # /mnt/out/result.html. The organizer auto-creates its --out parent, but the runner executes the
+    # entrypoint as the NON-ROOT sandbox user and /mnt is root-owned, so creating /mnt/out was denied
+    # -> the organizer aborted (rc=1), staging stayed EMPTY,
+    # and the outbox shipped carrying only its placeholder verdicts.json -> the host read failed with
+    # "transport-only outbox has no 'result.html' candidate". C1.4 converged the transport but never
+    # moved the Entrypoint, and Profiles.Tests.ps1 asserted the stale path, keeping the suite green.
+    # The inner-name MUST be result.html - that is what the host outbox read extracts as this
+    # transport-only profile's artifact (ResultInnerName). The seed builder injects this string in
+    # place of __ENTRYPOINT__ in the OutboxOutput runner. `--out /run/staging/result.html` is the
+    # SOLE writer of result.html: the script writes the Netscape-HTML there itself, and the runner
+    # does NOT also redirect stdout into it (that double-write - shell `>` plus the script's --out on
+    # the same path - is undefined-order and could 0-byte/corrupt the file; the runner sends
+    # stdout/stderr to separate /run/{stdout.log,stderr.txt}, which die with the guest at poweroff).
+    # Operates on the read-only input copy at /mnt/in; emits to /run/staging. NEVER mutates the input.
+    # (Superseded: first the serial/container-era /opt/organizer + /work/out/bookmarks.html form,
+    # then the exFAT /mnt/out/result.html form that the OutboxOutput transport replaced.)
     # ------------------------------------------------------------------
-    Entrypoint = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+    Entrypoint = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
 
     # ------------------------------------------------------------------
     # ExtraAllowlist — DELIBERATELY EMPTY. The Tier-0 default is offline (tier0's
@@ -138,7 +149,7 @@
     # Mounts (SUPERSEDED for Disk mode — SERIAL/CONTAINER-ERA, kept for shape/history).
     # In the DISK model these bind mounts NO LONGER deliver inputs/collect output: inputs
     # arrive on the INPUT data disk (guest /mnt/in) and the result lands on the OUTPUT data disk
-    # (guest /mnt/out/result.html) — see WorkloadMode/Inputs/InputFiles/Entrypoint above. These
+    # (guest /run/staging/result.html, packed into the outbox) — see WorkloadMode/Inputs/InputFiles/Entrypoint above. These
     # entries are retained only because the loader still secret-screens them (regression guard)
     # and to document the pre-Disk mechanism; the Disk-mode runner does not consult them.
     #
