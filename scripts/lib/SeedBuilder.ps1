@@ -78,10 +78,22 @@ users:
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
     lock_passwd: true          # no password login anywhere; this is a sealed offline guest
 
-# RC3 (2026-06-24 live): network is {config: disabled} for this sealed offline guest, yet
-# systemd-networkd-wait-online.service still blocked ~47s of every boot for a network that never
-# comes up — pure dead time. Mask it EARLY (bootcmd runs before systemd brings the unit up) so the
-# wait never happens. Network stays disabled; this only removes the pointless wait.
+# RC3 (2026-06-24 live) — CLAIM CORRECTED 2026-07-21. network is {config: disabled} for this sealed
+# offline guest, yet systemd-networkd-wait-online.service still blocks the boot waiting for a network
+# that never comes up (measured 120s, its own default timeout, on the 2026-07-21 live capture).
+#
+# THIS MASK DOES NOT PREVENT THAT WAIT AND CANNOT. The original comment claimed "bootcmd runs before
+# systemd brings the unit up"; the live serial capture disproves it, twice over:
+#   1. ORDERING - `bootcmd` runs in the cloud-init.service (network) stage, which is itself ordered
+#      After=systemd-networkd-wait-online.service. The capture shows cloud-init.service starting 18ms
+#      AFTER wait-online FAILED, and this mask's symlink appearing 224ms after that. The fix cannot
+#      execute until the wait it targets has already spent its full timeout.
+#   2. SINGLE BOOT - masking only affects a LATER boot, and a Voidseal sandbox boots exactly ONCE and
+#      is then destroyed. There is no later boot for it to help.
+# Kept because it is harmless and self-documenting. The REAL fix belongs in the golden image (mask the
+# unit at image-prep, or `systemd.mask=systemd-networkd-wait-online.service` on the kernel cmdline) so
+# it is masked BEFORE systemd computes the boot transaction. TRACKED, NOT DONE: that changes the
+# golden image, so it needs its own thinking about what the helper's SHA-512 pin still attests to.
 bootcmd:
   - [ systemctl, mask, --now, systemd-networkd-wait-online.service ]
 
@@ -206,7 +218,9 @@ users:
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
     lock_passwd: true          # no password login anywhere; this is a sealed offline guest
 
-# Network stays disabled; mask the pointless wait-online delay (same as the exFAT offline runner).
+# Network stays disabled. This mask is INEFFECTIVE for the current boot (same as the exFAT offline
+# runner - see its RC3 note: bootcmd runs in a stage ordered AFTER wait-online, and a sandbox boots
+# only once), so expect ~120s of wait-online dead time until the golden image masks it at image-prep.
 bootcmd:
   - [ systemctl, mask, --now, systemd-networkd-wait-online.service ]
 

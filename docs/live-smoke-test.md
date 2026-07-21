@@ -455,9 +455,17 @@ never assumes "Off == success".
   **falls back to a plain `mount LABEL=…`** if it fails, so OUTPUT/INPUT always mount regardless of the
   filesystem driver. On the live Debian *cloud* kernel `exfat` loaded fine — but FAT32 remains a
   one-knob fallback (`FileSystem='FAT32'` in the profile) if a future image is exfat-trimmed.
-- **`ds=nocloud`** on the guest kernel cmdline (GRUB, baked at image-prep) is a boot-speed
-  tunable — without it the first boot adds a 2–5 min datasource-probe delay (the host
-  `-WorkloadTimeoutSeconds` default 600 still bounds it, so it's not a blocker).
+- **Boot takes ~125 s, and ~120 s of that is `systemd-networkd-wait-online` — not the datasource**
+  (MEASURED 2026-07-21, live serial capture; this bullet previously blamed a "2-5 min datasource
+  probe", which the capture disproves). cloud-init resolved `DataSourceNoCloud [seed=/dev/sdd1]` and
+  finished its local stage **~2.2 s** after kernel start; the seed is a `CIDATA`-labelled volume found
+  locally. The dead time is `systemd-networkd-wait-online.service` blocking on a network that never
+  comes up in a sealed guest, until its own 120 s timeout expires. The seed's `bootcmd` mask cannot
+  prevent it (it runs in a stage ordered *after* that unit, and a sandbox boots only once). The real
+  fix is to mask the unit in the **golden image** at image-prep — **not done yet**. Nothing is broken
+  either way: the host `-WorkloadTimeoutSeconds` (default 600) bounds it comfortably.
+- **`ds=nocloud`** on the guest kernel cmdline is a *marginal* speed tunable here, not the fix above —
+  discovery is already ~2 s. See `guest-images/debian-12-cloud.md` for delivery paths.
 
 > **Gotcha — Hyper-V Secure Boot template enumeration can wedge under churn (RC5, 2026-06-24 live).**
 > After ~10 rapid VM create/destroy cycles, `Set-VMFirmware -SecureBootTemplate <any>` began failing
@@ -576,7 +584,7 @@ Then confirm no orphans (as §3.3): `Get-VM -Name 'sbx-*'` empty; `Get-VMSwitch 
 |---|---|---|
 | `Failed`, reason mentions **`outbox header missing/!magic`** | **Nothing valid reached the raw OUTPUT region** — the guest aborted *before* the producer ran, or wrote to the wrong device. The engine is reporting a real absence, not misreading a result | **Attach the serial capture** (`pwsh -File C:\sandbox\capture-serial.ps1 -VMName <vm>`) and read the `[voidseal-diag]` markers — they name the exact branch: INPUT not mounted, `out_candidates` ≠ 1, or the chosen `output_dev`. The run ends with `output_head`, which must be `56534f5554425831` (`VSOUTBX1`). |
 | `Failed`, reason mentions **`no 'result.html' candidate`** | A structurally **valid but EMPTY** outbox shipped: the transport worked, the *workload* produced nothing | `entrypoint_rc` / `staging_count` in the serial capture say so directly. Most likely the entrypoint failed — confirm it writes `--out /run/staging/result.html` (**not** `/mnt/out`, which the outbox runner never mounts) and re-run the §4A.2 host gate. |
-| `Failed`, reason mentions **timed out** | The guest never reached `State=Off` within `-WorkloadTimeoutSeconds` | Boot too slow (add `ds=nocloud`; the plain image adds a 2-5 min datasource probe) or the runner never reached `poweroff`. The serial capture shows how far it got. The VM was force-stopped + torn down. |
+| `Failed`, reason mentions **timed out** | The guest never reached `State=Off` within `-WorkloadTimeoutSeconds` | Boot too slow (a sealed guest spends ~120 s in `systemd-networkd-wait-online` before it times out — see §4A.1) or the runner never reached `poweroff`. The serial capture shows how far it got. The VM was force-stopped + torn down. |
 | `Failed`, `ExitCode` non-zero (e.g. 3) | The organizer ran but exited non-zero | A real organizer bug; `result.html`/`stderr.txt` may still hold partial output (extracted). |
 | `Failed`, reason mentions **`result … empty`** | The guest wrote a 0-byte/whitespace `result.html` (e.g. the organizer printed to stdout instead of `--out`) | Re-run the §4A.2 pre-run gate — the organizer is not writing the file via `--out`. **Host-side**, not a containment issue. |
 | `Failed`, reason mentions **`detach`** | A transient host-side `Remove-VMHardDiskDrive` failed after the run; the host skipped the read rather than read a possibly-still-attached disk | **Host-side**, not a guest bug. `result.html` is likely fine on the OUTPUT disk — just re-run. The VM was still torn down (no orphan). |
@@ -759,7 +767,8 @@ any gap-related friction observed).
 
 **Milestone 3 — Firefox Tier-0 REAL workload (disk mode) — the real round-trip**
 - [ ] CIDATA seed carries the **disk-mode workload-runner** user-data (not the bare serial seed); the seed's `users:` block **creates** the non-root **`sandbox`** user (RC2 — the golden image no longer needs one baked) — §4A.1 / debian-12-cloud.md §2a
-- [ ] `ds=nocloud` baked into guest GRUB; python3 (+ any organizer deps) in the golden image — §4A.1
+- [ ] python3 (+ any organizer deps) in the golden image — §4A.1. (Optional speed: mask
+      `systemd-networkd-wait-online` in the golden image — that is the ~120 s item, not `ds=nocloud`.)
 - [ ] **★ HARD GATE:** host-side organizer pre-test passes — writes `result.html` via `--out` (non-empty), first line is exactly `<!DOCTYPE NETSCAPE-Bookmark-file-1>`, dedup applied (<4 `<A>`) — §4A.2
 - [ ] `-Workload.Inputs` populated from the host organizer + sample; live `Invoke-Voidseal -Tier 0 -Profile firefox -Workload @{WorkloadMode='Disk';Inputs=...}` run — §4A.3
 - [ ] `RunResult.Status='Success'`, `ExitCode=0`, a **real guest-generated** `result.html` (dedup applied), VM destroyed — §4A.4

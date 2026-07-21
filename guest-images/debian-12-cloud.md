@@ -156,8 +156,9 @@ consumes it, then it is detached as part of the import-then-seal ritual.
 > (the golden image has none); (RC4) **mounts robustly** — tries the `uid=/gid=` mount then **falls back
 > to a plain `mount LABEL=…`** (the live cloud kernel failed the uid/gid mount where a plain mount
 > worked), tracking whether OUTPUT mounted sandbox-owned so it only runs the entrypoint as `sandbox` when
-> that user can actually write; and (RC3) **masks `systemd-networkd-wait-online.service`** in `bootcmd`
-> (network is disabled, so its ~47 s wait was pure dead time). The block below is a **verbatim** mirror
+> that user can actually write; and (RC3) *attempts* to **mask `systemd-networkd-wait-online.service`**
+> in `bootcmd` — **which does not work and cannot** (corrected 2026-07-21; see "Boot-time dead wait"
+> below): that unit still burns ~120 s of every boot. The block below is a **verbatim** mirror
 > of the shipped template as of that update.
 
 ### The contract this runner MUST match (engine defaults — do NOT drift)
@@ -211,10 +212,10 @@ users:
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
     lock_passwd: true          # no password login anywhere; this is a sealed offline guest
 
-# RC3 (2026-06-24 live): network is {config: disabled} for this sealed offline guest, yet
-# systemd-networkd-wait-online.service still blocked ~47s of every boot for a network that never
-# comes up — pure dead time. Mask it EARLY (bootcmd runs before systemd brings the unit up) so the
-# wait never happens. Network stays disabled; this only removes the pointless wait.
+# RC3 (2026-06-24 live) — CLAIM CORRECTED 2026-07-21: this mask does NOT prevent the wait and cannot.
+# bootcmd runs in the cloud-init.service stage, which is ordered After=systemd-networkd-wait-online,
+# and a sandbox boots exactly once, so the mask can only ever apply to a boot that never happens.
+# Expect ~120s of wait-online dead time until the GOLDEN IMAGE masks it. See "Boot-time dead wait" below.
 bootcmd:
   - [ systemctl, mask, --now, systemd-networkd-wait-online.service ]
 
@@ -343,10 +344,32 @@ runcmd:
 Unchanged from §2 — the same `instance-id` / `local-hostname` pair. NoCloud still requires both
 `meta-data` and `user-data` at the seed ISO root with the volume label `CIDATA`.
 
-### `ds=nocloud` delivery (boot-speed tunable — not a correctness blocker)
+### Boot-time dead wait — MEASURED 2026-07-21 (read this before reaching for `ds=nocloud`)
 
-To skip cloud-init's multi-datasource probe (a 2–5 min delay on some boots), pin the datasource on
-the **guest kernel cmdline**: `ds=nocloud`. Two delivery paths, both decided **at image-prep** (not
+**The boot time does NOT go where this doc used to claim.** From the live serial capture:
+
+| Stage | Measured |
+|---|---|
+| Kernel → cloud-init-local finished (datasource **already resolved**: `DataSourceNoCloud [seed=/dev/sdd1]`) | **~2.2 s** |
+| `systemd-networkd-wait-online.service` blocking on a network that never comes up, then FAILING | **~120 s** |
+| cloud-init network stage + workload start | ~2 s |
+
+So datasource discovery was never slow — the seed is a `CIDATA`-labelled volume found locally in
+about two seconds. **~120 s of a ~125 s boot is `systemd-networkd-wait-online`** hitting its own
+default timeout. The `bootcmd` mask above cannot help (see its corrected note).
+
+**The fix that would actually work** is to mask the unit in the **golden image**, so it is masked
+before systemd computes the boot transaction — either `systemctl mask systemd-networkd-wait-online.service`
+at image-prep, or `systemd.mask=systemd-networkd-wait-online.service` on the baked kernel cmdline.
+Expected effect: boot-to-workload drops from ~125 s to a few seconds. **NOT DONE — needs live
+verification and a decision about what the fetch helper's SHA-512 pin still attests to once the local
+image is modified post-convert.**
+
+### `ds=nocloud` delivery (boot-speed tunable — measured effect here: negligible)
+
+`ds=nocloud` pins the datasource on the **guest kernel cmdline** so cloud-init skips multi-datasource
+discovery. On *this* image that discovery is already ~2 s (see above), so treat this as a marginal
+win, not the boot-time fix. Two delivery paths, both decided **at image-prep** (not
 at run time — the sealed guest takes no run-time config beyond the seed):
 
 - **Guest GRUB (baked at image-prep):** append `ds=nocloud` to `GRUB_CMDLINE_LINUX` in
@@ -355,8 +378,9 @@ at run time — the sealed guest takes no run-time config beyond the seed):
   cloud-init reads `ds=` from SMBIOS. This needs no guest edit but is a Hyper-V firmware tweak.
 
 Either way it is **only a speed tunable**: the host `Wait-WorkloadComplete` timeout bounds even a
-slow datasource-probe boot, so getting this wrong slows a run, it does not break one. Lean on the
-GRUB-baked path for the golden image; settle empirically on the first live boot.
+slow boot, so getting this wrong slows a run, it does not break one. Settled empirically on the
+2026-07-21 live boot: discovery was ~2 s, so `ds=nocloud` buys little — mask
+`systemd-networkd-wait-online` in the golden image instead if you want the ~120 s back.
 
 ---
 

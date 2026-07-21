@@ -126,10 +126,17 @@ Describe 'New-CidataUserData — disk-mode runner' {
         New-CidataUserData -Profile $script:DiskProfile | Should -BeLike '*|| mount LABEL=INPUT*' -Because 'RC4: the read-only INPUT mount must also fall back to a plain mount'
     }
 
-    It 'RC3: masks systemd-networkd-wait-online (network is disabled — the ~47s wait is dead time)' {
+    It 'RC3: the seed still carries the wait-online mask directive (INEFFECTIVE for this boot — see below)' {
+        # HONESTY (corrected 2026-07-21): this asserts only that the directive is PRESENT. It does NOT
+        # assert the mask works, because live capture proves it does not and cannot: `bootcmd` runs in
+        # the cloud-init.service stage, which is ordered After=systemd-networkd-wait-online.service, so
+        # it cannot execute until that unit has already burned its full 120s timeout — and a sandbox VM
+        # boots exactly ONCE, so a mask that only affects a later boot never applies. The unit still
+        # costs ~120s of every boot; the real fix is masking it in the GOLDEN IMAGE (not done).
+        # The old test name claimed the wait was "removed", which was never true.
         $ud = New-CidataUserData -Profile $script:DiskProfile
-        $ud | Should -BeLike '*systemd-networkd-wait-online*' -Because 'RC3: the runner must reference the wait-online service to disable/mask it'
-        $ud | Should -Match '(?i)mask' -Because 'RC3: the boot delay is removed by masking systemd-networkd-wait-online.service'
+        $ud | Should -BeLike '*systemd-networkd-wait-online*' -Because 'the directive is still shipped (harmless, self-documenting)'
+        $ud | Should -Match '(?i)mask' -Because 'it is a mask directive, whatever its (nil) effect on the current boot'
     }
 
     It 'substitutes the profile Entrypoint for __ENTRYPOINT__ (and leaves no token behind)' {
