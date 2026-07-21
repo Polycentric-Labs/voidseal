@@ -403,17 +403,24 @@ Remove-Sandbox -Name '<sbx-1-...>' -DeleteDisks
 
 **Proves the disk-passing goal:** a real workload runs *inside* the sealed guest and its **real** output
 comes back — not the pre-seeded stand-in Milestone 1 used. This is the **disk-passing** model:
-the host hands the guest its inputs on an INPUT data disk + a pre-formatted (exFAT) OUTPUT
-disk, the guest's cloud-init runner mounts both, runs the organizer, writes `result.html` +
-an exit-code sentinel `result.exitcode` to the OUTPUT disk, **unmounts then self-powers-off**;
-the host polls `State==Off` (with a timeout), detaches the disks, reads the output natively
-(`Mount-VHD -ReadOnly`, no WSL), and **classifies success/failure from the sentinel** — it
+the host hands the guest its inputs on an INPUT data disk + a **raw** OUTPUT disk (no filesystem),
+the guest's cloud-init runner mounts INPUT read-only, runs the organizer into `/run/staging`, and
+the in-guest producer packs staging into a memory-safe **outbox** written to the raw OUTPUT device
+before the guest **self-powers-off**; the host polls `State==Off` (with a timeout), detaches the
+disks, and reads that outbox in **user space** (`ReadVhdxRawRegion` — never `Mount-VHD` on
+guest-written data), **classifying success/failure from what the outbox actually contains** — it
 never assumes "Off == success".
 
 > **Why this exists:** Milestone 1 reached `INIT…DESTROYED` + `SealVerdict=True` but its
 > `bookmarks.html` was a stand-in because the serial command channel raced the boot. The
 > disk-passing model replaces that fragile handshake. The engine is **mock-proven (700+ tests)**;
 > this milestone is its first *live* exercise.
+
+> **Note — this section describes the CURRENT contract, not Milestone 3's original one.** Milestone 3
+> (2026-06-25) proved the round-trip with an **exFAT OUTPUT disk + a `result.exitcode` sentinel** that
+> the host mounted read-only. firefox has since converged onto the **user-space outbox transport**
+> (C1.4): OUTPUT is Raw, there is no sentinel, and the host never mounts guest-written data. The steps
+> below are the outbox contract. A *legacy* non-outbox Disk profile still uses the older exFAT runner.
 
 ### 4A.1 Preconditions (mostly reuse Milestone-1 groundwork)
 
@@ -424,8 +431,12 @@ never assumes "Off == success".
   time (`New-WorkloadSeedDisk` → `New-CidataUserData`, the §2a runner with the profile's `Entrypoint`
   substituted) that survives the seal exactly like the INPUT/OUTPUT disks. **You do not touch the seed
   for a firefox run** — the profile's `SeedIso` path is ignored in disk mode. The runner mounts
-  `LABEL=INPUT` ro at `/mnt/in` + `LABEL=OUTPUT` rw at `/mnt/out`, runs the entrypoint, writes
-  `result.html` + `result.exitcode`, `umount`s, then `poweroff`s.
+  `LABEL=INPUT` ro at `/mnt/in`, runs the entrypoint into `/run/staging`, hands staging to the
+  in-guest producer (`run_disk_workload.py --transport-only`) which packs the **outbox** and writes
+  it to the **raw** OUTPUT block device, then `poweroff`s. (firefox is an `OutboxOutput` profile:
+  OUTPUT carries **no filesystem**, so there is no `/mnt/out` mount and no `result.exitcode`
+  sentinel — the host reads the outbox in user space, never `Mount-VHD`. A *legacy* non-outbox
+  Disk profile still gets the older exFAT runner that does mount `LABEL=OUTPUT` at `/mnt/out`.)
   - (Serial mode — Ralph, Tier 1, §4 — STILL uses a DVD seed ISO via `New-CidataSeed`; that path is
     unchanged. Only disk mode moved to the inline data-disk seed.)
 - **Automatic checkpoints are disabled at provision** (RC7, 2026-06-25 live): Hyper-V defaults
@@ -457,12 +468,24 @@ never assumes "Off == success".
 > that error, **reboot the host** and re-run — it is a host-side Hyper-V state bug surfaced by repeated
 > acceptance cycles, **not** a Voidseal containment failure.
 
-### 4A.2 The organizer script must be /mnt/in ⇄ /mnt/out aligned (one-time check)
+### 4A.2 The organizer script must be /mnt/in ⇄ /run/staging aligned (one-time check)
 
 The host source `C:\sandbox\organizer-src\organize_bookmarks.py` must **read its `--profile`
-from `/mnt/in`** and **write `--out` to `/mnt/out/result.html`** (the runner invokes it that
+from `/mnt/in`** and **write `--out` to `/run/staging/result.html`** (the runner invokes it that
 way). If your current copy writes `bookmarks.html` or reads a different path, use an aligned
-copy for the live run. (Don't worry about the OLD `firefox.psd1` `Mounts`/`StageAssets`/`/work/out`
+copy for the live run.
+
+> **Why staging, not `/mnt/out` (corrected 2026-07-21, found live).** firefox is an `OutboxOutput`
+> profile, so its OUTPUT disk is **Raw and is never mounted** — the runner creates only `/mnt/in`
+> and `/run/staging`, runs the entrypoint into staging, then hands staging to
+> `run_disk_workload.py`, which packs the outbox and writes it to the raw device. An entrypoint
+> aimed at `/mnt/out` fails in the *worst* way: the organizer auto-creates its `--out` parent, but
+> the runner runs it as the **non-root `sandbox` user** and `/mnt` is root-owned, so the create is
+> denied → `rc=1`, empty staging, and a structurally **valid but empty** outbox ships — which reads
+> as a transport fault rather than a workload one. `New-CidataUserData` now refuses to build a seed
+> for an outbox-transport profile whose entrypoint names `/mnt/out`.
+
+(Don't worry about the OLD `firefox.psd1` `Mounts`/`StageAssets`/`/work/out`
 comments — those are the superseded serial/container-era mechanism; Disk mode uses the data disks.)
 
 > **★ HARD PRE-RUN GATE — validate the organizer on the host first.** The organizer lives *outside*
@@ -519,8 +542,7 @@ $inputs = @{
 . .\scripts\Invoke-Voidseal.ps1
 
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `
-    -Workload @{ WorkloadMode = 'Disk'; Inputs = $inputs;
-                 ResultInnerName = 'result.html'; SentinelInnerName = 'result.exitcode' } `
+    -Workload @{ WorkloadMode = 'Disk'; Inputs = $inputs; ResultInnerName = 'result.html' } `
     -ParentDiskPath $GoldenVhdx `
     -Destination 'C:\sandbox\extracted\firefox-g4'
 ```
@@ -552,8 +574,9 @@ Then confirm no orphans (as §3.3): `Get-VM -Name 'sbx-*'` empty; `Get-VMSwitch 
 
 | `RunResult.Status` / `Reason` | Meaning | Where to look |
 |---|---|---|
-| `Failed`, reason mentions **`sentinel`** | The guest never wrote `result.exitcode` → the workload crashed, hung pre-write, or cloud-init didn't run the runner | The guest serial console / the OUTPUT disk's `stderr.txt` (mount it read-only on the host: `Mount-VHD -Path <out.vhdx> -ReadOnly`). Most likely: the runner didn't mount the disks (label mismatch?), python3 missing, or the organizer path wrong (`/mnt/in`). |
-| `Failed`, reason mentions **timed out** | The guest never reached `State=Off` within `-WorkloadTimeoutSeconds` | Boot too slow (add `ds=nocloud`) or the runner never called `poweroff` (an exFAT umount hang — check the runner's umount-retry loop). The VM was force-stopped + torn down. |
+| `Failed`, reason mentions **`outbox header missing/!magic`** | **Nothing valid reached the raw OUTPUT region** — the guest aborted *before* the producer ran, or wrote to the wrong device. The engine is reporting a real absence, not misreading a result | **Attach the serial capture** (`pwsh -File C:\sandbox\capture-serial.ps1 -VMName <vm>`) and read the `[voidseal-diag]` markers — they name the exact branch: INPUT not mounted, `out_candidates` ≠ 1, or the chosen `output_dev`. The run ends with `output_head`, which must be `56534f5554425831` (`VSOUTBX1`). |
+| `Failed`, reason mentions **`no 'result.html' candidate`** | A structurally **valid but EMPTY** outbox shipped: the transport worked, the *workload* produced nothing | `entrypoint_rc` / `staging_count` in the serial capture say so directly. Most likely the entrypoint failed — confirm it writes `--out /run/staging/result.html` (**not** `/mnt/out`, which the outbox runner never mounts) and re-run the §4A.2 host gate. |
+| `Failed`, reason mentions **timed out** | The guest never reached `State=Off` within `-WorkloadTimeoutSeconds` | Boot too slow (add `ds=nocloud`; the plain image adds a 2-5 min datasource probe) or the runner never reached `poweroff`. The serial capture shows how far it got. The VM was force-stopped + torn down. |
 | `Failed`, `ExitCode` non-zero (e.g. 3) | The organizer ran but exited non-zero | A real organizer bug; `result.html`/`stderr.txt` may still hold partial output (extracted). |
 | `Failed`, reason mentions **`result … empty`** | The guest wrote a 0-byte/whitespace `result.html` (e.g. the organizer printed to stdout instead of `--out`) | Re-run the §4A.2 pre-run gate — the organizer is not writing the file via `--out`. **Host-side**, not a containment issue. |
 | `Failed`, reason mentions **`detach`** | A transient host-side `Remove-VMHardDiskDrive` failed after the run; the host skipped the read rather than read a possibly-still-attached disk | **Host-side**, not a guest bug. `result.html` is likely fine on the OUTPUT disk — just re-run. The VM was still torn down (no orphan). |
@@ -566,6 +589,13 @@ Whatever the outcome, **teardown still runs** (the `finally`), so you won't accu
 The 700+ mock tests prove the *host orchestration* + *classification* logic. These pieces run for
 the **first time** on real hardware here — if something snags, it's most likely one of these,
 **not** a containment failure:
+
+> **⚠ Items 2-4 below describe the LEGACY exFAT path** (host `Mount-VHD` read, `LABEL=OUTPUT` at
+> `/mnt/out`, the `result.exitcode` sentinel) — the model Milestone 3 originally used and which a
+> *non-outbox* Disk profile still uses. **firefox no longer takes that path:** OUTPUT is Raw, the
+> host reads the outbox in user space, and the guest writes into `/run/staging`. For a firefox run,
+> the live-relevant equivalents are the raw-device identification and the outbox write — both now
+> narrated on serial as `[voidseal-diag]` markers (§4A.5).
 
 1. **Host disk format** — `New-VHD`+`Mount-VHD`+`Initialize-Disk -GPT`+`New-Partition`+`Format-Volume -exFAT`+`Dismount` (the `NewOutputVhdx` real path; has a Get-Disk settle-retry).
 2. **Native host read** — `Mount-VHD` (read-**write**, see note) + drive-letter assign + read + `Dismount` (the `ReadVhdxFile` real path). NOTE: `ReadVhdxFile` deliberately mounts the OUTPUT disk read-write, not read-only — a read-only mount on Windows often won't auto-assign a drive letter and `Add-PartitionAccessPath -AssignDriveLetter` can throw against a write-protected volume, which would make this *first* read spuriously report `result read failed`. RW is safe (the OUTPUT disk is the deployer's own host-formatted volume, detached from the powered-off guest; Tier ≥ 2 untrusted output never reaches here — it quarantines first). If a read *still* fails after this, suspect the guest didn't write `result.html`/`result.exitcode` (item 3), not the mount.
