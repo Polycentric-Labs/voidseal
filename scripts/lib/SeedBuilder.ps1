@@ -245,34 +245,48 @@ write_files:
       if ! mountpoint -q /mnt/in; then diag "ABORT input-not-mounted (LABEL=INPUT did not mount at /mnt/in - exfat module missing on this kernel? label mismatch?)"; poweroff; exit 0; fi
       diag "input_mounted=yes input_files=$(ls -1 /mnt/in 2>/dev/null | wc -l)"
       chown -R "$SBX_UID:$SBX_GID" /run/staging 2>/dev/null
-      # --- Identify the raw OUTPUT block device structurally (no filesystem/label to mount by) ---
-      # Candidates = every whole-disk block device MINUS the root/boot disk MINUS any exFAT/INPUT-
-      # labelled disk. FAIL-CLOSED: anything other than exactly one remaining candidate -> poweroff,
-      # no outbox written (mirrors the exFAT runner's "no OUTPUT -> poweroff" guard above).
+      # --- Identify the raw OUTPUT block device POSITIVELY (no filesystem/label to mount by) ---
+      # The OUTPUT disk is the ONLY attached whole-disk that is RAW: host-created with NO partition
+      # table and NO filesystem (New-WorkloadDisks / NewOutputVhdx FileSystem='Raw'). EVERY other disk
+      # in a disk-mode run is partitioned and/or formatted: the system/root disk; the exFAT INPUT disk
+      # (LABEL=INPUT); the FAT32 CIDATA seed DATA DISK (RC6 moved the seed off the DVD so it survives
+      # the seal's eject); and, on a processor run, the DEPS disk. So select on that DEFINING property
+      # rather than enumerating disks to EXCLUDE.
+      #
+      # WHY (live 2026-07-20): the previous logic excluded only root + INPUT. RC6 added the CIDATA seed
+      # as a 4th disk AFTER this runner's exclusion list was written, so two candidates always remained
+      # (OUTPUT + seed) and EVERY OutboxOutput run fail-closed aborted here with no outbox written --
+      # the host then correctly reported "outbox header missing/!magic". An exclusion list has to be
+      # kept in sync with every disk we ever attach; the raw-ness test does not (a DEPS disk would have
+      # reproduced the identical bug on the processor path).
+      #
+      # FAIL-CLOSED: anything other than exactly one remaining candidate -> poweroff, no outbox written
+      # (mirrors the exFAT runner's "no OUTPUT -> poweroff" guard above).
       ROOT_SRC=$(findmnt -no SOURCE / 2>/dev/null)
       ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null)
       # PKNAME is empty when the root SOURCE is already a whole disk (no partition) — fall back to
       # its own basename so ROOT_DISK is never blank (a blank ROOT_DISK would match nothing below and
       # wrongly leave the root disk itself as an OUTPUT candidate).
       [ -z "$ROOT_DISK" ] && ROOT_DISK=$(basename "$ROOT_SRC")
-      INPUT_SRC=$(blkid -L INPUT 2>/dev/null)
-      INPUT_DISK=$(lsblk -no PKNAME "$INPUT_SRC" 2>/dev/null)
-      [ -z "$INPUT_DISK" ] && [ -n "$INPUT_SRC" ] && INPUT_DISK=$(basename "$INPUT_SRC")
-      # Narrate the exclusion inputs + the RAW sd* enumeration — the exact fresh-image unknowns:
-      # does `blkid -L INPUT` resolve (so INPUT is excluded)? do the Hyper-V disks enumerate as sd*?
-      diag "root_src=$ROOT_SRC root_disk=$ROOT_DISK input_src=$INPUT_SRC input_disk=$INPUT_DISK"
+      diag "root_src=$ROOT_SRC root_disk=$ROOT_DISK"
       diag "sysblock_sd=$(ls /sys/block 2>/dev/null | grep '^sd' | tr '\n' ' ')"
       OUT_CANDIDATES=""
       for d in /sys/block/sd*; do
         dev=$(basename "$d")
+        # belt-and-braces: never consider the root/boot disk even if the probes below misbehave.
         [ "$dev" = "$ROOT_DISK" ] && continue
-        [ "$dev" = "$INPUT_DISK" ] && continue
+        # Partitioned? A raw OUTPUT disk has no partition table, so /sys/block/<dev>/<dev>N is absent.
+        if ls -d "$d/$dev"[0-9]* >/dev/null 2>&1; then diag "skip $dev (has partitions)"; continue; fi
+        # Carries a filesystem/label signature? (INPUT exFAT, CIDATA vfat, DEPS, ...). `blkid -p` is
+        # LOW-LEVEL PROBE mode: it reads the device now instead of trusting the cache, and exits
+        # non-zero when it finds no signature — which is exactly the raw OUTPUT disk.
+        if blkid -p "/dev/$dev" >/dev/null 2>&1; then diag "skip $dev (has a filesystem signature)"; continue; fi
         OUT_CANDIDATES="$OUT_CANDIDATES $dev"
       done
       OUT_CANDIDATES=$(echo "$OUT_CANDIDATES" | xargs)   # trim whitespace
       set -- $OUT_CANDIDATES
       diag "out_candidates=[$OUT_CANDIDATES] count=$#"
-      if [ "$#" -ne 1 ]; then diag "ABORT output-candidates-not-1 (need exactly one leftover disk after excluding root+INPUT; got $#: [$OUT_CANDIDATES])"; poweroff; exit 0; fi
+      if [ "$#" -ne 1 ]; then diag "ABORT output-candidates-not-1 (need exactly one RAW disk - no partitions, no filesystem; got $#: [$OUT_CANDIDATES])"; poweroff; exit 0; fi
       OUTPUT_DEV="/dev/$1"
       diag "output_dev=$OUTPUT_DEV"
       # Run the workload ONCE, into staging (not directly onto OUTPUT — there is no OUTPUT mount).

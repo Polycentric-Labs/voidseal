@@ -279,6 +279,27 @@ Describe 'New-CidataUserData — OutboxOutput disk runner (C1.3, firefox transpo
         $leaky | Should -BeNullOrEmpty -Because 'the release boundary: serial narrates structure (device nodes/counts/rc/magic), never staged payload bytes'
     }
 
+    # --- raw-OUTPUT identification (root cause of the 2026-07-20 live abort) ---------------------
+    # LIVE: the runner excluded only root + INPUT, but RC6 had added the FAT32 CIDATA seed as a 4th
+    # disk, so two candidates always remained (OUTPUT + seed) and EVERY OutboxOutput run fail-closed
+    # aborted with no outbox written. A DEPS disk would reproduce it on the processor path. The fix
+    # selects the OUTPUT disk by its DEFINING property (raw: no partitions, no filesystem signature).
+    It 'identifies the raw OUTPUT disk POSITIVELY (no partitions + no filesystem signature)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        $ud | Should -Match 'blkid -p'                    -Because 'low-level PROBE mode tests the device for a filesystem signature now, rather than trusting the blkid cache'
+        $ud | Should -Match 'has partitions'              -Because 'a partitioned disk (root/INPUT/CIDATA/DEPS) is not the raw OUTPUT disk'
+        $ud | Should -Match 'has a filesystem signature'  -Because 'a formatted disk is not the raw OUTPUT disk'
+    }
+
+    It 'does NOT identify OUTPUT by an exclusion list of known labels (the RC6 CIDATA seed disk broke that live)' {
+        $ud = New-CidataUserData -Profile $script:OutboxProfile
+        # `LABEL=INPUT` must still appear (the INPUT *mount*, asserted above) — this pins that the
+        # OUTPUT *identification* no longer hinges on resolving INPUT's label to subtract it, which
+        # silently left the seed disk as a second candidate.
+        $ud | Should -Not -Match 'blkid -L INPUT' -Because 'an exclusion list must be kept in sync with every disk we attach; the raw-ness test does not'
+        $ud | Should -BeLike '*LABEL=INPUT*'      -Because 'the INPUT disk is still MOUNTED by label — only the OUTPUT identification changed'
+    }
+
     It 'a plain (non-OutboxOutput) Disk profile is UNCHANGED — still the direct exFAT result.html runner' {
         # Regression guard: C1.3 must not touch the existing non-outbox Disk-mode runner (a legacy
         # profile with WorkloadMode='Disk' and no OutboxOutput key keeps the old exFAT contract).
