@@ -175,3 +175,26 @@ proves them.*
 
 Until every item above has been exercised live, treat the mock-green suite as proof of *shape*
 correctness, not proof of live behavior.
+
+### Serial capture is mandatory for the live run
+
+Attach the COM1 serial capture **before starting the VM** — it is the project's default live-debug
+tool (it pinned both Tier-0 live root causes) and, for the builder, it is the **only** live signal of
+fetch outcome: `Invoke-BuilderVM`'s `Status='Success'` means *clean power-off* only (the in-guest
+`result.exitcode` is written to the OUTPUT disk, which teardown deletes, and the host never reads it —
+by design, no host-mount). The builder runner narrates structural `[voidseal-diag]` markers to the
+serial console (mirroring the OutboxOutput runner's discipline; asserted by `SeedBuilder.Tests.ps1`):
+
+| Marker | What it attributes |
+|---|---|
+| `squid_active=` | a dead Squid (every fetch becomes an opaque connection failure) |
+| `egress_lockdown=v4-applied redirect80_rc= redirect443_rc=` | lockdown applied; an unapplied REDIRECT silently bypasses the domain-ACL |
+| `ip6_lockdown=applied\|skipped` | the IPv6 belt-and-braces outcome |
+| `ABORT output-not-mounted` / `ABORT input-not-mounted` | the two fail-closed poweroff branches (formerly silent) |
+| `output_mounted= owner_sandbox=` / `input_mounted= input_files=` | data-disk mounts + who may write |
+| `entrypoint_rc=` | `fetch_deps.py` rc (2 = first failed fetcher; fail-closed) |
+| `fetched pip= apt= hf= manifest_present=` | per-fetcher artifact **counts** + the single yes/no of a fully-green fetch (`write_manifest` runs only after all fetchers succeed) |
+
+Read the live verdict off `entrypoint_rc=0` **and** `manifest_present=yes` — never off `Status`
+alone. Markers are structural only (liveness/rc/counts/presence); dependency payload bytes never
+ride the console.

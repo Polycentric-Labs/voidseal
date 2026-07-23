@@ -670,6 +670,58 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         $ud | Should -Not -Match '(?i)disable_ipv6'
         $ud | Should -Match 'network: \{config: disabled\}'
     }
+
+    # --- serial diagnostics (Phase-6 live-debug observability; structural facts ONLY) -------------
+    # The builder runner had ZERO serial markers, while the OutboxOutput runner's diag lines are what
+    # pinned BOTH Tier-0 live root causes (D4-D). Phase 6 is the project's FIRST live egress: a failed
+    # fetch must be attributable to squid-down vs REDIRECT-not-applied vs mount-failure vs the fetch
+    # itself. And Invoke-BuilderVM's Status=Success is clean-POWEROFF-only today (the exitcode read
+    # deferred to Phase 4 and never landed for the builder) while teardown DELETES the OUTPUT disk —
+    # so the serial console is the ONLY live signal of whether the fetch actually worked. Same
+    # discipline as the outbox runner: STRUCTURAL ONLY — liveness, rc values, file COUNTS, manifest
+    # presence; never fetched-artifact bytes.
+    It 'emits structural [voidseal-diag] serial markers (the silent-runner class already cost two live debug rounds)' {
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        $ud | Should -Match '\[voidseal-diag\]' -Because 'a fail-closed poweroff must narrate WHY to the serial console, not vanish silently'
+    }
+
+    It 'narrates the egress bring-up: squid liveness + per-REDIRECT rc (the first layer a failed live fetch must rule out)' {
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        $ud | Should -Match 'diag "squid_active='   -Because 'a dead Squid turns every fetch into an opaque connection failure; its liveness must be on serial before the entrypoint runs'
+        $ud | Should -Match 'diag "egress_lockdown' -Because 'the lockdown/REDIRECT application must be narrated so a no-egress failure is attributable to THIS layer, not guessed'
+        $ud | Should -Match 'redirect80_rc='        -Because 'an unapplied 80-REDIRECT silently bypasses the Squid ACL for HTTP — its rc must be visible'
+        $ud | Should -Match 'redirect443_rc='       -Because 'an unapplied 443-REDIRECT silently bypasses the Squid ACL for HTTPS — its rc must be visible'
+        $ud | Should -Match 'diag "ip6_lockdown'    -Because 'the IPv6 belt-and-braces outcome (applied vs no-binary skip) must be visible live'
+    }
+
+    It 'narrates mounts, entrypoint rc, per-fetcher artifact counts, and manifest presence (Success is poweroff-only today — serial is the live fetch-outcome signal)' {
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        $ud | Should -Match 'diag "input_mounted='  -Because 'a failed INPUT mount means the runner + DepsSpec never reached the guest'
+        $ud | Should -Match 'diag "output_mounted=' -Because 'a failed OUTPUT mount means nothing can be staged — and which owner it mounted under decides who may write'
+        $ud | Should -Match 'diag "entrypoint_rc='  -Because 'fetch_deps.py exits 2 on any failed fetcher; that rc never reaches the host Status (clean-poweroff-only), so it must ride serial'
+        $ud | Should -Match 'fetched pip='          -Because 'a per-fetcher artifact COUNT attributes an empty deps disk to the fetcher that produced nothing'
+        $ud | Should -Match 'apt='                  -Because 'apt artifacts land under /mnt/out/apt — its count must be narrated separately'
+        $ud | Should -Match 'hf='                   -Because 'HF artifacts land under /mnt/out/hf — its count must be narrated separately'
+        $ud | Should -Match 'manifest_present='     -Because 'write_manifest only runs after ALL fetchers succeed; its presence is the single yes/no of a fully-green fetch'
+    }
+
+    It 'echoes a DISTINCT ABORT reason before each of the two fail-closed poweroffs (no-OUTPUT vs no-INPUT+rc70)' {
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        $ud | Should -Match 'diag "ABORT output-not-mounted' -Because 'the no-OUTPUT branch powers off with NOTHING written anywhere; only serial can say why'
+        $ud | Should -Match 'diag "ABORT input-not-mounted'  -Because 'the no-INPUT branch writes the rc70 sentinel the host never reads (no host-mount by design); serial must name the branch'
+    }
+
+    It 'builder diag markers are STRUCTURAL only — no fetched-artifact bytes on the serial console (same contract as the outbox runner)' {
+        $ud = New-CidataUserData -Profile $script:builderProfile
+        $diagLines = @(($ud -split "`r?`n") | Where-Object { $_ -match 'diag "' })
+        $diagLines.Count | Should -BeGreaterThan 6 -Because 'every decision point (squid, lockdown/redirects, ip6, both mounts, entrypoint, fetch counts, manifest, poweroff) must be narrated'
+        # A diag line must never dump dependency-payload bytes to the console: counts/presence/rc are
+        # structural and allowed; catting fetched files is not. (The builder carries zero personal data —
+        # this is contract-consistency with the shared outbox runner, and it keeps the serial capture a
+        # control-flow record rather than a payload mirror.)
+        $leaky = @($diagLines | Where-Object { $_ -match '/mnt/out' -and $_ -match '\b(cat|head|tail|od|xxd|hexdump|dd|strings)\b' })
+        $leaky | Should -BeNullOrEmpty -Because 'serial narrates structure (liveness/rc/counts/presence), never dependency payload bytes'
+    }
 }
 
 Describe 'Write-Iso9660Image — REAL IMAPI2 round-trip (gated on IMAPI availability)' {

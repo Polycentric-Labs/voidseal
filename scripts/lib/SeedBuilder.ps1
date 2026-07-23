@@ -418,9 +418,24 @@ write_files:
       # Voidseal builder runner: bring up Squid SNI proxy, mount data disks, run the dep-fetch
       # entrypoint as the non-root 'sandbox' user, write result + sentinel to OUTPUT, power off.
       set +e
+      # SERIAL DIAGNOSTICS (Phase-6 live-debug observability — the same discipline whose markers
+      # pinned BOTH Tier-0 live root causes in the OutboxOutput runner). Phase 6 is the FIRST live
+      # egress: a failed fetch must be attributable to squid-down vs REDIRECT-not-applied vs
+      # mount-failure vs the fetch itself. Invoke-BuilderVM's Status=Success is clean-POWEROFF-only
+      # (the exitcode read deferred to Phase 4 and never landed for the builder) and teardown deletes
+      # the OUTPUT disk, so this console narration is the ONLY live signal of fetch outcome.
+      # STRUCTURAL ONLY: liveness, rc values, file COUNTS, manifest presence — NEVER fetched-artifact
+      # bytes (contract-consistency with the shared outbox runner; serial stays a control-flow record,
+      # not a payload mirror). Never alters control flow: runs under `set +e`, writes to /dev/console
+      # (always present) and swallows any error.
+      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
+      diag "builder-runner start"
 
       # --- Squid transparent proxy setup ---
       systemctl restart squid 2>/dev/null || true
+      # A dead Squid turns every fetch into an opaque connection failure (the REDIRECTs below would
+      # route 80/443 into a closed port) — put its liveness on serial BEFORE anything depends on it.
+      diag "squid_active=$(systemctl is-active squid 2>/dev/null)"
       # --- Egress lockdown: DEFAULT-DROP OUTPUT + a minimal allow-list (SEC-2) ---
       # tier1 BlockProtocols (QUIC/UDP-443, DoH, DoT) is enforced BY CONSTRUCTION: only the flows below are
       # permitted, so QUIC/UDP-443 and DoT/853 are dropped, and DoH (443) hits Squid's domain-ACL (a DoH
@@ -444,7 +459,13 @@ write_files:
       # Transparent-proxy REDIRECT of outbound 80/443 through Squid (domain-ACL gatekeeps the fetch); the
       # owner-exclusion keeps Squid's OWN upstream egress from being re-redirected.
       iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
+      r80=$?
       iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
+      r443=$?
+      # An unapplied REDIRECT silently bypasses the Squid domain-ACL for that protocol (traffic rides
+      # the raw 80/443 ACCEPTs above) — each rule's rc must be visible so a live capture can rule
+      # this layer in or out without guessing.
+      diag "egress_lockdown=v4-applied redirect80_rc=$r80 redirect443_rc=$r443"
       # --- IPv6 belt-and-braces (SEC-2/C3): default-DROP OUTPUT over ip6tables too. disable_ipv6 above
       # is the primary control (no IPv6 route should exist at all); this guards the case where it is
       # somehow bypassed. Guarded on `command -v` so a missing ip6tables binary cannot abort this
@@ -455,6 +476,12 @@ write_files:
         ip6tables -P OUTPUT DROP
         ip6tables -A OUTPUT -o lo -j ACCEPT
         ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        diag "ip6_lockdown=applied"
+      else
+        # Fail-closed posture is unchanged (disable_ipv6 ran at bootcmd; no v6 ACCEPT exists anywhere)
+        # but the skip must be visible: a missing binary is exactly the kind of quiet divergence a
+        # live capture needs to see rather than infer.
+        diag "ip6_lockdown=skipped (no ip6tables binary)"
       fi
 
       # --- Mount data disks (same robust pattern as the offline runner) ---
@@ -467,10 +494,17 @@ write_files:
       OUT_SANDBOX_OWNED=0
       if mount -o uid=$SBX_UID,gid=$SBX_GID LABEL=OUTPUT /mnt/out 2>/dev/null; then OUT_SANDBOX_OWNED=1; fi
       mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out 2>/dev/null
-      if ! mountpoint -q /mnt/out; then poweroff; exit 0; fi
-      if ! mountpoint -q /mnt/in; then printf '%s' 70 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
+      # Both fail-closed branches below were SILENT `poweroff` guards — the exact silent-runner class
+      # that hid the Tier-0 root causes. Each now names its branch first. The no-INPUT branch writes
+      # the rc70 sentinel to OUTPUT, but the host never reads it (no host-mount by design), so serial
+      # is the only place that sentinel's meaning surfaces.
+      if ! mountpoint -q /mnt/out; then diag "ABORT output-not-mounted (LABEL=OUTPUT did not mount at /mnt/out - exfat module missing on this kernel? label mismatch?)"; poweroff; exit 0; fi
+      diag "output_mounted=yes owner_sandbox=$OUT_SANDBOX_OWNED"
+      if ! mountpoint -q /mnt/in; then diag "ABORT input-not-mounted (LABEL=INPUT did not mount at /mnt/in; rc70 sentinel written to OUTPUT)"; printf '%s' 70 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
+      diag "input_mounted=yes input_files=$(ls -1 /mnt/in 2>/dev/null | wc -l)"
 
       # --- Run the dep-fetch entrypoint ---
+      diag "entrypoint start"
       if [ "$OUT_SANDBOX_OWNED" = "1" ] && id -u sandbox >/dev/null 2>&1; then
         runuser -u sandbox -- /bin/sh -c '__ENTRYPOINT__' > /mnt/out/stdout.log 2> /mnt/out/stderr.txt
       else
@@ -478,9 +512,16 @@ write_files:
       fi
       rc=$?
       printf '%s' "$rc" > /mnt/out/result.exitcode
+      # fetch_deps.py exits 2 on the FIRST failed fetcher; that rc reaches result.exitcode on the
+      # OUTPUT disk (which teardown deletes) and nowhere else — narrate it, plus the per-fetcher
+      # artifact COUNTS (never names/bytes) and the manifest verdict. write_manifest runs only after
+      # ALL fetchers succeed, so manifest_present=yes is the single yes/no of a fully-green fetch.
+      diag "entrypoint_rc=$rc"
+      diag "fetched pip=$(find /mnt/out/pip -type f 2>/dev/null | wc -l) apt=$(find /mnt/out/apt -type f 2>/dev/null | wc -l) hf=$(find /mnt/out/hf -type f 2>/dev/null | wc -l) manifest_present=$([ -f /mnt/out/deps-manifest.json ] && echo yes || echo no)"
       sync
       umount /mnt/out
       i=0; while mountpoint -q /mnt/out && [ $i -lt 10 ]; do sleep 1; umount /mnt/out 2>/dev/null; i=$((i+1)); done
+      diag "sync+umount+poweroff"
       poweroff
 
   - path: /etc/systemd/system/vmdep-builder.service
