@@ -103,7 +103,7 @@ fake backend must match real Hyper-V behavior.
 
 This project was developed alongside AI platforms.
 
-AI models and tools used: Claude, Codex, Cursor, Ollama (and other local models), OpenRouter (incl. Gemini, GPT, etc.), Perplexity.
+Details, including the tools used: [`docs/ai-assistance.md`](docs/ai-assistance.md).
 
 ## License
 
