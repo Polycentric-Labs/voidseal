@@ -204,6 +204,11 @@ function Get-HyperVBackendMethodManifest {
                                                                      # the fake ALSO surfaces Label/FileSystem as a mock-internal convenience for the
                                                                      # $findOutputDisk OUTPUT-disk tag — those two fields are non-observable on real)
         RemoveVHD            = @('Path')                            # delete a DETACHED .vhdx file (the Reaper's explicit cleanup)
+        # Host free space on the volume backing a path. Behind the seam because it is a HOST
+        # query: routing it here is what lets the mock-backed suite run on a machine (or a CI
+        # runner) that does not have the production disk budget free. REAL = Get-Volume
+        # -FilePath ... .SizeRemaining; FAKE = a configurable figure, default generous.
+        GetVolumeFreeSpace   = @('Path')                            # -> [long] free bytes
         AddHardDiskDrive     = @('VMName', 'Path')
         RemoveHardDiskDrive  = @('VMName', 'Path')
         SetDvdDrive          = @('VMName', 'Path')                  # ISO attach
@@ -1472,6 +1477,15 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
+    $b.GetVolumeFreeSpace = {
+        param([System.Collections.IDictionary] $P)
+        $path = & $AssertArg $P 'Path' 'GetVolumeFreeSpace'
+        & $InvokeOp {
+            $vol = Get-Volume -FilePath $path -ErrorAction Stop
+            [long]$vol.SizeRemaining
+        }
+    }.GetNewClosure()
+
     $b.AddHardDiskDrive = {
         param([System.Collections.IDictionary] $P)
         $vm   = & $AssertArg $P 'VMName' 'AddHardDiskDrive'
@@ -1790,11 +1804,13 @@ function New-FakeHyperVBackend {
         [int] $SimulateDetachSettleLag = 0,
         [switch] $SimulateDetachError,
         [switch] $SimulateWriteEnospc,
-        [switch] $SimulateCreateEnospc
+        [switch] $SimulateCreateEnospc,
+        [long] $SimulateFreeSpaceBytes = 500GB
     )
 
     # Hoist shared helpers into factory-locals so the method closures capture them
     # (see the helpers' header note — closures can't reach script-scoped functions).
+    $freeSpaceBytes = $SimulateFreeSpaceBytes
     $GetArg       = $script:SbGetArg
     $AssertArg    = $script:SbAssertArg
     $CopyVM       = $script:SbCopyFakeVM
@@ -2499,6 +2515,15 @@ function New-FakeHyperVBackend {
         # step (RemoveHardDiskDrive); this only forgets the disk record.
         $path = & $AssertArg $P 'Path' 'RemoveVHD'
         if ($state.VHDs.ContainsKey($path)) { $state.VHDs.Remove($path) | Out-Null }
+    }.GetNewClosure()
+
+    $b.GetVolumeFreeSpace = {
+        param([System.Collections.IDictionary] $P)
+        # The fake reports a configurable figure (default generous) so a mock-backed run never
+        # depends on the host's real free space. Pass -SimulateFreeSpaceBytes to drive the
+        # preflight's refusal path deterministically.
+        $null = & $AssertArg $P 'Path' 'GetVolumeFreeSpace'
+        [long]$freeSpaceBytes
     }.GetNewClosure()
 
     $b.AddHardDiskDrive = {

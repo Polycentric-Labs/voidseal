@@ -150,10 +150,20 @@ function Test-HostFreeSpace {
     param(
         [Parameter(Mandatory)] [string] $Path,
         [Parameter(Mandatory)] [long]   $RequiredBytes,
-        [long] $HeadroomBytes = 1GB   # fixed safety margin above the summed disk budgets
+        [long] $HeadroomBytes = 1GB,  # fixed safety margin above the summed disk budgets
+        [hashtable] $Backend           # optional: query free space through the backend seam
     )
-    $vol = Get-Volume -FilePath $Path -ErrorAction Stop   # maps the .vhdx path to its hosting volume
-    $free = [long]$vol.SizeRemaining
+    # Reading free space is a HOST query, so it goes through the backend seam when the caller
+    # has one. That is what keeps a mock-backed run independent of the machine it runs on: the
+    # fake reports a configurable figure instead of whatever the real volume happens to have.
+    # Without a Backend (a direct call) we fall back to Get-Volume, so callers and tests that
+    # exercise this function on its own are unaffected.
+    if ($Backend) {
+        $free = [long](& $Backend.GetVolumeFreeSpace @{ Path = $Path })
+    } else {
+        $vol  = Get-Volume -FilePath $Path -ErrorAction Stop  # maps the .vhdx path to its volume
+        $free = [long]$vol.SizeRemaining
+    }
     $need = $RequiredBytes + $HeadroomBytes
     if ($free -lt $need) {
         throw ("Test-HostFreeSpace: insufficient host free space on the volume hosting '$Path' — " +
@@ -409,7 +419,7 @@ function New-SandboxVM {
     else {
         $SystemDiskSizeBytes
     }
-    $null = Test-HostFreeSpace -Path $storageRoot -RequiredBytes $requiredBytes
+    $null = Test-HostFreeSpace -Path $storageRoot -RequiredBytes $requiredBytes -Backend $Backend
 
     # --- artifact tracking for mid-provision ROLLBACK ---------------------
     # If ANY creation step below throws, the catch best-effort tears down EXACTLY what was

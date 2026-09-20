@@ -161,7 +161,7 @@ function New-WorkloadDisks {
     # exhaustion risk I6b closed for the system disk. Reuse the SAME helper with the SUMMED INPUT+
     # OUTPUT budget, measured against the volume hosting $StorageRoot (the same root both data disks
     # land on), before either NewOutputVhdx call — so a refusal here leaves NEITHER disk created.
-    $null = Test-HostFreeSpace -Path $StorageRoot -RequiredBytes ($inSizeBytes + $outSizeBytes)
+    $null = Test-HostFreeSpace -Path $StorageRoot -RequiredBytes ($inSizeBytes + $outSizeBytes) -Backend $Backend
 
     # INCREMENTAL-RECORD INVARIANT (orphan-window fix): each data disk is recorded on the descriptor
     # — its path field AND a deduped append to CreatedDisks — IMMEDIATELY after it is CREATED, before

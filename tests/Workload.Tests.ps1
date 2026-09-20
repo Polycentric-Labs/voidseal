@@ -238,10 +238,11 @@ Describe 'New-WorkloadDisks — profile-driven disk sizes (I2b)' {
 Describe 'New-WorkloadDisks — workload-disk host-free-space preflight (I2b, folds I6b coverage)' {
 
     It 'refuses BEFORE creating either data disk when the INPUT+OUTPUT budget exceeds host free space' {
-        # Reuses Test-HostFreeSpace (Provisioner.ps1, I6b) — mock Get-Volume (the cmdlet it calls),
-        # mirroring the Provisioner.Tests.ps1 idiom (dot-sourced file, not a module -> plain Mock).
-        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 500MB } }
-        $b = New-FakeHyperVBackend
+        # Free space is read through the backend seam (GetVolumeFreeSpace), so the fake drives the
+        # refusal deterministically. That is what makes this suite independent of the host's real
+        # disk: it used to Mock Get-Volume, which left every OTHER provisioning test depending on
+        # the machine actually having the production budget free.
+        $b = New-FakeHyperVBackend -SimulateFreeSpaceBytes 500MB
         $null = & $b.NewVM @{ Name='nospace1'; Generation=2 }
         $d = New-SandboxDescriptor -Name 'nospace1' -Tier 0
         $prof = @{ Name='nospace1'; InputDiskSizeBytes = 4GB; OutputDiskSizeBytes = 4GB; FileSystem = 'exFAT' }
@@ -253,8 +254,7 @@ Describe 'New-WorkloadDisks — workload-disk host-free-space preflight (I2b, fo
     }
 
     It 'provisions normally when host free space comfortably covers the summed INPUT+OUTPUT budget' {
-        Mock Get-Volume { [pscustomobject]@{ SizeRemaining = 50GB } }
-        $b = New-FakeHyperVBackend
+        $b = New-FakeHyperVBackend -SimulateFreeSpaceBytes 50GB
         $null = & $b.NewVM @{ Name='hasspace1'; Generation=2 }
         $d = New-SandboxDescriptor -Name 'hasspace1' -Tier 0
         $prof = @{ Name='hasspace1'; InputDiskSizeBytes = 1GB; OutputDiskSizeBytes = 1GB; FileSystem = 'exFAT' }
@@ -263,15 +263,21 @@ Describe 'New-WorkloadDisks — workload-disk host-free-space preflight (I2b, fo
         $d2.OutputDiskPath | Should -Not -BeNullOrEmpty
     }
 
-    It 'the real (unmocked) preflight passes on a real dev/CI volume for the default 1GB+1GB budget' {
-        # No Get-Volume mock: proves the wiring doesn't break the ordinary happy path against the
-        # REAL host volume backing the test's StorageRoot (any dev/CI box has GB+ free on C:).
+    It 'the default (fake) free-space figure comfortably covers the default 1GB+1GB budget' {
+        # The seam's default must not be so tight that an ordinary mock-backed run trips the
+        # preflight. This is the happy path through GetVolumeFreeSpace with no simulation set.
         $b = New-FakeHyperVBackend
         $null = & $b.NewVM @{ Name='realspace1'; Generation=2 }
         $d = New-SandboxDescriptor -Name 'realspace1' -Tier 0
         $d2 = New-WorkloadDisks -Descriptor $d -Profile @{ Name='realspace1' } -StorageRoot 'C:\s\realspace1' -Backend $b
         $d2.InputDiskPath  | Should -Not -BeNullOrEmpty
         $d2.OutputDiskPath | Should -Not -BeNullOrEmpty
+    }
+
+    It 'the REAL host path still works: Test-HostFreeSpace with no Backend queries the real volume' {
+        # A Backend-less call is the production read via Get-Volume. Small budget so it holds on
+        # any dev box or CI runner, and it proves the fallback branch is still wired.
+        Test-HostFreeSpace -Path $env:TEMP -RequiredBytes 1MB -HeadroomBytes 0 | Should -BeTrue
     }
 }
 
