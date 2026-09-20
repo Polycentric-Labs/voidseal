@@ -247,7 +247,7 @@ Describe 'Start-SandboxWorkload — runs the workload over the serial seam + rec
         $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-runfail' -Backend $bad
         Lock-Sandbox -Descriptor $d -Backend $bad
         $art = Join-Path $script:TmpRoot ("runfail-{0}" -f ([guid]::NewGuid().ToString('N')))
-        $result = Start-SandboxWorkload -Descriptor $d -Entrypoint 'bash will-fail.sh' -ArtifactRoot $art -Backend $bad
+        $result = Start-SandboxWorkload -Descriptor $d -Entrypoint 'bash will-fail.sh' -ArtifactRoot $art -Backend $bad -BootWaitSeconds 0 -BootPollDelaySeconds 0
         $result.ExitCode | Should -Not -Be 0 -Because 'a non-zero guest exit is reported on the result, not thrown'
     }
 }

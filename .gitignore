@@ -10,3 +10,19 @@ __pycache__/
 *.pyc
 # Private per-repo working memory (Claude Code loads it; never published)
 CLAUDE.local.md
+
+# Local secrets and private-key material. Never commit, even accidentally.
+.env
+.env.*
+*.pem
+*.key
+# Agent + tooling scratch (build history, worktrees, caches). Not product.
+.claude/
+.superpowers/
+.local/
+_internal/
+.pytest_cache/
+# Editor / OS noise
+*.bak
+*.swp
+.DS_Store
