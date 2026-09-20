@@ -167,7 +167,7 @@ The table above answers *"if this happened, would it be a Voidseal bug?"* — a 
 below answers a different question, *"has this actually been exercised?"* — a maturity question. Don't
 blend them: something can be correctly scoped as IN SCOPE and still be unproven live.
 
-- **Tier 0/1 provisioning + seal:** mock-proven against a fake Hyper-V backend (867 Pester tests, no
+- **Tier 0/1 provisioning + seal:** mock-proven against a fake Hyper-V backend (866 passed, 0 failed, 2 skipped, no
   elevation, no real VM). The first live end-to-end run — the live smoke test — is the operator's own
   elevated step; nothing in this document should be read as a claim that it has been exercised live.
 - **Tier-1 in-guest egress:** shape-asserted only. The mock suite proves the rendered Squid config text,

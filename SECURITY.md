@@ -192,7 +192,7 @@ full privileges of whoever invokes it — here, the host operator.
 
 ## Status / honesty
 
-- The Tier-0/1 engine is **mock-proven** (867 Pester tests, 0 failed, 2 skipped, plus 56 pytest tests,
+- The Tier-0/1 engine is **mock-proven** (866 Pester tests passed, 0 failed, 2 skipped, plus 56 pytest tests,
   all against the fake backend). The **Tier-0 `firefox` disk round-trip has run end-to-end on real
   Hyper-V** (2026-06-25). No other tier has had a live acceptance run; Tier 1 remains the operator's
   elevated step.

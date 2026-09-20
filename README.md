@@ -14,7 +14,7 @@ rather than duplicating it.
 > [!IMPORTANT]
 > **Honesty up front (read this before you trust it with anything dangerous).**
 > - **The Tier-0 disk round-trip is live-proven once; the full multi-tier acceptance is not.** The whole
->   engine is **mock-proven** (867 Pester tests plus 56 pytest tests against a fake Hyper-V backend), and the **Tier-0
+>   engine is **mock-proven** (868 Pester tests (866 passed, 2 skipped) plus 56 pytest tests against a fake Hyper-V backend), and the **Tier-0
 >   `firefox` disk-mode round-trip has run end-to-end on real Hyper-V** (Milestone 3, 2026-06-25 —
 >   provision → host-verified seal → disk-passing workload → host-read result → clean teardown). The
 >   **Tier-1 `ralph` live run is still pending**, and no tier above 0 has had a live acceptance yet
