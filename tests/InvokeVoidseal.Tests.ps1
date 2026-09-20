@@ -1305,7 +1305,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 # ===========================================================================
 #  C1.2 — non-processor OutboxOutput read-path: user-space outbox, NEVER Mount-VHD
 # ===========================================================================
-#  Intent (plan _dev/plans/2026-07-01-pre-phase6-hardening-plan.md Task C1.2): a Disk-mode profile
+#  Intent: a Disk-mode profile
 #  that opts into OutboxOutput=$true (C1.1's Raw-OUTPUT predicate) but is NOT a processor (no
 #  ScreenConfig) must have its result read via the SAME user-space path a processor uses
 #  (ReadVhdxRawRegion -> read_outbox.py), NEVER Read-WorkloadResult/ReadVhdxFile — the Raw OUTPUT has

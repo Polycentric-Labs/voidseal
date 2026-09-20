@@ -27,7 +27,7 @@
     # !!! DATA-ACCESS RULE (BINDING) !!!
     #   This profile DEFAULTS TO SYNTHETIC / SAMPLE bookmark data. Reading your
     #   REAL Firefox profile (bookmarks/history/places.sqlite/etc.) requires EXPLICIT,
-    #   PER-TASK authorization and is NEVER the default. "Personal-only this round"
+    #   PER-TASK authorization and is NEVER the default. "Personal-only in v1"
     #   is NOT standing read-authorization. In the Disk model the input source is the
     #   INPUT data disk (InputFiles -> Inputs -> guest /mnt/in), which defaults to a
     #   SAMPLE/synthetic 'sample-bookmarks.json'; to run against real data, the operator must

@@ -802,7 +802,7 @@ function Assert-Sealed {
     # The DEPS disk is attached normally; the recorded DepsDiskPath is simply ACCEPTED (not refused
     # as a residual), exactly like INPUT/OUTPUT. (D3 correction — 2026-06-28.)
     $depsDisk   = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'DepsDiskPath')
-    # HARDENING 2 (path canonicalization): the set-membership compares below (the structural rule (c)
+    # Path canonicalization: the set-membership compares below (the structural rule (c)
     # and the all-tier backstop (d)) test a host-truth attached path against these recorded sets with
     # an exact OrdinalIgnoreCase string compare. A recorded path and the attached path that differ
     # only by FORM (trailing slash, relative '.'/'..', '\\?\' prefix, 8.3 short name) would compare as
@@ -895,7 +895,7 @@ function Assert-Sealed {
         # (d) ALL-TIER best-effort backend-truth backstop: an ACTUALLY-attached disk that is not an
         # EXPECTED disk (system disk + the descriptor's CreatedDisks/DiskPaths) is a residual and is
         # refused — at EVERY tier, including Tier-1 (where (c)'s strict single-disk rule does not
-        # apply). This closes the Tier-1 gap the review caught: a residual that is neither secret-
+        # apply). This closes a Tier-1 gap: a residual that is neither secret-
         # shaped by name (b) nor recorded as import media (a) would otherwise slip through at Tier-1.
         # It is BEST-EFFORT — it can only catch disks the descriptor did not record as legitimate;
         # the authoritative no-net structural guarantee remains (c) at Tier>=2. We only apply it when

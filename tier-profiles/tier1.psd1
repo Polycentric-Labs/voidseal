@@ -8,7 +8,7 @@
     # HONESTY (2026-07-18): EgressMode names the real mechanism this tier ships as — in-guest
     # iptables default-DROP + transparent Squid dstdomain ACL over EgressAllowlist, ported from
     # the builder's proven mechanism (SeedBuilder.ps1) — replacing the fabricated/schema-only
-    # 'NftablesAllowlist' (design-invalidated by Pass-5, 2026-06-28: static nftables/ipset
+    # 'NftablesAllowlist' (design-invalidated 2026-06-28: static nftables/ipset
     # allowlists don't survive CDN IP rotation). Now WIRED into New-CidataUserData's serial seed
     # (CidataSerialEgressTemplate) — the in-guest Squid defense-in-depth control SHIPS, mock-
     # asserted for SHAPE only (real packet-drop + the activation-timing ordering vs pre-seal
@@ -22,7 +22,9 @@
         'github.com', 'raw.githubusercontent.com', 'objects.githubusercontent.com', 'codeload.github.com',
         'pypi.org', 'files.pythonhosted.org'
     )
-    BlockProtocols  = @('QUIC', 'UDP/443', 'DoH', 'DoT')   # force plaintext-resolvable egress through the allowlist
+    # DECLARATIVE ONLY: no code reads this array. Not the loader, not SeedBuilder. The builder seed's
+    # default-DROP ruleset is a superset of this list but is written literally and never consults it.
+    BlockProtocols  = @('QUIC', 'UDP/443', 'DoH', 'DoT')
     Credentials     = 'ScopedOnDemand'           # default none; a scoped token only when the task needs a live API
     GuestImage      = 'debian-12-cloud'          # Debian 12 cloud image .vhdx + cloud-init NoCloud
     SecureBootTemplate = 'MicrosoftUEFICertificateAuthority'   # verified for Debian Gen2

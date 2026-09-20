@@ -430,7 +430,7 @@ function Wait-WorkloadComplete {
     TIER >= 2 (HOSTILE): the host MUST NOT direct-mount/direct-read a presumed-hostile output disk.
     The whole containment model would be defeated by a trusting host-read of a hostile tier. So this
     routes to Export-ColdVhdxQuarantine (Runner.ps1) — the clearly-marked cold-VHDX -> quarantine-VM
-    -> CDR sink, a NotImplemented stub this round that THROWS *before* any read. The tier is read
+    -> CDR sink, a NotImplemented stub in v1 that THROWS *before* any read. The tier is read
     from OUR descriptor (a pscustomobject) via direct property access — correct here; the Get-VMField
     concern was only for backend GetVM results, not our own descriptor.
 

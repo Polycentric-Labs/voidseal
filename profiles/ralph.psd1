@@ -87,7 +87,9 @@
     }
 
     # ------------------------------------------------------------------
-    # Mounts — host->guest bind mounts. The loader REFUSES any secret-shaped source
+    # Mounts — DECLARED, NOT WIRED (Gap 2): no code path attaches a host-guest bind mount, so
+    # these entries move no files. They are kept because the loader still screens their source keys
+    # and because they document the intended shape. The loader REFUSES any secret-shaped source
     # (.env*, *.pem, *.key, credentials*.json, .credentials.json, id_rsa*, ~/.ssh,
     # ~/.aws/credentials, anything under a `.secrets/` dir, etc.).
     #
@@ -109,10 +111,13 @@
     #       Copy-Item "$env:USERPROFILE\.claude\.credentials.json" `
     #                 "C:\sandbox\agent-cred\agent.token"
     #
-    #   The mount KEY below points at THAT copied token file. It is read-only in
-    #   the guest (the ':ro' suffix on the target documents the intent; the Sealer/
-    #   backend attaches it read-only), single-purpose, and rotatable (re-copy +
-    #   re-deploy). Rotate the token after any session that touched it.
+    #   The mount KEY below points at THAT copied token file. IMPORTANT: nothing attaches it.
+    #   Mounts are declared and secret-path-screened but NOT wired into the guest (no component
+    #   attaches a host-guest bind mount; see docs/live-smoke-test.md Gap 2), so the ':ro' suffix
+    #   records intent only and the token does NOT reach the guest through this block. A live ralph
+    #   run must deliver the token by a wired channel (bake it into the CIDATA seed or a StageAssets
+    #   ISO, read-only) or authenticate some other way. Rotate the token after any session that
+    #   touched it.
     #
     #   This passes Import-WorkloadProfile because the SOURCE path is not
     #   secret-shaped (a `.token` leaf in a `claude-oauth` dir — neither the leaf

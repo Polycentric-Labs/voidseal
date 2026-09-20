@@ -16,7 +16,7 @@ jobs:
       # The Sensitivity-Gate tests shell out to `python guest/screener.py`, so the
       # runner needs Python on PATH. (Phase 0 introduced the first Python to the repo.)
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.x'
 
@@ -25,6 +25,10 @@ jobs:
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser
+          # windows-latest ships Pester 3.4.0 machine-wide; import explicitly so the v5
+          # configuration API below cannot bind against the old module.
+          Import-Module Pester -MinimumVersion 5.5.0 -Force
+          (Get-Module Pester).Version
 
       - name: Run the suite (mockable backend — no Hyper-V / no admin needed)
         shell: pwsh
@@ -35,3 +39,10 @@ jobs:
           $c.Output.Verbosity = 'Detailed'
           $c.Run.Exit = $true          # non-zero exit on any failure -> fails the job
           Invoke-Pester -Configuration $c
+
+      - name: Run the Python suite (guest screener + outbox + host reader)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pytest tests/guest tests/host -q

@@ -196,8 +196,10 @@ $report.ExtractedArtifact   # the emitted Netscape-HTML file (result.html), copi
 ```
 
 > **Organizer-script contract (must match the runner):** `organize_bookmarks.py` reads its
-> `--profile` from `/mnt/in` and writes `--out /mnt/out/result.html` (NOT `bookmarks.html`, the
-> serial/container-era inner name). See `guest-images/debian-12-cloud.md` §2a + §5. The host source
+> `--profile` from `/mnt/in` and writes `--out /run/staging/result.html`. Not `/mnt/out`: firefox is
+> an `OutboxOutput` profile, so OUTPUT is Raw and never mounted, and `New-CidataUserData` refuses to
+> build a seed whose entrypoint names `/mnt/out`. Not `bookmarks.html` either (the serial-era inner
+> name). See `docs/live-smoke-test.md` §4A.2 for the host-side pre-run gate. The host source
 > `C:\sandbox\organizer-src\organize_bookmarks.py` must be a version aligned to those paths.
 
 > **DATA-ACCESS:** the `firefox` profile defaults to a **synthetic/sample** profile copy.
@@ -303,12 +305,16 @@ The Ralph loop's `claude` CLI needs an OAuth token. The rules:
 
   `ralph.psd1` mounts **that** copied file read-only.
 - **Rotate** the token after any session that touched it. Re-copy + re-deploy to refresh.
-- The same applies to anything secret-shaped (`.env*`, `*.pem`, `*.key`,
-  `credentials*.json`, `~/.ssh/*`, `.npmrc`, …): the loader refuses to mount it, full stop.
+- The same applies to anything whose **path shape** is secret-like (`.env*`, `*.pem`, `*.key`,
+  keystores, `id_ed25519*`, `credentials*.json`, `.netrc`, `.git-credentials`, `*.tfvars`, anything
+  under `.ssh/`, `.gnupg/` or `.secrets/`, and more): the loader refuses it as a `Mounts` **or**
+  `StageAssets` source. `tier-profiles/SCHEMA.md` carries the full list. The check reads the name,
+  never the file, so renaming a credential defeats it: the rule below (copy the token to a dedicated
+  `.token` path) is the practice that actually protects you.
 
 ---
 
-## 3. Tier 2/3 — not armed this round
+## 3. Tier 2/3 — not armed in v1
 
 Tier 2 (disposable no-net) and Tier 3 (airgapped detonation) are **scaffolded and validated
 with benign placeholder inputs only**. There is **no live malware or plugin detonation** in
@@ -328,15 +334,17 @@ Invoke-Pester -Path tests/
 
 # A single area
 Invoke-Pester -Path tests/Profiles.Tests.ps1 -Output Detailed
-Invoke-Pester -Path tests/DeploySandbox.Tests.ps1 -Output Detailed
+Invoke-Pester -Path tests/InvokeVoidseal.Tests.ps1 -Output Detailed
 
 # CI-style (writes testResults.xml, gitignored)
 Invoke-Pester -Path tests/ -CI
 ```
 
-The must-pass safety tests are the profile-loader invariant refusals (secret-mount, Tier ≥ 2
-starvation, the pre-seal gate) and the seal-gate abort in `DeploySandbox.Tests.ps1`. A red
-on any of those means a containment guarantee regressed — do not ship.
+The must-pass safety tests are the profile-loader refusals (secret-shaped `Mounts` and `StageAssets`
+sources, Tier >= 2 starvation, the pre-seal gate) and the seal-gate abort in
+`tests/InvokeVoidseal.Tests.ps1`. A red on any of those means a containment guarantee regressed, so
+do not ship. Run the Python suite too if you touched anything under `guest/`:
+`python -m pytest tests/guest tests/host -q`.
 
 ---
 
@@ -347,5 +355,5 @@ on any of those means a containment guarantee regressed — do not ship.
 | `Hyper-V unavailable or insufficient privilege` on provision | session not elevated / not in Hyper-V Administrators | re-launch PowerShell **as administrator** (§0.1) |
 | `declares a secret-shaped mount source …` at load | a `Mounts` source matches the secret list (e.g. the live `.credentials.json`) | mount a copied `.token` file in a non-secret path instead (§2) |
 | `seal gate did not certify …` in the report | `Assert-Sealed` failed (NIC still attached / a host channel readable) | inspect the profile's `HostChannels` (all `$false` for VM tiers) + that `Lock-Sandbox` removed the NIC; the abort already tore the VM down |
-| `Tier-… cold-VHDX … is NOT IMPLEMENTED` | a Tier ≥ 2 extraction was attempted | expected — Tier ≥ 2 extraction is post-v1; do not run hostile tiers live this round |
+| `Tier-… cold-VHDX … is NOT IMPLEMENTED` | a Tier ≥ 2 extraction was attempted | expected — Tier ≥ 2 extraction is post-v1; do not run hostile tiers live in v1 |
 | serial console silent on a live Tier-1 boot | guest `serial-getty@ttyS0` not enabled / wrong `CIDATA` label | re-check the seed `user-data` + that the ISO volume label is exactly `CIDATA` (see the guest-image recipe) |

@@ -403,7 +403,7 @@ function Start-SandboxWorkload {
     writes to a dedicated output-VHDX -> power off -> revert to a clean snapshot -> DETACH the VHDX ->
     mount it READ-ONLY in a SEPARATE no-net quarantine VM -> AV scan + Content-Disarm-&-Reconstruction
     -> promote only inert, sanitized formats to the host) is the riskiest post-v1 work and is
-    deliberately NOT built this round. Calling it THROWS so that:
+    deliberately NOT built in v1. Calling it THROWS so that:
       (a) a Tier >= 2 extraction can never silently succeed via a trusting read, and
       (b) no one can accidentally wire a Tier-0/1-style read through this function later by mistake.
     Live detonation/extraction from a hostile tier stays gated behind explicit operator approval + a

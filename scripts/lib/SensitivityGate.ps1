@@ -31,7 +31,7 @@
     C2.4 — REGENERATOR CORE (the load-bearing hardening on top of the base partition, gate side):
       an offline content screen cannot give an information-theoretic leakage bound against an
       adversarial producer that controls the released content (detection cannot bound leakage;
-      regeneration can — see _dev/plans/2026-07-01-pre-phase6-hardening-plan.md, C2 header). So
+      regeneration can). So
       the host acts as a REGENERATOR, not a passive partitioner, on every Consume-mode verdict:
         1. Enum-schema validation (Test-VerdictSchema): a verdict with an unknown key (including
            a producer-supplied 'run_id' — never part of the schema), an out-of-enum verdict/
@@ -88,7 +88,7 @@
     layer consulted ONCE per gate invocation, strictly BEFORE the per-file C2.4/C2.5 loop):
     where C2.4/C2.5 bound the leakage of a SINGLE run, C2.6 bounds AGGREGATE leakage across
     MANY runs of the same profile (per-run bit bound x runs/interval — see
-    _dev/plans/2026-07-01-pre-phase6-hardening-plan.md, C2 header). Pass -RateLedgerPath (+
+    the release-governor design). Pass -RateLedgerPath (+
     -RateProfile, -RateToday, optionally -MaxReleasesPerDay) to enable it; omitting
     -RateLedgerPath skips the rate-cap check entirely (pre-C2.6 callers/tests are unaffected —
     this is an ADDITIVE backstop, never a mandatory global gate keyed on an implicit default

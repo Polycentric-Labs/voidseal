@@ -151,7 +151,7 @@ consumes it, then it is detached as part of the import-then-seal ritual.
 > flushes (`umount`), and **self-powers-off**. The host polls `State == Off`, detaches, reads, and
 > classifies (`Wait-WorkloadComplete` → `Read-WorkloadResult` in `scripts/lib/Workload.ps1`).
 >
-> **Live-acceptance updates (2026-06-24 — see `_dev/2026-06-24-live-acceptance-findings.md`):** the
+> **Live-acceptance updates (2026-06-24, from the first live runs):** the
 > shipped runner now also (RC2) **creates the non-root `sandbox` user** via a cloud-config `users:` block
 > (the golden image has none); (RC4) **mounts robustly** — tries the `uid=/gid=` mount then **falls back
 > to a plain `mount LABEL=…`** (the live cloud kernel failed the uid/gid mount where a plain mount
@@ -393,7 +393,9 @@ raw cmdlet). For reference, the equivalent raw Hyper-V calls are:
 # Gen2 VM (UEFI), Linux Secure Boot template, COM1 over a host named pipe.
 Set-VMFirmware -VMName $vm -SecureBootTemplate MicrosoftUEFICertificateAuthority
 Set-VMComPort  -VMName $vm -Number 1 -Path "\\.\pipe\$vm-com1"   # the serial command seam
-# (Tier 1: Internal vSwitch, NIC kept — in-guest egress enforcement NOT YET implemented; Tier 2/3: NO NIC at all.)
+# (Tier 1: Internal vSwitch, NIC kept. An in-guest iptables + Squid allowlist exists as a seed
+#  template but is rendered only by the hand-run New-CidataSeed, never by Invoke-Voidseal, and is
+#  defense-in-depth rather than a boundary. Tier 2/3: NO NIC at all.)
 ```
 
 The host reads/writes `\\.\pipe\<vm>-com1` with a pipe-aware serial client to drive the
@@ -437,8 +439,9 @@ disk** (it is an `Inputs` entry, host-populated onto the `INPUT`-labelled volume
 runner above it **MUST**:
 
 - read its `--profile` from **`/mnt/in`** (where the host populated the sample/synthetic profile);
-- write its `--out` to **`/mnt/out/result.html`** (the host's `result.html` default — NOT
-  `bookmarks.html`, which was the serial/container-era inner name);
+- write its `--out` to **`/run/staging/result.html`**. Firefox is an `OutboxOutput` profile: its
+  OUTPUT disk is Raw and never mounted, `/mnt/out` does not exist in the guest, and the seed builder
+  refuses an entrypoint that names it. `result.html` is still the inner-name the host extracts;
 - still emit a first line of exactly `<!DOCTYPE NETSCAPE-Bookmark-file-1>` so the export is
   Firefox-importable, and never touch `logins.json` / `key4.db` / `cookies.sqlite`.
 

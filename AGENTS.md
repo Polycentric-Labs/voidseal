@@ -70,10 +70,10 @@ not a special case to disclose apologetically. The norm, gVisor-style:
 - **Be transparent about substantial AI assistance** in your PR description, at whatever level of
   detail you think is useful to a reviewer (which tool, which parts, how much you verified
   independently) — this project's own README carries an "AI Assistance" section in that spirit.
-- This norm is about **transparency and review discipline for contributors**, not about commit
-  metadata. It does not say anything about whether *your* commits should or shouldn't carry an AI
-  co-author trailer — that's your own call to make for your own commits, not something this project
-  mandates one way or the other.
+- On commit metadata, this project does take a position, and it is in CONTRIBUTING.md: disclose
+  significant AI assistance in the pull request description or with an `Assisted-by: <tool>` trailer.
+  Do **not** add a `Co-authored-by` trailer naming an AI tool. Such a trailer creates a contributor
+  identity in the repository record, and only people are contributors here.
 
 ## Anything else
 

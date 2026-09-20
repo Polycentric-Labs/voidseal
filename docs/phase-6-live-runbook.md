@@ -26,7 +26,7 @@
   being a passive test harness and starts making real outbound network decisions on real hardware.
 - **Scope: the first LIVE Tier-1 builder round-trip only.** Tier 2 (disposable no-net) and Tier 3
   (airgapped detonation) stay gated behind an explicit, separate verified-isolation green-light — this
-  runbook does not arm them (`docs/operator-runbook.md` §3, "Tier 2/3 — not armed this round," is
+  runbook does not arm them (`docs/operator-runbook.md` §3, "Tier 2/3, not armed in v1," is
   unaffected by this doc).
 - Nothing in §§2–4 below is implemented as live-enforced code today. §2 (host egress) and §3 (qemu-img
   confinement) are host-side / native-shim mechanisms that sit outside the mock-green PowerShell+Pester

@@ -7,7 +7,7 @@
 >
 > **What it proves:** milestones **4** (Tier-0 Firefox proof) and **5** (Tier-1
 > Ralph proof) — the Tier 0/1 lifecycle end-to-end, on a **live** Hyper-V backend, after a
-> mock-backed `292/292` green suite. It does **NOT** exercise Tier 2/3 (harness-only this
+> mock-backed green suite (865 passed, 0 failed, 2 skipped as of the last local run). It does **NOT** exercise Tier 2/3 (harness-only this
 > round) and does **NOT** touch your real personal data (synthetic-by-default).
 >
 > **Safe by default:** synthetic Firefox data; a bounded Ralph loop; no auto-push; manual
@@ -33,7 +33,7 @@ hand. **Read all four before milestone 1.**
 | **Gap 3** | **The result must land on a host-readable path for extraction.** `Export-SandboxArtifact` (Tier 0/1) does a host **filesystem** read of `-Workload.ResultPath`. Because of Gap 2 there is no automatic shared dir, so a `ResultPath` like `C:\sandbox\...\out\bookmarks.html` is **not** populated by the guest through a bind mount. | Decide how the guest's output reaches a host path: e.g. the workload writes to an **attached output VHDX** you then mount/read on the host, or you copy it out over the serial seam. For this smoke test you may stage a **pre-seeded `ResultPath` file** to drive the extraction step to green (see §3/§2) while you validate the *boundary*, and treat real guest-produced output as a follow-up once a transfer-out path is wired. |
 | **Gap 4** | **The COM1 serial transport is live-only and best-effort v1.** `InvokeGuestCommand` (the real backend) opens `\\.\pipe\<vm>-com1` as a `NamedPipeClientStream`, writes `<cmd>; echo "__VMDEP_RC__:$?"`, and parses the RC marker. It is **never** exercised against a real guest (the fake carries all behavioral tests). It has **no per-command nonce** yet (deferred). | This is the single biggest live unknown. The guest **must** have `serial-getty@ttyS0` enabled with **autologin** (no password prompt — the client doesn't authenticate) and a shell that echoes the marker. If the pipe is unreachable or there's a login prompt, the Runner **times out** (`TimeoutSeconds`, default 300) and the run is reported as a failure — teardown still runs. |
 
-> **Disposition for this round:** these gaps are about the *workload data path*, not the
+> **Disposition for in v1:** these gaps are about the *workload data path*, not the
 > *containment engine*. The smoke test's job is to prove the lifecycle + the seal gate on a
 > real backend. Where a gap blocks an end-to-end data flow, the step below says so and gives
 > a safe stand-in (e.g. a pre-seeded `ResultPath`) so you can still certify the milestone.
@@ -152,15 +152,18 @@ Test-Path $GoldenVhdx    # must be True before milestone 1/2
 
 Prove the logic is green and watch the state machine before any real VM exists.
 
-### 2.1 The mock-backed suite MUST be `292/292` green
+### 2.1 The mock-backed suite MUST be green
 
 ```powershell
 Invoke-Pester -Path tests/
-# Expect: Tests Passed: 292, Failed: 0, Errors: 0
+# Expect: Failed: 0, Errors: 0. The passed count is 865 as of the last local run
+# (2 skipped); it grows as features land, so gate on Failed: 0, never on an exact total.
+python -m pytest tests/guest tests/host -q
+# Expect: 56 passed, 0 failed.
 ```
 
 If **any** test is red — especially the profile-loader invariant refusals (secret-mount,
-Tier ≥ 2 starvation) or the seal-gate abort in `DeploySandbox.Tests.ps1` — a containment
+Tier >= 2 starvation) or the seal-gate abort in `tests/InvokeVoidseal.Tests.ps1` — a containment
 guarantee regressed. **Stop. Do not run live.**
 
 ### 2.2 A dry Invoke-Voidseal over the fake backend
@@ -232,7 +235,7 @@ egress dependency. Per **Gap 1** this runs as a **Debian Gen2 VM with no NIC**, 
 
 This milestone operates on a **SYNTHETIC / sample** Firefox profile copy. Reading your
 **real** Firefox profile (bookmarks / history / `places.sqlite`) requires **explicit
-per-task authorization** and is **NOT** part of this smoke test. "Personal-only this round"
+per-task authorization** and is **NOT** part of this smoke test. "Personal-only in v1"
 is not standing read-authorization (see `firefox.psd1` header + the operator-runbook
 DATA-ACCESS note). Build a sample profile dir with a couple of dummy bookmarks; never point
 at the live profile, and never at `logins.json` / `key4.db` / `cookies.sqlite`.
@@ -308,7 +311,7 @@ Remove-Sandbox -Name '<the VM name from $report.Name, e.g. sbx-0-xxxxxxxx>' -Del
 > `SeedBuilder.ps1`) — but the mock suite only asserts the seed's SHAPE (the rendered Squid
 > config / iptables rule text), never real packet-drop or the activation-timing ordering
 > against the guest's own pre-seal package install (see [`tier-reference.md`](tier-reference.md)'s
-> Egress note for the full picture + the Pass-5 finding that ruled out a static nftables
+> Egress note for the full picture and the finding that ruled out a static nftables
 > allowlist). A compromised/root guest can disable this layer (flush iptables, kill Squid).
 > **Do NOT run untrusted/hostile agent workloads at Tier-1 live relying on the in-guest layer
 > alone — the host-verified boundary is Phase-6.**
@@ -378,7 +381,7 @@ $report.ExtractedArtifact    # the extracted workspace diff/output dir, copied t
   `Lock-Sandbox` does **not** install egress rules either way — that was never its job; it
   removes host↔guest channels + detaches import media, same as every tier. This in-guest
   **Squid-based redirect** (the approach the separate builder profile pioneered — static
-  nftables/ipset allowlists don't survive CDN IP rotation, per Pass-5) is **defense-in-depth
+  nftables/ipset allowlists don't survive CDN IP rotation) is **defense-in-depth
   only**: a compromised/root guest can disable it. The **host-verified boundary is Phase-6**
   (see [`phase-6-live-runbook.md`](phase-6-live-runbook.md)).
 - The Ralph loop is **bounded** — rate/iteration caps (`MAX_CALLS_PER_HOUR`,
@@ -413,7 +416,7 @@ never assumes "Off == success".
 
 > **Why this exists:** Milestone 1 reached `INIT…DESTROYED` + `SealVerdict=True` but its
 > `bookmarks.html` was a stand-in because the serial command channel raced the boot. The
-> disk-passing model replaces that fragile handshake. The engine is **mock-proven (700+ tests)**;
+> disk-passing model replaces that fragile handshake. The engine is **mock-proven (867 Pester tests)**;
 > this milestone is its first *live* exercise.
 
 > **Note — this section describes the CURRENT contract, not Milestone 3's original one.** Milestone 3
@@ -594,7 +597,7 @@ Whatever the outcome, **teardown still runs** (the `finally`), so you won't accu
 
 ### 4A.6 The live-only-unproven list (what this milestone is actually testing for the first time)
 
-The 700+ mock tests prove the *host orchestration* + *classification* logic. These pieces run for
+The 867 mock tests prove the *host orchestration* + *classification* logic. These pieces run for
 the **first time** on real hardware here — if something snags, it's most likely one of these,
 **not** a containment failure:
 
@@ -715,7 +718,7 @@ Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows 
 - The **host-verified seal gate** is a real gate on a real backend (the workload only runs on
   `SealVerdict=$true`).
 
-**Does NOT do (out of scope this round — gated behind explicit future authorization):**
+**Does NOT do (out of scope in v1 — gated behind explicit future authorization):**
 
 - **No Tier 2/3 live detonation.** Those paths are scaffold/harness-only; the Tier ≥ 2
   extractor routes to a quarantine sink that **throws** (`Export-ColdVhdxQuarantine` is
@@ -756,7 +759,8 @@ any gap-related friction observed).
 - [ ] CIDATA seed ISO built (label exactly `CIDATA`; `meta-data`+`user-data`; serial-getty autologin) — §1
 
 **Dry run**
-- [ ] `Invoke-Pester -Path tests/` → **all green, 0 failed** (425+ as of the disk-mode build; the exact count grows as features land) — §2.1
+- [ ] `Invoke-Pester -Path tests/` → **0 failed** (865 passed / 2 skipped as of the last local run; gate on Failed: 0, not on a total) — §2.1
+- [ ] `python -m pytest tests/guest tests/host -q` → **56 passed, 0 failed** — §2.1
 - [ ] Fake-backend `Invoke-Voidseal` shows `INIT..DESTROYED`, `SealVerdict=$true`, clean teardown — §2.2
 
 **Milestone 1 — Firefox (Tier 0), synthetic (containment proof, stand-in output)**

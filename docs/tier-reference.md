@@ -38,7 +38,7 @@ plus a **transparent Squid `dstdomain` allowlist** over the profile's `EgressAll
 ported from the same mechanism the separate builder profile already proved. This retires the
 prior fabricated, schema-only `EgressMode='NftablesAllowlist'` value, which named a
 mechanism that never had any code path behind it. That retirement wasn't just a rename:
-Pass-5 (2026-06-28) had already **design-invalidated** the nftables/ipset approach — a
+Earlier design work had already **invalidated** the nftables/ipset approach: a
 *static* FQDN allowlist doesn't survive CDN IP rotation (DNS is resolved once, at rule-load,
 and never re-resolved), and tier1's own allowlist targets CDN-fronted hosts
 (`api.anthropic.com`, `pypi.org`, `github.com`). Squid's `dstdomain` ACL matches the
@@ -91,7 +91,7 @@ row is green across P1–P10.** Use this as the sign-off checklist before trusti
 
 Legend: ✅ implemented & exercised · 🛡️ implemented in mock only (SHAPE-asserted, not
 live-exercised) as **defense-in-depth**, not this tier's structural boundary · ➖ deferred /
-not-applicable-at-this-tier · (T2/T3 are scaffolded + benign-dry-run only this round — the
+not-applicable-at-this-tier · (T2/T3 are scaffolded + benign-dry-run only in v1 — the
 controls are coded and validated against benign inputs; **no live untrusted artifact runs**
 until verified-isolation green-light).
 
@@ -122,7 +122,7 @@ install/lifecycle hooks, no dynamic eval, no native/obfuscated code, statically-
 IO, pinned non-vulnerable deps, and no taint reaching a sink; otherwise it **must detonate**
 (in Tier 2/3). Cloud scanners (Aikido/Snyk/Socket) are **advisory-only, never an airgap
 gate**. Output = a **signed, content-addressed behavior report**, diffable across versions.
-**Scaffolded this round — not armed.**
+**Scaffolded in v1 — not armed.**
 
 ---
 
@@ -130,8 +130,8 @@ gate**. Output = a **signed, content-addressed behavior report**, diffable acros
 
 - **Trusted code/data, operating on copies, needs the net or not** → **Tier 0** (container, fast).
 - **An agent loop or organizer you trust, that needs a *restricted* allowlisted net** → **Tier 1** (net-restricted VM; in-guest allowlist now ships as defense-in-depth, mock-shape-asserted — the host-verified boundary is still Phase-6; see the Egress note above).
-- **A semi-trusted artifact you want to analyze with no net** → **Tier 2** (disposable no-net) — *scaffold only this round.*
-- **Presumed-hostile / malware, full airgap + detonation** → **Tier 3** — *scaffold only this round; live detonation is gated behind explicit operator approval + verified isolation.*
+- **A semi-trusted artifact you want to analyze with no net** → **Tier 2** (disposable no-net) — *scaffold only in v1.*
+- **Presumed-hostile / malware, full airgap + detonation** → **Tier 3** — *scaffold only in v1; live detonation is gated behind explicit operator approval + verified isolation.*
 
 When in doubt, pick the **higher** tier — over-isolation costs a little speed; under-isolation
 costs the host.

@@ -1,7 +1,7 @@
 ---
 name: voidseal
 description: >
-  Provision a risk-tiered, sandboxed/airgapped Hyper-V VM (or Tier-0 container) on
+  Provision a risk-tiered, sandboxed/airgapped Hyper-V VM on
   a Windows 11 Pro host, inject the files/tools a task needs, SEAL it to the
   required isolation, run the workload, capture results across a one-way boundary, and
   tear it down. Use when the user says "provision a sandbox VM", "spin up an isolated VM",
@@ -11,14 +11,14 @@ description: >
   (Tier-0 bookmark organizer on a profile COPY). Tier 0 is live-proven on real Hyper-V
   (firefox disk-mode round-trip); Tier 1 (net-restricted VM) is mock-green with its live
   run pending; Tier 2 (disposable no-net) + Tier 3 (airgapped detonation) are
-  scaffolded/harness-only this round — NO live malware or plugin detonation. Live runs
+  scaffolded/harness-only in v1 — NO live malware or plugin detonation. Live runs
   require an ELEVATED session (Hyper-V Administrators).
 ---
 
 # voidseal — risk-tiered sandbox VM provisioning
 
 A Claude-facing **skill + PowerShell engine** that auto-provisions **risk-tiered,
-sandboxed Hyper-V VMs** (and Tier-0 containers) so you can work on risky things —
+sandboxed Hyper-V VMs** so you can work on risky things —
 autonomous agent loops, untrusted plugins, eventually malware — without exposing the
 host. It runs the full lifecycle:
 
@@ -31,7 +31,7 @@ assume the agent/code inside is a prompt-injectable insider; make the blast radi
 structurally small. Isolation strength is matched to the task's risk via the **tier axis**.
 
 > **Status (v1):** core engine + the Tier 0/1 Hyper-V provisioning paths built + tested. The whole
-> module is **mock-backed green (700+ tests)**, AND the **Tier-0 `firefox` disk-mode round-trip is now
+> module is **mock-backed green (867 Pester tests, 0 failed, 2 skipped; plus 56 pytest tests)**, AND the **Tier-0 `firefox` disk-mode round-trip is now
 > LIVE-PROVEN on real Hyper-V** (2026-06-25 — Milestone 3: provision → host-verified seal gate →
 > disk-passing workload → host-read result → clean teardown, end to end; the first live run drove out
 > 7 real `fake≠real` host/Hyper-V gaps, all since fixed). The **Tier-1 `ralph` live run is still
@@ -49,7 +49,7 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 
 | Tier | Substrate | Network / egress | Credentials | Extraction | Lifecycle | v1 status |
 |---|---|---|---|---|---|---|
-| **0** | **Hyper-V path / lightweight guest** today (container runtime — Docker / devcontainer / `docker sbx` / sandbox-runtime — is **PLANNED, not yet built**) | host-proxy allowlist (default offline) | none | host reads result dir | `--rm` ephemeral (container tier, when built) | **validated (mock-backed; live run = the live smoke test, operator-run, elevated)** — `firefox` proof runs the Hyper-V path |
+| **0** | **Hyper-V path / lightweight guest** today (container runtime — Docker / devcontainer / `docker sbx` / sandbox-runtime — is **PLANNED, not yet built**) | host-proxy allowlist (default offline) | none | host reads result dir | `--rm` ephemeral (container tier, when built) | **mock-backed, and LIVE-PROVEN once** (the `firefox` disk round-trip on real Hyper-V, 2026-06-25) — the proof runs the Hyper-V path, not a container |
 | **1** | Hyper-V Gen2 VM | Internal switch (NIC kept); in-guest egress **defense-in-depth ships** — `EgressMode='InGuestSquid'`: iptables default-DROP + Squid `dstdomain` allowlist, mock-shape-asserted only, NOT a boundary | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal validated (mock-backed; live run = the live smoke test, operator-run, elevated); in-guest egress defense-in-depth ships (mock-shape-asserted), NOT yet live-exercised — the boundary is Phase-6** — `ralph` proof |
 | **2** | Hyper-V VM, disposable | **no NIC** (structurally starved) | **none** (enforced) | **cold output-VHDX → quarantine VM → CDR → inert promote** | create → destroy | **scaffold / benign dry-run only** |
 | **3** | Hyper-V Gen2, **no NIC** + sinkhole VM | **structurally no egress** | **none** (enforced) | same as Tier 2, mandatory | detonate → wipe | **scaffold / benign dry-run only** |
@@ -102,7 +102,7 @@ mismatch is a caller error and throws). See the full parameter list in the
 
 - **INIT** — load + validate the tier/workload profile (fail-closed on a bad/unknown profile).
 - **PROVISIONED** — `New-SandboxVM` creates the substrate (Gen2, Secure Boot template, COM1 serial, Internal switch) from the profile. Left **powered off**.
-- **STAGED** — `Import-SandboxAsset` for each `StageAssets` entry (one-way IN, read-only ISO, **before** the seal). The loader already refused any secret-shaped source, so staging cannot smuggle a secret in.
+- **STAGED** — `Import-SandboxAsset` for each `StageAssets` entry (one-way IN, read-only ISO, **before** the seal). The loader screens both the `StageAssets` and the `Mounts` source keys against the secret-shaped-path list at load time, so a source whose *name* looks like a credential is refused before anything is attached. That screen is a path-shape lint, not a content scan: it catches the common accident, not a caller who renamed the file.
 - **SEALED** — `Lock-Sandbox` cuts the VM to the tier's isolation, then **`Assert-Sealed` is a HARD GATE**. If it fails, the deploy **aborts here** — the workload never runs and the VM is torn down.
 - **RUNNING** — `Start-SandboxWorkload` boots the sealed VM and delivers the entrypoint over the **COM1 named-pipe serial seam** (PowerShell Direct is Windows-guest-only; the Debian guest is driven over serial).
 - **CAPTURED** — the run-result + its host-side capture artifact are recorded **out-of-band** (P8 — never trust the guest to self-report).
@@ -116,17 +116,23 @@ mismatch is a caller error and throws). See the full parameter list in the
 | **`profiles/ralph.psd1`** | 1 | `bash ralph_loop.sh` (`frankbria/ralph-claude-code`, pinned by **commit SHA** — it's bash, has no tags). Drives the `claude` CLI ≥ 2.0.76 headless (`claude -p … --output-format json --allowedTools … --resume`; **no** `--dangerously-skip-permissions`). Bare Debian VM, no nested devcontainer; native bubblewrap for defense-in-depth. | inherits tier1's `EgressAllowlist` (`api.anthropic.com`, `github.com`, npm, pypi …), with the Serial seed's in-guest iptables+Squid defense-in-depth control over it (ships in the seed, mock-shape-asserted only; not a boundary — the host-verified boundary is Phase-6) | OAuth token via **read-only file bind-mount** — never `-e`, never embedded |
 | **`profiles/firefox.psd1`** | 0 | `organize_bookmarks.py` — dedupe + frecency-rank + auto-folder a Firefox profile, emit an importable `<!DOCTYPE NETSCAPE-Bookmark-file-1>` HTML file. Operates on a **COPY** (`places.sqlite` closed-copy + `bookmarkbackups/*.jsonlz4` via `lz4.block`), never mutates live, never reads `logins.json`/`key4.db`/`cookies.sqlite`. | **none** (offline; the lone optional dead-link check escalates to Tier 1) | **defaults to SYNTHETIC/sample data**; real profile data needs explicit per-task authorization |
 
-## Safety invariants (load-time + runtime — fail closed)
+## Load-time and runtime refusals (fail closed)
 
 These are enforced in code (`scripts/lib/ProfileLoader.ps1`) and covered by must-pass tests:
 
-1. **Secret-file mount refusal** — any `Mounts` source matching the exclusion list
-   (`.env*`, `*.pem`, `*.key`, `*.p12`/`*.pfx`, `id_rsa*`, `credentials*.json`,
-   `.credentials.json`, `~/.aws/credentials`, `~/.ssh/*`, `~/.kube/config`,
-   `~/.docker/config.json`, `.npmrc`, `.pypirc`, `*-service-account.json`, anything
-   under a `.secrets/` dir; trailing-dot/space and NTFS-ADS bypasses normalized away) is
-   **refused** — the file is never even opened. *This is why the Ralph profile mounts a
-   copied `.token` file, never the live `~/.claude/.credentials.json` (which IS refused).*
+1. **Secret-shaped-path refusal (a lint, not a boundary)** — the loader screens the source keys of
+   **both `Mounts` and `StageAssets`** against a filename-and-directory pattern list
+   (`$script:SecretLeafGlobs`, `$script:SecretDirSegments` and `$script:SecretDirFilePairs` in
+   `scripts/lib/ProfileLoader.ps1` are the single source of truth; `tier-profiles/SCHEMA.md` mirrors
+   them). Dotenv files, PEM and other private-key extensions, keystores, SSH and GPG key material,
+   `credentials*.json`, `.netrc`, `.git-credentials`, `.npmrc`, `.pypirc`, `*.tfvars`, service-account
+   keys and anything under a `.secrets/`, `.ssh/` or `.gnupg/` directory all match; trailing dots or
+   spaces and NTFS alternate-data-stream suffixes are normalized away first. **This matches names, not
+   contents.** It never opens the file, so it cannot tell a real credential from a lookalike, and it
+   does not fire on a credential you renamed. It lowers the odds of an accident; it is not a control
+   that stops a determined profile author. *It is why the Ralph profile points at a copied `.token`
+   file rather than the live `~/.claude/.credentials.json`, which does match.*
+
 2. **Credential + network starvation at Tier ≥ 2** — a Tier ≥ 2 profile MUST set
    `Credentials='None'`, `EgressMode='None'`, and an empty `EgressAllowlist`, or it is
    refused at load time.
@@ -138,7 +144,7 @@ These are enforced in code (`scripts/lib/ProfileLoader.ps1`) and covered by must
 5. **One-way boundaries** — assets flow IN before the seal (read-only ISO); results flow
    OUT after the run (host-read at Tier 0/1; quarantine/CDR sink at Tier ≥ 2). No live
    host-filesystem mount of a hostile guest.
-6. **Harness-only for the dangerous tiers this round** — Tier 2/3 paths run only with
+6. **Harness-only for the dangerous tiers in v1** — Tier 2/3 paths run only with
    benign placeholder inputs. **No live malware or plugin detonation** until you
    explicitly green-light verified isolation.
 
@@ -203,6 +209,7 @@ From the skill root (no elevation needed — the backend is mocked):
 Invoke-Pester -Path tests/
 ```
 
-All tests are green (unit + e2e + invariant refusals + the two profiles). The
-profile-loader invariant refusals (secret-mount, Tier ≥ 2 starvation, the pre-seal gate)
-and the seal-gate abort are **must-pass** tests.
+As of the last local run: 865 passed, 0 failed, 2 skipped (unit, e2e, invariant refusals, and the
+shipped profiles), plus 56 pytest tests for the guest and host helpers. The profile-loader refusals
+(secret-shaped `Mounts` and `StageAssets` sources, Tier >= 2 starvation, the pre-seal gate) and the
+seal-gate abort are **must-pass** tests.

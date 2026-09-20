@@ -11,9 +11,14 @@ structurally small.
 - A guest that misbehaves, is compromised, or lies about its own state.
 
 The core control is the **host-verified, fail-closed seal gate** (`Assert-Sealed`): after isolation is
-cut, the **host** (never the guest's self-report) certifies the VM has no network adapter, no credential
-volume, no residual transfer medium, and no live host↔guest channel — and the workload is structurally
-unreachable unless that certification returns true. For a Tier-1 VM, which legitimately keeps a NIC
+cut, the **host** (never the guest's self-report) certifies the VM against its tier's contract, and the
+workload is structurally unreachable unless that certification returns true. What gets certified is
+tier-scoped, and the scope matters. At every tier the host verifies that no import DVD or ISO is still
+attached, that no secret-shaped or unrecorded volume remains, and that the host channels it can read
+report off. **The no-network-adapter certification applies only at Tier >= 2, plus any profile that
+declares `Network='None'` (a "processor") at any tier**: the check is gated on
+`if ($tier -ge 2 -or $isProcessor)` in `scripts/lib/Sealer.ps1`. A Tier-0 or Tier-1 VM never has its
+adapter count certified. For a Tier-1 VM, which legitimately keeps a NIC
 (net-restricted, not no-net), the seal instead certifies that NIC's vSwitch is an isolated **Internal**
 switch — never an unfiltered External or Private switch — so the guest's only possible route off-box is
 the host-controlled gateway on that Internal switch. That is a host-verified **switch-isolation**
@@ -153,7 +158,7 @@ seal + disk-passing mechanism above, not the regenerator described in this secti
 ## The qemu-img raw read: an undiscovered-bug-class risk, not a catalogued RCE
 
 The user-space outbox read (`ReadVhdxRawRegion`, `scripts/lib/HyperVBackend.ps1`) never `Mount-VHD`s the
-guest-written OUTPUT disk (Pass-5: even a read-only host attach runs `partmgr.sys` + filesystem-recognizer
+guest-written OUTPUT disk (even a read-only host attach runs `partmgr.sys` + filesystem-recognizer
 parses against attacker-controlled bytes). Instead it runs `qemu-img convert -f vhdx -O raw` offline against
 the detached `.vhdx`, then reads the flattened raw bytes with a plain `FileStream`. This closes the
 kernel-filesystem-parse risk, but it opens a different one: **`qemu-img`'s own VHDX parser now runs against
@@ -187,8 +192,10 @@ full privileges of whoever invokes it — here, the host operator.
 
 ## Status / honesty
 
-- The Tier-0/1 engine is **mock-proven** (700+ tests against the fake backend). A live end-to-end
-  acceptance run on real Hyper-V is the operator's elevated step and is **not** yet certified here.
+- The Tier-0/1 engine is **mock-proven** (867 Pester tests, 0 failed, 2 skipped, plus 56 pytest tests,
+  all against the fake backend). The **Tier-0 `firefox` disk round-trip has run end-to-end on real
+  Hyper-V** (2026-06-25). No other tier has had a live acceptance run; Tier 1 remains the operator's
+  elevated step.
 - **Tier 2/3 (disposable no-net / air-gapped detonation) and the cold-VHDX→quarantine extraction are
   scaffold-only** in v1 (the quarantine sink throws `NotImplemented`). No live malware or untrusted-plugin
   detonation should be run until verified isolation is in place.
@@ -198,6 +205,20 @@ full privileges of whoever invokes it — here, the host operator.
   `iptables` rules or kill its own Squid process — the untrusted principal cannot be trusted to police
   itself, by construction. Treat these in-guest rules as defense-in-depth (they raise the bar for an
   unsophisticated or non-adversarial workload) — not as the security boundary.
+- **Three of the four host channels are reported off by construction, not measured.** `Assert-Sealed`
+  iterates all four (clipboard, shares, guest-services, enhanced-session), but the real backend's
+  `GetHostChannels` (`scripts/lib/HyperVBackend.ps1`) returns a hardcoded `$false` for clipboard,
+  shares and enhanced-session, and reads only `GuestServices` from the host. That read is genuinely
+  fail-closed: it rethrows rather than coercing an unreadable channel to off. The other three rest on
+  an argument, documented in that function, that Hyper-V exposes no per-VM Enhanced Session signal and
+  that the ESM facets are structurally absent on a stock Linux guest. Treat the host-channel gate as
+  one host-verified channel plus three asserted-absent ones. The fake backend models all four as
+  readable, so the mock suite exercises a check the real host cannot perform.
+- **The secret-path denylist is a lint, not a control.** `Test-IsSecretPath`
+  (`scripts/lib/ProfileLoader.ps1`) matches filename globs and directory segments against the `Mounts`
+  and `StageAssets` source keys. It never opens or inspects a file, so it cannot tell a real credential
+  from a file that merely looks like one, and it does not fire on a credential the caller renamed. It
+  reduces accidents. It is not a cryptographic or content-based boundary.
   - **What IS host-verified today: switch isolation, not egress filtering.** `Assert-Sealed` verifies
     (from the host, never the guest's self-report) that a Tier-1 VM's NIC sits on an isolated **Internal**
     vSwitch rather than an External or Private switch. That is a genuine host-enforced guarantee that the

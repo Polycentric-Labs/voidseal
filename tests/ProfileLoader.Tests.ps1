@@ -131,11 +131,18 @@ Describe 'Import-TierProfile — real example profiles' {
         # empty allowlist normalizes to an array (count 0), never $null
         @($p.EgressAllowlist).Count | Should -Be 0
         $p.HostChannels        | Should -BeOfType [System.Collections.IDictionary]
-        $p.HostChannels.Shares | Should -Be 'ReadOnlyInput'   # string on a container tier is allowed
+        # Every declared channel must be falsey. Lock-Sandbox turns all four OFF from its own
+        # hardcoded list without reading this profile, so a truthy value here advertises a channel
+        # that never exists in a sealed guest. tier0 previously declared Shares='ReadOnlyInput',
+        # a truthy string; it was inert and misleading, and is now $false.
+        $p.HostChannels.Shares          | Should -BeFalse
+        $p.HostChannels.Clipboard       | Should -BeFalse
+        $p.HostChannels.GuestServices   | Should -BeFalse
+        $p.HostChannels.EnhancedSession | Should -BeFalse
         $p.ContainsKey('ManagementChannel') | Should -BeFalse # container tier has no mgmt channel
-        # RC1: Tier-0 today provisions a real Debian Gen2 VM, so it MUST carry the Linux Secure Boot
+        # Tier-0 today provisions a real Debian Gen2 VM, so it MUST carry the Linux Secure Boot
         # template (an omitted/Windows-default template rejects Debian's MS-UEFI-CA-signed bootloader).
-        $p.SecureBootTemplate  | Should -Be 'MicrosoftUEFICertificateAuthority' -Because 'RC1: a Linux Gen2 guest needs the MS-UEFI-CA template, not the Windows default'
+        $p.SecureBootTemplate  | Should -Be 'MicrosoftUEFICertificateAuthority' -Because 'a Linux Gen2 guest needs the MS-UEFI-CA template, not the Windows default'
     }
 
     It 'loads tier1.psd1 without error and returns the expected normalized shape' {

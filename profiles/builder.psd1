@@ -15,7 +15,7 @@
     WorkloadMode = 'Disk'
     Inputs       = @{}
 
-    # The builder egress: transparent Squid SNI proxy (Pass-5: nftables CANNOT runtime-FQDN-filter —
+    # The builder egress: transparent Squid SNI proxy (nftables CANNOT runtime-FQDN-filter —
     # it resolves name->IP once at rule-load and CDN rotation then drops the connection). This is the
     # FIRST live Tier-1 egress in the project; the allowlist is load-bearing. Guarded workload override
     # (D-1): the loader accepts EgressMode here ONLY because it is exactly 'SquidSniProxy'.
@@ -30,7 +30,7 @@
         'huggingface.co', 'cdn-lfs.huggingface.co', 'cas-bridge.xethub.hf.co', '.hf.co'
     )
 
-    # MVFR DepsSpec (Pass-5 §B) — minimal-viable-first-run isolates network/firewall failures from
+    # Minimal-viable-first-run DepsSpec: isolates network/firewall failures from
     # dependency-resolution complexity. pip urllib3 (pure-Python, no manylinux complexity), apt jq
     # (tiny, no complex maintainer scripts), HF tiny-random-gpt2 (few-MB CI model). Expand to the 5a
     # stack (Tika/spaCy/Presidio/datasketch) only AFTER the live round-trip is green. NO Github fetcher
@@ -72,7 +72,7 @@
 
     # The cloud-init NoCloud CIDATA seed path. ci-2 NOTE: this is UNUSED in the disk-mode/builder path —
     # the builder is WorkloadMode='Disk', and New-WorkloadSeedDisk (Workload.ps1) builds the seed CONTENT
-    # in-line onto a recorded CIDATA *data disk* ('<name>-cidata.vhdx' under the storage root, RC6) that
+    # in-line onto a recorded CIDATA *data disk* ('<name>-cidata.vhdx' under the storage root) that
     # survives the seal; it never reads this SeedIso file. SeedIso is consumed ONLY by the serial/DVD path
     # (New-CidataSeed -Destination default + Add-SandboxSeed). Kept (not dropped) because the loader still
     # carries the key (mirrors firefox.psd1, which also declares it for disk-mode) and it documents the

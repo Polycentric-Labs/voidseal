@@ -14,7 +14,7 @@ rather than duplicating it.
 > [!IMPORTANT]
 > **Honesty up front (read this before you trust it with anything dangerous).**
 > - **The Tier-0 disk round-trip is live-proven once; the full multi-tier acceptance is not.** The whole
->   engine is **mock-proven** (700+ Pester tests against a fake Hyper-V backend), and the **Tier-0
+>   engine is **mock-proven** (867 Pester tests plus 56 pytest tests against a fake Hyper-V backend), and the **Tier-0
 >   `firefox` disk-mode round-trip has run end-to-end on real Hyper-V** (Milestone 3, 2026-06-25 —
 >   provision → host-verified seal → disk-passing workload → host-read result → clean teardown). The
 >   **Tier-1 `ralph` live run is still pending**, and no tier above 0 has had a live acceptance yet
@@ -29,6 +29,15 @@ rather than duplicating it.
 >   compromised/root guest can disable it. The host-verified boundary is Phase-6. Don't rely on the
 >   in-guest layer against a hostile guest (see the Egress note in
 >   [`docs/tier-reference.md`](docs/tier-reference.md)).
+> - **A profile's `Mounts` block does not deliver anything into the guest.** Nothing in the Provisioner
+>   or Runner attaches a host-guest bind mount; the backend has no 9p, virtiofs or SMB method. `Mounts`
+>   is validated (its source keys are secret-path-screened) and otherwise inert. The wired delivery
+>   channels are `StageAssets` (read-only ISO), Disk-mode `Inputs` (the INPUT data disk), and the
+>   cloud-init seed. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
+> - **`EgressAllowlist` and `BlockProtocols` are declarative on the `Invoke-Voidseal` path.** They are
+>   validated, merged and deduped; no firewall, proxy or resolver configuration is emitted for a run
+>   started through `Invoke-Voidseal`. The Squid allowlist text exists in `SeedBuilder.ps1` and is
+>   rendered only by `New-CidataSeed`, which an operator runs by hand to build a seed ISO.
 
 ## What it is
 
@@ -61,7 +70,9 @@ an **integrated combination on a specific delivery surface**:
 1. **A risk-tier *ladder* in one tool** — most sandbox tools expose a single fixed boundary; Voidseal
    escalates Tier 0 → 3 with one interface.
 2. **A host-side, fail-closed seal *verification* before run** — the host independently certifies the
-   isolation actually holds (no network, no credentials, no channels) and *refuses to run otherwise*.
+   tier's isolation contract and *refuses to run otherwise*. The adapter-count certification is
+   Tier >= 2 (and any `Network='None'` profile); at Tier 1 the host instead certifies the NIC's vSwitch
+   is a purpose-built isolated Internal switch. Media, disk and host-channel checks run at every tier.
    This is the part nobody else ships: runtime *enforcement* (gVisor/Kata) and agent *health checks*
    (Cuckoo/CAPE) are not the same as a pre-run, host-side proof that the box is starved.
 3. **A no-live-channel disk-passing model** — inputs/outputs ride attached data disks; the guest
@@ -79,7 +90,8 @@ contained work; reach for Voidseal when a process sandbox on your real host kern
 
 ## Quick start
 
-Requirements: Windows 10/11 Pro (Hyper-V), PowerShell 7, Pester 5; an elevated session (or `Hyper-V
+Requirements: Windows 11 Pro (Hyper-V) is the tested host; Windows 10 Pro is untested. PowerShell 7,
+Pester 5; an elevated session (or `Hyper-V
 Administrators` membership) to actually provision; a Debian-12 golden `.vhdx` + a cloud-init seed (see
 [`guest-images/debian-12-cloud.md`](guest-images/debian-12-cloud.md)).
 

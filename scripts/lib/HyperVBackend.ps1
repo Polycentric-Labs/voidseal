@@ -650,7 +650,7 @@ function Resolve-QemuImg {
 # PHASE-6 TODO: v1 body below is a direct pass-through (LIVE-ONLY-UNPROVEN — no live confinement yet). The
 # real mechanism is a restricted-token / Job-Object native shim for Tier-0/1 (drop privileges + cap
 # resources on the child qemu-img process) or a Windows Sandbox (.wsb) for Tier-2/3 (full OS-level
-# confinement for the disposable/detonation tiers) — see _dev/labcoat/PassB-ClientHVPrimitives/
+# confinement for the disposable/detonation tiers). Design notes are internal and not published;
 # PASSB-SYNTHESIS.md §Q4 for the full mechanism comparison. That mechanism is built and LIVE-TESTED at
 # Phase 6, Allen's explicit choice (ship the seam now; wire the real confinement then) — do not silently
 # "upgrade" this function without a live test proving the confined child still produces correct output.
@@ -681,7 +681,7 @@ function Invoke-ConfinedQemu {
     )
     # PHASE-6 TODO: wrap this invocation in a restricted-token/Job-Object shim (Tier-0/1) or run it inside
     # a Windows Sandbox (Tier-2/3) instead of directly in the host operator's session. See
-    # _dev/labcoat/PassB-ClientHVPrimitives/PASSB-SYNTHESIS.md §Q4. v1 = direct exec (LIVE-ONLY-UNPROVEN).
+    # v1 = direct exec (LIVE-ONLY-UNPROVEN); the confinement seam is a Phase-6 item.
     return (& $QemuPath @Arguments 2>&1)
 }
 
@@ -936,7 +936,7 @@ function New-RealHyperVBackend {
     # actually enforced in that case — only a guest that keeps streaming partial output without ever
     # emitting the RC marker is caught by this loop. A fully honest real-side enforcement would need
     # an outer job-race (background job + Wait-Job -Timeout) around the whole pipe read, which is
-    # deliberately NOT built this round (see task-2-report.md FIX PASS notes). TODO(Phase 6): prove/
+    # deliberately NOT built in v1. TODO(Phase 6): prove/
     # harden this against a live silent-hang guest, or add the outer job-race if it does not hold.
     $b.InvokeGuestCommand = {
         param([System.Collections.IDictionary] $P)
