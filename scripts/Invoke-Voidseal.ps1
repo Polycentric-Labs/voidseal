@@ -490,9 +490,12 @@ function Invoke-Voidseal {
         $states.Add('PROVISIONED')
 
         # --- STAGED: one-way asset import BEFORE the seal ------------------
-        # Import every StageAssets entry the profile declares (host source -> in-guest). The loader
-        # already refused any secret-shaped source, so staging cannot smuggle a secret in. With no
-        # StageAssets this is a recorded no-op transition (the state is still traversed).
+        # Import every StageAssets entry the profile declares (host source -> in-guest). Invariant 1
+        # screens these KEYS (and the Mounts keys) against Test-IsSecretPath at load time, so a
+        # secret-SHAPED source is refused before the lifecycle starts. That screen is a path-shape
+        # lint, not a content scan: it stops the common accident, not a caller who renames a
+        # credential. With no StageAssets this is a recorded no-op transition (the state is still
+        # traversed).
         $seedIso       = if ($resolved.ContainsKey('SeedIso')) { [string]$resolved['SeedIso'] } else { $null }
         $hasSeed       = -not [string]::IsNullOrWhiteSpace($seedIso)
         $stageIsoCount = 0

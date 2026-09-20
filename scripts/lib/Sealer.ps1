@@ -859,7 +859,16 @@ function Assert-Sealed {
         # Reuses the ProfileLoader's single-source-of-truth secret-path matcher (dot-sourced).
         # IMPORTANT: this runs BEFORE the recorded-disk allowances (c)/(d), so recording a secret-
         # shaped path as InputDiskPath/OutputDiskPath CANNOT launder it past this check.
-        if ((Get-Command Test-IsSecretPath -ErrorAction SilentlyContinue) -and (Test-IsSecretPath -Path $disk)) {
+        # FAIL CLOSED when the matcher itself is unavailable. Everywhere else in this function an
+        # unreadable input throws; a MISSING verifier must not degrade to "no secret found". The
+        # orchestrator dot-sources ProfileLoader.ps1, so absence means the engine was loaded wrong,
+        # which is exactly the moment a trusting pass is most dangerous.
+        if (-not (Get-Command Test-IsSecretPath -ErrorAction SilentlyContinue)) {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED - the secret-path matcher " +
+                   "(Test-IsSecretPath, from ProfileLoader.ps1) is not loaded, so attached volumes cannot " +
+                   "be screened. Dot-source the full engine before sealing. Fail closed.")
+        }
+        if (Test-IsSecretPath -Path $disk) {
             throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED — a secret-shaped volume '$disk' is " +
                    "attached. No secret volume may be present in a sealed sandbox (SCHEMA invariant 6). Fail closed.")
         }

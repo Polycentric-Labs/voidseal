@@ -120,23 +120,40 @@ $script:SecretLeafGlobs = @(
     '*.key',                   # private keys
     '*.p12',                   # PKCS#12 bundles
     '*.pfx',                   # PFX bundles
+    '*.jks',                   # Java keystore
+    '*.keystore',              # Android / Java keystore
+    '*.ppk',                   # PuTTY private key
+    '*.kdbx',                  # KeePass database
     'id_rsa*',                 # id_rsa, id_rsa.pub (public key blocked by design), id_rsa_work, ...
+    'id_ed25519*',             # modern default SSH key pair
+    'id_ecdsa*',               # ECDSA SSH key pair
+    'id_dsa*',                 # legacy DSA SSH key pair
     'credentials*.json',       # credentials.json, credentials-prod.json
     '.credentials.json',       # dotfile credentials
+    '.netrc',                  # curl / ftp machine credentials (POSIX)
+    '_netrc',                  # same file, Windows spelling
+    '.git-credentials',        # git credential store (plaintext)
+    '.pgpass',                 # PostgreSQL password file
+    '.my.cnf',                 # MySQL client password file
     '.npmrc',                  # npm auth token file
     '.pypirc',                 # PyPI upload creds
+    'secrets.yaml',            # common k8s / ansible secret file
+    'secrets.yml',             # same, alternate extension
+    '*.tfvars',                # Terraform variable files routinely carry creds
     '*-service-account.json'   # GCP service-account keys
 )
 
 # Directory-segment rules: any path segment EXACTLY equal to one of these makes
 # the whole path secret-shaped (a .secrets/ or .ssh/ dir anywhere in the path).
-$script:SecretDirSegments = @('.secrets', '.ssh')
+$script:SecretDirSegments = @('.secrets', '.ssh', '.gnupg')
 
 # Adjacent directory/file pair rules: [parentSegment, childSegment]. Matches when
 # 'parent' is immediately followed by 'child' (e.g. ~/.aws/credentials). Lowercase.
 $script:SecretDirFilePairs = @(
     @('.aws',    'credentials'),
+    @('.aws',    'config'),
     @('.kube',   'config'),
+    @('gh',      'hosts.yml'),
     @('.docker', 'config.json')
 )
 
@@ -261,11 +278,11 @@ function Test-IsSecretPath {
 #>
 function Assert-NoSecretMounts {
     [CmdletBinding()]
-    param([AllowNull()] $Mounts, [string] $Context = 'profile')
+    param([AllowNull()] $Mounts, [string] $Context = 'profile', [string] $Field = 'Mounts')
 
     if ($null -eq $Mounts) { return }
     if (-not ($Mounts -is [System.Collections.IDictionary])) {
-        throw "Invariant 1 (secret-file refusal): '$Context' Mounts must be a hashtable of host->guest paths."
+        throw "Invariant 1 (secret-file refusal): '$Context' $Field must be a hashtable whose KEYS are host source paths."
     }
     # Build the human-readable pattern summary from the single source of truth so it
     # can never drift from what Test-IsSecretPath actually enforces (SCHEMA.md §1).
@@ -273,7 +290,7 @@ function Assert-NoSecretMounts {
     $patternSummary = (@($script:SecretLeafGlobs) + @($script:SecretDirSegments | ForEach-Object { "$_/" }) + $dirPairList) -join ', '
     foreach ($src in @($Mounts.Keys)) {
         if (Test-IsSecretPath -Path ([string]$src)) {
-            throw "Invariant 1 (secret-file refusal): '$Context' declares a secret-shaped mount source '$src'. Secret files ($patternSummary; trailing dots/spaces and NTFS ADS suffixes are normalized away) must never be mounted into a sandbox."
+            throw "Invariant 1 (secret-file refusal): '$Context' declares a secret-shaped $Field source '$src'. Secret-shaped paths ($patternSummary; trailing dots/spaces and NTFS ADS suffixes are normalized away) must never be staged into or mounted into a sandbox. NOTE: this is a path-SHAPE lint, not a content scan - it catches the common accident, not a determined caller."
         }
     }
 }
@@ -372,9 +389,17 @@ function Assert-TierProfileValid {
         Assert-EnumMember -Value ([string]$Profile['SecureBootTemplate']) -Allowed $script:Enum_SecureBootTemplate -Field 'SecureBootTemplate' -Context $Context
     }
 
-    # --- invariant 1: secret-file mount refusal --------------------------
+    # --- invariant 1: secret-file refusal (BOTH delivery fields) ---------
+    # Screen every field whose KEYS are host source paths. StageAssets is the field the
+    # orchestrator actually imports into the guest (Invoke-Voidseal -> Import-SandboxAsset);
+    # Mounts is declared but NOT yet wired into the guest (docs/live-smoke-test.md Gap 2).
+    # Screening only Mounts guarded the unused door and left the live one open, so both are
+    # screened here and both are covered by must-pass tests.
     if ($Profile.ContainsKey('Mounts')) {
-        Assert-NoSecretMounts -Mounts $Profile['Mounts'] -Context $Context
+        Assert-NoSecretMounts -Mounts $Profile['Mounts'] -Context $Context -Field 'Mounts'
+    }
+    if ($Profile.ContainsKey('StageAssets')) {
+        Assert-NoSecretMounts -Mounts $Profile['StageAssets'] -Context $Context -Field 'StageAssets'
     }
 
     # --- invariant 2: Tier >= 2 starvation -------------------------------

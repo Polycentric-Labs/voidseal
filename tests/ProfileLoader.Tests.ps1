@@ -320,6 +320,102 @@ Describe 'Invariant 1 — secret-file mount refusal' {
     }
 }
 
+Describe 'Invariant 1: StageAssets secret refusal (regression - the live delivery field)' {
+
+    # REGRESSION GUARD. Invariant 1 originally screened ONLY Mounts, which the Provisioner/Runner
+    # never wire into the guest (docs/live-smoke-test.md Gap 2). StageAssets is the field the
+    # orchestrator actually imports (Invoke-Voidseal -> Import-SandboxAsset), and it was unscreened,
+    # so a secret-shaped path could be staged into a guest and still pass the seal gate. Both fields
+    # are screened now. These cases fail if that ever regresses.
+
+    $stageSecretCases = @(
+        @{ Src = 'C:\Users\testuser\.secrets\anthropic.env'; Label = '.secrets dir (the original escape)' }
+        @{ Src = 'C:\proj\.env';                             Label = '.env' }
+        @{ Src = 'C:\certs\server.key';                      Label = '*.key' }
+        @{ Src = 'C:\Users\testuser\.aws\credentials';       Label = '.aws-credentials' }
+        @{ Src = '/home/testuser/.ssh/id_rsa';               Label = '.ssh (posix)' }
+    )
+
+    It 'rejects secret-shaped StageAssets source <Label> (<Src>) on a tier profile' -ForEach $stageSecretCases {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @{ $Src = 'pinned asset' }
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*secret*'
+    }
+
+    It 'rejects a secret-shaped StageAssets source on the MERGED workload (the path the orchestrator imports)' {
+        $wl = @{
+            BaseTier    = 1
+            Name        = 'evil-stage'
+            Entrypoint  = '/bin/run'
+            StageAssets = @{ 'C:\Users\testuser\.secrets\anthropic.env' = 'pinned asset' }
+        }
+        $wlPath = script:New-Psd1File -Data $wl -Name 'evil-stage.psd1'
+        { Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir } |
+            Should -Throw -ExpectedMessage '*secret*'
+    }
+
+    It 'names StageAssets (not Mounts) in the refusal so the operator can find the offending field' {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @{ 'C:\proj\.env' = 'pinned asset' }
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*StageAssets*'
+    }
+
+    It 'allows a benign StageAssets source (no secret shape)' {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @{ 'C:\sandbox\assets\ralph-claude-code.iso' = 'pinned @ sha' }
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Not -Throw
+    }
+
+    It 'refuses a StageAssets value that is not a hashtable (unscreenable shape fails closed)' {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @('C:\sandbox\assets\thing.iso')
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*StageAssets*'
+    }
+}
+
+Describe 'Invariant 1: broadened denylist coverage' {
+
+    # Added after an external review demonstrated these common credential shapes were missed.
+    $broadenedCases = @(
+        @{ Src = 'C:\proj\id_ed25519';                      Label = 'id_ed25519 outside .ssh' }
+        @{ Src = 'C:\proj\id_ecdsa';                        Label = 'id_ecdsa outside .ssh' }
+        @{ Src = 'C:\Users\testuser\.netrc';                Label = 'dot-netrc' }
+        @{ Src = 'C:\Users\testuser\_netrc';                Label = 'underscore-netrc (windows)' }
+        @{ Src = 'C:\Users\testuser\.git-credentials';      Label = 'git-credentials' }
+        @{ Src = 'C:\keys\release.jks';                     Label = 'jks' }
+        @{ Src = 'C:\keys\debug.keystore';                  Label = 'keystore' }
+        @{ Src = 'C:\keys\session.ppk';                     Label = 'ppk' }
+        @{ Src = 'C:\vault\passwords.kdbx';                 Label = 'kdbx' }
+        @{ Src = 'C:\Users\testuser\.pgpass';               Label = 'pgpass' }
+        @{ Src = 'C:\Users\testuser\.my.cnf';               Label = 'my-cnf' }
+        @{ Src = 'C:\infra\secrets.yaml';                   Label = 'secrets-yaml' }
+        @{ Src = 'C:\infra\secrets.yml';                    Label = 'secrets-yml' }
+        @{ Src = 'C:\infra\prod.tfvars';                    Label = 'tfvars' }
+        @{ Src = 'C:\Users\testuser\.aws\config';           Label = 'aws-config' }
+        @{ Src = 'C:\Users\testuser\.config\gh\hosts.yml';  Label = 'gh-hosts' }
+        @{ Src = 'C:\Users\testuser\.gnupg\secring.gpg';    Label = 'gnupg dir' }
+    )
+
+    It 'Test-IsSecretPath flags <Label> (<Src>)' -ForEach $broadenedCases {
+        Test-IsSecretPath -Path $Src | Should -BeTrue
+    }
+
+    It 'the loader refuses <Label> (<Src>) declared via StageAssets' -ForEach $broadenedCases {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @{ $Src = 'pinned asset' }
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*secret*'
+    }
+
+    It 'still allows the ralph .token delivery path (documented, deliberately not secret-shaped)' {
+        Test-IsSecretPath -Path 'C:\sandbox\agent-cred\agent.token' | Should -BeFalse
+    }
+}
+
 Describe 'Invariant 1 — Windows leaf-equivalence bypass refusal' {
 
     # Windows treats these LEAF forms as equivalent to the real secret file:
