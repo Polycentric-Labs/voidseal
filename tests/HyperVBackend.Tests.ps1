@@ -63,7 +63,7 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             # host channels (the seal surface)
             'SetHostChannel', 'GetHostChannels'
             # disk
-            'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
+            'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'ReadVhdxRawRegion', 'GetVhdxImageHash', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
             # switch / network
             'NewSwitch', 'GetSwitch', 'RemoveSwitch', 'ConnectNetworkAdapter', 'RemoveNetworkAdapter', 'GetNetworkAdapter'
             # checkpoint
@@ -104,6 +104,18 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
         $m['NewOutputVhdx'] | Should -Contain 'Label'
         $m['NewOutputVhdx'] | Should -Contain 'FileSystem'
         $m['NewOutputVhdx'] | Should -Contain 'SizeBytes'
+    }
+
+    It 'manifest documents ReadVhdxRawRegion with Path + Offset + Length' {
+        $m = Get-HyperVBackendMethodManifest
+        $m.Contains('ReadVhdxRawRegion') | Should -BeTrue
+        $m['ReadVhdxRawRegion'] | Should -Be @('Path','Offset','Length')
+    }
+
+    It 'manifest documents GetVhdxImageHash with Path' {
+        $m = Get-HyperVBackendMethodManifest
+        $m.Contains('GetVhdxImageHash') | Should -BeTrue
+        $m['GetVhdxImageHash'] | Should -Be @('Path')
     }
 }
 
@@ -157,7 +169,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
             InvokeGuestCommand = 'VMName'
             SetHostChannel = 'VMName'; GetHostChannels = 'VMName'
-            NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'
+            NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; WriteVhdxFileBytes = 'Path'; ReadVhdxFileBytes = 'Path'; ReadVhdxRawRegion = 'Path'; GetVhdxImageHash = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'; GetVolumeFreeSpace = 'Path'
             AddHardDiskDrive = 'VMName'; RemoveHardDiskDrive = 'VMName'; SetDvdDrive = 'VMName'; RemoveDvdDrive = 'VMName'; GetDvdDrives = 'VMName'
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
@@ -258,6 +270,30 @@ Describe 'Fake backend — VM lifecycle' {
         (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Running'
         & $script:B.StopVM @{ Name = 'vm1' }
         (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
+    }
+
+    It 'StartVM logs exactly one Op=StartVM CallLog entry for the started VM (positive control — pins the invocation-was-reached instrumentation used by the I2b lifecycle-abort tests'' zero-StartVM-entries assertions)' {
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $script:B.StartVM @{ Name = 'vm1' }
+        $entries = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' })
+        $entries.Count | Should -Be 1 -Because 'StartVM must log its own invocation exactly once — otherwise a lifecycle test asserting zero StartVM CallLog entries would pass vacuously regardless of whether StartVM ran'
+        $entries[0].VMName | Should -Be 'vm1'
+    }
+
+    It 'RemoveNetworkAdapter logs exactly one Op=RemoveNetworkAdapter CallLog entry for the VM (positive control — pins the invocation-was-reached instrumentation used by the builder no-seal tests'' zero-RemoveNetworkAdapter-entries assertions)' {
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        $entries = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' })
+        $entries.Count | Should -Be 1 -Because 'RemoveNetworkAdapter must log its own invocation exactly once — otherwise a test asserting zero RemoveNetworkAdapter CallLog entries would pass vacuously regardless of whether RemoveNetworkAdapter ran'
+        $entries[0].VMName | Should -Be 'vm1'
+    }
+
+    It 'SetHostChannel logs exactly one Op=SetHostChannel CallLog entry for the VM (positive control — pins the invocation-was-reached instrumentation used by the builder no-seal tests'' zero-SetHostChannel-entries assertion)' {
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $script:B.SetHostChannel @{ VMName = 'vm1'; Channel = 'Clipboard'; Enabled = $false }
+        $entries = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'SetHostChannel' })
+        $entries.Count | Should -Be 1 -Because 'SetHostChannel must log its own invocation exactly once — otherwise a test asserting zero SetHostChannel CallLog entries would pass vacuously regardless of whether SetHostChannel ran'
+        $entries[0].VMName | Should -Be 'vm1'
     }
 
     It 'RemoveVM removes the VM but does NOT delete its VHDX records (caller cleans disks)' {
@@ -979,6 +1015,79 @@ Describe 'Fake backend — disk operations' {
         (& $b.GetVHDInfo @{ Path='C:\t\z.vhdx' }).FileSystem | Should -Be 'exFAT'
     }
 
+    # ---- Task 4.2: Raw FileSystem mode (create-without-format) ----
+    It 'NewOutputVhdx (fake) accepts FileSystem=Raw and records FileSystem=Raw' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\raw.vhdx'; Label='OUTPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $info = & $b.GetVHDInfo @{ Path='C:\t\raw.vhdx' }
+        $info | Should -Not -BeNullOrEmpty
+        $info.FileSystem | Should -Be 'Raw' -Because 'a Raw disk is recorded with FileSystem=Raw'
+    }
+    It 'NewOutputVhdx (fake) Raw disk keeps its Label as mock-internal discovery tag' {
+        # The Label on a Raw disk is a MOCK-INTERNAL discovery tag (the real raw disk has no FS label;
+        # real GetVHDInfo returns no Label — non-observable divergence documented here per task-4.2-brief).
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\rawlbl.vhdx'; Label='OUTPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $info = & $b.GetVHDInfo @{ Path='C:\t\rawlbl.vhdx' }
+        $info.Label | Should -Be 'OUTPUT' -Because 'the Label is a mock-internal tag so findOutputDisk still discovers the Raw OUTPUT disk'
+    }
+    It 'NewOutputVhdx (fake) accepts lowercase raw and normalizes to Raw' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\rawlc.vhdx'; Label='OUTPUT'; FileSystem='raw'; SizeBytes=1GB }
+        $info = & $b.GetVHDInfo @{ Path='C:\t\rawlc.vhdx' }
+        $info.FileSystem | Should -Be 'Raw' -Because 'Raw is case-normalized like exFAT'
+    }
+    It 'NewOutputVhdx (fake) Raw disk does not impose a label-length ceiling (no Format-Volume runs)' {
+        # Raw = create-without-format: no Format-Volume, so no real label limit applies.
+        # The Label is a mock-internal tag only — any length is accepted.
+        $b = New-FakeHyperVBackend
+        { & $b.NewOutputVhdx @{ Path='C:\t\rawlong.vhdx'; Label='THIS_LABEL_IS_WAY_TOO_LONG_FOR_EXFAT'; FileSystem='Raw'; SizeBytes=1GB } } |
+            Should -Not -Throw -Because 'Raw skips Format-Volume so no label-length ceiling applies'
+    }
+    It 'SECURITY: real NewOutputVhdx Raw branch does NOT reference Format-Volume (AST check)' {
+        # Guard that the REAL backend Raw branch genuinely skips formatting — via a real AST walk,
+        # not a comment-canary regex (a comment can survive deletion of the actual guard it describes).
+        $realB = New-RealHyperVBackend
+        $ast = $realB.NewOutputVhdx.Ast
+
+        # Presence check: a Raw branch exists at all.
+        $src = $realB.NewOutputVhdx.ToString()
+        $src | Should -Match '(?i)raw' -Because 'the real NewOutputVhdx must have a Raw branch'
+
+        # Find every Format-Volume command node. At least one must exist (the non-Raw path formats).
+        $fmtCalls = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Format-Volume'
+            }, $true)
+        $fmtCalls.Count | Should -BeGreaterThan 0 -Because 'the non-Raw path must call Format-Volume'
+
+        # Find the Raw-branch IfStatementAst: the clause whose condition extent mentions 'Raw'.
+        $ifStatements = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.IfStatementAst]
+            }, $true)
+        $rawIf = $ifStatements | Where-Object {
+            $_.Clauses | Where-Object { $_.Item1.Extent.Text -match "-eq 'Raw'|Raw" }
+        } | Select-Object -First 1
+        $rawIf | Should -Not -BeNullOrEmpty -Because 'an if-statement gating on Raw must exist'
+
+        # Within the Raw clause's body, find the early ReturnStatementAst.
+        $rawClause = $rawIf.Clauses | Where-Object { $_.Item1.Extent.Text -match "-eq 'Raw'|Raw" } | Select-Object -First 1
+        $rawReturn = $rawClause.Item2.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.ReturnStatementAst]
+            }, $true) | Select-Object -First 1
+        $rawReturn | Should -Not -BeNullOrEmpty -Because 'the Raw branch must contain an early return'
+
+        # THE core assertion: the Raw branch's return occurs (textually/structurally) BEFORE every
+        # Format-Volume call reachable in the scriptblock. This fails if the early return is removed
+        # or moved to after Format-Volume — which the old comment-canary would not have caught.
+        foreach ($fmt in $fmtCalls) {
+            $rawReturn.Extent.StartOffset | Should -BeLessThan $fmt.Extent.StartOffset `
+                -Because 'the Raw path must return before any Format-Volume is reachable'
+        }
+    }
+
     # ---- per-VHDX file populate/read (host writes a seed file onto a VHDX, reads results off) ----
     It 'fake WriteVhdxFile then ReadVhdxFile round-trips a file' {
         $b = New-FakeHyperVBackend
@@ -999,6 +1108,130 @@ Describe 'Fake backend — disk operations' {
         $m = Get-HyperVBackendMethodManifest
         $m.Keys | Should -Contain 'WriteVhdxFile'
         $m.Keys | Should -Contain 'ReadVhdxFile'
+    }
+
+    # ---- I2a: byte-transfer variants (the string path corrupts 0x00/0x80-0xFF; see WriteVhdxFile) ----
+    It 'manifest documents WriteVhdxFileBytes and ReadVhdxFileBytes' {
+        $m = Get-HyperVBackendMethodManifest
+        $m.Keys | Should -Contain 'WriteVhdxFileBytes'
+        $m['WriteVhdxFileBytes'] | Should -Contain 'Path'
+        $m['WriteVhdxFileBytes'] | Should -Contain 'InnerPath'
+        $m['WriteVhdxFileBytes'] | Should -Contain 'Bytes'
+        $m.Keys | Should -Contain 'ReadVhdxFileBytes'
+        $m['ReadVhdxFileBytes'] | Should -Contain 'Path'
+        $m['ReadVhdxFileBytes'] | Should -Contain 'InnerPath'
+    }
+    It 'fake WriteVhdxFileBytes then ReadVhdxFileBytes round-trips arbitrary bytes incl. 0x00 and 0x80-0xFF (string path would corrupt these)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-in.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $bytes = [byte[]]@(0x00,0x01,0x7F,0x80,0xFE,0xFF,0x00,0xAA)
+        & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-in.vhdx'; InnerPath='blob.bin'; Bytes=$bytes }
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-in.vhdx'; InnerPath='blob.bin' }
+        ,$got | Should -Not -BeNullOrEmpty
+        $got | Should -BeOfType [byte]
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$got, $bytes) | Should -BeTrue
+    }
+    It 'fake WriteVhdxFileBytes then ReadVhdxFileBytes round-trips a single-byte payload without array-unrolling to a scalar' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-one.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $bytes = [byte[]]@(0x2A)
+        & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-one.vhdx'; InnerPath='one.bin'; Bytes=$bytes }
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-one.vhdx'; InnerPath='one.bin' }
+        , $got | Should -Not -BeNullOrEmpty
+        ($got -is [byte[]]) | Should -BeTrue -Because 'a leading-comma return must prevent PowerShell from unrolling a 1-element array to a scalar'
+        $got.Length | Should -Be 1
+        $got[0] | Should -Be 0x2A
+    }
+    It 'fake ReadVhdxFileBytes returns $null for an absent inner file' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-missing.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        (& $b.ReadVhdxFileBytes @{ Path='C:\t\bin-missing.vhdx'; InnerPath='missing.bin' }) | Should -Be $null
+    }
+    It 'fake WriteVhdxFileBytes throws for a VHD that does not exist' {
+        $b = New-FakeHyperVBackend
+        { & $b.WriteVhdxFileBytes @{ Path='C:\t\ghost.vhdx'; InnerPath='a'; Bytes=[byte[]]@(1,2,3) } } | Should -Throw -ExpectedMessage '*does not exist*'
+    }
+    It 'fake ReadVhdxFileBytes throws for a VHD that does not exist' {
+        $b = New-FakeHyperVBackend
+        { & $b.ReadVhdxFileBytes @{ Path='C:\t\ghost2.vhdx'; InnerPath='a' } } | Should -Throw -ExpectedMessage '*does not exist*'
+    }
+    It 'fake ReadVhdxFileBytes on a file written via the STRING WriteVhdxFile returns its UTF-8 bytes (honest cross-read, not a fake shortcut)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-cross.vhdx'; Label='INPUT'; FileSystem='exFAT'; SizeBytes=64MB }
+        & $b.WriteVhdxFile @{ Path='C:\t\bin-cross.vhdx'; InnerPath='sample.json'; Content='{"x":1}' }
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-cross.vhdx'; InnerPath='sample.json' }
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$got, [System.Text.Encoding]::UTF8.GetBytes('{"x":1}')) | Should -BeTrue
+    }
+    It 'fake WriteVhdxFileBytes stores an immutable copy (mutating the caller''s array after the call does not affect stored bytes)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-mut.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $bytes = [byte[]]@(0x11,0x22,0x33)
+        & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-mut.vhdx'; InnerPath='m.bin'; Bytes=$bytes }
+        $bytes[0] = 0xFF
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-mut.vhdx'; InnerPath='m.bin' }
+        $got[0] | Should -Be 0x11 -Because 'the fake must store a copy, not a reference to the caller''s array'
+    }
+    It 'fake ReadVhdxFileBytes returns a fresh copy on each read (mutating a returned array does not corrupt a later read) — ULTRACODE fake≠real gate regression' {
+        # This is the READ-side aliasing gap (distinct from the WRITE-side copy test above): the fake's
+        # store previously handed back the LIVE stored reference (`return ,$v`), so a caller mutating its
+        # own read result would silently corrupt every subsequent read of the same key — a divergence the
+        # real backend can never exhibit (ReadAllBytes allocates a fresh byte[] every call; the filesystem
+        # is the immutability boundary). Fixed via copy-on-read in ReadVhdxFileBytes.
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-alias.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        $bytes = [byte[]]@(0x01,0x02,0x03)
+        & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-alias.vhdx'; InnerPath='a.bin'; Bytes=$bytes }
+        $first = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-alias.vhdx'; InnerPath='a.bin' }
+        $first[0] = 0xEE   # mutate the CALLER's copy of the read result
+        $second = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-alias.vhdx'; InnerPath='a.bin' }
+        $second[0] | Should -Be 0x01 -Because 'ReadVhdxFileBytes must hand out a fresh copy each call, not a live alias into the fake''s own store'
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$second, [byte[]]@(0x01,0x02,0x03)) | Should -BeTrue
+    }
+    # F2 FIX (follow-up task, closes the gap flagged above): a WriteVhdxFileBytes round-trip of a
+    # genuine 0-LENGTH byte[] payload used to throw ArgumentNullException, because
+    # $script:SbAssertArg's `return $P[$Key]` (no leading comma) unrolled a 0-length array argument
+    # to $null across ITS OWN `&`-invocation boundary, before WriteVhdxFileBytes's
+    # `[byte[]](& $AssertArg ...)` cast ever saw it. That reproduced identically on the REAL and
+    # FAKE write paths (both share the `[byte[]](& $AssertArg $P 'Bytes' 'WriteVhdxFileBytes')`
+    # hoist) — fake≠real-PARITY-PRESERVING, not a divergence. Fixed by comma-wrapping SbAssertArg's
+    # return (`return ,$P[$Key]`); see that scriptblock's header comment (HyperVBackend.ps1) and the
+    # direct helper coverage in the "$script:SbAssertArg — array shape preservation" Describe block
+    # below. This test proves the fix end-to-end through the fake's actual write/read path.
+    It 'fake WriteVhdxFileBytes with an empty [byte[]] payload writes an empty inner file (F2: $SbAssertArg 0-length shape fix)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path='C:\t\bin-empty.vhdx'; Label='INPUT'; FileSystem='Raw'; SizeBytes=1GB }
+        { & $b.WriteVhdxFileBytes @{ Path='C:\t\bin-empty.vhdx'; InnerPath='empty.bin'; Bytes=[byte[]]@() } } |
+            Should -Not -Throw -Because 'a genuinely-empty [byte[]] Bytes arg must not unroll to $null and trip the required-argument-missing throw'
+        $got = & $b.ReadVhdxFileBytes @{ Path='C:\t\bin-empty.vhdx'; InnerPath='empty.bin' }
+        ($got -is [byte[]]) | Should -BeTrue -Because 'the round-tripped empty payload must come back as an intact [byte[]], not $null'
+        $got.Length | Should -Be 0
+    }
+    It 'REAL byte-return composition-analog: a return crossing the exact two `&`-boundary shape (& $InvokeOp { return ,,$x }) yields an intact [byte[]] for 0/1/N bytes, while a single comma through the SAME shape does not — ULTRACODE fake≠real gate regression' {
+        # HyperVBackend.ps1's REAL ReadVhdxFileBytes/ReadVhdxRawRegion route their byte[] return through
+        # $InvokeOp (`try { return (& $Operation) } catch {...}`), a scriptblock invoked via `&` — a SECOND
+        # `&`-boundary on top of the inner operation block's own `return`. $InvokeOp is a local closure
+        # inside New-RealHyperVBackend (not exported), so it cannot be driven directly without live
+        # Mount-VHD/Hyper-V (LIVE-ONLY-UNPROVEN, matching this file's existing pattern for other real-only
+        # methods, e.g. ReadVhdxRawRegion's qemu-img path). This test reconstructs the IDENTICAL
+        # two-boundary composition in isolation and empirically pins the array-unrolling contract that
+        # both real fixes rely on, so a future edit that collapses back to a single comma fails loudly.
+        $invokeOp = {
+            param([scriptblock] $Operation)
+            try { return (& $Operation) }
+            catch { throw }
+        }.GetNewClosure()
+
+        foreach ($n in 0, 1, 4) {
+            $payload = [byte[]]::new($n)
+            for ($i = 0; $i -lt $n; $i++) { $payload[$i] = [byte](($i + 1) % 256) }
+
+            $doubleComma = & $invokeOp { return ,,$payload }.GetNewClosure()
+            ($doubleComma -is [byte[]]) | Should -BeTrue -Because "n=$n through the double-`&` boundary must survive as [byte[]] with a double leading comma"
+            $doubleComma.Count | Should -Be $n
+
+            $singleComma = & $invokeOp { return ,$payload }.GetNewClosure()
+            ($singleComma -is [byte[]]) | Should -BeFalse -Because "n=$n through the SAME double-`&` boundary with only a SINGLE comma must NOT survive as [byte[]] (proves the double comma is load-bearing, not redundant)"
+        }
     }
 
     It 'AddHardDiskDrive then RemoveHardDiskDrive adjusts the VM disk list' {
@@ -1075,6 +1308,152 @@ Describe 'Fake backend — disk operations' {
     It 'RemoveVHD on an unknown path is an idempotent no-op (does not throw)' {
         { & $script:B.RemoveVHD @{ Path = 'C:\vhd\never.vhdx' } } |
             Should -Not -Throw -Because 'deleting an absent disk is a no-op, mirroring the real Test-Path guard'
+    }
+}
+
+# ===========================================================================
+#  $script:SbAssertArg — array shape preservation across the & boundary (F2)
+# ===========================================================================
+# The helper is shared by BOTH factories (hoisted into each factory's locals), so testing it
+# directly here — rather than only indirectly via a backend method — pins its contract once for
+# both. See the scriptblock's own header comment (HyperVBackend.ps1) for the pipeline-unroll
+# mechanism these tests exercise.
+Describe '$script:SbAssertArg — array shape preservation across the & boundary (F2)' {
+
+    It 'returns an intact 0-length [byte[]] for an empty array arg (not $null)' {
+        $got = & $script:SbAssertArg @{ Bytes = [byte[]]@() } 'Bytes' 'X'
+        ($got -is [byte[]]) | Should -BeTrue -Because 'a 0-length [byte[]] must survive the & boundary shape-intact, not unroll to $null'
+        $got.Length | Should -Be 0
+    }
+
+    It 'returns an intact 1-element [byte[]] (no collapse to a bare scalar [byte])' {
+        $got = & $script:SbAssertArg @{ Bytes = [byte[]]@(42) } 'Bytes' 'X'
+        ($got -is [byte[]]) | Should -BeTrue -Because 'a 1-element [byte[]] must not collapse to a scalar [byte] crossing the & boundary'
+        $got.Length | Should -Be 1
+        $got[0] | Should -Be 42
+    }
+
+    It 'returns an intact n-element [byte[]] with values preserved (no re-collection to [object[]])' {
+        $got = & $script:SbAssertArg @{ Bytes = [byte[]]@(1,2,3) } 'Bytes' 'X'
+        ($got -is [byte[]]) | Should -BeTrue -Because 'an n-element [byte[]] must not re-collect as [object[]] crossing the & boundary'
+        $got.Count | Should -Be 3
+        [System.Linq.Enumerable]::SequenceEqual([byte[]]$got, [byte[]]@(1,2,3)) | Should -BeTrue
+    }
+
+    It 'returns a plain [string] arg unchanged (shape guard: the fix must not disturb the scalar case)' {
+        $got = & $script:SbAssertArg @{ Name = 'vm1' } 'Name' 'X'
+        ($got -is [string]) | Should -BeTrue
+        $got | Should -Be 'vm1'
+    }
+
+    It 'returns a [hashtable] arg unchanged (shape guard: the fix must not disturb the dictionary case)' {
+        $inner = @{ a = 1; b = 2 }
+        $got = & $script:SbAssertArg @{ Cfg = $inner } 'Cfg' 'X'
+        ($got -is [hashtable]) | Should -BeTrue
+        $got.a | Should -Be 1
+        $got.b | Should -Be 2
+    }
+
+    It 'still throws the required-argument-missing message for an absent key (unchanged refusal)' {
+        { & $script:SbAssertArg @{ } 'Missing' 'SomeMethod' } |
+            Should -Throw -ExpectedMessage "*required argument 'Missing' is missing*"
+    }
+
+    It 'still throws the required-argument-missing message for a present-but-$null value (unchanged refusal)' {
+        { & $script:SbAssertArg @{ Missing = $null } 'Missing' 'SomeMethod' } |
+            Should -Throw -ExpectedMessage "*required argument 'Missing' is missing*"
+    }
+
+    It 'still throws the required-argument-missing message for a whitespace-only string value (unchanged refusal)' {
+        { & $script:SbAssertArg @{ Missing = '   ' } 'Missing' 'SomeMethod' } |
+            Should -Throw -ExpectedMessage "*required argument 'Missing' is missing*"
+    }
+}
+
+# ===========================================================================
+#  $script:SbIsUnavailableError — name-scoped CommandNotFound classification (F3)
+# ===========================================================================
+# I5a lesson: EVERY real method's body runs inside $InvokeOp, which routes any caught error
+# through this classifier. A BLANKET "any CommandNotFoundException is Hyper-V unavailable"
+# branch would rebrand a closure-capture NameError (the I5a bug class — e.g. a renamed helper
+# called by bare name from inside a .GetNewClosure()'d body) as a misleading "Hyper-V
+# unavailable / insufficient privilege" message instead of surfacing the real
+# CommandNotFoundException. So the classifier must be scoped by the missing command's NAME:
+# only genuinely Hyper-V-cmdlet-shaped names (Get-VM, New-VHD, ...) classify as unavailable.
+# Tested directly here (like $script:SbAssertArg above) so the contract is pinned once,
+# independent of any one backend method's wiring.
+Describe '$script:SbIsUnavailableError — name-scoped CommandNotFound classification (F3)' {
+
+    BeforeAll {
+        # A minimal stand-in exception living in the SAME namespace prefix the classifier
+        # checks (Microsoft.HyperV.PowerShell*), so the tests below exercise the actual
+        # '-like' namespace match instead of assuming it. Avoids depending on the real Hyper-V
+        # module's internal VirtualizationException, which has no public constructor.
+        if (-not ('Microsoft.HyperV.PowerShell.VoidsealTestException' -as [type])) {
+            Add-Type -TypeDefinition @'
+namespace Microsoft.HyperV.PowerShell {
+    public class VoidsealTestException : System.Exception {
+        public VoidsealTestException(string message) : base(message) {}
+    }
+}
+'@
+        }
+    }
+
+    It 'classifies a REAL CommandNotFoundException for a Hyper-V-shaped VM cmdlet name as unavailable' {
+        $errorRecord = $null
+        try { & 'Get-VMAbsentZz9' } catch { $errorRecord = $_ }
+        $errorRecord.Exception | Should -BeOfType ([System.Management.Automation.CommandNotFoundException])
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue -Because 'Get-VM*-shaped missing commands are the Hyper-V-module-absent case'
+    }
+
+    It 'classifies a REAL CommandNotFoundException for a Hyper-V-shaped VHD cmdlet name as unavailable' {
+        $errorRecord = $null
+        try { & 'Mount-VHDAbsentZz9' } catch { $errorRecord = $_ }
+        $errorRecord.Exception | Should -BeOfType ([System.Management.Automation.CommandNotFoundException])
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue -Because 'Mount-VHD*-shaped missing commands are the Hyper-V-module-absent case'
+    }
+
+    It 'does NOT classify a REAL CommandNotFoundException for a non-Hyper-V helper name as unavailable (the I5a closure-NameError class)' {
+        $errorRecord = $null
+        try { & 'Invoke-ConfinedQemuAbsentZz9' } catch { $errorRecord = $_ }
+        $errorRecord.Exception | Should -BeOfType ([System.Management.Automation.CommandNotFoundException])
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeFalse -Because 'a renamed/missing non-Hyper-V helper called from inside a closure must surface as its real CommandNotFoundException, not a mislabeled "Hyper-V unavailable"'
+    }
+
+    It 'does NOT classify a REAL CommandNotFoundException for an arbitrary non-Hyper-V name as unavailable' {
+        $errorRecord = $null
+        try { & 'Format-ThingAbsentZz9' } catch { $errorRecord = $_ }
+        $errorRecord.Exception | Should -BeOfType ([System.Management.Automation.CommandNotFoundException])
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeFalse
+    }
+
+    It 'still classifies a Microsoft.HyperV.PowerShell*-namespace permission-denied error as unavailable (existing behavior preserved)' {
+        $ex = New-Object Microsoft.HyperV.PowerShell.VoidsealTestException('You do not have the required permission to complete this task.')
+        $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
+    }
+
+    It 'still classifies a Microsoft.HyperV.PowerShell*-namespace service-down error as unavailable (existing behavior preserved)' {
+        $ex = New-Object Microsoft.HyperV.PowerShell.VoidsealTestException('The Virtual Machine Management service is not running.')
+        $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
+    }
+
+    It 'still classifies generic permission phrasing from any exception layer as unavailable (existing behavior preserved)' {
+        $ex = New-Object System.Exception('Access is denied. Run as Administrator or join Hyper-V Administrators.')
+        $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
+    }
+
+    It 'still returns $false for an arbitrary unrelated exception (existing behavior preserved)' {
+        $ex = New-Object System.InvalidOperationException('the widget is jammed')
+        $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::InvalidOperation, $null)
+        (& $script:SbIsUnavailableError $errorRecord) | Should -BeFalse
+    }
+
+    It 'still returns $false for a $null ErrorRecord (existing behavior preserved)' {
+        (& $script:SbIsUnavailableError $null) | Should -BeFalse
     }
 }
 
@@ -1400,6 +1779,64 @@ Describe 'Real backend — SetFirmware retries the transient Secure Boot templat
 }
 
 # ===========================================================================
+#  REAL backend — ReadVhdxRawRegion rides out a transient detach SETTLE-LAG lock (RC8/MUST-FIX 1)
+# ===========================================================================
+#  Mirror of the SbInvokeFirmwareWithRetry pattern. The real ReadVhdxRawRegion's qemu-img convert can
+#  hit a sub-second SHARING VIOLATION when Remove-VMHardDiskDrive / Stop-VM has returned but the Hyper-V
+#  worker-process handle on the .vhdx has not yet been released (a fresh RC8 — a SUCCESSFUL run that
+#  spuriously fails on the first open). The convert is wrapped in the shared $script:SbInvokeWithLockRetry
+#  helper: a LOCK-CLASS error is retried (the handle is releasing), any OTHER error rethrows immediately,
+#  and exhaustion fails closed with a clear "...still locked after N attempts..." message. Factored out so
+#  it is UNIT-testable in-process (drive it with a stub Operation that throws a lock-class error N times
+#  then returns a sentinel) WITHOUT a live VM — exactly the path the real ReadVhdxRawRegion uses. The FAKE
+#  models the same bounded tolerance via -SimulateDetachSettleLag (see the fake-axes Describe below); the
+#  two budgets share the SAME default MaxAttempts (5) so they agree.
+Describe 'Real backend — ReadVhdxRawRegion rides out a transient detach settle-lag lock (RC8; lock-retry helper)' {
+
+    It 'exposes the shared lock-retry helper scriptblock' {
+        $script:SbInvokeWithLockRetry | Should -BeOfType [scriptblock] -Because 'the real ReadVhdxRawRegion factors its convert retry through this shared helper so it is unit-testable'
+    }
+
+    It 'SUCCEEDS without retry when the operation succeeds first try' {
+        $script:lockCalls = 0
+        { & $script:SbInvokeWithLockRetry -Operation { $script:lockCalls++; 'OK' } -MaxAttempts 5 -DelayMilliseconds 1 } | Should -Not -Throw
+        $script:lockCalls | Should -Be 1 -Because 'a first-try success must not retry'
+    }
+
+    It 'RETRIES a lock-class error (sharing violation) N times then returns the sentinel for N < MaxAttempts' {
+        $script:lockCalls = 0
+        $op = {
+            $script:lockCalls++
+            if ($script:lockCalls -lt 3) { throw 'qemu-img: Could not open: The process cannot access the file because it is being used by another process.' }
+            'SENTINEL'   # third attempt succeeds
+        }
+        $result = & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 5 -DelayMilliseconds 1
+        $script:lockCalls | Should -Be 3 -Because 'it must keep retrying the transient lock until the handle releases'
+        $result | Should -Be 'SENTINEL' -Because 'a lag WITHIN budget must return the operation result'
+    }
+
+    It 'after exhausting retries on a lock-class error (N >= MaxAttempts), throws a fail-closed message naming the unreleased handle' {
+        $script:lockCalls = 0
+        $op = { $script:lockCalls++; throw 'sharing violation' }
+        $msg = $null
+        try { & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 3 -DelayMilliseconds 1 } catch { $msg = $_.Exception.Message }
+        $script:lockCalls | Should -Be 3 -Because 'all attempts must be spent before failing closed'
+        $msg | Should -Not -BeNullOrEmpty
+        $msg | Should -Match '(?i)still locked' -Because 'the message must name the persistent-lock condition'
+        $msg | Should -Match '(?i)(handle|released|detach)' -Because 'the remediation is that the VHDX handle was not released after detach'
+        $msg | Should -Match '(?i)failing closed' -Because 'an unresolved lock fails closed, never silently'
+    }
+
+    It 'does NOT retry an UNRELATED error — it rethrows immediately (no masking malformed-image failures)' {
+        $script:lockCalls = 0
+        $op = { $script:lockCalls++; throw 'qemu-img: error while reading sector: Invalid argument (a malformed image, not a lock)' }
+        { & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 5 -DelayMilliseconds 1 } |
+            Should -Throw -ExpectedMessage '*malformed image*'
+        $script:lockCalls | Should -Be 1 -Because 'a malformed-image error is not transient; retrying would mask the real cause'
+    }
+}
+
+# ===========================================================================
 #  REAL backend — builds the right cmdlet params (out-of-process capture)
 # ===========================================================================
 #  THE BEHAVIORAL REGRESSION TEST FOR A REAL-BACKEND BUG FOUND DURING LIVE DEBUGGING.
@@ -1516,5 +1953,437 @@ Describe 'Real backend — builds the right cmdlet params (out-of-process; live-
         $cap.Count       | Should -Be 2
         $cap.ExposeGiven | Should -BeTrue
         $cap.Expose      | Should -BeTrue
+    }
+}
+
+# ===========================================================================
+#  GetVhdxImageHash — whole-image deps fingerprint (fake axes + real never-mounts)
+# ===========================================================================
+Describe 'GetVhdxImageHash — whole-image deps fingerprint (fake axes + real never-mounts)' {
+    BeforeAll {
+        function script:New-DepsFake([byte[]] $blob, [int] $lag = 0, [string] $vm = 'b1', [string] $disk = 'C:\s\deps.vhdx') {
+            $f = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob -SimulateDetachSettleLag $lag
+            & $f.NewVM @{ Name = $vm; Generation = 2 }
+            & $f.SetAutomaticCheckpoints @{ VMName = $vm; Enabled = $false }
+            & $f.NewOutputVhdx @{ Path = $disk; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+            & $f.AddHardDiskDrive @{ VMName = $vm; Path = $disk }
+            return $f
+        }
+        # No -SimulateSelfPowerOff: StartVM leaves State='Running' (the live worker holds the lock). The deps
+        # blob is NOT recorded without SelfPowerOff, but the *locked*/Off-but-attached tests only assert a
+        # throw / a successful (possibly empty) hash, so that is fine.
+        function script:New-DepsFakeRunning([string] $vm = 'br', [string] $disk = 'C:\s\depsr.vhdx') {
+            $f = New-FakeHyperVBackend
+            & $f.NewVM @{ Name = $vm; Generation = 2 }
+            & $f.SetAutomaticCheckpoints @{ VMName = $vm; Enabled = $false }
+            & $f.NewOutputVhdx @{ Path = $disk; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+            & $f.AddHardDiskDrive @{ VMName = $vm; Path = $disk }
+            return $f
+        }
+    }
+    It 'AXIS 1: hashing a disk attached to a RUNNING VM throws *locked* (live worker holds the lock; real never says *still attached*)' {
+        # FIX-2: gate on the holder State. A Running holder => sharing violation => $LockRetry => *locked*.
+        # (The pre-fix fake threw *still attached* for ANY attach regardless of State; the real never does.)
+        $f = New-DepsFakeRunning
+        & $f.StartVM @{ Name = 'br' }   # no SelfPowerOff -> State='Running', disk still attached
+        { & $f.GetVhdxImageHash @{ Path = 'C:\s\depsr.vhdx' } } | Should -Throw -ExpectedMessage '*locked*'
+    }
+    It 'AXIS 1 (FIX-2): an OFF-but-attached disk is OpenRead-able -> returns a hash (the real allows it; the builder post-power-off pre-detach window)' {
+        # NewVM + NewOutputVhdx + AddHardDiskDrive, but NO StartVM: State stays 'Off' while the disk is still
+        # attached. The real OpenReads (no live vmwp handle) and returns a hash; the fake must too (pre-fix it
+        # over-strictly refused). Empty image -> SHA-256 of zero bytes (the canonical empty digest).
+        $f = New-DepsFakeRunning 'boff' 'C:\s\depsoff.vhdx'
+        $h = & $f.GetVhdxImageHash @{ Path = 'C:\s\depsoff.vhdx' }   # must NOT throw (proven by reaching here)
+        $h | Should -BeOfType ([string])
+        $h | Should -Match '^[0-9a-f]{64}$'
+    }
+    It 'AXIS 1+3: after detach, returns the SHA-256 of the recorded bytes; deterministic; FakeCallLog proves detach precedes hash' {
+        $f = New-DepsFake ([byte[]](1..32))
+        & $f.StartVM @{ Name = 'b1' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'b1'; Path = 'C:\s\deps.vhdx' }
+        $h1 = & $f.GetVhdxImageHash @{ Path = 'C:\s\deps.vhdx' }
+        $h2 = & $f.GetVhdxImageHash @{ Path = 'C:\s\deps.vhdx' }
+        $h1 | Should -Be $h2
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $want = [System.BitConverter]::ToString($sha.ComputeHash([byte[]](1..32))).Replace('-','').ToLowerInvariant()
+        $sha.Dispose()
+        $h1 | Should -Be $want
+        $ops = @($f.FakeCallLog | Where-Object { $_.Path -eq 'C:\s\deps.vhdx' } | ForEach-Object { $_.Op })
+        ($ops.IndexOf('RemoveHardDiskDrive')) | Should -BeLessThan ($ops.IndexOf('GetVhdxImageHash'))
+    }
+    It 'RC7 (fake≠real symmetry): checkpoints LEFT ON -> deps land in the .avhdx child -> a host BASE-file hash sees SHA256(empty); checkpoints OFF -> the real deps hash' {
+        # The signature RC7 model: the real GetVhdxImageHash OpenReads the BASE OutputDiskPath. If
+        # AutomaticCheckpointsEnabled is ON at StartVM, the guest's deps land in the per-disk .avhdx CHILD
+        # layer; a host BASE-file hash sees an EMPTY base. The fake models that by routing the blob to
+        # DepsImageChildLayer (which GetVhdxImageHash does NOT read) when checkpoints are ON. Build the
+        # fake WITHOUT calling SetAutomaticCheckpoints Enabled=$false (a fresh fake VM mirrors Hyper-V's
+        # real default = ON) and prove the hash is SHA256 of EMPTY — the exact empty-hash RC7 bug.
+        $blob = [byte[]](1..32)
+        $emptyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
+        # --- checkpoints ON (RC7 NOT fixed): blob hidden in the child -> base hash is SHA256(empty) ---
+        $fOn = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        & $fOn.NewVM @{ Name = 'rc7on'; Generation = 2 }                              # AutomaticCheckpointsEnabled defaults to $true (Hyper-V default)
+        (& $fOn.GetVM @{ Name = 'rc7on' }).AutomaticCheckpointsEnabled | Should -BeTrue -Because 'a fresh fake VM mirrors Hyper-V''s checkpoints-ON default'
+        & $fOn.NewOutputVhdx @{ Path = 'C:\s\rc7on.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $fOn.AddHardDiskDrive @{ VMName = 'rc7on'; Path = 'C:\s\rc7on.vhdx' }
+        & $fOn.StartVM @{ Name = 'rc7on' }
+        & $fOn.RemoveHardDiskDrive @{ VMName = 'rc7on'; Path = 'C:\s\rc7on.vhdx' }
+        (& $fOn.GetVhdxImageHash @{ Path = 'C:\s\rc7on.vhdx' }) |
+            Should -Be $emptyHash -Because 'checkpoints ON -> deps in the .avhdx child -> the host BASE-file hash sees deps-EMPTY base (RC7)'
+
+        # --- checkpoints OFF (the RC7 fix): blob in the base -> the real deps hash ---
+        $fOff = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        & $fOff.NewVM @{ Name = 'rc7off'; Generation = 2 }
+        & $fOff.SetAutomaticCheckpoints @{ VMName = 'rc7off'; Enabled = $false }      # the provisioner/builder RC7 fix
+        & $fOff.NewOutputVhdx @{ Path = 'C:\s\rc7off.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $fOff.AddHardDiskDrive @{ VMName = 'rc7off'; Path = 'C:\s\rc7off.vhdx' }
+        & $fOff.StartVM @{ Name = 'rc7off' }
+        & $fOff.RemoveHardDiskDrive @{ VMName = 'rc7off'; Path = 'C:\s\rc7off.vhdx' }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $want = [System.BitConverter]::ToString($sha.ComputeHash($blob)).Replace('-','').ToLowerInvariant(); $sha.Dispose()
+        (& $fOff.GetVhdxImageHash @{ Path = 'C:\s\rc7off.vhdx' }) |
+            Should -Be $want -Because 'checkpoints OFF -> deps in the base -> the host hash sees them'
+        $want | Should -Not -Be $emptyHash -Because 'the non-empty deps hash must differ from SHA256(empty) for the RC7 contrast to be meaningful'
+    }
+    It 'AXIS 3: a DIFFERENT deps blob yields a DIFFERENT hash (tamper-sensitive)' {
+        $fa = New-DepsFake ([byte[]](1..32)) 0 'ba' 'C:\s\a.vhdx'
+        $fb = New-DepsFake ([byte[]](100..131)) 0 'bb' 'C:\s\b.vhdx'
+        & $fa.StartVM @{ Name='ba' }; & $fa.RemoveHardDiskDrive @{ VMName='ba'; Path='C:\s\a.vhdx' }
+        & $fb.StartVM @{ Name='bb' }; & $fb.RemoveHardDiskDrive @{ VMName='bb'; Path='C:\s\b.vhdx' }
+        (& $fa.GetVhdxImageHash @{ Path='C:\s\a.vhdx' }) | Should -Not -Be (& $fb.GetVhdxImageHash @{ Path='C:\s\b.vhdx' })
+    }
+    It 'AXIS 2: settle-lag WITHIN budget rides out; EXCEEDING budget throws *still locked*' {
+        $f3 = New-DepsFake ([byte[]](1..8)) 3 'bl' 'C:\s\dl.vhdx'
+        & $f3.StartVM @{ Name='bl' }; & $f3.RemoveHardDiskDrive @{ VMName='bl'; Path='C:\s\dl.vhdx' }
+        { & $f3.GetVhdxImageHash @{ Path='C:\s\dl.vhdx' } } | Should -Not -Throw
+        $f7 = New-DepsFake ([byte[]](1..8)) 7 'bl2' 'C:\s\dl2.vhdx'
+        & $f7.StartVM @{ Name='bl2' }; & $f7.RemoveHardDiskDrive @{ VMName='bl2'; Path='C:\s\dl2.vhdx' }
+        { & $f7.GetVhdxImageHash @{ Path='C:\s\dl2.vhdx' } } | Should -Throw -ExpectedMessage '*still locked*'
+    }
+    It 'AXIS 2 BOUNDARY (FIX-1): lag=4 (== MaxAttempts-1) is tolerated; lag=5 (== MaxAttempts) fails closed *still locked*' {
+        # The real $SbInvokeWithLockRetry (increment-then-compare, MaxAttempts=5) tolerates 4 transient
+        # lock-failures and throws on the 5th attempt. Pin the exact edge: 4 must NOT throw, 5 must. (Pre-fix
+        # the fake's check-before-decrement tolerated 5 and threw at 6 — one off, mock-green where real fails.)
+        $f4 = New-DepsFake ([byte[]](1..8)) 4 'be4' 'C:\s\dl4.vhdx'
+        & $f4.StartVM @{ Name='be4' }; & $f4.RemoveHardDiskDrive @{ VMName='be4'; Path='C:\s\dl4.vhdx' }
+        { & $f4.GetVhdxImageHash @{ Path='C:\s\dl4.vhdx' } } | Should -Not -Throw -Because 'lag=4 == MaxAttempts-1 is the real''s tolerance'
+        $f5 = New-DepsFake ([byte[]](1..8)) 5 'be5' 'C:\s\dl5.vhdx'
+        & $f5.StartVM @{ Name='be5' }; & $f5.RemoveHardDiskDrive @{ VMName='be5'; Path='C:\s\dl5.vhdx' }
+        { & $f5.GetVhdxImageHash @{ Path='C:\s\dl5.vhdx' } } | Should -Throw -ExpectedMessage '*still locked*' -Because 'lag=5 == MaxAttempts: the real throws on the 5th attempt'
+    }
+    It 'ERROR-PARITY: hashing a NON-EXISTENT disk throws (missing artifact), in both factories' {
+        $f = New-DepsFake ([byte[]](1..8))
+        { & $f.GetVhdxImageHash @{ Path = 'C:\s\nope.vhdx' } } | Should -Throw -ExpectedMessage '*does not exist*'
+        # real: same fail-closed shape when the file is absent (no VM/elevation needed — Test-Path is false)
+        $real = New-RealHyperVBackend
+        { & $real.GetVhdxImageHash @{ Path = 'C:\does\not\exist.vhdx' } } | Should -Throw -ExpectedMessage '*does not exist*'
+    }
+    It 'SECURITY: the REAL GetVhdxImageHash NEVER references Mount-VHD / Add-VMHardDiskDrive / qemu (user-space file hash only)' {
+        $real = New-RealHyperVBackend
+        $body = $real.GetVhdxImageHash.ToString()
+        $body | Should -Not -Match 'Mount-VHD'
+        $body | Should -Not -Match 'Add-VMHardDiskDrive'
+        $body | Should -Not -Match 'qemu'
+        $body | Should -Match 'SHA256'
+        $body | Should -Match 'OpenRead'
+    }
+}
+
+Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-mounts)' {
+    BeforeEach {
+        $script:fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16))
+        & $script:fake.NewVM @{ Name = 'p1'; Generation = 2 }
+        & $script:fake.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $false }   # the RC7 fix
+        & $script:fake.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $script:fake.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+    }
+    It 'AXIS 1: reading a disk attached to a RUNNING VM throws *locked* (live worker holds the lock; real never says *still attached*)' {
+        # FIX-2: gate on the holder State. Build a fake WITHOUT -SimulateSelfPowerOff so StartVM leaves
+        # State='Running' (the live vmwp.exe holds the file lock) with the disk still attached. The fake must
+        # throw a *locked* message (the real hits a sharing violation -> $LockRetry -> *locked*; it NEVER
+        # emits *still attached*). Pre-fix the fake threw *still attached* for ANY attach regardless of State.
+        $f = New-FakeHyperVBackend
+        & $f.NewVM @{ Name = 'pr'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'pr'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\outr.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'pr'; Path = 'C:\s\outr.vhdx' }
+        & $f.StartVM @{ Name = 'pr' }   # no SelfPowerOff -> State='Running', disk still attached
+        { & $f.ReadVhdxRawRegion @{ Path = 'C:\s\outr.vhdx'; Offset = 0; Length = 16 } } |
+            Should -Throw -ExpectedMessage '*locked*'
+    }
+    It 'AXIS 1 (FIX-2): an OFF-but-attached disk is qemu-readable -> returns bytes (the real allows it; the builder post-power-off pre-detach window)' {
+        # NewVM + NewOutputVhdx + AddHardDiskDrive, but NO StartVM: State stays 'Off' while the disk is still
+        # attached. The real qemu-img opens it (no live vmwp handle) and returns bytes; the fake must too
+        # (pre-fix it over-strictly refused). No blob recorded -> a zero-padded buffer of the requested length.
+        $f = New-FakeHyperVBackend
+        & $f.NewVM @{ Name = 'poff'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'poff'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\outoff.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'poff'; Path = 'C:\s\outoff.vhdx' }
+        # Call directly (must NOT throw — proven by reaching the asserts); a Should -Not -Throw scriptblock
+        # would swallow the return value in its child scope.
+        $bytes = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\outoff.vhdx'; Offset = 0; Length = 16 }
+        ,$bytes | Should -BeOfType ([byte[]])
+        $bytes.Length | Should -Be 16
+    }
+    It 'AXIS 1+3: after detach + SelfPowerOff, returns the recorded outbox bytes; CallLog proves detach precedes read' {
+        & $script:fake.StartVM @{ Name = 'p1' }
+        & $script:fake.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $script:fake.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 }
+        ,$bytes | Should -BeOfType ([byte[]])
+        ($bytes -join ',') | Should -Be ((1..16) -join ',')
+    }
+    It 'AXIS 2: checkpoints ON (RC7 trap) -> base raw-read returns ALL ZEROS (outbox stuck in .avhdx child)' {
+        & $script:fake.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $true }
+        & $script:fake.StartVM @{ Name = 'p1' }
+        & $script:fake.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $script:fake.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 }
+        (@($bytes | Where-Object { $_ -ne 0 })).Count | Should -Be 0
+    }
+    It 'AXIS 4: an over-read past the written payload is zero-padded, never an error (FIXED-disk tail)' {
+        & $script:fake.StartVM @{ Name = 'p1' }
+        & $script:fake.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $script:fake.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 32 }
+        $bytes.Length | Should -Be 32
+        (@($bytes[16..31] | Where-Object { $_ -ne 0 })).Count | Should -Be 0
+    }
+    It 'MUST-FIX 1 (settle-lag WITHIN budget): -SimulateDetachSettleLag 2 still returns the recorded bytes (method tolerates a transient detach lock, like the real internal retry)' {
+        # Rebuild with a small lag inside the read's internal retry budget (matches the real helper's
+        # MaxAttempts default of 5). The method must ride it out and return the bytes.
+        $f = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16)) -SimulateDetachSettleLag 2
+        & $f.NewVM @{ Name = 'p1'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        & $f.StartVM @{ Name = 'p1' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 }
+        ($bytes -join ',') | Should -Be ((1..16) -join ',') -Because 'a lag within budget is retried away and the bytes are returned'
+    }
+    It 'MUST-FIX 1 (settle-lag BEYOND budget): -SimulateDetachSettleLag 99 fails closed with a lock message (handle never released)' {
+        $f = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16)) -SimulateDetachSettleLag 99
+        & $f.NewVM @{ Name = 'p1'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        & $f.StartVM @{ Name = 'p1' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        { & $f.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 } } |
+            Should -Throw -ExpectedMessage '*still locked*'
+    }
+    It 'MUST-FIX 1 BOUNDARY (FIX-1): lag=4 (== MaxAttempts-1) is tolerated; lag=5 (== MaxAttempts) fails closed *still locked*' {
+        # The real $SbInvokeWithLockRetry (increment-then-compare, MaxAttempts=5) tolerates 4 transient
+        # lock-failures and throws on the 5th attempt. Pin the exact edge: 4 must NOT throw, 5 must. (Pre-fix
+        # the fake's check-before-decrement tolerated 5 and threw at 6 — one off, mock-green where real fails.)
+        $f4 = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16)) -SimulateDetachSettleLag 4
+        & $f4.NewVM @{ Name = 'pe4'; Generation = 2 }
+        & $f4.SetAutomaticCheckpoints @{ VMName = 'pe4'; Enabled = $false }
+        & $f4.NewOutputVhdx @{ Path = 'C:\s\oe4.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f4.AddHardDiskDrive @{ VMName = 'pe4'; Path = 'C:\s\oe4.vhdx' }
+        & $f4.StartVM @{ Name = 'pe4' }
+        & $f4.RemoveHardDiskDrive @{ VMName = 'pe4'; Path = 'C:\s\oe4.vhdx' }
+        { & $f4.ReadVhdxRawRegion @{ Path = 'C:\s\oe4.vhdx'; Offset = 0; Length = 16 } } | Should -Not -Throw -Because 'lag=4 == MaxAttempts-1 is the real''s tolerance'
+        $f5 = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16)) -SimulateDetachSettleLag 5
+        & $f5.NewVM @{ Name = 'pe5'; Generation = 2 }
+        & $f5.SetAutomaticCheckpoints @{ VMName = 'pe5'; Enabled = $false }
+        & $f5.NewOutputVhdx @{ Path = 'C:\s\oe5.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f5.AddHardDiskDrive @{ VMName = 'pe5'; Path = 'C:\s\oe5.vhdx' }
+        & $f5.StartVM @{ Name = 'pe5' }
+        & $f5.RemoveHardDiskDrive @{ VMName = 'pe5'; Path = 'C:\s\oe5.vhdx' }
+        { & $f5.ReadVhdxRawRegion @{ Path = 'C:\s\oe5.vhdx'; Offset = 0; Length = 16 } } | Should -Throw -ExpectedMessage '*still locked*' -Because 'lag=5 == MaxAttempts: the real throws on the 5th attempt'
+    }
+    It 'MUST-FIX 2 (write-flush gate): a guest that NEVER cleanly powers off leaves the outbox UNFLUSHED -> raw read is ALL ZEROS' {
+        # -SimulateNeverOff + -SimulateOutboxBlob but NO -SimulateSelfPowerOff: the blob must NOT be recorded
+        # (a live unflushed disk reads zeros — the mock-green/live-empty trap the gate closes).
+        $f = New-FakeHyperVBackend -SimulateNeverOff -SimulateOutboxBlob ([byte[]](1..16))
+        & $f.NewVM @{ Name = 'p1'; Generation = 2 }
+        & $f.SetAutomaticCheckpoints @{ VMName = 'p1'; Enabled = $false }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'NTFS'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        & $f.StartVM @{ Name = 'p1' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'p1'; Path = 'C:\s\out.vhdx' }
+        $bytes = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\out.vhdx'; Offset = 0; Length = 16 }
+        (@($bytes | Where-Object { $_ -ne 0 })).Count | Should -Be 0 -Because 'no clean self-power-off means the RAW region was never flushed'
+    }
+    It 'SECURITY: the REAL ReadVhdxRawRegion invokes NO host-attach/mount cmdlet (AST, not substring)' {
+        # The project's ONLY encoded guard for the load-bearing Pass-5 no-host-attach decision, so it must
+        # BIND THE REAL PROPERTY structurally. A substring match would PASS a future impl that host-attaches
+        # via a different cmdlet (Mount-DiskImage / Add-PartitionAccessPath / a variable-built Add-VMHardDiskDrive)
+        # and would FALSE-FAIL if a rationale comment moved into the body. An AST walk over CommandAst nodes
+        # binds the actual invoked command names instead.
+        $real = New-RealHyperVBackend
+        $src  = $real.ReadVhdxRawRegion.ToString()
+        $ast  = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+        $cmds = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $denylist = @('Mount-VHD','Mount-DiskImage','Add-VMHardDiskDrive','Add-PartitionAccessPath','Set-Disk','Initialize-Disk')
+        foreach ($c in $cmds) {
+            $name = $c.GetCommandName()    # $null for a dynamic invocation like `& $qemu.Source ...` (legit)
+            if ($null -ne $name) { $denylist | Should -Not -Contain $name -Because "the user-space read must never host-attach/mount (Pass-5)" }
+        }
+        # No dynamic eval that could hide a mount behind a string.
+        $src | Should -Not -Match 'Invoke-Expression'
+        # The user-space mechanism is still present (positive assertion).
+        $src | Should -Match 'qemu-img'
+    }
+    It 'SECURITY: the REAL ReadVhdxRawRegion resolves qemu-img through Resolve-QemuImg (version-floor + pin), not a bare Get-Command' {
+        # I5a: a bare `Get-Command qemu-img` had no version floor and no binary pin, so ANY qemu-img on
+        # PATH (however stale or substituted) would run against untrusted guest bytes. The real backend
+        # must resolve through the testable, fail-closed helper instead.
+        $real = New-RealHyperVBackend
+        $src  = $real.ReadVhdxRawRegion.ToString()
+        $src | Should -Match 'Resolve-QemuImg' -Because 'the real resolve must route through the version-floor + pin helper, not a bare Get-Command'
+    }
+    It 'SECURITY (review Critical, I5a wiring, out-of-process): the REAL ReadVhdxRawRegion ACTUALLY INVOKES Resolve-QemuImg with the configured floor propagated through the closure (not a string match)' {
+        # The string-match test above only proves the SOURCE TEXT contains "Resolve-QemuImg" — it
+        # would stay green even if the call read $script:QemuImgMinVersion directly (which resolves
+        # EMPTY inside a .GetNewClosure()'d body, per this file's own closure-capture rule at
+        # ~line 240) instead of a properly-hoisted factory-local. That exact regression shipped once:
+        # a live run got -MinVersion '' -> ParameterBindingValidationException, misroutable through
+        # $InvokeOp's SbIsUnavailableError path into a MISLEADING "Hyper-V unavailable" message (now
+        # closed by the F3 name-scoping — `^\w+-(VM|VHD)`-only — since 'Resolve-QemuImg' isn't
+        # Hyper-V-cmdlet-shaped, so that CommandNotFoundException now propagates raw and undisguised).
+        #
+        # WHY OUT-OF-PROCESS (mirrors 'Real backend — builds the right cmdlet params' above): verified
+        # empirically in this task that an in-process Pester Mock of Get-QemuImgPath/Get-QemuImgVersion
+        # does NOT intercept ReadVhdxRawRegion's closure at all here — ANY .GetNewClosure()'d scriptblock
+        # invoked from inside a Pester It/Describe body fails to resolve a bare-name call to a dot-sourced
+        # function (CommandNotFoundException: 'Resolve-QemuImg' is not recognized), reproduced even with
+        # zero Mocks active and even via a trivial ad-hoc closure unrelated to New-RealHyperVBackend. That
+        # is a Pester dynamic-module scoping fact of this closure pattern, not something the I5a hoist
+        # fixes or should paper over. The harness below shadows the qemu seams AND dot-sources the lib in
+        # the SAME top-level child-process scope (exactly Invoke-RealBackendCapture.ps1's proven pattern),
+        # so the REAL closure body executes for real and the assertion is on its actual thrown message —
+        # proving the configured floor value reached Resolve-QemuImg, not just that the source text
+        # mentions it.
+        $harness = Join-Path $PSScriptRoot 'fixtures/Invoke-RealReadVhdxRawRegionQemuFloor.ps1'
+        Test-Path $harness | Should -BeTrue -Because 'the out-of-process qemu-floor-wiring harness must exist'
+
+        $pwsh = (Get-Process -Id $PID).Path   # the exact pwsh running these tests
+        if ([string]::IsNullOrWhiteSpace($pwsh)) { $pwsh = 'pwsh' }
+        # '1.0.0' is deliberately BELOW $script:QemuImgMinVersion (8.2.0, the shipped default floor).
+        $raw = & $pwsh -NoProfile -File $harness -LibPath $script:LibPath -StubVersion '1.0.0' 2>&1
+        $rawText = ($raw | Out-String).Trim()
+        $jsonLine = ($rawText -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        $jsonLine | Should -Not -BeNullOrEmpty -Because "the harness must emit JSON; got: $rawText"
+        $cap = $jsonLine | ConvertFrom-Json
+
+        $cap.err | Should -Not -BeNullOrEmpty -Because 'a below-floor qemu-img version must fail closed'
+        $cap.err | Should -Match 'below the required floor' -Because 'the specific Resolve-QemuImg floor error must surface, not a ParameterBindingValidationException (empty -MinVersion) or a mislabeled "Hyper-V unavailable"'
+        $cap.err | Should -Match '8\.2\.0' -Because 'the CONFIGURED floor value must have propagated through the closure to Resolve-QemuImg, proving the hoist (not a $script: read that resolves empty)'
+    }
+    It 'SECURITY (I5b): the REAL ReadVhdxRawRegion routes the qemu convert through the Invoke-ConfinedQemu confinement seam, never a bare native call (AST, non-vacuous)' {
+        # Finding I5 (part b): the qemu-img convert of an untrusted OUTPUT disk runs directly in the host
+        # operator's session. Route it through a single confinement seam (Invoke-ConfinedQemu) so the REAL
+        # mechanism (Tier-0/1 restricted-token/Job-Object shim, Tier-2/3 Windows Sandbox) is pluggable and
+        # built/live-tested at Phase 6 — the seam ships now. An AST walk over CommandAst nodes binds the
+        # ACTUAL invoked command name, so a rationale comment mentioning "convert" in prose cannot false-trip
+        # this (a substring match would), and a future impl that calls the native exe under a different
+        # variable name / a raw '&' invocation outside the seam WOULD be caught.
+        $real = New-RealHyperVBackend
+        $src  = $real.ReadVhdxRawRegion.ToString()
+        $ast  = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+
+        # Positive: Invoke-ConfinedQemu IS invoked as a command inside the real body.
+        $cmds = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $cmdNames = $cmds | ForEach-Object { $_.GetCommandName() } | Where-Object { $null -ne $_ }
+        $cmdNames | Should -Contain 'Invoke-ConfinedQemu' -Because 'the qemu-img convert must be routed through the confinement seam, not invoked directly'
+
+        # Negative: no bare native invocation of the resolved qemu path (`& $qemuPath ...` / `& $qemu... convert`)
+        # anywhere in the real body — every native exec must go through the seam. A CommandAst with a $null
+        # command name is a dynamic invocation (`& $something ...`); assert none of those dynamic-invocation
+        # source spans mention 'convert' outside of Invoke-ConfinedQemu's own argument list.
+        $dynamicConvertCalls = $cmds | Where-Object {
+            $null -eq $_.GetCommandName() -and $_.Extent.Text -match 'convert' -and $_.Extent.Text -notmatch 'Invoke-ConfinedQemu'
+        }
+        $dynamicConvertCalls | Should -BeNullOrEmpty -Because 'every native qemu-img convert invocation must go through Invoke-ConfinedQemu, never a bare dynamic call'
+
+        # NON-VACUOUS CONTROL (mirrors the C1 no-Mount-VHD canary's own self-check): prove this AST technique
+        # WOULD catch a bare `& $qemuPath convert ...` if one existed, by running the identical check against
+        # a synthetic snippet that intentionally bypasses the seam.
+        $bypassSrc = @'
+$out = & $qemuPath convert -f vhdx -O raw -- $path $tmpRaw 2>&1
+'@
+        $bypassAst = [System.Management.Automation.Language.Parser]::ParseInput($bypassSrc, [ref]$null, [ref]$null)
+        $bypassCmds = $bypassAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $bypassDynamicConvertCalls = $bypassCmds | Where-Object {
+            $null -eq $_.GetCommandName() -and $_.Extent.Text -match 'convert' -and $_.Extent.Text -notmatch 'Invoke-ConfinedQemu'
+        }
+        $bypassDynamicConvertCalls | Should -Not -BeNullOrEmpty -Because 'the canary must be non-vacuous: a bare seam-bypassing convert call must be DETECTED by this exact technique, proving it is not silently passing everything'
+    }
+    It 'SECURITY (I5b, out-of-process): the REAL ReadVhdxRawRegion ACTUALLY INVOKES Invoke-ConfinedQemu at runtime (not just a string/AST match)' {
+        # The AST test above proves the SOURCE routes through the seam. Confirm the seam is also REACHED at
+        # runtime, mirroring the I5a qemu-floor-wiring harness pattern (Invoke-RealReadVhdxRawRegionQemuFloor.ps1):
+        # shadow the qemu seams AND dot-source the lib in the SAME top-level child-process scope so the real
+        # .GetNewClosure()'d body executes for real, then assert Invoke-ConfinedQemu was actually called.
+        $harness = Join-Path $PSScriptRoot 'fixtures/Invoke-RealReadVhdxRawRegionConfinedQemu.ps1'
+        Test-Path $harness | Should -BeTrue -Because 'the out-of-process Invoke-ConfinedQemu runtime-routing harness must exist'
+
+        $pwsh = (Get-Process -Id $PID).Path   # the exact pwsh running these tests
+        if ([string]::IsNullOrWhiteSpace($pwsh)) { $pwsh = 'pwsh' }
+        $raw = & $pwsh -NoProfile -File $harness -LibPath $script:LibPath 2>&1
+        $rawText = ($raw | Out-String).Trim()
+        $jsonLine = ($rawText -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        $jsonLine | Should -Not -BeNullOrEmpty -Because "the harness must emit JSON; got: $rawText"
+        $cap = $jsonLine | ConvertFrom-Json
+
+        $cap.invoked | Should -BeTrue -Because 'Invoke-ConfinedQemu must actually be called by the real ReadVhdxRawRegion closure at runtime, proving the seam is reached (not just present in source)'
+        $cap.qemuPath | Should -Be 'C:\stub\qemu-img.exe' -Because 'the resolved qemu-img path must be passed through to the seam'
+        ($cap.arguments -join ',') | Should -Match 'convert' -Because 'the convert subcommand must be passed as an Argument through the seam, not invoked directly'
+    }
+}
+
+# ===========================================================================
+#  Resolve-QemuImg (I5a) — version-floor (patch-currency) + optional SHA-256 pin
+# ===========================================================================
+#  Finding I5 (part a): the real ReadVhdxRawRegion ran qemu-img against an UNTRUSTED guest VHDX in the
+#  host operator's session with NO version floor and NO binary pin — a stale or substituted qemu-img on
+#  PATH would parse attacker-controlled bytes with no floor at all. This helper factors the resolve into
+#  a pure, unit-testable seam: Get-QemuImgPath / Get-QemuImgVersion / Get-FileSha256 are thin wrappers
+#  (over Get-Command qemu-img / `& qemu-img --version` / Get-FileHash) that Resolve-QemuImg calls, so
+#  tests can Mock them directly (dot-sourced Pester Mock, no -ModuleName — matches this file's idiom).
+#
+#  FLOOR FRAMING (load-bearing, do not weaken): the MinVersion floor is a PATCH-CURRENCY check, not a
+#  CVE-derived gate. The only real qemu VHDX-parser CVE found under verification is CVE-2014-0148 (a DoS,
+#  fixed at QEMU 2.0) — nowhere near a modern floor. The floor exists so the resolver runs a CURRENTLY
+#  PATCHED qemu (re-resolve the current stable at ship time), not because a specific CVE is fixed at that
+#  version. Do not cite a CVE as the floor's justification.
+Describe 'Resolve-QemuImg (I5 version-floor + SHA-256 pin)' {
+    It 'fails closed when qemu-img version is below the floor' {
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-QemuImgVersion { '1.7.0' }   # below floor 8.2.0
+        { Resolve-QemuImg -MinVersion '8.2.0' } | Should -Throw -ExpectedMessage '*below the required floor*'
+    }
+    It 'fails closed when qemu-img is not found on PATH' {
+        Mock Get-QemuImgPath { $null }
+        { Resolve-QemuImg -MinVersion '8.2.0' } | Should -Throw -ExpectedMessage '*qemu-img not found*'
+    }
+    It 'passes when version meets the floor and no pin is supplied' {
+        Mock Get-QemuImgVersion { '9.1.0' }
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
+    }
+    It 'passes when version EXACTLY equals the floor (boundary, no pin)' {
+        Mock Get-QemuImgVersion { '8.2.0' }
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
+    }
+    It 'passes when version meets the floor AND the pinned SHA-256 matches (case-insensitive)' {
+        Mock Get-QemuImgVersion { '9.1.0' }
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256     { 'A' * 64 }
+        Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a' * 64) | Should -Be 'C:\qemu\qemu-img.exe'
+    }
+    It 'fails closed when the pinned SHA-256 does not match' {
+        Mock Get-QemuImgVersion { '9.1.0' }; Mock Get-QemuImgPath { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256 { 'deadbeef' }
+        { Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a'*64) } | Should -Throw -ExpectedMessage '*hash mismatch*'
+    }
+    It 'does NOT hash the binary at all when no pin is supplied (Get-FileSha256 not called)' {
+        Mock Get-QemuImgVersion { '9.1.0' }
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256     { 'should-not-be-called' }
+        Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
+        Should -Invoke Get-FileSha256 -Times 0
     }
 }

@@ -2,17 +2,29 @@
     # Voidseal — Tier 1 isolation contract (net-restricted Hyper-V VM).
     # Declarative; consumed by the profile loader (Import-TierProfile).
     Tier            = 1
-    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress = credential-free in-guest nftables allowlist. Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
+    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress = in-guest iptables default-DROP + transparent Squid domain-ACL (defense-in-depth, NOT a boundary; the host-verified boundary is Phase-6). Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
     Substrate       = 'HyperV-Gen2'
-    Network         = 'Internal+Allowlist'      # Internal vSwitch + static host IP + in-guest nftables
-    EgressMode      = 'NftablesAllowlist'        # v1 credential-FREE. Phase-1B: 'HostEnvoy' (deferred)
+    Network         = 'Internal+Allowlist'      # Internal vSwitch + static host IP; in-guest egress is defense-in-depth only — the host-side boundary is Phase-6
+    # HONESTY (2026-07-18): EgressMode names the real mechanism this tier ships as — in-guest
+    # iptables default-DROP + transparent Squid dstdomain ACL over EgressAllowlist, ported from
+    # the builder's proven mechanism (SeedBuilder.ps1) — replacing the fabricated/schema-only
+    # 'NftablesAllowlist' (design-invalidated 2026-06-28: static nftables/ipset
+    # allowlists don't survive CDN IP rotation). Now WIRED into New-CidataUserData's serial seed
+    # (CidataSerialEgressTemplate) — the in-guest Squid defense-in-depth control SHIPS, mock-
+    # asserted for SHAPE only (real packet-drop + the activation-timing ordering vs pre-seal
+    # package install are unproven until a live run). This is NOT a boundary — a compromised/
+    # root guest can disable it — the host-verified boundary is Phase-6 (host-side
+    # NAT/Squid/default-DROP).
+    EgressMode      = 'InGuestSquid'             # v1 credential-FREE. Phase-1B: 'HostEnvoy' (deferred)
     EgressAllowlist = @(
         'api.anthropic.com',
         'registry.npmjs.org',
         'github.com', 'raw.githubusercontent.com', 'objects.githubusercontent.com', 'codeload.github.com',
         'pypi.org', 'files.pythonhosted.org'
     )
-    BlockProtocols  = @('QUIC', 'UDP/443', 'DoH', 'DoT')   # force plaintext-resolvable egress through the allowlist
+    # DECLARATIVE ONLY: no code reads this array. Not the loader, not SeedBuilder. The builder seed's
+    # default-DROP ruleset is a superset of this list but is written literally and never consults it.
+    BlockProtocols  = @('QUIC', 'UDP/443', 'DoH', 'DoT')
     Credentials     = 'ScopedOnDemand'           # default none; a scoped token only when the task needs a live API
     GuestImage      = 'debian-12-cloud'          # Debian 12 cloud image .vhdx + cloud-init NoCloud
     SecureBootTemplate = 'MicrosoftUEFICertificateAuthority'   # verified for Debian Gen2

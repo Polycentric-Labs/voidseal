@@ -5,10 +5,33 @@
 > handling, and how to run the tests. Companion to [`tier-reference.md`](tier-reference.md)
 > (the tier model + P1–P10 acceptance rubric) and the Claude-facing
 > [`../SKILL.md`](../SKILL.md).
+>
+> This runbook covers **running** a deploy (the two shipped example profiles, `firefox` and
+> `ralph`). To **author your own workload profile** instead, see
+> [`authoring-a-workload-profile.md`](authoring-a-workload-profile.md) (the field contract + a
+> minimal skeleton to copy) — then come back here for the run mechanics.
 
 ---
 
 ## 0. Preconditions (do these BEFORE any live run)
+
+**One-command check first.** Hyper-V eligibility (edition, feature-vs-service, elevation scope)
+is genuinely hard to self-check by reading prose — `scripts/Test-VoidsealPrereqs.ps1` converts
+every precondition below into a read-only, unelevated PASS/FAIL/WARN/UNKNOWN table plus an overall
+verdict:
+
+```powershell
+pwsh scripts/Test-VoidsealPrereqs.ps1
+# or, to also verify the golden parent disk:
+pwsh scripts/Test-VoidsealPrereqs.ps1 -ParentDiskPath <golden.vhdx>
+```
+
+It never creates/modifies a VM or setting, and never requires elevation to run — a check that
+needs rights it doesn't have (e.g. the Hyper-V optional-feature query) reports UNKNOWN with a note
+rather than a false PASS. Passing every row is **necessary, not sufficient** — the script prints a
+caveat block (nested virtualization, admin-rights scope, feature-vs-service, host-patch floors)
+after the table. The subsections below are the underlying preconditions it's built from, and the
+manual verification path if you want to check any of them by hand.
 
 ### 0.1 Elevation (mandatory for live runs)
 
@@ -54,9 +77,63 @@ If the host is below the floor, **stop** and patch before running any tier.
 
 ### 0.3 Golden parent disk + workload assets
 
-- Build the Debian 12 golden `.vhdx` per [`../guest-images/debian-12-cloud.md`](../guest-images/debian-12-cloud.md).
+- Build the Debian 12 golden `.vhdx` — run `pwsh scripts/Get-VoidsealGoldenImage.ps1` (downloads the pinned
+  image, verifies its SHA-512, converts to VHDX; `-Plan` previews the pinned URL + hash), or follow
+  [`../guest-images/debian-12-cloud.md`](../guest-images/debian-12-cloud.md) by hand.
 - Stage workload assets (the pinned Ralph repo ISO, the organizer ISO) at the host paths the
   profiles' `StageAssets` reference, with the SHA pinned (Ralph has no tags — pin a commit SHA).
+
+### 0.4 Builder deps: what is (and isn't) verified
+
+The `builder` profile (Phase 2+) fetches pip wheels, apt `.deb`s, and Hugging Face models into a
+`deps.vhdx` that a downstream Tier-1 `processor` run attaches. Two **different** integrity
+properties are in play here — do not conflate them:
+
+- **Whole-image hash (`DepsImageHash`, `GetVhdxImageHash`)** — this is **tamper-evidence of the
+  deps hand-off**, i.e. proof that the `deps.vhdx` a processor VM attaches is byte-identical to
+  what the builder emitted. It catches substitution/corruption in the host-side hand-off between
+  the builder run and the processor run. **It says nothing about whether the packages/models
+  inside the disk are what upstream actually published** — that's a separate, per-fetcher
+  question (below).
+- **Per-fetcher upstream provenance** — established (or not) at *fetch* time, inside
+  `guest/fetch_deps.py`:
+  - **apt** is authenticated by default — `apt-get download` verifies each `.deb` against the
+    Debian archive's GPG-signed `Release`/`Packages` metadata (dpkg/APT signature verification).
+    No extra wiring needed.
+  - **pip** enforces per-package hashes **only** when driven by a hashed requirements file. A
+    bare `pip download --require-hashes <packages>` with no `-r <file>` is a **no-op** — pip has
+    nothing to check hashes *against*. `fetch_deps.py`'s `build_commands` now **rejects**
+    `Pip.RequireHashes=True` unless `Pip.RequirementsFile` is also set (`ValueError` at plan/build
+    time, not a silent pass-through). The lockfile itself is **minted by the operator/build step**,
+    not by `fetch_deps.py`:
+
+    ```bash
+    # Operator step (NOT run inside the guest / fetch_deps.py). Produces a requirements.txt
+    # carrying --hash=sha256:... for every pinned package AND its full transitive closure.
+    pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+    ```
+
+    This gives **reproducibility against a defined input** (the lockfile you compiled and
+    reviewed) — it is **not** cryptographic proof of upstream authorship the way a signed
+    artifact would be; a compromised PyPI package present when you ran `pip-compile` is hashed
+    faithfully, not detected.
+  - **Hugging Face** models are pinned with `--revision <full-40-char-commit-sha>`
+    (`HuggingFace.Revision` in the DepsSpec) so the fetch is an immutable snapshot rather than
+    "whatever `main` currently resolves to". This does not by itself verify the *content* —
+    it verifies you got the *exact commit* you reviewed/pinned, and that a later force-push to
+    `main` cannot silently swap what gets fetched.
+  - **PEP 740 attestations** (the newer cryptographic-provenance mechanism for PyPI) are **not
+    universal**: as of this writing `transformers` and `numpy` publish PEP 740 attestations,
+    **`torch` does not**. Do not assume attestation coverage across a dependency set without
+    checking package-by-package.
+- **Net effect:** the whole-image hash + per-fetcher pinning together give you "the processor got
+  exactly what the builder fetched, and the builder fetched exactly the pinned/hashed inputs you
+  reviewed" — a defined, reproducible, tamper-evident chain. They do **not** give you upstream
+  cryptographic authenticity for every artifact (pip in particular is reproducibility, not
+  provenance, unless every package in the closure separately ships PEP 740).
+
+See `profiles/builder.psd1`'s `DepsSpec` for the `RequirementsFile` / `Revision` keys in
+practice, and `guest/fetch_deps.py` for the enforcement.
 
 ---
 
@@ -79,15 +156,33 @@ INPUT data disk (guest `/mnt/in`), the result lands on the OUTPUT data disk at t
 inner-name `result.html` (guest `/mnt/out/result.html`), and the guest self-powers-off. The profile
 ships `Inputs = @{}` because a `.psd1` cannot cleanly inline a whole Python file — so the
 **live-acceptance step populates `Inputs` from the host files** declared in the profile's
-`InputFiles` map, then passes them through `-Workload`. The populate is 3 lines (read each host file
-into an innerName→content hashtable):
+`InputFiles` map, then passes them through `-Workload`. The populate reads each host file into an
+innerName→content hashtable. Since C1.4, `firefox` opts into the shared user-space outbox transport
+(`OutboxOutput = $true` — Raw OUTPUT, host reads it via `ReadVhdxRawRegion`, never `Mount-VHD`), so
+`InputFiles` carries **four** entries: the organizer script + sample profile (the workload itself)
+plus `run_disk_workload.py` + its `outbox.py` dependency (the shared in-guest outbox producer the
+seed's disk-mode runner invokes after the organizer writes `result.html` into staging):
+
+> **Operator note — the qemu-img raw read.** `ReadVhdxRawRegion` avoids a kernel filesystem mount of the
+> guest-written OUTPUT disk by running `qemu-img convert -f vhdx -O raw` offline instead. That trades a
+> kernel-parse risk for a different one: `qemu-img`'s own VHDX parser now runs against those same untrusted
+> bytes, in **your** (the operator's) session. The only catalogued QEMU VHDX-parser CVE is
+> **CVE-2014-0148** (a DoS, fixed at QEMU 2.0) — there is no catalogued RCE here. The real concern is the
+> **undiscovered-bug class**: an unpatched memory-safety bug in an offline parser handling adversarial
+> input. Mitigated today by a patch-currency version floor + optional SHA-256 pin (`Resolve-QemuImg`) and a
+> confinement seam every convert call is routed through (`Invoke-ConfinedQemu`) — but that seam's v1 is a
+> **pass-through** (LIVE-ONLY-UNPROVEN); the real confinement (restricted-token/Job-Object shim for
+> Tier-0/1, Windows Sandbox for Tier-2/3) is wired and live-tested at Phase 6, not yet. See `SECURITY.md`
+> §"The qemu-img raw read" for the full writeup.
 
 ```powershell
-# Populate the INPUT-disk inputs from the host files (organizer script + sample profile).
-# These paths are the profile's InputFiles entries (innerName -> host FILE PATH).
+# Populate the INPUT-disk inputs from the host files — the organizer + sample profile (the
+# workload) and run_disk_workload.py + outbox.py (the shared outbox producer, C1.3/C1.4).
 $inputs = @{
     'organize_bookmarks.py' = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\organize_bookmarks.py' -Raw)
     'sample-bookmarks.json' = (Get-Content -LiteralPath 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json' -Raw)
+    'run_disk_workload.py'  = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\run_disk_workload.py' -Raw)
+    'outbox.py'             = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\outbox.py' -Raw)
 }
 
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `
@@ -101,8 +196,10 @@ $report.ExtractedArtifact   # the emitted Netscape-HTML file (result.html), copi
 ```
 
 > **Organizer-script contract (must match the runner):** `organize_bookmarks.py` reads its
-> `--profile` from `/mnt/in` and writes `--out /mnt/out/result.html` (NOT `bookmarks.html`, the
-> serial/container-era inner name). See `guest-images/debian-12-cloud.md` §2a + §5. The host source
+> `--profile` from `/mnt/in` and writes `--out /run/staging/result.html`. Not `/mnt/out`: firefox is
+> an `OutboxOutput` profile, so OUTPUT is Raw and never mounted, and `New-CidataUserData` refuses to
+> build a seed whose entrypoint names `/mnt/out`. Not `bookmarks.html` either (the serial-era inner
+> name). See `docs/live-smoke-test.md` §4A.2 for the host-side pre-run gate. The host source
 > `C:\sandbox\organizer-src\organize_bookmarks.py` must be a version aligned to those paths.
 
 > **DATA-ACCESS:** the `firefox` profile defaults to a **synthetic/sample** profile copy.
@@ -122,6 +219,35 @@ $report = Invoke-Voidseal -Tier 1 -Profile ralph `
 $report.SealVerdict   # MUST be $true — the loop only runs on a sealed VM
 $report.RunResult.ExitCode
 ```
+
+> **Operator note — what `SealVerdict = $true` guarantees for Tier-1, and what it doesn't.** A Tier-1
+> VM legitimately keeps its NIC (net-restricted, not no-net), so the seal can't certify "no network" the
+> way it does at Tier ≥ 2. What it certifies instead: `Assert-Sealed` reads the NIC's vSwitch from the
+> **host** and refuses to certify unless that switch is an isolated **Internal** vSwitch — never an
+> unfiltered External or Private switch. That's a real, host-verified guarantee that the guest's only
+> possible route off-box is the host-controlled gateway on that Internal switch — **for a purpose-built
+> Internal switch.** It is **not** a guarantee that egress is filtered — nothing today inspects or
+> restricts what crosses that gateway once traffic is on it. **It DOES, now, refuse the built-in
+> "Default Switch" by name:** the Default Switch is itself `SwitchType=Internal` (Hyper-V's
+> ICS/internet-connected switch), so the SwitchType check alone could not distinguish it from a
+> purpose-built isolated Internal switch — the seal now ALSO verifies the switch is not the Default
+> Switch, by name, and refuses it if it is. Real Tier-1 provisioning uses a purpose-built Internal
+> switch, never the Default Switch. **This by-name match is the switch's ENGLISH friendly name**; on a
+> non-English/localized Windows host the friendly name differs, so the by-name refusal does not fire
+> there — the locale-independent guarantee is the immutable-GUID refusal
+> (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`), which is Phase-6-live, not yet shipped. This by-name refusal
+> is a reachability/isolation control, not egress filtering — see below.
+>
+> The in-guest controls (the builder profile's iptables default-DROP-plus-allowlist, the in-guest Squid
+> SNI proxy) are **not** a containment boundary: a compromised or adversarial guest with code-execution
+> can flush its own `iptables` rules or kill its own Squid — you cannot have the untrusted principal police
+> itself. Treat them as defense-in-depth, not as what stands between an exfiltrating workload and the
+> internet. The layer that WOULD make that guarantee — a host-run transparent Squid SNI-splice proxy plus
+> host-side NAT (`New-NetNat`) and a host default-DROP policy on the gateway interface, so filtering
+> happens from a position the guest cannot reach — is the **Phase-6-live** work, not yet built. Until then,
+> a "sealed" Tier-1 VM is isolation-verified, not egress-filtered; see `SECURITY.md` for the full writeup.
+> The full prescribed live-run sequence — host egress enforcement, qemu-img confinement, seal-time
+> assertions to add live — is `docs/phase-6-live-runbook.md`.
 
 ### 1.3 Reading the report
 
@@ -179,12 +305,16 @@ The Ralph loop's `claude` CLI needs an OAuth token. The rules:
 
   `ralph.psd1` mounts **that** copied file read-only.
 - **Rotate** the token after any session that touched it. Re-copy + re-deploy to refresh.
-- The same applies to anything secret-shaped (`.env*`, `*.pem`, `*.key`,
-  `credentials*.json`, `~/.ssh/*`, `.npmrc`, …): the loader refuses to mount it, full stop.
+- The same applies to anything whose **path shape** is secret-like (`.env*`, `*.pem`, `*.key`,
+  keystores, `id_ed25519*`, `credentials*.json`, `.netrc`, `.git-credentials`, `*.tfvars`, anything
+  under `.ssh/`, `.gnupg/` or `.secrets/`, and more): the loader refuses it as a `Mounts` **or**
+  `StageAssets` source. `tier-profiles/SCHEMA.md` carries the full list. The check reads the name,
+  never the file, so renaming a credential defeats it: the rule below (copy the token to a dedicated
+  `.token` path) is the practice that actually protects you.
 
 ---
 
-## 3. Tier 2/3 — not armed this round
+## 3. Tier 2/3 — not armed in v1
 
 Tier 2 (disposable no-net) and Tier 3 (airgapped detonation) are **scaffolded and validated
 with benign placeholder inputs only**. There is **no live malware or plugin detonation** in
@@ -204,15 +334,17 @@ Invoke-Pester -Path tests/
 
 # A single area
 Invoke-Pester -Path tests/Profiles.Tests.ps1 -Output Detailed
-Invoke-Pester -Path tests/DeploySandbox.Tests.ps1 -Output Detailed
+Invoke-Pester -Path tests/InvokeVoidseal.Tests.ps1 -Output Detailed
 
 # CI-style (writes testResults.xml, gitignored)
 Invoke-Pester -Path tests/ -CI
 ```
 
-The must-pass safety tests are the profile-loader invariant refusals (secret-mount, Tier ≥ 2
-starvation, the pre-seal gate) and the seal-gate abort in `DeploySandbox.Tests.ps1`. A red
-on any of those means a containment guarantee regressed — do not ship.
+The must-pass safety tests are the profile-loader refusals (secret-shaped `Mounts` and `StageAssets`
+sources, Tier >= 2 starvation, the pre-seal gate) and the seal-gate abort in
+`tests/InvokeVoidseal.Tests.ps1`. A red on any of those means a containment guarantee regressed, so
+do not ship. Run the Python suite too if you touched anything under `guest/`:
+`python -m pytest tests/guest tests/host -q`.
 
 ---
 
@@ -223,5 +355,5 @@ on any of those means a containment guarantee regressed — do not ship.
 | `Hyper-V unavailable or insufficient privilege` on provision | session not elevated / not in Hyper-V Administrators | re-launch PowerShell **as administrator** (§0.1) |
 | `declares a secret-shaped mount source …` at load | a `Mounts` source matches the secret list (e.g. the live `.credentials.json`) | mount a copied `.token` file in a non-secret path instead (§2) |
 | `seal gate did not certify …` in the report | `Assert-Sealed` failed (NIC still attached / a host channel readable) | inspect the profile's `HostChannels` (all `$false` for VM tiers) + that `Lock-Sandbox` removed the NIC; the abort already tore the VM down |
-| `Tier-… cold-VHDX … is NOT IMPLEMENTED` | a Tier ≥ 2 extraction was attempted | expected — Tier ≥ 2 extraction is post-v1; do not run hostile tiers live this round |
+| `Tier-… cold-VHDX … is NOT IMPLEMENTED` | a Tier ≥ 2 extraction was attempted | expected — Tier ≥ 2 extraction is post-v1; do not run hostile tiers live in v1 |
 | serial console silent on a live Tier-1 boot | guest `serial-getty@ttyS0` not enabled / wrong `CIDATA` label | re-check the seed `user-data` + that the ISO volume label is exactly `CIDATA` (see the guest-image recipe) |

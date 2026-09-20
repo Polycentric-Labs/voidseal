@@ -7,7 +7,7 @@
 >
 > **What it proves:** milestones **4** (Tier-0 Firefox proof) and **5** (Tier-1
 > Ralph proof) — the Tier 0/1 lifecycle end-to-end, on a **live** Hyper-V backend, after a
-> mock-backed `292/292` green suite. It does **NOT** exercise Tier 2/3 (harness-only this
+> mock-backed green suite (865 passed, 0 failed, 2 skipped as of the last local run). It does **NOT** exercise Tier 2/3 (harness-only this
 > round) and does **NOT** touch your real personal data (synthetic-by-default).
 >
 > **Safe by default:** synthetic Firefox data; a bounded Ralph loop; no auto-push; manual
@@ -33,7 +33,7 @@ hand. **Read all four before milestone 1.**
 | **Gap 3** | **The result must land on a host-readable path for extraction.** `Export-SandboxArtifact` (Tier 0/1) does a host **filesystem** read of `-Workload.ResultPath`. Because of Gap 2 there is no automatic shared dir, so a `ResultPath` like `C:\sandbox\...\out\bookmarks.html` is **not** populated by the guest through a bind mount. | Decide how the guest's output reaches a host path: e.g. the workload writes to an **attached output VHDX** you then mount/read on the host, or you copy it out over the serial seam. For this smoke test you may stage a **pre-seeded `ResultPath` file** to drive the extraction step to green (see §3/§2) while you validate the *boundary*, and treat real guest-produced output as a follow-up once a transfer-out path is wired. |
 | **Gap 4** | **The COM1 serial transport is live-only and best-effort v1.** `InvokeGuestCommand` (the real backend) opens `\\.\pipe\<vm>-com1` as a `NamedPipeClientStream`, writes `<cmd>; echo "__VMDEP_RC__:$?"`, and parses the RC marker. It is **never** exercised against a real guest (the fake carries all behavioral tests). It has **no per-command nonce** yet (deferred). | This is the single biggest live unknown. The guest **must** have `serial-getty@ttyS0` enabled with **autologin** (no password prompt — the client doesn't authenticate) and a shell that echoes the marker. If the pipe is unreachable or there's a login prompt, the Runner **times out** (`TimeoutSeconds`, default 300) and the run is reported as a failure — teardown still runs. |
 
-> **Disposition for this round:** these gaps are about the *workload data path*, not the
+> **Disposition for in v1:** these gaps are about the *workload data path*, not the
 > *containment engine*. The smoke test's job is to prove the lifecycle + the seal gate on a
 > real backend. Where a gap blocks an end-to-end data flow, the step below says so and gives
 > a safe stand-in (e.g. a pre-seeded `ResultPath`) so you can still certify the milestone.
@@ -152,15 +152,18 @@ Test-Path $GoldenVhdx    # must be True before milestone 1/2
 
 Prove the logic is green and watch the state machine before any real VM exists.
 
-### 2.1 The mock-backed suite MUST be `292/292` green
+### 2.1 The mock-backed suite MUST be green
 
 ```powershell
 Invoke-Pester -Path tests/
-# Expect: Tests Passed: 292, Failed: 0, Errors: 0
+# Expect: Failed: 0, Errors: 0. The passed count is 865 as of the last local run
+# (2 skipped); it grows as features land, so gate on Failed: 0, never on an exact total.
+python -m pytest tests/guest tests/host -q
+# Expect: 56 passed, 0 failed.
 ```
 
 If **any** test is red — especially the profile-loader invariant refusals (secret-mount,
-Tier ≥ 2 starvation) or the seal-gate abort in `DeploySandbox.Tests.ps1` — a containment
+Tier >= 2 starvation) or the seal-gate abort in `tests/InvokeVoidseal.Tests.ps1` — a containment
 guarantee regressed. **Stop. Do not run live.**
 
 ### 2.2 A dry Invoke-Voidseal over the fake backend
@@ -232,7 +235,7 @@ egress dependency. Per **Gap 1** this runs as a **Debian Gen2 VM with no NIC**, 
 
 This milestone operates on a **SYNTHETIC / sample** Firefox profile copy. Reading your
 **real** Firefox profile (bookmarks / history / `places.sqlite`) requires **explicit
-per-task authorization** and is **NOT** part of this smoke test. "Personal-only this round"
+per-task authorization** and is **NOT** part of this smoke test. "Personal-only in v1"
 is not standing read-authorization (see `firefox.psd1` header + the operator-runbook
 DATA-ACCESS note). Build a sample profile dir with a couple of dummy bookmarks; never point
 at the live profile, and never at `logins.json` / `key4.db` / `cookies.sqlite`.
@@ -301,8 +304,23 @@ Remove-Sandbox -Name '<the VM name from $report.Name, e.g. sbx-0-xxxxxxxx>' -Del
 
 ## 4. Milestone 2 — Ralph proof (Tier 1), LIVE
 
-**Proves milestone 5.** A net-**restricted** (not no-net) Gen2 VM that runs a
-**bounded** Ralph loop reaching `api.anthropic.com` through the in-guest nftables allowlist.
+> **⚠️ WARNING — in-guest egress is defense-in-depth, NOT a boundary, and still unproven
+> live.** Tier-1's Serial seed now ships an in-guest **iptables default-DROP OUTPUT +
+> transparent Squid `dstdomain` allowlist** over `EgressAllowlist` (`EgressMode='InGuestSquid'`
+> in `tier-profiles/tier1.psd1`, rendered by `CidataSerialEgressTemplate` in
+> `SeedBuilder.ps1`) — but the mock suite only asserts the seed's SHAPE (the rendered Squid
+> config / iptables rule text), never real packet-drop or the activation-timing ordering
+> against the guest's own pre-seal package install (see [`tier-reference.md`](tier-reference.md)'s
+> Egress note for the full picture and the finding that ruled out a static nftables
+> allowlist). A compromised/root guest can disable this layer (flush iptables, kill Squid).
+> **Do NOT run untrusted/hostile agent workloads at Tier-1 live relying on the in-guest layer
+> alone — the host-verified boundary is Phase-6.**
+
+**Proves milestone 5 — net-reachable, with an in-guest allowlist exercised live for the first
+time.** A Gen2 VM that keeps its NIC (not no-net) and runs a **bounded** Ralph loop reaching
+`api.anthropic.com` — the seed's in-guest Squid allowlist is intended to block any *other*
+destination, but whether it actually activates in time and holds under a live guest is exactly
+what this milestone is the first live test of (see §5.2).
 
 ### 4.1 Pin the upstream SHA (placeholder in `ralph.psd1`)
 
@@ -353,11 +371,19 @@ $report.RunResult.ExitCode   # the Ralph loop's exit status over the serial seam
 $report.ExtractedArtifact    # the extracted workspace diff/output dir, copied to the host
 ```
 
-- The **net-restricted** VM keeps its NIC (Tier 1 is restricted, **not** no-NIC — only
-  Tier ≥ 2 removes the NIC). Egress is the **in-guest nftables allowlist** (`api.anthropic.com`
-  et al.). **Important:** `Lock-Sandbox` does **not** install the nftables rules — egress
-  restriction is an **in-guest** concern set up by the CIDATA seed / staging. The
-  seal removes host↔guest channels + detaches import media; the allowlist is the guest's job.
+- The VM (**net-reachable, defense-in-depth-restricted**) keeps its NIC (Tier 1 is not no-NIC
+  — only Tier ≥ 2 removes the NIC). **In-guest egress control now ships, unproven live:** the
+  ralph/Serial CIDATA seed's `CidataSerialEgressTemplate` installs **iptables default-DROP
+  OUTPUT** plus a **transparent Squid `dstdomain` allowlist** over `EgressAllowlist`, so a
+  working activation should filter `api.anthropic.com` from any other destination — but this
+  run is the first live exercise of whether the control actually activates (and in time
+  relative to the guest's own pre-seal package install) and whether the packet-drop holds.
+  `Lock-Sandbox` does **not** install egress rules either way — that was never its job; it
+  removes host↔guest channels + detaches import media, same as every tier. This in-guest
+  **Squid-based redirect** (the approach the separate builder profile pioneered — static
+  nftables/ipset allowlists don't survive CDN IP rotation) is **defense-in-depth
+  only**: a compromised/root guest can disable it. The **host-verified boundary is Phase-6**
+  (see [`phase-6-live-runbook.md`](phase-6-live-runbook.md)).
 - The Ralph loop is **bounded** — rate/iteration caps (`MAX_CALLS_PER_HOUR`,
   `CLAUDE_TIMEOUT_MINUTES`, etc.) are set via env in the **guest** (cloud-init / seed), not in
   the profile. Confirm your seed sets a small cap for the smoke test so it can't run away.
@@ -380,17 +406,24 @@ Remove-Sandbox -Name '<sbx-1-...>' -DeleteDisks
 
 **Proves the disk-passing goal:** a real workload runs *inside* the sealed guest and its **real** output
 comes back — not the pre-seeded stand-in Milestone 1 used. This is the **disk-passing** model:
-the host hands the guest its inputs on an INPUT data disk + a pre-formatted (exFAT) OUTPUT
-disk, the guest's cloud-init runner mounts both, runs the organizer, writes `result.html` +
-an exit-code sentinel `result.exitcode` to the OUTPUT disk, **unmounts then self-powers-off**;
-the host polls `State==Off` (with a timeout), detaches the disks, reads the output natively
-(`Mount-VHD -ReadOnly`, no WSL), and **classifies success/failure from the sentinel** — it
+the host hands the guest its inputs on an INPUT data disk + a **raw** OUTPUT disk (no filesystem),
+the guest's cloud-init runner mounts INPUT read-only, runs the organizer into `/run/staging`, and
+the in-guest producer packs staging into a memory-safe **outbox** written to the raw OUTPUT device
+before the guest **self-powers-off**; the host polls `State==Off` (with a timeout), detaches the
+disks, and reads that outbox in **user space** (`ReadVhdxRawRegion` — never `Mount-VHD` on
+guest-written data), **classifying success/failure from what the outbox actually contains** — it
 never assumes "Off == success".
 
 > **Why this exists:** Milestone 1 reached `INIT…DESTROYED` + `SealVerdict=True` but its
 > `bookmarks.html` was a stand-in because the serial command channel raced the boot. The
-> disk-passing model replaces that fragile handshake. The engine is **mock-proven (425 tests)**;
+> disk-passing model replaces that fragile handshake. The engine is **mock-proven (867 Pester tests)**;
 > this milestone is its first *live* exercise.
+
+> **Note — this section describes the CURRENT contract, not Milestone 3's original one.** Milestone 3
+> (2026-06-25) proved the round-trip with an **exFAT OUTPUT disk + a `result.exitcode` sentinel** that
+> the host mounted read-only. firefox has since converged onto the **user-space outbox transport**
+> (C1.4): OUTPUT is Raw, there is no sentinel, and the host never mounts guest-written data. The steps
+> below are the outbox contract. A *legacy* non-outbox Disk profile still uses the older exFAT runner.
 
 ### 4A.1 Preconditions (mostly reuse Milestone-1 groundwork)
 
@@ -401,8 +434,12 @@ never assumes "Off == success".
   time (`New-WorkloadSeedDisk` → `New-CidataUserData`, the §2a runner with the profile's `Entrypoint`
   substituted) that survives the seal exactly like the INPUT/OUTPUT disks. **You do not touch the seed
   for a firefox run** — the profile's `SeedIso` path is ignored in disk mode. The runner mounts
-  `LABEL=INPUT` ro at `/mnt/in` + `LABEL=OUTPUT` rw at `/mnt/out`, runs the entrypoint, writes
-  `result.html` + `result.exitcode`, `umount`s, then `poweroff`s.
+  `LABEL=INPUT` ro at `/mnt/in`, runs the entrypoint into `/run/staging`, hands staging to the
+  in-guest producer (`run_disk_workload.py --transport-only`) which packs the **outbox** and writes
+  it to the **raw** OUTPUT block device, then `poweroff`s. (firefox is an `OutboxOutput` profile:
+  OUTPUT carries **no filesystem**, so there is no `/mnt/out` mount and no `result.exitcode`
+  sentinel — the host reads the outbox in user space, never `Mount-VHD`. A *legacy* non-outbox
+  Disk profile still gets the older exFAT runner that does mount `LABEL=OUTPUT` at `/mnt/out`.)
   - (Serial mode — Ralph, Tier 1, §4 — STILL uses a DVD seed ISO via `New-CidataSeed`; that path is
     unchanged. Only disk mode moved to the inline data-disk seed.)
 - **Automatic checkpoints are disabled at provision** (RC7, 2026-06-25 live): Hyper-V defaults
@@ -421,9 +458,17 @@ never assumes "Off == success".
   **falls back to a plain `mount LABEL=…`** if it fails, so OUTPUT/INPUT always mount regardless of the
   filesystem driver. On the live Debian *cloud* kernel `exfat` loaded fine — but FAT32 remains a
   one-knob fallback (`FileSystem='FAT32'` in the profile) if a future image is exfat-trimmed.
-- **`ds=nocloud`** on the guest kernel cmdline (GRUB, baked at image-prep) is a boot-speed
-  tunable — without it the first boot adds a 2–5 min datasource-probe delay (the host
-  `-WorkloadTimeoutSeconds` default 600 still bounds it, so it's not a blocker).
+- **Boot takes ~125 s, and ~120 s of that is `systemd-networkd-wait-online` — not the datasource**
+  (MEASURED 2026-07-21, live serial capture; this bullet previously blamed a "2-5 min datasource
+  probe", which the capture disproves). cloud-init resolved `DataSourceNoCloud [seed=/dev/sdd1]` and
+  finished its local stage **~2.2 s** after kernel start; the seed is a `CIDATA`-labelled volume found
+  locally. The dead time is `systemd-networkd-wait-online.service` blocking on a network that never
+  comes up in a sealed guest, until its own 120 s timeout expires. The seed's `bootcmd` mask cannot
+  prevent it (it runs in a stage ordered *after* that unit, and a sandbox boots only once). The real
+  fix is to mask the unit in the **golden image** at image-prep — **not done yet**. Nothing is broken
+  either way: the host `-WorkloadTimeoutSeconds` (default 600) bounds it comfortably.
+- **`ds=nocloud`** on the guest kernel cmdline is a *marginal* speed tunable here, not the fix above —
+  discovery is already ~2 s. See `guest-images/debian-12-cloud.md` for delivery paths.
 
 > **Gotcha — Hyper-V Secure Boot template enumeration can wedge under churn (RC5, 2026-06-24 live).**
 > After ~10 rapid VM create/destroy cycles, `Set-VMFirmware -SecureBootTemplate <any>` began failing
@@ -434,12 +479,24 @@ never assumes "Off == success".
 > that error, **reboot the host** and re-run — it is a host-side Hyper-V state bug surfaced by repeated
 > acceptance cycles, **not** a Voidseal containment failure.
 
-### 4A.2 The organizer script must be /mnt/in ⇄ /mnt/out aligned (one-time check)
+### 4A.2 The organizer script must be /mnt/in ⇄ /run/staging aligned (one-time check)
 
 The host source `C:\sandbox\organizer-src\organize_bookmarks.py` must **read its `--profile`
-from `/mnt/in`** and **write `--out` to `/mnt/out/result.html`** (the runner invokes it that
+from `/mnt/in`** and **write `--out` to `/run/staging/result.html`** (the runner invokes it that
 way). If your current copy writes `bookmarks.html` or reads a different path, use an aligned
-copy for the live run. (Don't worry about the OLD `firefox.psd1` `Mounts`/`StageAssets`/`/work/out`
+copy for the live run.
+
+> **Why staging, not `/mnt/out` (corrected 2026-07-21, found live).** firefox is an `OutboxOutput`
+> profile, so its OUTPUT disk is **Raw and is never mounted** — the runner creates only `/mnt/in`
+> and `/run/staging`, runs the entrypoint into staging, then hands staging to
+> `run_disk_workload.py`, which packs the outbox and writes it to the raw device. An entrypoint
+> aimed at `/mnt/out` fails in the *worst* way: the organizer auto-creates its `--out` parent, but
+> the runner runs it as the **non-root `sandbox` user** and `/mnt` is root-owned, so the create is
+> denied → `rc=1`, empty staging, and a structurally **valid but empty** outbox ships — which reads
+> as a transport fault rather than a workload one. `New-CidataUserData` now refuses to build a seed
+> for an outbox-transport profile whose entrypoint names `/mnt/out`.
+
+(Don't worry about the OLD `firefox.psd1` `Mounts`/`StageAssets`/`/work/out`
 comments — those are the superseded serial/container-era mechanism; Disk mode uses the data disks.)
 
 > **★ HARD PRE-RUN GATE — validate the organizer on the host first.** The organizer lives *outside*
@@ -474,22 +531,29 @@ comments — those are the superseded serial/container-era mechanism; Disk mode 
 The firefox profile ships `Inputs = @{}` (empty by design — a `.psd1` can't cleanly inline a
 Python file). You inject the real inputs at deploy time via `-Workload.Inputs` (the engine
 folds this onto the resolved profile → `New-WorkloadDisks` writes them onto the INPUT disk).
-The map is `innerName -> CONTENT`:
+The map is `innerName -> CONTENT` — firefox needs **all four** inner-names (the organizer + sample,
+**plus the two in-guest outbox helpers** `run_disk_workload.py` + `outbox.py`):
 
 ```powershell
 $GoldenVhdx = 'C:\sandbox\golden\debian-12-cloud.vhdx'
 
-# Read the organizer script + the synthetic sample into an innerName -> content map.
+# firefox is an OutboxOutput profile: besides the organizer + sample, the in-guest outbox PRODUCER
+# (run_disk_workload.py) and its outbox.py dependency are invoked as /mnt/in/run_disk_workload.py,
+# so they MUST also ride the INPUT disk. Populate all FOUR inner-names (mirrors firefox.psd1's
+# InputFiles map, the source of truth). Omitting the two guest helpers -> the runner's
+# `python3 /mnt/in/run_disk_workload.py` cannot run -> no outbox is written -> the host read fails
+# closed with "OUTPUT outbox header missing/!magic".
 $inputs = @{
     'organize_bookmarks.py' = Get-Content -LiteralPath 'C:\sandbox\organizer-src\organize_bookmarks.py' -Raw
     'sample-bookmarks.json' = Get-Content -LiteralPath 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json' -Raw
+    'run_disk_workload.py'  = Get-Content -LiteralPath 'C:\sandbox\organizer-src\run_disk_workload.py'  -Raw
+    'outbox.py'             = Get-Content -LiteralPath 'C:\sandbox\organizer-src\outbox.py'             -Raw
 }
 
 . .\scripts\Invoke-Voidseal.ps1
 
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `
-    -Workload @{ WorkloadMode = 'Disk'; Inputs = $inputs;
-                 ResultInnerName = 'result.html'; SentinelInnerName = 'result.exitcode' } `
+    -Workload @{ WorkloadMode = 'Disk'; Inputs = $inputs; ResultInnerName = 'result.html' } `
     -ParentDiskPath $GoldenVhdx `
     -Destination 'C:\sandbox\extracted\firefox-g4'
 ```
@@ -521,8 +585,9 @@ Then confirm no orphans (as §3.3): `Get-VM -Name 'sbx-*'` empty; `Get-VMSwitch 
 
 | `RunResult.Status` / `Reason` | Meaning | Where to look |
 |---|---|---|
-| `Failed`, reason mentions **`sentinel`** | The guest never wrote `result.exitcode` → the workload crashed, hung pre-write, or cloud-init didn't run the runner | The guest serial console / the OUTPUT disk's `stderr.txt` (mount it read-only on the host: `Mount-VHD -Path <out.vhdx> -ReadOnly`). Most likely: the runner didn't mount the disks (label mismatch?), python3 missing, or the organizer path wrong (`/mnt/in`). |
-| `Failed`, reason mentions **timed out** | The guest never reached `State=Off` within `-WorkloadTimeoutSeconds` | Boot too slow (add `ds=nocloud`) or the runner never called `poweroff` (an exFAT umount hang — check the runner's umount-retry loop). The VM was force-stopped + torn down. |
+| `Failed`, reason mentions **`outbox header missing/!magic`** | **Nothing valid reached the raw OUTPUT region** — the guest aborted *before* the producer ran, or wrote to the wrong device. The engine is reporting a real absence, not misreading a result | **Attach the serial capture** (`pwsh -File C:\sandbox\capture-serial.ps1 -VMName <vm>`) and read the `[voidseal-diag]` markers — they name the exact branch: INPUT not mounted, `out_candidates` ≠ 1, or the chosen `output_dev`. The run ends with `output_head`, which must be `56534f5554425831` (`VSOUTBX1`). |
+| `Failed`, reason mentions **`no 'result.html' candidate`** | A structurally **valid but EMPTY** outbox shipped: the transport worked, the *workload* produced nothing | `entrypoint_rc` / `staging_count` in the serial capture say so directly. Most likely the entrypoint failed — confirm it writes `--out /run/staging/result.html` (**not** `/mnt/out`, which the outbox runner never mounts) and re-run the §4A.2 host gate. |
+| `Failed`, reason mentions **timed out** | The guest never reached `State=Off` within `-WorkloadTimeoutSeconds` | Boot too slow (a sealed guest spends ~120 s in `systemd-networkd-wait-online` before it times out — see §4A.1) or the runner never reached `poweroff`. The serial capture shows how far it got. The VM was force-stopped + torn down. |
 | `Failed`, `ExitCode` non-zero (e.g. 3) | The organizer ran but exited non-zero | A real organizer bug; `result.html`/`stderr.txt` may still hold partial output (extracted). |
 | `Failed`, reason mentions **`result … empty`** | The guest wrote a 0-byte/whitespace `result.html` (e.g. the organizer printed to stdout instead of `--out`) | Re-run the §4A.2 pre-run gate — the organizer is not writing the file via `--out`. **Host-side**, not a containment issue. |
 | `Failed`, reason mentions **`detach`** | A transient host-side `Remove-VMHardDiskDrive` failed after the run; the host skipped the read rather than read a possibly-still-attached disk | **Host-side**, not a guest bug. `result.html` is likely fine on the OUTPUT disk — just re-run. The VM was still torn down (no orphan). |
@@ -532,9 +597,16 @@ Whatever the outcome, **teardown still runs** (the `finally`), so you won't accu
 
 ### 4A.6 The live-only-unproven list (what this milestone is actually testing for the first time)
 
-The 425 mock tests prove the *host orchestration* + *classification* logic. These pieces run for
+The 867 mock tests prove the *host orchestration* + *classification* logic. These pieces run for
 the **first time** on real hardware here — if something snags, it's most likely one of these,
 **not** a containment failure:
+
+> **⚠ Items 2-4 below describe the LEGACY exFAT path** (host `Mount-VHD` read, `LABEL=OUTPUT` at
+> `/mnt/out`, the `result.exitcode` sentinel) — the model Milestone 3 originally used and which a
+> *non-outbox* Disk profile still uses. **firefox no longer takes that path:** OUTPUT is Raw, the
+> host reads the outbox in user space, and the guest writes into `/run/staging`. For a firefox run,
+> the live-relevant equivalents are the raw-device identification and the outbox write — both now
+> narrated on serial as `[voidseal-diag]` markers (§4A.5).
 
 1. **Host disk format** — `New-VHD`+`Mount-VHD`+`Initialize-Disk -GPT`+`New-Partition`+`Format-Volume -exFAT`+`Dismount` (the `NewOutputVhdx` real path; has a Get-Disk settle-retry).
 2. **Native host read** — `Mount-VHD` (read-**write**, see note) + drive-letter assign + read + `Dismount` (the `ReadVhdxFile` real path). NOTE: `ReadVhdxFile` deliberately mounts the OUTPUT disk read-write, not read-only — a read-only mount on Windows often won't auto-assign a drive letter and `Add-PartitionAccessPath -AssignDriveLetter` can throw against a write-protected volume, which would make this *first* read spuriously report `result read failed`. RW is safe (the OUTPUT disk is the deployer's own host-formatted volume, detached from the powered-off guest; Tier ≥ 2 untrusted output never reaches here — it quarantines first). If a read *still* fails after this, suspect the guest didn't write `result.html`/`result.exitcode` (item 3), not the mount.
@@ -554,8 +626,9 @@ Remove-Sandbox -Name '<sbx-0-... from $report.Name>' -DeleteDisks
 ## 5. Per-tier seal verification
 
 The seal gate (`Assert-Sealed`) runs **inside** `Invoke-Voidseal` as a hard gate before
-RUNNING. You verify it certified by reading the report; for Tier 1 you also spot-check that
-egress is actually restricted.
+RUNNING. You verify it certified by reading the report; for Tier 1 you also spot-check the
+in-guest egress control (defense-in-depth, unproven live) — see §5.2, the first live exercise
+of it, not a pass/fail config check.
 
 ### 5.1 Eyeball that the gate certified
 
@@ -570,25 +643,31 @@ $report.SealVerdict    # MUST be $true for BOTH milestones — the workload only
   operator-runbook troubleshooting table.
 - `States` should include `SEALED` on success; a seal-gate abort stops **before** `RUNNING`.
 
-### 5.2 Tier-1 egress is actually restricted (quick in-guest test)
+### 5.2 Tier-1 egress: first live exercise of the in-guest control (not a boundary)
 
-The seal does **not** enforce egress (5/§4.4) — the in-guest nftables allowlist does. Verify
-it from **inside** the guest over the serial console: a non-allowlisted host must be blocked
-while an allowlisted one is reachable.
+The seal does **not** enforce egress (§4.4) — egress is the in-guest iptables+Squid control's
+job, and this is the **first live exercise** of it. The mock suite only asserts the seed's
+SHAPE (the rendered Squid config text, the iptables rule text, the ACL substitution) — it has
+never proven real packet-drop or the activation-timing ordering against the guest's own
+pre-seal package install. Run this to see what the live guest actually does, not to confirm a
+known gap.
 
 ```text
 # In the guest serial console (the host drives \\.\pipe\<vm>-com1):
-#   allowlisted -> should connect:
 curl -sS -m 8 https://api.anthropic.com/ -o /dev/null ; echo "anthropic rc=$?"
-#   NOT allowlisted -> should FAIL (blocked by nftables default-deny):
 curl -sS -m 8 https://example.com/ -o /dev/null ; echo "example rc=$?"
 ```
 
-Expect a **non-zero / timeout** rc for `example.com` (blocked) and `rc=0` for
-`api.anthropic.com` (allowed). A reachable `example.com` means the in-guest allowlist isn't
-in force — fix the seed's nftables setup before trusting the tier. (This is an *in-guest*
-control and is bypassable by guest-root — acceptable for v1's trusted-workload Tier 1; host/
-hypervisor enforcement is the documented escalation, per tier-reference.md.)
+**If the control is active and working:** `anthropic rc=0`, `example rc≠0` (the Squid
+`dstdomain` ACL denies it and default-DROP blocks anything Squid doesn't redirect) — the
+in-guest control now restricts a benign agent to the allowlist, as designed. **If BOTH
+succeed:** the control did not activate in time (check the activation-timing ordering vs the
+guest's own pre-seal package install — `deb.debian.org` is intentionally not in the
+allowlist) — record this as a live-validation finding, not something to silently patch around.
+**Either way, this control is defense-in-depth only** — it is guest-disableable (a
+compromised/root guest can flush its own iptables or kill Squid) — so do **not** treat a
+passing check here as clearing Tier-1 for a hostile/untrusted workload. The **host-verified
+boundary is Phase-6** (see [`phase-6-live-runbook.md`](phase-6-live-runbook.md)).
 
 ---
 
@@ -632,13 +711,14 @@ Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows 
 - Tier-0 Firefox: the full `INIT → … → DESTROYED` lifecycle with **zero egress dependency**,
   the seal gate certifying, a one-way host-read extraction, and a clean teardown — the core
   engine end-to-end.
-- Tier-1 Ralph: the same lifecycle on a **net-restricted** Gen2 VM, with a **bounded** agent
-  loop reaching only the allowlisted egress, the diff extracted for **human cherry-pick**
-  (no auto-push), and a clean teardown.
+- Tier-1 Ralph: the same lifecycle on a **net-reachable** Gen2 VM (Internal-switch isolated,
+  NIC kept), with a **bounded** agent loop and the in-guest defense-in-depth egress control
+  (iptables default-DROP + Squid allowlist) exercised live for the first time, the diff
+  extracted for **human cherry-pick** (no auto-push), and a clean teardown.
 - The **host-verified seal gate** is a real gate on a real backend (the workload only runs on
   `SealVerdict=$true`).
 
-**Does NOT do (out of scope this round — gated behind explicit future authorization):**
+**Does NOT do (out of scope in v1 — gated behind explicit future authorization):**
 
 - **No Tier 2/3 live detonation.** Those paths are scaffold/harness-only; the Tier ≥ 2
   extractor routes to a quarantine sink that **throws** (`Export-ColdVhdxQuarantine` is
@@ -653,6 +733,11 @@ Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows 
 - **Does not harden the serial transport (Gap 4).** The COM1 client is best-effort v1 with no
   per-command nonce; the smoke test exercises it live for the first time but does not certify
   it against an adversarial guest.
+- **Does not prove the in-guest egress control holds against a hostile guest.** The
+  iptables+Squid layer is **defense-in-depth**, not a boundary — a compromised/root guest can
+  disable it. This run is the first live check of activation + packet-drop (§5.2), not a
+  certification of that layer as trustworthy against adversarial code. The **host-verified
+  boundary is Phase-6**.
 
 ---
 
@@ -674,7 +759,8 @@ any gap-related friction observed).
 - [ ] CIDATA seed ISO built (label exactly `CIDATA`; `meta-data`+`user-data`; serial-getty autologin) — §1
 
 **Dry run**
-- [ ] `Invoke-Pester -Path tests/` → **all green, 0 failed** (425+ as of the disk-mode build; the exact count grows as features land) — §2.1
+- [ ] `Invoke-Pester -Path tests/` → **0 failed** (865 passed / 2 skipped as of the last local run; gate on Failed: 0, not on a total) — §2.1
+- [ ] `python -m pytest tests/guest tests/host -q` → **56 passed, 0 failed** — §2.1
 - [ ] Fake-backend `Invoke-Voidseal` shows `INIT..DESTROYED`, `SealVerdict=$true`, clean teardown — §2.2
 
 **Milestone 1 — Firefox (Tier 0), synthetic (containment proof, stand-in output)**
@@ -685,7 +771,8 @@ any gap-related friction observed).
 
 **Milestone 3 — Firefox Tier-0 REAL workload (disk mode) — the real round-trip**
 - [ ] CIDATA seed carries the **disk-mode workload-runner** user-data (not the bare serial seed); the seed's `users:` block **creates** the non-root **`sandbox`** user (RC2 — the golden image no longer needs one baked) — §4A.1 / debian-12-cloud.md §2a
-- [ ] `ds=nocloud` baked into guest GRUB; python3 (+ any organizer deps) in the golden image — §4A.1
+- [ ] python3 (+ any organizer deps) in the golden image — §4A.1. (Optional speed: mask
+      `systemd-networkd-wait-online` in the golden image — that is the ~120 s item, not `ds=nocloud`.)
 - [ ] **★ HARD GATE:** host-side organizer pre-test passes — writes `result.html` via `--out` (non-empty), first line is exactly `<!DOCTYPE NETSCAPE-Bookmark-file-1>`, dedup applied (<4 `<A>`) — §4A.2
 - [ ] `-Workload.Inputs` populated from the host organizer + sample; live `Invoke-Voidseal -Tier 0 -Profile firefox -Workload @{WorkloadMode='Disk';Inputs=...}` run — §4A.3
 - [ ] `RunResult.Status='Success'`, `ExitCode=0`, a **real guest-generated** `result.html` (dedup applied), VM destroyed — §4A.4

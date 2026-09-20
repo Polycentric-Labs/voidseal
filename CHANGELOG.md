@@ -2,32 +2,31 @@
 
 ## How this was built
 
-Voidseal was developed with a deliberately adversarial process, because a containment tool that's
-*almost* right is worse than useless:
+Every Hyper-V call goes through one seam with a real factory and a fake factory that share a
+manifest-enforced method set, so the whole engine is unit-tested with no elevation and no real VM
+(867 Pester tests, plus 56 pytest tests for the guest and host helpers). The recurring failure mode
+that design guards against, a fake that accepts what real Hyper-V rejects, is treated as the first
+bug class to rule out.
 
-- **Mockable-backend-first.** Every Hyper-V interaction goes through one seam with a real + a fake
-  factory sharing a manifest-enforced method set, so the whole engine is unit-tested without elevation
-  or a real VM (400+ Pester tests). The recurring failure mode it guards — "the fake accepts what real
-  Hyper-V rejects" — is treated as the #1 bug class.
-- **Subagent-driven development with two-stage review.** Each task was implemented, then reviewed for
-  spec-compliance and for code quality before landing. The review loop caught **2 CRITICAL safety bugs**
-  (seal-gate bypasses) that the happy-path tests missed.
-- **A disk-passing workload model.** The first containment milestone proved the seal but the live
-  serial command channel raced the guest boot; rather than paper over it, the workload path was
-  redesigned to pass inputs/outputs on attached data disks with **no live host↔guest channel** — the
-  guest self-powers-off and the host classifies the run from an exit-code sentinel. This works identically
-  at every tier, including fully air-gapped.
-- **Three independent review layers before the (pending) live acceptance.** A whole-implementation
-  review, a multi-lens adversarial workflow (which independently corroborated the containment invariants
-  and surfaced ~10 first-live-run reliability fixes), and a primary-source implementation-verification
-  pass (exFAT mount semantics, `runuser` exit-code propagation, the PowerShell storage-cmdlet null/settle
-  edge cases). Net: the mock-untestable real-backend + guest-side seams were hardened against the exact
-  fake≠real defects that would otherwise have surfaced only on a costly live run.
+The workload path passes inputs and outputs on attached data disks rather than over a live
+host-to-guest channel: the guest self-powers-off and the host classifies the run from what it reads
+back off the detached disk. That works identically at every tier, including fully air-gapped.
+
+`CONTRIBUTING.md` and `AGENTS.md` carry the discipline that follows from that design.
+`SECURITY.md` and `docs/threat-model.md` carry what it does and does not guarantee, including the
+places where a check is an argument rather than a measurement.
 
 ## Unreleased
 
 - Initial public-ready cut: risk-tiered engine (Tier 0/1 mock-proven), host-verified fail-closed seal
-  gate, disk-passing workload model, cold-VHDX→quarantine routing (Tier ≥ 2 sink is a NotImplemented stub
-  this round), two worked example profiles, full Pester suite.
-- Live end-to-end acceptance on real Hyper-V: pending (operator-run, elevated — see
-  `docs/live-smoke-test.md`).
+  gate, disk-passing workload model, cold-VHDX to quarantine routing (the Tier >= 2 sink is a
+  `NotImplemented` stub in v1), four example profiles (`firefox`, `ralph`, `builder`,
+  `example-skeleton`), full Pester and pytest suites.
+- Sensitivity Gate: an offline screener plus a host-side regenerator that partitions extracted
+  artifacts into released and held, with enum-only verdicts that hold anything not provably safe.
+- Release Governor: a per-profile per-day release rate cap backed by an append-only ledger.
+- Tier-1 builder VM and the `builder` profile; `Get-VoidsealGoldenImage.ps1` and
+  `Test-VoidsealPrereqs.ps1`; the user-space outbox transport for Raw OUTPUT disks.
+- Live acceptance status: the **Tier-0 `firefox` disk round-trip ran end-to-end on real Hyper-V**
+  (2026-06-25). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see
+  `docs/live-smoke-test.md`). Tier 2 and Tier 3 are scaffold-only and have had no live run.

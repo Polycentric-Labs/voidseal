@@ -1,0 +1,11 @@
+Statement Date: 2026-06-01
+Institution: First Synthetic Bank
+
+Account 123456789 routing 021000021 balance $4,210.00
+
+Transaction History:
+2026-05-03  Direct Deposit       +$2,850.00
+2026-05-10  Utility Payment       -$140.00
+2026-05-17  Grocery Store         -$212.50
+2026-05-24  Online Transfer       -$287.50
+2026-06-01  Closing Balance      $4,210.00

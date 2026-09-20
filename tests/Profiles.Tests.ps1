@@ -25,10 +25,12 @@ BeforeAll {
     $script:ProfileDir  = Join-Path $script:SkillRoot 'profiles'
     $script:RalphPath   = Join-Path $script:ProfileDir 'ralph.psd1'
     $script:FirefoxPath = Join-Path $script:ProfileDir 'firefox.psd1'
+    $script:SkeletonPath = Join-Path $script:ProfileDir 'example-skeleton.psd1'
 
     Test-Path $script:LibPath     | Should -BeTrue -Because 'the loader must exist to test profiles through it'
     Test-Path $script:RalphPath   | Should -BeTrue -Because 'the ralph profile must exist'
     Test-Path $script:FirefoxPath | Should -BeTrue -Because 'the firefox profile must exist'
+    Test-Path $script:SkeletonPath | Should -BeTrue -Because 'the onboarding skeleton profile must exist'
     . $script:LibPath
 }
 
@@ -123,15 +125,26 @@ Describe 'profiles/firefox.psd1 — loads + merges through Import-WorkloadProfil
         @($script:Firefox.EgressAllowlist).Count | Should -Be 0 -Because 'the organizer needs no network; the dead-link check escalates to Tier 1 instead'
     }
 
-    It 'is a Disk-mode profile whose entrypoint matches the engine contract (/mnt/in -> /mnt/out/result.html)' {
-        # Disk model: inputs ride the INPUT disk (guest /mnt/in), the result lands on the OUTPUT
-        # disk at the engine default inner-name result.html (Read-WorkloadResult -ResultInnerName).
-        # The OLD serial/container-era form (/opt/organizer + /mnt/firefox-profile + bookmarks.html)
-        # is superseded — asserting result.html here keeps profile + runner + engine consistent.
+    It 'is a Disk-mode + OutboxOutput profile whose entrypoint writes into the STAGING dir (/run/staging/result.html)' {
+        # Disk model: inputs ride the INPUT disk (guest /mnt/in). Because OutboxOutput=$true the
+        # OUTPUT disk is RAW and is NEVER mounted — SeedBuilder's CidataOutboxDiskRunnerTemplate
+        # creates only /mnt/in + /run/staging, runs the Entrypoint into staging, then hands staging
+        # to run_disk_workload.py, which packs the outbox onto the raw device. The inner-name stays
+        # result.html (what the host outbox read extracts as the transport-only artifact).
+        #
+        # LIVE 2026-07-21 — THIS TEST WAS PINNING THE BUG. It previously asserted the exFAT-era
+        # '/mnt/out/result.html', so the suite stayed GREEN while enforcing a contract the
+        # OutboxOutput runner cannot satisfy. The organizer auto-creates its --out parent, but the
+        # runner runs the entrypoint as the NON-ROOT sandbox user and /mnt is root-owned, so creating
+        # /mnt/out was denied: rc=1, staging stayed EMPTY, and the outbox shipped with only its
+        # placeholder verdicts.json ->
+        # "transport-only outbox has no 'result.html' candidate". C1.4 converged the transport but
+        # never moved the Entrypoint, and this assertion locked the stale path in place.
         $script:Firefox.WorkloadMode | Should -Be 'Disk' -Because 'firefox runs via the disk-passing model'
         $script:Firefox.Entrypoint   | Should -Match 'organize'
         $script:Firefox.Entrypoint   | Should -Match '/mnt/in'  -Because 'inputs arrive on the INPUT disk mounted at /mnt/in'
-        $script:Firefox.Entrypoint   | Should -Match '/mnt/out/result\.html' -Because 'the result inner-name MUST be result.html (the engine default)'
+        $script:Firefox.Entrypoint   | Should -Match '/run/staging/result\.html' -Because 'an OutboxOutput entrypoint writes into the staging dir the producer packs; the inner-name stays result.html'
+        $script:Firefox.Entrypoint   | Should -Not -Match '/mnt/out' -Because 'OUTPUT is Raw for an OutboxOutput profile — there is NO /mnt/out mount, so writing there aborts the workload'
         $script:Firefox.Entrypoint   | Should -Not -Match 'bookmarks\.html' -Because 'bookmarks.html was the serial/container-era inner name; the engine default is result.html'
     }
 
@@ -151,6 +164,74 @@ Describe 'profiles/firefox.psd1 — loads + merges through Import-WorkloadProfil
         $raw = Get-Content -LiteralPath $script:FirefoxPath -Raw
         $raw | Should -Match '(?i)synthetic'  -Because 'the profile must state synthetic/sample data is the default'
         $raw | Should -Match '(?i)(per-task|authoriz)' -Because 'reading real profile data must require explicit per-task authorization'
+    }
+
+    # ----- C1.4: firefox opts into the user-space outbox transport (Raw OUTPUT, no host Mount-VHD) -----
+    It 'opts into OutboxOutput=$true (Raw OUTPUT + user-space outbox read, C1.1/C1.2 transport path)' {
+        $script:Firefox.ContainsKey('OutboxOutput') | Should -BeTrue -Because 'firefox converges onto the shared outbox transport (C1.4)'
+        $script:Firefox.OutboxOutput | Should -BeTrue
+    }
+
+    It 'regression: OutboxOutput does not disturb WorkloadMode/Tier/Network/EgressAllowlist' {
+        $script:Firefox.WorkloadMode | Should -Be 'Disk' -Because 'C1.4 is transport-only; the disk-passing model is unchanged'
+        $script:Firefox.Tier         | Should -Be 0
+        $script:Firefox.BaseTier     | Should -Be 0
+        @($script:Firefox.EgressAllowlist).Count | Should -Be 0 -Because 'firefox stays offline; OutboxOutput is a transport change, not a network change'
+    }
+
+    It 'is transport-only: NOT a processor (no ScreenConfig, Network unforced to None)' {
+        $script:Firefox.ContainsKey('ScreenConfig') | Should -BeFalse -Because 'firefox is transport-only (LOCKED design) — never screened, so it must not carry a processor ScreenConfig'
+    }
+
+    It 'delivers run_disk_workload.py (the shared outbox producer) + its outbox.py dependency via the INPUT disk' {
+        # C1.3 handoff: run_disk_workload.py is the shared in-guest outbox-producer template, delivered
+        # the SAME way as organize_bookmarks.py — via InputFiles (raw .psd1 doc-only metadata; the
+        # live-acceptance step folds these host paths into Inputs before deploy — see the InputFiles
+        # header comment in firefox.psd1 and Invoke-Voidseal.ps1's processor-gate wiring). It imports outbox.py from its
+        # own directory (sys.path.insert(0, HERE)), so outbox.py must ride alongside it on the INPUT disk too.
+        $raw = Import-PowerShellDataFile -LiteralPath $script:FirefoxPath
+        $raw.InputFiles.ContainsKey('run_disk_workload.py') | Should -BeTrue -Because 'the seed runner invokes python3 /mnt/in/run_disk_workload.py (SeedBuilder.ps1 CidataOutboxDiskRunnerTemplate)'
+        $raw.InputFiles.ContainsKey('outbox.py') | Should -BeTrue -Because 'run_disk_workload.py imports outbox from its own directory — it must ride the INPUT disk alongside it'
+        [string]$raw.InputFiles['run_disk_workload.py'] | Should -Match '(?i)run_disk_workload\.py$'
+        [string]$raw.InputFiles['outbox.py'] | Should -Match '(?i)outbox\.py$'
+    }
+}
+
+Describe 'profiles/example-skeleton.psd1 — the onboarding skeleton loads clean (docs/authoring-a-workload-profile.md)' {
+
+    BeforeAll {
+        $script:Skeleton = Import-WorkloadProfile -Path $script:SkeletonPath -TierProfileDir $script:TierDir
+    }
+
+    It 'loads without throwing and is a hashtable' {
+        $script:Skeleton | Should -Not -BeNullOrEmpty
+        $script:Skeleton | Should -BeOfType [System.Collections.IDictionary]
+    }
+
+    It 'resolves to BaseTier 0 (Container, the lightweight/offline tier)' {
+        $script:Skeleton.Tier      | Should -Be 0
+        $script:Skeleton.BaseTier  | Should -Be 0
+        $script:Skeleton.Substrate | Should -Be 'Container'
+        $script:Skeleton.Name      | Should -Be 'example-skeleton'
+    }
+
+    It 'stays OFFLINE: the merged EgressAllowlist is empty (no ExtraAllowlist declared beyond @())' {
+        @($script:Skeleton.EgressAllowlist).Count | Should -Be 0 -Because 'the skeleton is a minimal offline example — no network by default'
+    }
+
+    It 'is a Serial-mode profile (WorkloadMode omitted -> not layered onto the merge)' {
+        $script:Skeleton.ContainsKey('WorkloadMode') | Should -BeFalse -Because 'the skeleton omits WorkloadMode, so it inherits the engine default (Serial)'
+    }
+
+    It 'declares no secret-shaped Mounts source' {
+        @($script:Skeleton.Mounts.Keys) | ForEach-Object {
+            Test-IsSecretPath -Path ([string]$_) | Should -BeFalse -Because "mount source '$_' must not be secret-shaped"
+        }
+    }
+
+    It 'is heavily commented with copy-editor EDIT markers' {
+        $raw = Get-Content -LiteralPath $script:SkeletonPath -Raw
+        (Select-String -InputObject $raw -Pattern '<-- EDIT' -AllMatches).Matches.Count | Should -BeGreaterThan 3 -Because 'every field a newcomer edits should carry an EDIT marker'
     }
 }
 

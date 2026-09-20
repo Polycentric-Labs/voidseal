@@ -78,7 +78,7 @@ BeforeAll {
             Description        = 'fixture tier 1'
             Substrate          = 'HyperV-Gen2'
             Network            = 'Internal+Allowlist'
-            EgressMode         = 'NftablesAllowlist'
+            EgressMode         = 'InGuestSquid'
             EgressAllowlist    = @('api.anthropic.com', 'github.com')
             BlockProtocols     = @('QUIC')
             Credentials        = 'ScopedOnDemand'
@@ -131,11 +131,18 @@ Describe 'Import-TierProfile — real example profiles' {
         # empty allowlist normalizes to an array (count 0), never $null
         @($p.EgressAllowlist).Count | Should -Be 0
         $p.HostChannels        | Should -BeOfType [System.Collections.IDictionary]
-        $p.HostChannels.Shares | Should -Be 'ReadOnlyInput'   # string on a container tier is allowed
+        # Every declared channel must be falsey. Lock-Sandbox turns all four OFF from its own
+        # hardcoded list without reading this profile, so a truthy value here advertises a channel
+        # that never exists in a sealed guest. tier0 previously declared Shares='ReadOnlyInput',
+        # a truthy string; it was inert and misleading, and is now $false.
+        $p.HostChannels.Shares          | Should -BeFalse
+        $p.HostChannels.Clipboard       | Should -BeFalse
+        $p.HostChannels.GuestServices   | Should -BeFalse
+        $p.HostChannels.EnhancedSession | Should -BeFalse
         $p.ContainsKey('ManagementChannel') | Should -BeFalse # container tier has no mgmt channel
-        # RC1: Tier-0 today provisions a real Debian Gen2 VM, so it MUST carry the Linux Secure Boot
+        # Tier-0 today provisions a real Debian Gen2 VM, so it MUST carry the Linux Secure Boot
         # template (an omitted/Windows-default template rejects Debian's MS-UEFI-CA-signed bootloader).
-        $p.SecureBootTemplate  | Should -Be 'MicrosoftUEFICertificateAuthority' -Because 'RC1: a Linux Gen2 guest needs the MS-UEFI-CA template, not the Windows default'
+        $p.SecureBootTemplate  | Should -Be 'MicrosoftUEFICertificateAuthority' -Because 'a Linux Gen2 guest needs the MS-UEFI-CA template, not the Windows default'
     }
 
     It 'loads tier1.psd1 without error and returns the expected normalized shape' {
@@ -143,7 +150,7 @@ Describe 'Import-TierProfile — real example profiles' {
         $p                       | Should -Not -BeNullOrEmpty
         $p.Tier                  | Should -Be 1
         $p.Substrate             | Should -Be 'HyperV-Gen2'
-        $p.EgressMode            | Should -Be 'NftablesAllowlist'
+        $p.EgressMode            | Should -Be 'InGuestSquid'
         $p.ManagementChannel     | Should -Be 'Com1Serial'
         @($p.EgressAllowlist)    | Should -Contain 'api.anthropic.com'
         @($p.EgressAllowlist).Count | Should -BeGreaterThan 1
@@ -173,6 +180,17 @@ Describe 'Import-TierProfile — basic schema validation (invariant 6)' {
     It 'throws when an enum field is outside its allowed set (EgressMode)' {
         $h = script:Get-ValidTier1Hashtable
         $h.EgressMode = 'WideOpen'
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*EgressMode*'
+    }
+
+    It 'REJECTS the retired NftablesAllowlist EgressMode (fabricated/never-implemented; pins the retirement)' {
+        # NftablesAllowlist was schema-only and design-invalidated (Pass-5: static nftables can't
+        # runtime-FQDN-filter CDN-fronted hosts). It has been replaced by 'InGuestSquid'
+        # (real in-guest transparent-Squid domain-ACL). Nothing should be able to silently
+        # re-introduce the fabricated value via an unknown enum member.
+        $h = script:Get-ValidTier1Hashtable
+        $h.EgressMode = 'NftablesAllowlist'
         $path = script:New-Psd1File -Data $h
         { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*EgressMode*'
     }
@@ -309,6 +327,102 @@ Describe 'Invariant 1 — secret-file mount refusal' {
     }
 }
 
+Describe 'Invariant 1: StageAssets secret refusal (regression - the live delivery field)' {
+
+    # REGRESSION GUARD. Invariant 1 originally screened ONLY Mounts, which the Provisioner/Runner
+    # never wire into the guest (docs/live-smoke-test.md Gap 2). StageAssets is the field the
+    # orchestrator actually imports (Invoke-Voidseal -> Import-SandboxAsset), and it was unscreened,
+    # so a secret-shaped path could be staged into a guest and still pass the seal gate. Both fields
+    # are screened now. These cases fail if that ever regresses.
+
+    $stageSecretCases = @(
+        @{ Src = 'C:\Users\testuser\.secrets\anthropic.env'; Label = '.secrets dir (the original escape)' }
+        @{ Src = 'C:\proj\.env';                             Label = '.env' }
+        @{ Src = 'C:\certs\server.key';                      Label = '*.key' }
+        @{ Src = 'C:\Users\testuser\.aws\credentials';       Label = '.aws-credentials' }
+        @{ Src = '/home/testuser/.ssh/id_rsa';               Label = '.ssh (posix)' }
+    )
+
+    It 'rejects secret-shaped StageAssets source <Label> (<Src>) on a tier profile' -ForEach $stageSecretCases {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @{ $Src = 'pinned asset' }
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*secret*'
+    }
+
+    It 'rejects a secret-shaped StageAssets source on the MERGED workload (the path the orchestrator imports)' {
+        $wl = @{
+            BaseTier    = 1
+            Name        = 'evil-stage'
+            Entrypoint  = '/bin/run'
+            StageAssets = @{ 'C:\Users\testuser\.secrets\anthropic.env' = 'pinned asset' }
+        }
+        $wlPath = script:New-Psd1File -Data $wl -Name 'evil-stage.psd1'
+        { Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir } |
+            Should -Throw -ExpectedMessage '*secret*'
+    }
+
+    It 'names StageAssets (not Mounts) in the refusal so the operator can find the offending field' {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @{ 'C:\proj\.env' = 'pinned asset' }
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*StageAssets*'
+    }
+
+    It 'allows a benign StageAssets source (no secret shape)' {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @{ 'C:\sandbox\assets\ralph-claude-code.iso' = 'pinned @ sha' }
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Not -Throw
+    }
+
+    It 'refuses a StageAssets value that is not a hashtable (unscreenable shape fails closed)' {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @('C:\sandbox\assets\thing.iso')
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*StageAssets*'
+    }
+}
+
+Describe 'Invariant 1: broadened denylist coverage' {
+
+    # Added after an external review demonstrated these common credential shapes were missed.
+    $broadenedCases = @(
+        @{ Src = 'C:\proj\id_ed25519';                      Label = 'id_ed25519 outside .ssh' }
+        @{ Src = 'C:\proj\id_ecdsa';                        Label = 'id_ecdsa outside .ssh' }
+        @{ Src = 'C:\Users\testuser\.netrc';                Label = 'dot-netrc' }
+        @{ Src = 'C:\Users\testuser\_netrc';                Label = 'underscore-netrc (windows)' }
+        @{ Src = 'C:\Users\testuser\.git-credentials';      Label = 'git-credentials' }
+        @{ Src = 'C:\keys\release.jks';                     Label = 'jks' }
+        @{ Src = 'C:\keys\debug.keystore';                  Label = 'keystore' }
+        @{ Src = 'C:\keys\session.ppk';                     Label = 'ppk' }
+        @{ Src = 'C:\vault\passwords.kdbx';                 Label = 'kdbx' }
+        @{ Src = 'C:\Users\testuser\.pgpass';               Label = 'pgpass' }
+        @{ Src = 'C:\Users\testuser\.my.cnf';               Label = 'my-cnf' }
+        @{ Src = 'C:\infra\secrets.yaml';                   Label = 'secrets-yaml' }
+        @{ Src = 'C:\infra\secrets.yml';                    Label = 'secrets-yml' }
+        @{ Src = 'C:\infra\prod.tfvars';                    Label = 'tfvars' }
+        @{ Src = 'C:\Users\testuser\.aws\config';           Label = 'aws-config' }
+        @{ Src = 'C:\Users\testuser\.config\gh\hosts.yml';  Label = 'gh-hosts' }
+        @{ Src = 'C:\Users\testuser\.gnupg\secring.gpg';    Label = 'gnupg dir' }
+    )
+
+    It 'Test-IsSecretPath flags <Label> (<Src>)' -ForEach $broadenedCases {
+        Test-IsSecretPath -Path $Src | Should -BeTrue
+    }
+
+    It 'the loader refuses <Label> (<Src>) declared via StageAssets' -ForEach $broadenedCases {
+        $h = script:Get-ValidTier1Hashtable
+        $h.StageAssets = @{ $Src = 'pinned asset' }
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*secret*'
+    }
+
+    It 'still allows the ralph .token delivery path (documented, deliberately not secret-shaped)' {
+        Test-IsSecretPath -Path 'C:\sandbox\agent-cred\agent.token' | Should -BeFalse
+    }
+}
+
 Describe 'Invariant 1 — Windows leaf-equivalence bypass refusal' {
 
     # Windows treats these LEAF forms as equivalent to the real secret file:
@@ -407,7 +521,7 @@ Describe 'Invariant 2 — Tier >= 2 starvation' {
 
     It 'throws if Tier 2 has EgressMode other than None' {
         $h = script:Get-ValidTier2Hashtable
-        $h.EgressMode = 'NftablesAllowlist'
+        $h.EgressMode = 'InGuestSquid'
         $path = script:New-Psd1File -Data $h
         { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*Egress*'
     }
@@ -565,5 +679,180 @@ Describe 'Import-WorkloadProfile — merge + re-validation' {
         $wlPath = script:New-Psd1File -Data $wl -Name 'starve-break.psd1'
         { Import-WorkloadProfile -Path $wlPath -TierProfileDir $scratchTierDir } |
             Should -Throw -ExpectedMessage '*Egress*'
+    }
+}
+
+Describe 'Processor profile (Network=None) + DepsSpec/ScreenConfig' {
+    BeforeAll {
+        . "$PSScriptRoot/../scripts/lib/ProfileLoader.ps1"
+        # New-ProcBase defined in BeforeAll so It blocks can find it (Pester 5 scoping).
+        function script:New-ProcBase {
+            @{ Tier=0; Description='p'; Substrate='HyperV-Gen2'; Network='None'; EgressMode='None';
+               EgressAllowlist=@(); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
+               HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
+               Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
+               Controls=@(); ManagementChannel='Com1Serial' }
+        }
+    }
+    It 'accepts a processor profile with Network=None + DepsSpec + ScreenConfig' {
+        $p = script:New-ProcBase; $p.DepsSpec=@{packages=@('tika')}; $p.ScreenConfig=@{mode='aggressive';categories=@('financial')}
+        { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Not -Throw
+    }
+    It 'REFUSES a Network=None profile that declares egress (EgressMode != None)' {
+        $p = script:New-ProcBase; $p.EgressMode='InGuestSquid'
+        { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Throw
+    }
+    It 'REFUSES a Network=None profile with a non-empty EgressAllowlist' {
+        $p = script:New-ProcBase; $p.EgressAllowlist=@('pypi.org')
+        { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Throw
+    }
+    It 'defaults a processor ScreenConfig mode to aggressive when omitted' {
+        $p = script:New-ProcBase; $p.ScreenConfig=@{categories=@('financial')}
+        (Resolve-ScreenConfig -Profile $p).mode | Should -Be 'aggressive'
+    }
+    It 'returns categories as an ARRAY even for a single-element categories (no unroll)' {
+        $p = @{ ScreenConfig = @{ mode='aggressive'; categories=@('financial') } }
+        $r = Resolve-ScreenConfig -Profile $p
+        ($r.categories -is [array]) | Should -BeTrue
+        @($r.categories).Count      | Should -Be 1
+        @($r.categories)[0]         | Should -Be 'financial'
+    }
+    It 'defaults BOTH mode and categories when ScreenConfig is absent entirely' {
+        $r = Resolve-ScreenConfig -Profile @{}
+        $r.mode                | Should -Be 'aggressive'
+        ($r.categories -is [array]) | Should -BeTrue
+        @($r.categories).Count | Should -Be 0
+    }
+}
+
+Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
+    It 'the real profiles/builder.psd1 loads green and is SquidSniProxy + Tier-1' {
+        $merged = Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/builder.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles"
+        $merged['EgressMode'] | Should -Be 'SquidSniProxy'
+        $merged['Tier']       | Should -Be 1
+        $merged['DepsSpec'].Keys | Should -Contain 'Pip'
+        # merged allowlist must cover apt + HF (unioned from ExtraAllowlist) and pip (from tier1)
+        @($merged['EgressAllowlist']) | Should -Contain 'deb.debian.org'
+        @($merged['EgressAllowlist']) | Should -Contain 'huggingface.co'
+    }
+    It 'Test-AllowlistCoversHost: a domain-suffix entry covers a rotating subdomain' {
+        Test-AllowlistCoversHost -Allowlist @('.hf.co') -HostName 'cas-bridge.xethub.hf.co' | Should -BeTrue
+        Test-AllowlistCoversHost -Allowlist @('huggingface.co') -HostName 'cdn-lfs.huggingface.co' | Should -BeFalse
+        Test-AllowlistCoversHost -Allowlist @('pypi.org') -HostName 'pypi.org' | Should -BeTrue
+    }
+    It 'SEC-1: an EgressAllowlist entry bearing a newline (Squid ACL injection) is REFUSED fail-closed, naming the bad entry' {
+        # A newline-bearing entry could inject `http_access allow all` into the builder's Squid dstdomain
+        # ACL (SeedBuilder substitutes ($allowlist -join ' ') with no escaping). The load-time charset
+        # check must reject it before it ever reaches the seed. Direct Assert-TierProfileValid on a
+        # network-tier hashtable (a .psd1 cannot even carry a literal newline-in-a-string cleanly).
+        $bad = @{
+            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='InGuestSquid';
+            EgressAllowlist=@("pypi.org`nhttp_access allow all"); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
+            HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
+            Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
+            Controls=@(); ManagementChannel='Com1Serial'
+        }
+        { Assert-TierProfileValid -Profile $bad -Context 'sec1' } |
+            Should -Throw -ExpectedMessage '*EgressAllowlist*invalid entry*'
+    }
+    It 'SEC-1: a clean hostname AND a leading-dot domain-suffix entry are ACCEPTED (the regex passes real allowlists)' {
+        $ok = @{
+            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='InGuestSquid';
+            EgressAllowlist=@('cas-bridge.xethub.hf.co', '.hf.co', 'pypi.org'); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
+            HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
+            Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
+            Controls=@(); ManagementChannel='Com1Serial'
+        }
+        { Assert-TierProfileValid -Profile $ok -Context 'sec1ok' } | Should -Not -Throw
+    }
+    It 'a workload overriding EgressMode to a NON-SquidSniProxy value is REFUSED' {
+        $wl = Join-Path $TestDrive 'bad-egress.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'bad'; Entrypoint = 'x'; EgressMode = 'HostProxy' }
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
+            Should -Throw -ExpectedMessage '*may only override EgressMode to*SquidSniProxy*'
+    }
+    It 'SquidSniProxy WITHOUT a DepsSpec is REFUSED' {
+        $wl = Join-Path $TestDrive 'no-depsspec.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'nd'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+   ExtraAllowlist = @('deb.debian.org','security.debian.org') }
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
+            Should -Throw -ExpectedMessage '*MUST carry a non-empty DepsSpec*'
+    }
+    It 'SquidSniProxy with a declared fetcher but a MISSING required host is REFUSED (derived per-fetcher)' {
+        $wl = Join-Path $TestDrive 'incomplete.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'inc'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+   ExtraAllowlist = @('deb.debian.org');                      # security.debian.org MISSING
+   DepsSpec = @{ Apt = @{ Packages = @('jq') } } }
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
+            Should -Throw -ExpectedMessage '*INCOMPLETE*security.debian.org*'
+    }
+    It 'a pip-ONLY DepsSpec is NOT forced to allowlist apt/HF hosts (derived per-fetcher)' {
+        $wl = Join-Path $TestDrive 'pip-only.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'pip'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+   DepsSpec = @{ Pip = @{ Packages = @('urllib3') } } }   # pypi+pythonhosted already in tier1
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
+    }
+    It 'existing ralph/firefox profiles still load (no EgressMode override -> backward compatible)' {
+        { Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/ralph.psd1"   -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
+        { Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/firefox.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
+    }
+}
+
+# ===========================================================================
+# Test-UsesOutboxTransport — THE single predicate for "does this profile release
+# its result through the user-space outbox (Raw OUTPUT) rather than a mounted exFAT
+# OUTPUT?". Workload.ps1 (disk shape), SeedBuilder.ps1 (in-guest runner) and
+# Invoke-Voidseal.ps1 (structural validator + read routing) ALL read this one
+# function. They used to compute it independently and drifted: SeedBuilder keyed on
+# OutboxOutput alone, so a PROCESSOR got a Raw OUTPUT disk AND the exFAT runner —
+# the guest would mount a filesystem that isn't there and fail closed silently.
+# ===========================================================================
+Describe 'Test-UsesOutboxTransport — the single outbox predicate' {
+
+    It 'is TRUE for a PROCESSOR (Network=None + ScreenConfig) even with NO OutboxOutput key' {
+        $p = @{ Name='proc'; WorkloadMode='Disk'; Network='None'; ScreenConfig=@{ mode='aggressive' } }
+        Test-UsesOutboxTransport -Profile $p | Should -BeTrue -Because 'a processor releases through the screener-governed outbox; its OUTPUT disk is Raw'
+    }
+
+    It 'is TRUE for an OutboxOutput profile (firefox) even with NO ScreenConfig' {
+        $p = @{ Name='firefox'; WorkloadMode='Disk'; OutboxOutput=$true }
+        Test-UsesOutboxTransport -Profile $p | Should -BeTrue -Because 'transport-only firefox opts into the same outbox transport'
+    }
+
+    It 'is FALSE for a legacy non-outbox Disk profile (keeps the direct exFAT result.html contract)' {
+        $p = @{ Name='legacy'; WorkloadMode='Disk'; Network='Internal' }
+        Test-UsesOutboxTransport -Profile $p | Should -BeFalse
+    }
+
+    It 'is FALSE when OutboxOutput is explicitly $false' {
+        $p = @{ Name='off'; WorkloadMode='Disk'; OutboxOutput=$false }
+        Test-UsesOutboxTransport -Profile $p | Should -BeFalse
+    }
+
+    It 'needs BOTH halves of the processor shape (Network=None alone is not a processor)' {
+        $p = @{ Name='half'; WorkloadMode='Disk'; Network='None' }
+        Test-UsesOutboxTransport -Profile $p | Should -BeFalse -Because 'a no-NIC profile without a ScreenConfig is not a processor'
+    }
+
+    It 'is FALSE for a null profile (fail-safe, no throw)' {
+        Test-UsesOutboxTransport -Profile $null | Should -BeFalse
+    }
+
+    It 'accepts a pscustomobject profile as well as a hashtable (both shapes callers pass)' {
+        $p = [pscustomobject]@{ Name='obj'; WorkloadMode='Disk'; OutboxOutput=$true }
+        Test-UsesOutboxTransport -Profile $p | Should -BeTrue
+    }
+
+    It 'agrees with the SHIPPED firefox profile (which is OutboxOutput transport-only)' {
+        $ff = Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/firefox.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles"
+        Test-UsesOutboxTransport -Profile $ff | Should -BeTrue
     }
 }

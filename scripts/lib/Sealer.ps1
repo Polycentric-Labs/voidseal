@@ -36,8 +36,9 @@
         3. turn OFF every host<->guest channel (clipboard / shares / guest-services /
            enhanced-session) via the backend's SetHostChannel,
         4. mark the descriptor State='Sealed'.
-      It does NOT power the VM on (the seal runs before first boot) and it does NOT touch the
-      egress allowlist — Tier-1 net-restriction is the in-guest nftables/allowlist concern,
+      It does NOT power the VM on (the seal runs before first boot) and it does NOT itself filter
+      egress — Tier-1 net-restriction relies on in-guest controls (Squid SNI proxy + allowlist) as
+      defense-in-depth today; host-side egress enforcement (Squid/NAT/default-DROP) is Phase-6-live,
       not this function's job. Tier-1 keeps its NIC; Tier >= 2 has it removed.
 
     THE GATE (Assert-Sealed; SCHEMA.md invariant 6 — the runtime pre-seal gate):
@@ -497,8 +498,9 @@ function Dismount-SandboxAsset {
       3. for a no-NIC tier (Tier >= 2): RemoveNetworkAdapter (remove, not disconnect),
       4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session),
       5. set the descriptor State = 'Sealed'.
-    It does NOT power the VM on, and does NOT manage the egress allowlist — Tier-1 net-restriction
-    is the in-guest nftables/allowlist concern, not this function's job. Tier-1 KEEPS its
+    It does NOT power the VM on, and does NOT itself filter egress — Tier-1 net-restriction today
+    relies on in-guest controls (Squid SNI proxy + allowlist) as defense-in-depth, not this
+    function's job; host-side egress enforcement is Phase-6-live. Tier-1 KEEPS its
     NIC; only Tier >= 2 is no-NIC. Generic over the tier so a future no-NIC profile seals correctly.
 .PARAMETER Descriptor
     The New-SandboxVM descriptor (consumed + updated; its Tier drives the NIC decision).
@@ -564,8 +566,8 @@ function Lock-Sandbox {
     }
 
     # --- 3. no-NIC tiers (Tier >= 2): remove the NIC entirely -------------
-    # Tier-1 is net-RESTRICTED, not no-net — its NIC stays (egress is the in-guest
-    # nftables/allowlist concern, not the seal). Generic over the tier.
+    # Tier-1 is net-RESTRICTED, not no-net — its NIC stays (egress control today is in-guest
+    # defense-in-depth, not the seal; host-side enforcement is Phase-6-live). Generic over the tier.
     if ($tier -ge 2) {
         $null = & $Backend.RemoveNetworkAdapter @{ VMName = $vmName }
     }
@@ -597,6 +599,15 @@ function Lock-Sandbox {
       * Tier >= 2: GetNetworkAdapter MUST be empty (no NIC = no live egress route). A Tier-1 VM
         legitimately keeps its NIC, so the NIC check is tier-gated; the media + channel checks
         apply to every tier.
+      * Tier == 1 (non-processor): every NIC MUST be on an isolated Internal vSwitch (I4) — its
+        SwitchType is host-verified via GetSwitch. An External, Private, or unresolvable switch
+        bypasses the host-controlled egress chokepoint and is refused, fail-closed. The
+        built-in Default Switch is itself SwitchType=Internal (ICS/internet-connected), so the
+        SwitchType check alone would certify it — an explicit by-NAME refusal of "Default Switch"
+        closes that gap (SHIPPED, mock-green). The name match is English-locale only; a GUID-based
+        refusal that also covers LOCALIZED (non-English) Default-Switch names is Phase-6-live (see
+        SECURITY.md). This is a switch-ISOLATION guarantee only — egress FILTERING is a separate,
+        still-Phase-6-live layer.
       * no import DVD/ISO attached (a live read-only-but-present host<->guest medium).
       * no transfer/import VHD recorded on the descriptor still attached.
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.
@@ -639,6 +650,11 @@ function Assert-Sealed {
         throw "Assert-Sealed: descriptor has no VM Name; cannot verify a seal."
     }
     $tier = [int](Get-DescriptorField -Descriptor $Descriptor -Name 'Tier' -Default 0)
+    # A processor profile carries Network='None' on the descriptor. It is structurally
+    # no-NIC — the same guarantee as Tier>=2 — even when the tier integer is 0 or 1.
+    # Read it once and propagate to the NIC check and error messaging below.
+    $network     = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'Network')
+    $isProcessor = ($network -eq 'None')
 
     # --- FAIL CLOSED: if the host can't be queried, do NOT certify --------
     # An inability to perform the host-side check is never a pass — that is the whole point of
@@ -656,13 +672,77 @@ function Assert-Sealed {
         throw "Assert-Sealed: REFUSING to certify — no VM named '$vmName' exists on the host. Fail closed."
     }
 
-    # --- Tier >= 2: NO NIC (host-verified; the guest's view is irrelevant) ----
+    # --- Tier >= 2 OR processor (Network='None'): NO NIC (host-verified; guest view irrelevant) ---
+    # A processor (Network='None') is structurally no-NIC at any tier — exactly the same
+    # guarantee as Tier>=2. We reuse the same GetNetworkAdapter call (D2: no new method)
+    # and branch the error message so the reason is unambiguous in the operator log: the
+    # PROCESSOR message fires for ANY processor tier (the no-NIC guarantee comes from
+    # Network='None', not the tier integer — so a Tier>=2 processor still gets the processor
+    # reason, never the generic one), and the generic Tier>=2 message is reserved for a
+    # NON-processor Tier>=2 VM (whose no-NIC guarantee comes purely from its tier).
     # Read the collection DIRECTLY (the backend preserves array semantics; never re-wrap).
-    if ($tier -ge 2) {
+    if ($tier -ge 2 -or $isProcessor) {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
         if ($nics.Count -ne 0) {
+            if ($isProcessor) {
+                # Processor case (any tier): the no-NIC guarantee comes from Network='None'.
+                throw ("Assert-Sealed: REFUSING to certify processor VM '$vmName' SEALED — $($nics.Count) " +
+                       "network adapter(s) still attached. A processor (Network='None') MUST have NO NIC " +
+                       "(no live egress route — structurally no-net at Tier-$tier). Fail closed.")
+            }
             throw ("Assert-Sealed: REFUSING to certify Tier-$tier VM '$vmName' SEALED — $($nics.Count) network " +
                    "adapter(s) still attached. A Tier>=2 VM MUST have NO NIC (no live egress route). Fail closed.")
+        }
+    }
+
+    # --- Tier 1 (net-restricted, non-processor): the NIC MUST be on the ISOLATED Internal vSwitch (I4) ---
+    # A Tier-1 VM legitimately HAS a NIC (net-restricted, not no-net), but its egress must ride the HOST
+    # chokepoint — an Internal vSwitch whose gateway the host controls (Pass A Q2). An External switch bypasses
+    # the host TCP/IP stack (unfiltered egress) and is refused. NOTE (accuracy, whole-branch review): the
+    # built-in "Default Switch" is ITSELF SwitchType='Internal' (it is Hyper-V's ICS/internet-connected
+    # switch, confirmed on real hardware) — so the SwitchType-based check alone does NOT distinguish it from a
+    # purpose-built isolated Internal switch and would CERTIFY a Default-Switch-connected NIC as sealed. This
+    # seal now verifies BOTH: (a) the NIC's switch is SwitchType='Internal' (fail closed on External/Private/
+    # unresolvable), AND (b) that switch is NOT the built-in Default Switch, refused explicitly BY NAME below
+    # (Phase-6 §Track item 1 — now shipped; see the dedicated throw for the LIVE-only GUID-hardening note).
+    # Egress FILTERING via host Squid/NAT/default-DROP remains Phase-6-live; this asserts switch ISOLATION
+    # only — the VM can reach only the host gateway of whatever (non-Default) Internal switch it's on.
+    if ($tier -eq 1 -and -not $isProcessor) {
+        $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
+        foreach ($nic in $nics) {
+            $switchName = [string]$nic.SwitchName
+            if ([string]::IsNullOrWhiteSpace($switchName)) {
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED — a network adapter is not " +
+                       "on any vSwitch (no SwitchName). A Tier-1 NIC MUST be on an isolated Internal vSwitch " +
+                       "(host-controlled egress chokepoint). Fail closed.")
+            }
+            $sw = & $Backend.GetSwitch @{ Name = $switchName }
+            if ($null -eq $sw -or [string]$sw.SwitchType -ne 'Internal') {
+                $gotType = if ($null -eq $sw) { '(switch not found on host)' } else { [string]$sw.SwitchType }
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED — its NIC is on switch " +
+                       "'$switchName' (SwitchType=$gotType), not an isolated Internal vSwitch. A Tier-1 VM's egress " +
+                       "MUST ride the host-controlled Internal-switch gateway, never an External or Private switch " +
+                       "(which bypasses the host stack). Fail closed.")
+            }
+            # By-NAME refusal of the built-in "Default Switch" (Phase-6 §Track item 1 — now shipped). The
+            # SwitchType check above is necessary but NOT sufficient: the Default Switch is ITSELF
+            # SwitchType=Internal (Hyper-V's ICS/internet-connected switch — Pass A Q2, confirmed on real
+            # hardware), so a Default-Switch-connected NIC would PASS the type check and be certified. It gives
+            # unmediated ICS internet egress the host gateway does not control — the opposite of an isolated
+            # Tier-1 Internal switch. Real Tier-1 provisioning names its switch "<vm>-int" (Provisioner.ps1),
+            # never the Default Switch, so this cannot false-positive a legitimate seal. Case-insensitive on the
+            # well-known friendly name. LIVE Phase-6 HARDENING (tracked, not mock-modelable here): ALSO refuse by
+            # the immutable Default-Switch GUID c08cb7b8-9b3c-408e-8e30-5e16a3aeb444 — the friendly NAME can be
+            # LOCALIZED on non-English Windows, but the GUID is stable. The fake backend does not model a switch
+            # .Id, so the GUID check is a real-host-only addition; the name-based refusal is the mock-verifiable
+            # control this slice ships.
+            if ($switchName.Trim() -ieq 'Default Switch') {
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED — its NIC is on the built-in " +
+                       "'Default Switch'. That switch reports SwitchType=Internal, but it is Hyper-V's " +
+                       "ICS/internet-connected switch (unmediated egress the host gateway does not control), NOT an " +
+                       "isolated Tier-1 Internal vSwitch. A Tier-1 VM MUST ride a purpose-built isolated Internal " +
+                       "switch (host-controlled egress chokepoint). Fail closed.")
+            }
         }
     }
 
@@ -710,7 +790,19 @@ function Assert-Sealed {
     # input/output, an UNRECORDED disk is still refused, and a secret-SHAPED SeedDiskPath is still caught
     # by the secret check (b) BEFORE these allowances — recording cannot launder a secret.
     $seedDisk   = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'SeedDiskPath')
-    # HARDENING 2 (path canonicalization): the set-membership compares below (the structural rule (c)
+    # Task 1.3: the processor-profile DEPS disk (DepsDiskPath) is a pre-provisioned dependency
+    # payload attached BEFORE the seal and recorded on the descriptor. It is EXPECTED to remain
+    # attached through the seal exactly like INPUT/OUTPUT/SeedDiskPath — NOT a residual. It joins
+    # both the expected set (all-tier backstop (d)) and the recorded-data-disk set (Tier>=2
+    # structural rule (c)). The secret check (b) still runs FIRST so a secret-SHAPED DepsDiskPath
+    # is caught before these allowances — recording cannot launder a secret. An UNRECORDED attached
+    # disk is still refused; the no-net structural guarantee is intact.
+    # NOTE: Hyper-V cannot host-enforce a read-only VHDX (no -ReadOnly on Add-VMHardDiskDrive and
+    # host-file-read-only is undefined), so there is NO read-only check and NO new backend method.
+    # The DEPS disk is attached normally; the recorded DepsDiskPath is simply ACCEPTED (not refused
+    # as a residual), exactly like INPUT/OUTPUT. (D3 correction — 2026-06-28.)
+    $depsDisk   = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'DepsDiskPath')
+    # Path canonicalization: the set-membership compares below (the structural rule (c)
     # and the all-tier backstop (d)) test a host-truth attached path against these recorded sets with
     # an exact OrdinalIgnoreCase string compare. A recorded path and the attached path that differ
     # only by FORM (trailing slash, relative '.'/'..', '\\?\' prefix, 8.3 short name) would compare as
@@ -721,15 +813,17 @@ function Assert-Sealed {
     # This does NOT weaken the gate: an UNRECORDED disk's canonical form is still absent from the set,
     # so it is still refused (a genuinely-different path canonicalizes to a genuinely-different string).
     $expectedDisks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($e in (@($systemDisk) + $createdDisks + $diskPaths + @($inputDisk) + @($outputDisk) + @($seedDisk))) {
+    foreach ($e in (@($systemDisk) + $createdDisks + $diskPaths + @($inputDisk) + @($outputDisk) + @($seedDisk) + @($depsDisk))) {
         if (-not [string]::IsNullOrWhiteSpace([string]$e)) { [void]$expectedDisks.Add((Get-CanonicalDiskPath ([string]$e))) }
     }
     # The recorded data disks, as a set, used by the Tier>=2 STRUCTURAL rule (c) to allow them too
     # (they are expected, not residual). Same OrdinalIgnoreCase + canonicalization as the expected set.
     # RC6: the CIDATA seed disk (SeedDiskPath) is a recorded data disk too — it must be allowed by the
     # Tier>=2 structural rule alongside INPUT/OUTPUT (an UNRECORDED disk is still refused; see (c)).
+    # Task 1.3: the DEPS disk (DepsDiskPath) joins the same recorded-data-disk set for the structural
+    # rule, mirroring the SeedDiskPath addition (an UNRECORDED disk is still refused by rule (c)).
     $recordedDataDisks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($e in (@($inputDisk) + @($outputDisk) + @($seedDisk))) {
+    foreach ($e in (@($inputDisk) + @($outputDisk) + @($seedDisk) + @($depsDisk))) {
         if (-not [string]::IsNullOrWhiteSpace([string]$e)) { [void]$recordedDataDisks.Add((Get-CanonicalDiskPath ([string]$e))) }
     }
     # The system disk in canonical form, for the structural rule (c)'s system-disk compare.
@@ -765,7 +859,16 @@ function Assert-Sealed {
         # Reuses the ProfileLoader's single-source-of-truth secret-path matcher (dot-sourced).
         # IMPORTANT: this runs BEFORE the recorded-disk allowances (c)/(d), so recording a secret-
         # shaped path as InputDiskPath/OutputDiskPath CANNOT launder it past this check.
-        if ((Get-Command Test-IsSecretPath -ErrorAction SilentlyContinue) -and (Test-IsSecretPath -Path $disk)) {
+        # FAIL CLOSED when the matcher itself is unavailable. Everywhere else in this function an
+        # unreadable input throws; a MISSING verifier must not degrade to "no secret found". The
+        # orchestrator dot-sources ProfileLoader.ps1, so absence means the engine was loaded wrong,
+        # which is exactly the moment a trusting pass is most dangerous.
+        if (-not (Get-Command Test-IsSecretPath -ErrorAction SilentlyContinue)) {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED - the secret-path matcher " +
+                   "(Test-IsSecretPath, from ProfileLoader.ps1) is not loaded, so attached volumes cannot " +
+                   "be screened. Dot-source the full engine before sealing. Fail closed.")
+        }
+        if (Test-IsSecretPath -Path $disk) {
             throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED — a secret-shaped volume '$disk' is " +
                    "attached. No secret volume may be present in a sealed sandbox (SCHEMA invariant 6). Fail closed.")
         }
@@ -792,7 +895,7 @@ function Assert-Sealed {
         # (d) ALL-TIER best-effort backend-truth backstop: an ACTUALLY-attached disk that is not an
         # EXPECTED disk (system disk + the descriptor's CreatedDisks/DiskPaths) is a residual and is
         # refused — at EVERY tier, including Tier-1 (where (c)'s strict single-disk rule does not
-        # apply). This closes the Tier-1 gap the review caught: a residual that is neither secret-
+        # apply). This closes a Tier-1 gap: a residual that is neither secret-
         # shaped by name (b) nor recorded as import media (a) would otherwise slip through at Tier-1.
         # It is BEST-EFFORT — it can only catch disks the descriptor did not record as legitimate;
         # the authoritative no-net structural guarantee remains (c) at Tier>=2. We only apply it when

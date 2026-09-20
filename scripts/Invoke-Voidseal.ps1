@@ -60,6 +60,119 @@ $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
 . (Join-Path $script:DeployLibDir 'Runner.ps1')
 . (Join-Path $script:DeployLibDir 'Workload.ps1')
 . (Join-Path $script:DeployLibDir 'SeedBuilder.ps1')
+. (Join-Path $script:DeployLibDir 'SensitivityGate.ps1')
+
+# --------------------------------------------------------------------------
+# Fold-in #1: Resolve-PythonExe — robust host python3/python resolution.
+#
+# A hard `& python3` BREAKS the Windows host: the Windows Python installer provides
+# `python`, not `python3`. The in-guest binary is `python3` (Debian), but the HOST
+# shelling `host/read_outbox.py` at the seam-#2 gate is Windows PowerShell, which
+# needs the Windows `python` executable. Get-Command probes both names; throw fail-
+# closed naming both if NEITHER resolves (prefer python3 on non-Windows for safety).
+# --------------------------------------------------------------------------
+<#
+.SYNOPSIS
+    Resolve the host Python executable path (python3 preferred, python fallback).
+.DESCRIPTION
+    A hard `& python3` breaks on Windows hosts where the Python installer provides
+    `python`. This probes both names via Get-Command and returns the resolved path.
+    Throws a clear fail-closed message naming both candidates if neither resolves.
+#>
+function Resolve-PythonExe {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $cmd = Get-Command python3 -ErrorAction SilentlyContinue
+    if ($null -ne $cmd) { return $cmd.Source }
+
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($null -ne $cmd) { return $cmd.Source }
+
+    throw ("Resolve-PythonExe: neither 'python3' nor 'python' was found on PATH. " +
+           "Install Python and ensure it is on the PATH (Windows: the Python installer " +
+           "adds 'python'; Linux/macOS: 'python3'). Failing closed.")
+}
+
+# --------------------------------------------------------------------------
+# C1.2: shared outbox-producer READ template — user-space, NEVER Mount-VHD.
+#
+# Both a PROCESSOR (Network='None' + ScreenConfig) and a transport-only OutboxOutput profile
+# (firefox: OutboxOutput=$true, no ScreenConfig) write their result as a memory-safe "outbox"
+# container (guest/outbox.py) onto the Raw OUTPUT disk (C1.1) instead of a mountable filesystem.
+# This function is the ONE read-side implementation both branches share: two-phase
+# ReadVhdxRawRegion (probe the 24-byte header for the exact blob length, then read exactly that),
+# then shell host/read_outbox.py to parse it fail-closed into <out>/verdicts.json + <out>/staging/.
+# The host NEVER calls ReadVhdxFile / Mount-VHD on this disk — extracted from the processor gate
+# block (formerly inline at ~571-606) so the transport-only branch (below) can reuse it verbatim.
+# ANY anomaly (missing/short disk, bad magic, oversize header, read_outbox.py non-zero exit) THROWS
+# — the caller is responsible for catching + recording a fail-closed outcome; nothing is released
+# on a thrown outbox read.
+# --------------------------------------------------------------------------
+<#
+.SYNOPSIS
+    Read a Raw-OUTPUT disk's outbox container user-space (ReadVhdxRawRegion, never Mount-VHD) and
+    parse it fail-closed via host/read_outbox.py into <Destination>/gate-input/{verdicts.json,staging/}.
+.DESCRIPTION
+    Shared by the processor gate and the C1.2 transport-only OutboxOutput read path. THROWS on any
+    anomaly (missing/absent outbox, bad magic, oversize header, tamper, read_outbox.py failure) —
+    the caller must catch and record a fail-closed outcome.
+.PARAMETER OutputDiskPath
+    The (detached) Raw OUTPUT disk's host path.
+.PARAMETER Destination
+    The host destination dir; a 'gate-input' subdir + 'outbox.bin' are written under it.
+.PARAMETER Backend
+    The Hyper-V backend (real or fake) — ReadVhdxRawRegion is called through it.
+.OUTPUTS
+    The path to the gate-input dir (containing verdicts.json + staging/).
+#>
+function Read-OutboxToGateInput {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string] $OutputDiskPath,
+        [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] [hashtable] $Backend
+    )
+    if ([string]::IsNullOrWhiteSpace($OutputDiskPath)) { throw 'Read-OutboxToGateInput: no OUTPUT disk to read the outbox from.' }
+    if (-not (Test-Path -LiteralPath $Destination)) { $null = New-Item -ItemType Directory -Path $Destination -Force }
+
+    $gateInput = Join-Path $Destination 'gate-input'
+
+    # Two-phase user-space read: probe the 24-byte header for the exact blob length, then read exactly that.
+    $hdr = [byte[]](& $Backend.ReadVhdxRawRegion @{ Path = $OutputDiskPath; Offset = 0; Length = 24 })
+    if ($hdr.Length -lt 24 -or [System.Text.Encoding]::ASCII.GetString($hdr, 0, 8) -ne 'VSOUTBX1') {
+        throw 'outbox read: OUTPUT outbox header missing/!magic (empty base read? check AutomaticCheckpoints).'
+    }
+    $count = [System.BitConverter]::ToUInt32($hdr, 12)
+    $total = [System.BitConverter]::ToUInt64($hdr, 16)
+    if ($count -gt 256 -or $total -gt 67108864) { throw "outbox read: outbox header count/total over bound ($count/$total)." }
+    $exact = 24L + ([int64]$count * 104L) + [int64]$total
+    $blob  = [byte[]](& $Backend.ReadVhdxRawRegion @{ Path = $OutputDiskPath; Offset = 0; Length = $exact })
+    # Bridge PS bytes -> read_outbox.py via a host temp file (binary stdin is fragile on Windows PowerShell).
+    $blobFile = Join-Path $Destination 'outbox.bin'
+    [System.IO.File]::WriteAllBytes($blobFile, $blob)
+    # Outbox constants (single source of truth: guest/outbox.py's _HEADER/_REC — read them there,
+    # not here, if this drifts again):
+    #   MAGIC   = b'VSOUTBX1'  (8 bytes, offset 0)
+    #   Header  = 24 bytes     (_HEADER = '<8sHHIQ' = magic[8] + version[2] + reserved[2] + count[4] + total_bytes[8])
+    #   Record  = 104 bytes    (_REC = '<40sQQ32s16x' = name[40] + offset[8] + length[8] + sha256[32] + reserved[16])
+    $readScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'host/read_outbox.py'   # <repo>/host/read_outbox.py
+    $pyExe = Resolve-PythonExe
+    $pyOut = & $pyExe $readScript --blob $blobFile --out $gateInput 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $pyStderr = ($pyOut | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                    ForEach-Object { $_.Exception.Message }) -join '; '
+        if ([string]::IsNullOrWhiteSpace($pyStderr)) {
+            # Capture any stdout lines as well (non-ErrorRecord items)
+            $pyStderr = ($pyOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join '; '
+        }
+        $stderrSuffix = if ([string]::IsNullOrWhiteSpace($pyStderr)) { '' } else { " stderr: $pyStderr" }
+        throw "outbox read: read_outbox.py failed (exit $LASTEXITCODE) — outbox invalid/tampered; releasing nothing.$stderrSuffix"
+    }
+    return $gateInput
+}
 
 # --------------------------------------------------------------------------
 # Internal: resolve the -Profile argument to a normalized profile hashtable (loader output).
@@ -209,10 +322,33 @@ function Get-WorkloadField {
     Also reused as the POLL cadence for the Disk-mode completion wait (Wait-WorkloadComplete) — how
     long between VM-State polls while waiting for the guest to self-power-off (tests inject 0).
 .PARAMETER WorkloadTimeoutSeconds
-    (Optional, Disk mode) the wall-clock deadline for the self-power-off completion wait. In Disk
-    mode the guest runs its boot workload then powers ITSELF off; the host polls VM State until Off or
-    this deadline fires (Wait-WorkloadComplete force-stops a hung guest on timeout). Default 600. Tests
-    inject 0 (one instant poll then trip the deadline) so they never sleep. Unused by Serial mode.
+    (Optional) the OVERALL wall-clock deadline for the workload run. In Disk mode the guest runs its
+    boot workload then powers ITSELF off; the host polls VM State until Off or this deadline fires
+    (Wait-WorkloadComplete force-stops a hung guest on timeout). In Serial mode (I6a) this value IS
+    passed as Start-SandboxWorkload's -TimeoutSeconds — the single serial guest-command dispatch's own
+    deadline — so it bounds the ACTUAL delivered command, not a pre-dispatch clock check. When that
+    guest command reports TimedOut=$true (the guest hung and never completed in time — a REPORTED
+    outcome from InvokeGuestCommand, not a thrown error), Invoke-Voidseal force-stops the VM and
+    records a Failed RunResult, mirroring the Disk-mode timeout shape. Default 600. Tests use the fake
+    backend's -SimulateGuestCommandTimeout switch (not a 0 value) to exercise this deterministically,
+    since a real elapsed-time trip cannot be forced instantaneously through a mock without a live
+    blocking primitive. NOTE (LIVE-ONLY-UNPROVEN, Phase 6): the real InvokeGuestCommand's timeout
+    re-check only fires between pipe reads, so a guest that goes fully silent is not guaranteed to trip
+    it live — see HyperVBackend.ps1's InvokeGuestCommand closure for the detailed caveat.
+.PARAMETER RateLedgerPath
+    (Optional) host-side path to the C2.6 runs/day release-rate JSON ledger (ReleaseGovernor.ps1).
+    ONLY consulted for a PROCESSOR profile (Network='None' + ScreenConfig) — a transport-only
+    OutboxOutput profile (firefox) is never screened, so it is never rate-capped either. Defaults to
+    a location UNDER the system temp path but OUTSIDE any single run's -ArtifactRoot: '<temp>\Voidseal\
+    state\release-ledger.json' — -ArtifactRoot defaults to a fresh GUID-named dir per run
+    ('<temp>\Voidseal\artifacts\<Name>'), so a ledger placed there would never accumulate across
+    separate Invoke-Voidseal calls and the runs/day cap would be silently inert. The default ledger
+    path is deliberately a SIBLING of the artifacts root, not a child of it, so it persists across runs
+    on the same host (the aggregate-leakage backstop this cap exists for is inherently a same-host,
+    cross-run concern). Pass an explicit path to relocate it (e.g. tests point it at $TestDrive).
+.PARAMETER MaxReleasesPerDay
+    (Optional) C2.6 per-profile, per-UTC-day release-event cap passed through to Invoke-SensitivityGate.
+    Default 5 (ReleaseGovernor.ps1's own conservative FORK default for Allen, tunable at Phase 6).
 .PARAMETER Backend
     The Hyper-V backend. Defaults to the real one; tests inject the fake.
 #>
@@ -230,6 +366,8 @@ function Invoke-Voidseal {
         [int]    $BootWaitSeconds = 180,
         [int]    $BootPollDelaySeconds = 5,
         [int]    $WorkloadTimeoutSeconds = 600,
+        [string] $RateLedgerPath,
+        [ValidateRange(1, [int]::MaxValue)] [int] $MaxReleasesPerDay = 5,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -256,6 +394,15 @@ function Invoke-Voidseal {
     if ([string]::IsNullOrWhiteSpace($Destination)) {
         $Destination = Join-Path $ArtifactRoot 'extracted'
     }
+    # C2.6 — the rate-cap ledger MUST NOT default under -ArtifactRoot: -ArtifactRoot defaults to a
+    # fresh GUID-named dir PER RUN ('<temp>\Voidseal\artifacts\<Name>'), so a ledger nested under it
+    # would never accumulate across separate Invoke-Voidseal calls and the runs/day cap would be
+    # silently inert (every run would see an empty ledger). Default it as a SIBLING of the artifacts
+    # root instead — stable across runs on the same host, which is the whole point of an aggregate-
+    # leakage backstop. See the .PARAMETER RateLedgerPath doc above for the full rationale.
+    if ([string]::IsNullOrWhiteSpace($RateLedgerPath)) {
+        $RateLedgerPath = Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\state\release-ledger.json'
+    }
 
     # The entrypoint: prefer the workload spec, fall back to a workload profile's Entrypoint.
     $entrypoint = [string](Get-WorkloadField -Workload $Workload -Name 'Entrypoint')
@@ -277,6 +424,38 @@ function Invoke-Voidseal {
     $resultInnerName   = [string](Get-WorkloadField -Workload $Workload -Name 'ResultInnerName'   -Default 'result.html')
     $sentinelInnerName = [string](Get-WorkloadField -Workload $Workload -Name 'SentinelInnerName' -Default 'result.exitcode')
 
+    # --- D (structural C1 no-mount): refuse a Disk-mode profile that would reach the legacy
+    # Read-WorkloadResult -> ReadVhdxFile -> Mount-VHD host-mount branch (~:684 below) -----------------
+    # A PROCESSOR (Network='None' + ScreenConfig) or an OutboxOutput profile (firefox) never reaches
+    # that branch — both are gated onto the user-space outbox read (Read-OutboxToGateInput ->
+    # ReadVhdxRawRegion, never Mount-VHD; see the $usesOutbox gate in the post-detach read block).
+    #
+    # NO BUILDER CARVE-OUT (deliberate, Step-1 finding): the builder (EgressMode='SquidSniProxy') has
+    # its OWN, entirely separate orchestrator (Invoke-BuilderVM, BuilderVM.ps1) — it never calls
+    # Invoke-Voidseal at all, and never calls Read-WorkloadResult; it hashes its OUTPUT disk whole-file
+    # via GetVhdxImageHash and never mounts it. Nothing in Invoke-Voidseal.ps1 or any test/caller ever
+    # legitimately passes a builder-shaped profile to Invoke-Voidseal — the only place 'builder' is
+    # referenced here is a PROCESSOR attaching a builder-PRODUCED, hash-VERIFIED deps disk (a different
+    # concept). So a builder-shaped profile arriving at Invoke-Voidseal is ALWAYS a caller misroute
+    # (should have called Invoke-BuilderVM), never a legitimate flow — carving it out here would silently
+    # let a misrouted builder profile fall through to the host-mount branch, reopening the exact P0 this
+    # validator exists to close. Refuse it the same as any other non-outbox, non-processor Disk profile.
+    #
+    # This calls the SAME shared predicate (Test-UsesOutboxTransport, ProfileLoader.ps1) that the
+    # post-detach read block, Workload.ps1's OUTPUT-disk shape and SeedBuilder.ps1's runner selection
+    # all use — evaluated here at the earliest point it is available, BEFORE any provisioning/backend
+    # call — and refuses fail-closed. It was previously a hand-mirrored copy of that expression; the
+    # copies drifted (see the predicate-drift note on Test-UsesOutboxTransport), so they are now one.
+    # No shipped profile hits this today; it closes the seam so a future Disk-mode profile (or a
+    # misrouted builder profile) cannot silently re-open the host-mount hole.
+    if ($workloadMode -eq 'Disk' -and -not (Test-UsesOutboxTransport -Profile $resolved)) {
+        throw ("Invoke-Voidseal: REFUSING a Disk-mode workload that is neither a processor (Network='None'+ScreenConfig) " +
+               "nor an OutboxOutput profile — it would reach the legacy host-mount result path (Read-WorkloadResult -> " +
+               "Mount-VHD on a guest-written FS = the C1 P0). A Disk-mode workload MUST use the user-space outbox read " +
+               "(OutboxOutput/ScreenConfig). The builder profile is not exempt here — it has its own orchestrator " +
+               "(Invoke-BuilderVM) and must never be passed to Invoke-Voidseal directly. Fail closed.")
+    }
+
     # --- the report, built up as we traverse ----------------------------
     $states     = [System.Collections.Generic.List[string]]::new()
     $report = [pscustomobject]@{
@@ -289,6 +468,14 @@ function Invoke-Voidseal {
         TeardownStatus    = '(not run)'
         Error             = $null
         Descriptor        = $null
+        # Processor-workload Sensitivity Gate outputs (set only when the post-detach gate runs — see
+        # the Disk-mode RUNNING block). Released/Held are arrays of the screener's per-file verdict
+        # objects (auto-certified-SAFE vs held-for-review); SensitivityReport is the host path to the
+        # gate's sensitivity-report.json. They stay $null for a non-processor deploy (the gate did not
+        # run). GateRan (the boolean fact that the gate executed) lives on the DESCRIPTOR, not here.
+        Released          = $null
+        Held              = $null
+        SensitivityReport = $null
     }
 
     $descriptor = $null
@@ -303,9 +490,12 @@ function Invoke-Voidseal {
         $states.Add('PROVISIONED')
 
         # --- STAGED: one-way asset import BEFORE the seal ------------------
-        # Import every StageAssets entry the profile declares (host source -> in-guest). The loader
-        # already refused any secret-shaped source, so staging cannot smuggle a secret in. With no
-        # StageAssets this is a recorded no-op transition (the state is still traversed).
+        # Import every StageAssets entry the profile declares (host source -> in-guest). Invariant 1
+        # screens these KEYS (and the Mounts keys) against Test-IsSecretPath at load time, so a
+        # secret-SHAPED source is refused before the lifecycle starts. That screen is a path-shape
+        # lint, not a content scan: it stops the common accident, not a caller who renames a
+        # credential. With no StageAssets this is a recorded no-op transition (the state is still
+        # traversed).
         $seedIso       = if ($resolved.ContainsKey('SeedIso')) { [string]$resolved['SeedIso'] } else { $null }
         $hasSeed       = -not [string]::IsNullOrWhiteSpace($seedIso)
         $stageIsoCount = 0
@@ -371,6 +561,17 @@ function Invoke-Voidseal {
             $descriptor = New-WorkloadDisks -Descriptor $descriptor -Profile $resolved `
                 -StorageRoot $diskStorageRoot -Backend $Backend
             $report.Descriptor = $descriptor
+            # I2b ENOSPC (FAIL-CLOSED): on a classified HOST-side ENOSPC writing an Input, New-WorkloadDisks
+            # stamps $descriptor.WorkloadDiskStatus='DiskFull' (diagnostic) then RE-THROWS a classified error
+            # — it does NOT return a DiskFull descriptor and fall through. The throw propagates to this
+            # cmdlet's OUTER lifecycle catch, which records the failure (.Error) and runs teardown, so a
+            # DiskFull ABORTS fail-closed BEFORE the seed-disk/seal/run steps below — the sandbox never seals
+            # or runs against a partial INPUT / absent OUTPUT disk. No orchestrator-side sentinel branch is
+            # needed here; the existing lifecycle-abort machinery handles it (same path as SimulateStartVMError
+            # et al.). This crossing ("a DiskFull throw never reaches Assert-Sealed") is pinned by the I2b
+            # lifecycle-abort tests in InvokeVoidseal.Tests.ps1: the 'SimulateWriteEnospc' Inputs-populate
+            # It and the 'CreateEnospc variant' It (title-matched — It titles are the stable anchor; line
+            # numbers drift). (Real host-disk-full HResult classification is LIVE-ONLY-UNPROVEN until Phase 6.)
 
             # RC6: the CIDATA seed DATA DISK — built from the resolved profile's Entrypoint (the disk-mode
             # runner) and recorded on the descriptor (SeedDiskPath + CreatedDisks) so it survives the seal
@@ -386,6 +587,65 @@ function Invoke-Voidseal {
                 $resolved['Entrypoint'] = $entrypoint
                 $descriptor = New-WorkloadSeedDisk -Descriptor $descriptor -Profile $resolved `
                     -StorageRoot $diskStorageRoot -Backend $Backend
+                $report.Descriptor = $descriptor
+            }
+
+            # --- PROCESSOR: attach + RECORD the DEPS disk BEFORE the seal -------------------------
+            # A processor profile (Network='None') runs against a pre-built, read-only DEPENDENCY disk.
+            # PHASE-1 ONLY: the deps.vhdx is a fixture supplied via -Workload.DepsDiskPath (or the resolved
+            # profile's DepsDiskPath); PHASE-2 (real): the builder produces deps.vhdx and hands its path in.
+            # Like the INPUT/OUTPUT/SeedDisk data disks, it must be
+            # ATTACHED and RECORDED (DepsDiskPath) on the descriptor BEFORE Lock-Sandbox so Assert-Sealed's
+            # host-truth scan ACCEPTS it as an expected disk — an UNRECORDED extra attached disk fails the
+            # seal gate as a residual. We attach via the existing AddHardDiskDrive (no read-only attach:
+            # Hyper-V cannot host-enforce a read-only VHDX — D3). The DEPS disk is the BUILDER's pre-
+            # existing file, so it is NOT added to CreatedDisks (we did not create it; teardown's
+            # Remove-Sandbox detaches it by removing the VM, but the deps.vhdx FILE is left on disk).
+            $depsDiskPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
+            if ([string]::IsNullOrWhiteSpace($depsDiskPath) -and $resolved.ContainsKey('DepsDiskPath')) { $depsDiskPath = [string]$resolved['DepsDiskPath'] }
+            if ($resolved['Network'] -eq 'None' -and -not [string]::IsNullOrWhiteSpace($depsDiskPath)) {
+                # I1 — STRUCTURE-BEFORE-HASH: a container-swap can rewrite a fixed disk's footer/parent-locator so it
+                # becomes a DIFFERENCING disk pointing at an attacker-controlled parent (which supplies the real blocks
+                # at attach time). Refuse ANY differencing / parent-bearing deps disk BEFORE trusting it — GetVHDInfo
+                # already surfaces these fields (they were never checked). Fail closed; the whole-image hash alone does
+                # not model an attacker who controls both child and parent.
+                $depsInfo = & $Backend.GetVHDInfo @{ Path = $depsDiskPath }
+                if ($null -eq $depsInfo) {
+                    throw "Invoke-Voidseal: '$Name' DEPS disk ('$depsDiskPath') is unreadable via GetVHDInfo — refusing to attach an unverifiable dependency disk. Failing closed."
+                }
+                if ([bool]$depsInfo.Differencing -or -not [string]::IsNullOrWhiteSpace([string]$depsInfo.ParentPath)) {
+                    throw "Invoke-Voidseal: '$Name' DEPS disk ('$depsDiskPath') is a DIFFERENCING disk (Differencing=$($depsInfo.Differencing), ParentPath='$($depsInfo.ParentPath)'). A dependency disk MUST be a self-contained fixed/dynamic VHDX — a differencing child pulls blocks from an external parent the host cannot verify. Refusing to attach; failing closed."
+                }
+                # PHASE 3 — VERIFY-BEFORE-ATTACH (tamper-evidence of the deps hand-off, NOT upstream
+                # supply-chain authenticity; Pass-5 + Pass-4 P1 "offline != trustworthy"; I3 reframe).
+                # This proves deps.vhdx is byte-identical to what the builder emitted (host<->processor
+                # hand-off integrity) — it says nothing about whether the packages/models INSIDE the
+                # disk are what upstream published (see guest/fetch_deps.py + docs/operator-runbook.md
+                # for the per-fetcher provenance story: apt signature verification, pip hashed-lockfile,
+                # HF --revision pin). The expected whole-image hash comes from the TRUSTED caller (who
+                # ran the builder + captured its WholeImageHash) via -Workload.DepsImageHash (fallback:
+                # the resolved profile). Re-hash deps.vhdx in USER-SPACE (GetVhdxImageHash — raw bytes,
+                # NEVER Mount-VHD) while it is still DETACHED (before this AddHardDiskDrive), and REFUSE
+                # on a missing OR mismatched hash — fail-closed: no unverified or tampered/substituted
+                # dependency disk ever attaches. (Live: GetVhdxImageHash is qemu-img-free streaming
+                # SHA-256 — re-resolve at fire; the mock fake returns SHA-256 of the recorded deps bytes.)
+                $expectedHash = [string](Get-WorkloadField -Workload $Workload -Name 'DepsImageHash')
+                if ([string]::IsNullOrWhiteSpace($expectedHash) -and $resolved.ContainsKey('DepsImageHash')) { $expectedHash = [string]$resolved['DepsImageHash'] }
+                if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+                    throw "Invoke-Voidseal: '$Name' attaches a DEPS disk ('$depsDiskPath') but no DepsImageHash was supplied. A deps disk MUST carry the builder's recorded whole-image hash (pass -Workload.DepsImageHash) — refusing to attach an UNVERIFIED dependency disk. Failing closed."
+                }
+                $expectedHash = $expectedHash.Trim().ToLowerInvariant()
+                $actualHash   = ([string](& $Backend.GetVhdxImageHash @{ Path = $depsDiskPath })).Trim().ToLowerInvariant()
+                if ($actualHash -ne $expectedHash) {
+                    throw "Invoke-Voidseal: '$Name' DEPS disk integrity check FAILED — '$depsDiskPath' hashes to '$actualHash' but the expected (builder-recorded) hash is '$expectedHash'. The dependency disk was tampered or substituted — refusing to attach. Failing closed."
+                }
+                # Verified -> attach + RECORD (DepsDiskPath + the verified DepsImageHash) BEFORE Lock-Sandbox so
+                # Assert-Sealed accepts it as an expected disk. NOT added to CreatedDisks (builder-owned, reusable
+                # across runs — D3-D; teardown's Remove-Sandbox leaves the deps.vhdx FILE on disk). No read-only
+                # attach (Hyper-V can't host-enforce guest-RO — D3).
+                $null = & $Backend.AddHardDiskDrive @{ VMName = $Name; Path = $depsDiskPath }
+                Set-DescriptorField -Descriptor $descriptor -Name 'DepsDiskPath'  -Value $depsDiskPath
+                Set-DescriptorField -Descriptor $descriptor -Name 'DepsImageHash' -Value $actualHash
                 $report.Descriptor = $descriptor
             }
         }
@@ -437,19 +697,39 @@ function Invoke-Voidseal {
                 $detachOk = $false
                 $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = "data-disk detach failed: $($_.Exception.Message)" }
             }
+            # D4-B / C1.2: a PROCESSOR (Network='None' + ScreenConfig) OR a transport-only OutboxOutput
+            # profile (firefox: OutboxOutput=$true, no ScreenConfig — C1.1) has a Raw OUTPUT disk —
+            # there is no filesystem to mount, and host-mounting untrusted guest data is a P0 risk. Gate
+            # Read-WorkloadResult OFF for BOTH; their result comes from the shared post-detach outbox
+            # block below (Read-OutboxToGateInput -> ReadVhdxRawRegion, never Mount-VHD). Only a legacy
+            # non-outbox, non-processor profile keeps the Read-WorkloadResult host-mount path.
+            # $isProcessorProfile stays local: it distinguishes a SCREENED processor from a
+            # transport-only outbox profile further down. Whether the outbox is used AT ALL comes from
+            # the single shared predicate (ProfileLoader.ps1), so this can never disagree with the
+            # OUTPUT disk shape (Workload.ps1) or the in-guest runner (SeedBuilder.ps1).
+            $isProcessorProfile = ($resolved['Network'] -eq 'None') -and $resolved.ContainsKey('ScreenConfig')
+            $usesOutbox         = Test-UsesOutboxTransport -Profile $resolved
             if ($detachOk -and -not $wait.TimedOut) {
-                # Tier>=2 Read-WorkloadResult THROWS (quarantine NotImplemented) — try/catch so a gated
-                # hostile-tier read is reported as a failed run, not an unhandled crash that aborts the
-                # whole deploy. The seal/teardown invariants are unaffected either way.
-                try {
-                    $runResult = Read-WorkloadResult -Descriptor $descriptor -Destination $Destination `
-                                    -ResultInnerName $resultInnerName -SentinelInnerName $sentinelInnerName -Backend $Backend
-                } catch {
-                    $runResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = "result read failed: $($_.Exception.Message)" }
+                if ($usesOutbox) {
+                    # Processor OR transport-only outbox: RunResult is derived from the shared outbox
+                    # block (post-detach, below). Do NOT call Read-WorkloadResult — the Raw OUTPUT has no
+                    # FS to mount. Set a provisional RunResult; the outbox block overwrites it below.
+                    $report.RunResult = @{ Status = 'Pending'; ExitCode = $null; ArtifactPath = $null; Reason = 'outbox: result from outbox read' }
+                } else {
+                    # Legacy non-outbox non-processor (exFAT OUTPUT): host-mount read, unchanged.
+                    # Tier>=2 Read-WorkloadResult THROWS (quarantine NotImplemented) — try/catch so a gated
+                    # hostile-tier read is reported as a failed run, not an unhandled crash that aborts the
+                    # whole deploy. The seal/teardown invariants are unaffected either way.
+                    try {
+                        $runResult = Read-WorkloadResult -Descriptor $descriptor -Destination $Destination `
+                                        -ResultInnerName $resultInnerName -SentinelInnerName $sentinelInnerName -Backend $Backend
+                    } catch {
+                        $runResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = "result read failed: $($_.Exception.Message)" }
+                    }
+                    $report.RunResult = $runResult
+                    if ($runResult.ArtifactPath) { $report.ExtractedArtifact = $runResult.ArtifactPath }
+                    $states.Add('EXTRACTED')
                 }
-                $report.RunResult = $runResult
-                if ($runResult.ArtifactPath) { $report.ExtractedArtifact = $runResult.ArtifactPath }
-                $states.Add('EXTRACTED')
             } elseif ($detachOk) {
                 # The guest never self-powered-off within the deadline (hung/runaway). Wait-WorkloadComplete
                 # already force-stopped it so the Reaper inherits a clean Off VM. Record a failed run; do
@@ -457,29 +737,126 @@ function Invoke-Voidseal {
                 $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = 'boot/workload timed out' }
             }
             # (detach failed -> RunResult already set above; EXTRACTED intentionally not reached)
+
+            # --- POST-DETACH OUTBOX READ (processor gate OR transport-only OutboxOutput, C1.2) --------
+            # The guest wrote its result as a memory-safe "outbox" onto the OUTPUT disk's raw region
+            # (a PROCESSOR's screener candidates + verdicts.json, OR — post-C1.1 — a transport-only
+            # profile's plain result, e.g. firefox's result.html). Now that OUTPUT is DETACHED, read it
+            # in USER-SPACE (Read-OutboxToGateInput: ReadVhdxRawRegion = qemu-img slice; NEVER Mount-VHD)
+            # and parse it fail-closed (read_outbox.py). A PROCESSOR then runs the EXISTING sensitivity
+            # gate, which partitions only auto-certified-SAFE artifacts into Released/Held. A
+            # TRANSPORT-ONLY profile ($usesOutbox -and -not $isProcessorProfile) is NOT screened —
+            # its sole candidate is materialized VERBATIM to $Destination as ExtractedArtifact (no
+            # SAFE-partition; Released/Held stay $null). DENY-on-timeout/failed-run EXPLICIT: this block
+            # runs ONLY after a clean detach AND a non-timed-out run — a timed-out/force-stopped guest
+            # released NOTHING. The $detachOk guard stays load-bearing (never read a disk still attached
+            # to a possibly-live guest). (Phase-2/4 repoints the read at the dedicated FIXED raw outbox disk.)
+            if ($detachOk -and -not $wait.TimedOut -and $usesOutbox) {
+                # D4-B: outbox profiles skip Read-WorkloadResult (which creates Destination for others).
+                # Ensure Destination exists before the read writes outbox.bin / gate-input/ into it.
+                if (-not (Test-Path -LiteralPath $Destination)) { $null = New-Item -ItemType Directory -Path $Destination -Force }
+                try {
+                    $outboxPath = [string]$descriptor.OutputDiskPath
+                    $gateInput  = Read-OutboxToGateInput -OutputDiskPath $outboxPath -Destination $Destination -Backend $Backend
+                    $gateStaging  = Join-Path $gateInput 'staging'
+                    $gateVerdicts = Join-Path $gateInput 'verdicts.json'
+
+                    if ($isProcessorProfile) {
+                        $gateOut   = Join-Path $Destination 'gate'
+                        $screenCfg = Resolve-ScreenConfig -Profile $resolved
+                        # C2.6 wiring: consult the runs/day rate-cap ledger for a PROCESSOR run only
+                        # (a transport-only OutboxOutput profile, e.g. firefox, is never screened — see
+                        # the $isProcessorProfile guard above — so it is never rate-capped either). The
+                        # ledger is keyed by the resolved profile's OWN Name (e.g. 'ralph'), never the
+                        # per-run VM -Name, and by the HOST-observed UTC calendar day — never a
+                        # guest-reported time (ReleaseGovernor.ps1's fail-closed threat model).
+                        $gateResult = Invoke-SensitivityGate -StagingDir $gateStaging -OutputDir $gateOut `
+                                        -Mode $screenCfg.mode -VerdictsPath $gateVerdicts `
+                                        -RateLedgerPath $RateLedgerPath -RateProfile ([string]$resolved['Name']) `
+                                        -RateToday ([datetime]::UtcNow.ToString('yyyy-MM-dd')) `
+                                        -MaxReleasesPerDay $MaxReleasesPerDay
+                        Set-DescriptorField -Descriptor $descriptor -Name 'GateRan' -Value $true
+                        $report.Descriptor        = $descriptor
+                        $report.Released          = $gateResult.Released
+                        $report.Held              = $gateResult.Held
+                        $report.SensitivityReport = $gateResult.ManifestPath
+                        $report.RunResult = @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $gateResult.ManifestPath; Reason = $null }
+                    } else {
+                        # C1.2 transport-only: materialize the outbox's sole candidate verbatim — NOT
+                        # screened/Released. LOCKED design (plan Task C1.2): firefox's result rides the
+                        # outbox transport but is never gated through the sensitivity screener.
+                        $resultSrc = Join-Path $gateStaging $resultInnerName
+                        if (-not (Test-Path -LiteralPath $resultSrc -PathType Leaf)) {
+                            throw "outbox read: transport-only outbox has no '$resultInnerName' candidate."
+                        }
+                        $artifact = Join-Path $Destination $resultInnerName
+                        Copy-Item -LiteralPath $resultSrc -Destination $artifact -Force
+                        $report.ExtractedArtifact = $artifact
+                        $report.RunResult = @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $artifact; Reason = $null }
+                    }
+                    $states.Add('EXTRACTED')
+                }
+                catch {
+                    # Fail-closed like the seal gate: record + let teardown run. APPEND (do not clobber a
+                    # detach/read error already on $report.Error) so neither failure is lost.
+                    $gateErr = "Sensitivity gate failed: $($_.Exception.Message)"
+                    if ([string]::IsNullOrWhiteSpace([string]$report.Error)) { $report.Error = $gateErr }
+                    else { $report.Error = "$($report.Error) | $gateErr" }
+                    $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = $gateErr }
+                    Write-Warning "Invoke-Voidseal: '$Name' outbox read/gate failed: $($_.Exception.Message)"
+                }
+            }
         }
         else {
             # SERIAL MODE (default): RUNNING/CAPTURED/EXTRACTED only when there is an entrypoint to deliver.
             if (-not [string]::IsNullOrWhiteSpace($entrypoint)) {
-                # RUNNING: start the sealed VM, WAIT for boot-readiness (the first command must not race
-                # cloud-init), deliver the entrypoint over the serial seam, and arm capture. The boot-wait is
-                # injectable (tests pass 0 so they never sleep the real ~60s).
+                # I6a: the OVERALL wall-clock DENY (Disk-mode parity). Disk mode already force-stops a
+                # hung guest on an overall deadline (Wait-WorkloadComplete -TimeoutSeconds
+                # $WorkloadTimeoutSeconds, above). Serial mode's real mechanism: $WorkloadTimeoutSeconds
+                # is passed as the OUTER bound (-TimeoutSeconds) of the single serial guest-command run
+                # (Start-SandboxWorkload -> InvokeGuestCommand). When that guest command reports
+                # TimedOut=$true (the guest hung and never completed before the deadline — a REPORTED
+                # outcome, not a thrown error; see InvokeGuestCommand's TimedOut contract in
+                # HyperVBackend.ps1/Runner.ps1), the host force-stops the VM and records a Failed run.
+                # A PRIOR version of this guard compared (Get-Date) against (Get-Date).AddSeconds(N)
+                # BEFORE ever dispatching the command — that is tautologically false for any positive N
+                # (both calls execute within the same instant) and so never fired in real operation; it
+                # was removed as a placebo. This is now a real DENY: it enforces on the ACTUAL guest
+                # command's reported timeout, not a pre-dispatch clock comparison.
                 $runResult = Start-SandboxWorkload -Descriptor $descriptor -Entrypoint $entrypoint `
                     -ArtifactRoot $ArtifactRoot -BootWaitSeconds $BootWaitSeconds `
-                    -BootPollDelaySeconds $BootPollDelaySeconds -Backend $Backend
+                    -BootPollDelaySeconds $BootPollDelaySeconds -TimeoutSeconds $WorkloadTimeoutSeconds `
+                    -Backend $Backend
                 $report.RunResult = $runResult
                 $states.Add('RUNNING')
 
-                # CAPTURED: the run-result + its out-of-band capture artifact are now recorded.
-                $states.Add('CAPTURED')
+                $serialTimedOut = [bool]$(
+                    if ($null -ne $runResult -and $null -ne $runResult.PSObject.Properties['TimedOut']) {
+                        $runResult.TimedOut
+                    } else { $false }
+                )
+                if ($serialTimedOut) {
+                    # The guest command itself reported the deadline trip. Force-stop (defense-in-depth —
+                    # Remove-Sandbox's teardown would stop it anyway, but this makes the DENY explicit and
+                    # immediate rather than deferred to the finally block) and overwrite the raw Runner
+                    # result with the same Failed RunResult shape the Disk-mode timeout path uses.
+                    $null = & $Backend.StopVM @{ Name = $Name; Force = $true }
+                    $report.RunResult = @{ Status = 'Failed'; ExitCode = -1; ArtifactPath = $null; Reason = 'serial workload exceeded the overall wall-clock deadline (guest command timed out)' }
+                    # No CAPTURED/EXTRACTED on a timeout trip: nothing was captured/extracted — the
+                    # entrypoint's guest command never completed, so there is no result to export.
+                }
+                else {
+                    # CAPTURED: the run-result + its out-of-band capture artifact are now recorded.
+                    $states.Add('CAPTURED')
 
-                # EXTRACTED: one-way OUT. Tier 0/1 reads the emitted result; Tier >= 2 routes to the
-                # quarantine stub (which THROWS — so a hostile-tier extraction aborts here, by design).
-                if (-not [string]::IsNullOrWhiteSpace($resultPath)) {
-                    $extracted = Export-SandboxArtifact -Descriptor $descriptor -ResultPath $resultPath `
-                        -Destination $Destination -Backend $Backend
-                    $report.ExtractedArtifact = $extracted
-                    $states.Add('EXTRACTED')
+                    # EXTRACTED: one-way OUT. Tier 0/1 reads the emitted result; Tier >= 2 routes to the
+                    # quarantine stub (which THROWS — so a hostile-tier extraction aborts here, by design).
+                    if (-not [string]::IsNullOrWhiteSpace($resultPath)) {
+                        $extracted = Export-SandboxArtifact -Descriptor $descriptor -ResultPath $resultPath `
+                            -Destination $Destination -Backend $Backend
+                        $report.ExtractedArtifact = $extracted
+                        $states.Add('EXTRACTED')
+                    }
                 }
             }
         }

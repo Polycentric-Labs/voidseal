@@ -44,7 +44,7 @@ $script:TierRequiredKeys = @(
 
 # Enum domains (SCHEMA.md type column).
 $script:Enum_Substrate         = @('Container', 'HyperV-Gen2')
-$script:Enum_EgressMode        = @('HostProxy', 'NftablesAllowlist', 'HostEnvoy', 'None')
+$script:Enum_EgressMode        = @('HostProxy', 'InGuestSquid', 'HostEnvoy', 'SquidSniProxy', 'None')
 $script:Enum_Credentials       = @('None', 'ScopedOnDemand')
 $script:Enum_ManagementChannel = @('Com1Serial', 'PSDirect')
 $script:Enum_Extraction        = @('HostReadResultDir', 'ColdVHDX-Quarantine-CDR')
@@ -55,6 +55,44 @@ $script:Enum_Lifecycle         = @('Ephemeral', 'SnapshotRevert', 'CreateDestroy
 # is a real Set-VMFirmware reject the fake would silently accept (the fake≠real bug class), so
 # the loader fails closed here BEFORE provisioning ever reaches Hyper-V.
 $script:Enum_SecureBootTemplate = @('MicrosoftWindows', 'MicrosoftUEFICertificateAuthority', 'OpenSourceShieldedVM')
+
+# Builder (EgressMode='SquidSniProxy') derived-per-fetcher required hosts (Pass-5 §B). The
+# completeness check requires, for EACH fetcher the DepsSpec declares, that the merged
+# EgressAllowlist COVERS every representative host below (exact OR domain-suffix — the Squid
+# domain-ACL model). Rotating CDN/LFS hostnames are covered by a suffix entry (e.g. '.hf.co').
+$script:BuilderRequiredHostsByFetcher = @{
+    Pip         = @('pypi.org', 'files.pythonhosted.org')
+    Apt         = @('deb.debian.org', 'security.debian.org')
+    HuggingFace = @('huggingface.co', 'cdn-lfs.huggingface.co', 'cas-bridge.xethub.hf.co')
+    Github      = @('github.com', 'api.github.com', 'codeload.github.com',
+                    'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
+}
+
+# A Squid domain-ACL "covers" a host if:
+#   - the entry is an exact match (e.g. 'pypi.org' covers 'pypi.org'), OR
+#   - the entry starts with a leading dot (suffix entry) and the host ends with that suffix
+#     (e.g. '.hf.co' covers 'cas-bridge.xethub.hf.co').
+# An entry WITHOUT a leading dot covers ONLY itself; 'huggingface.co' does NOT cover
+# 'cdn-lfs.huggingface.co' — that requires a '.huggingface.co' suffix entry.
+function Test-AllowlistCoversHost {
+    [OutputType([bool])]
+    param([string[]] $Allowlist, [string] $HostName)
+    $h = ([string]$HostName).ToLowerInvariant()
+    foreach ($entry in @($Allowlist)) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $raw = ([string]$entry).ToLowerInvariant()
+        if ($raw.StartsWith('.')) {
+            # Suffix entry: host must end with this suffix (e.g. '.hf.co' covers 'x.hf.co').
+            $suffix = $raw.TrimStart('.')
+            if ($h -eq $suffix -or $h.EndsWith('.' + $suffix)) { return $true }
+        }
+        else {
+            # Exact entry: host must equal this exactly.
+            if ($h -eq $raw) { return $true }
+        }
+    }
+    return $false
+}
 
 # Required keys for a workload profile.
 $script:WorkloadRequiredKeys = @('BaseTier', 'Name', 'Entrypoint')
@@ -82,23 +120,40 @@ $script:SecretLeafGlobs = @(
     '*.key',                   # private keys
     '*.p12',                   # PKCS#12 bundles
     '*.pfx',                   # PFX bundles
+    '*.jks',                   # Java keystore
+    '*.keystore',              # Android / Java keystore
+    '*.ppk',                   # PuTTY private key
+    '*.kdbx',                  # KeePass database
     'id_rsa*',                 # id_rsa, id_rsa.pub (public key blocked by design), id_rsa_work, ...
+    'id_ed25519*',             # modern default SSH key pair
+    'id_ecdsa*',               # ECDSA SSH key pair
+    'id_dsa*',                 # legacy DSA SSH key pair
     'credentials*.json',       # credentials.json, credentials-prod.json
     '.credentials.json',       # dotfile credentials
+    '.netrc',                  # curl / ftp machine credentials (POSIX)
+    '_netrc',                  # same file, Windows spelling
+    '.git-credentials',        # git credential store (plaintext)
+    '.pgpass',                 # PostgreSQL password file
+    '.my.cnf',                 # MySQL client password file
     '.npmrc',                  # npm auth token file
     '.pypirc',                 # PyPI upload creds
+    'secrets.yaml',            # common k8s / ansible secret file
+    'secrets.yml',             # same, alternate extension
+    '*.tfvars',                # Terraform variable files routinely carry creds
     '*-service-account.json'   # GCP service-account keys
 )
 
 # Directory-segment rules: any path segment EXACTLY equal to one of these makes
 # the whole path secret-shaped (a .secrets/ or .ssh/ dir anywhere in the path).
-$script:SecretDirSegments = @('.secrets', '.ssh')
+$script:SecretDirSegments = @('.secrets', '.ssh', '.gnupg')
 
 # Adjacent directory/file pair rules: [parentSegment, childSegment]. Matches when
 # 'parent' is immediately followed by 'child' (e.g. ~/.aws/credentials). Lowercase.
 $script:SecretDirFilePairs = @(
     @('.aws',    'credentials'),
+    @('.aws',    'config'),
     @('.kube',   'config'),
+    @('gh',      'hosts.yml'),
     @('.docker', 'config.json')
 )
 
@@ -113,6 +168,57 @@ $script:SecretDirFilePairs = @(
     Operates on the path STRING only — never opens the file. Case-insensitive.
     Normalizes both '/' and '\' to '\' so POSIX and Windows paths are caught.
 #>
+# --------------------------------------------------------------------------
+# Test-UsesOutboxTransport — THE single predicate for "does this profile release its result
+# through the user-space OUTBOX (a Raw OUTPUT disk the host reads via ReadVhdxRawRegion) rather
+# than a host-mounted exFAT OUTPUT?"
+#
+# TRUE for a PROCESSOR (Network='None' AND a ScreenConfig — its release is screener-governed and
+# rides the outbox) OR any profile opting in with OutboxOutput=$true (firefox's transport-only
+# convergence). FALSE for a legacy non-outbox Disk profile, which keeps the direct exFAT
+# result.html contract.
+#
+# WHY THIS EXISTS — PREDICATE DRIFT (found 2026-07-21). This one truth was computed independently
+# in three places: Workload.ps1 (which filesystem the OUTPUT disk gets), SeedBuilder.ps1 (which
+# in-guest runner the seed carries), and Invoke-Voidseal.ps1 (the structural no-mount validator +
+# the post-detach read routing). SeedBuilder's copy keyed on OutboxOutput ALONE, so a PROCESSOR
+# without an explicit OutboxOutput=$true got a RAW OUTPUT disk AND the exFAT runner: the guest
+# would `mount LABEL=OUTPUT` against a disk with no filesystem, fail, and hit the runner's silent
+# poweroff guard — nothing written, and the host reporting "outbox header missing/!magic". That is
+# mock-invisible (the fake never boots a guest) and is the same bug class as the 2026-07-20
+# raw-device-ID defect and the C1.4 entrypoint defect: duplicated truth drifting apart. Every
+# caller now reads THIS function so the copies cannot diverge again.
+# --------------------------------------------------------------------------
+function Test-UsesOutboxTransport {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [AllowNull()] $Profile)
+
+    if ($null -eq $Profile) { return $false }
+
+    # Tolerant of BOTH shapes callers pass: an IDictionary (hashtable — the normal resolved
+    # profile) and a pscustomobject (imported data / some fixtures), mirroring Get-SeedProfileField.
+    $hasField = {
+        param($p, $name)
+        if ($p -is [System.Collections.IDictionary]) { return [bool]$p.Contains($name) }
+        return [bool]($null -ne $p.PSObject.Properties[$name])
+    }
+    $getField = {
+        param($p, $name)
+        if ($p -is [System.Collections.IDictionary]) {
+            if ($p.Contains($name)) { return $p[$name] }
+            return $null
+        }
+        $prop = $p.PSObject.Properties[$name]
+        if ($null -ne $prop) { return $prop.Value }
+        return $null
+    }
+
+    $isProcessor = ([string](& $getField $Profile 'Network') -eq 'None') -and (& $hasField $Profile 'ScreenConfig')
+    $wantsOutbox = (& $hasField $Profile 'OutboxOutput') -and [bool](& $getField $Profile 'OutboxOutput')
+    return [bool]($isProcessor -or $wantsOutbox)
+}
+
 function Test-IsSecretPath {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -172,11 +278,11 @@ function Test-IsSecretPath {
 #>
 function Assert-NoSecretMounts {
     [CmdletBinding()]
-    param([AllowNull()] $Mounts, [string] $Context = 'profile')
+    param([AllowNull()] $Mounts, [string] $Context = 'profile', [string] $Field = 'Mounts')
 
     if ($null -eq $Mounts) { return }
     if (-not ($Mounts -is [System.Collections.IDictionary])) {
-        throw "Invariant 1 (secret-file refusal): '$Context' Mounts must be a hashtable of host->guest paths."
+        throw "Invariant 1 (secret-file refusal): '$Context' $Field must be a hashtable whose KEYS are host source paths."
     }
     # Build the human-readable pattern summary from the single source of truth so it
     # can never drift from what Test-IsSecretPath actually enforces (SCHEMA.md §1).
@@ -184,7 +290,7 @@ function Assert-NoSecretMounts {
     $patternSummary = (@($script:SecretLeafGlobs) + @($script:SecretDirSegments | ForEach-Object { "$_/" }) + $dirPairList) -join ', '
     foreach ($src in @($Mounts.Keys)) {
         if (Test-IsSecretPath -Path ([string]$src)) {
-            throw "Invariant 1 (secret-file refusal): '$Context' declares a secret-shaped mount source '$src'. Secret files ($patternSummary; trailing dots/spaces and NTFS ADS suffixes are normalized away) must never be mounted into a sandbox."
+            throw "Invariant 1 (secret-file refusal): '$Context' declares a secret-shaped $Field source '$src'. Secret-shaped paths ($patternSummary; trailing dots/spaces and NTFS ADS suffixes are normalized away) must never be staged into or mounted into a sandbox. NOTE: this is a path-SHAPE lint, not a content scan - it catches the common accident, not a determined caller."
         }
     }
 }
@@ -244,6 +350,24 @@ function Assert-TierProfileValid {
     # EgressAllowlist must be an array (already normalized by caller, but re-check shape).
     $allowlist = @($Profile['EgressAllowlist'])
 
+    # SEC-1: hostname-charset validation. The builder substitutes ($allowlist -join ' ') straight into
+    # a Squid `dstdomain` ACL (SeedBuilder.ps1) with NO escaping; an entry bearing a newline (or quote/
+    # whitespace) could inject a directive such as `http_access allow all` and defeat the egress ACL.
+    # Validate EACH entry against a strict hostname charset (optional leading dot for a domain-suffix
+    # match; the charset excludes whitespace/newline/quote/slash), failing closed and naming the bad
+    # entry. Runs on bare tiers AND the merged builder, so the allowlist is gatekept before it ever
+    # reaches the Squid seed. (Tier>=2 enforces an EMPTY allowlist below, so this is a no-op there.)
+    $hostnameRe = '^(?i)\.?[a-z0-9][a-z0-9.-]*$'
+    foreach ($entry in $allowlist) {
+        $e = [string]$entry
+        if ($e -notmatch $hostnameRe) {
+            throw ("Schema validation: '$Context' field 'EgressAllowlist' has an invalid entry '$e' " +
+                   "(must match $hostnameRe — a hostname/domain-suffix, optional leading dot, no whitespace/" +
+                   "newline/quote/slash). An unvalidated entry could inject directives into the builder's " +
+                   "Squid dstdomain ACL. Failing closed.")
+        }
+    }
+
     # HostChannels must be a hashtable.
     if (-not ($Profile['HostChannels'] -is [System.Collections.IDictionary])) {
         throw "Schema validation: '$Context' field 'HostChannels' must be a hashtable."
@@ -265,9 +389,17 @@ function Assert-TierProfileValid {
         Assert-EnumMember -Value ([string]$Profile['SecureBootTemplate']) -Allowed $script:Enum_SecureBootTemplate -Field 'SecureBootTemplate' -Context $Context
     }
 
-    # --- invariant 1: secret-file mount refusal --------------------------
+    # --- invariant 1: secret-file refusal (BOTH delivery fields) ---------
+    # Screen every field whose KEYS are host source paths. StageAssets is the field the
+    # orchestrator actually imports into the guest (Invoke-Voidseal -> Import-SandboxAsset);
+    # Mounts is declared but NOT yet wired into the guest (docs/live-smoke-test.md Gap 2).
+    # Screening only Mounts guarded the unused door and left the live one open, so both are
+    # screened here and both are covered by must-pass tests.
     if ($Profile.ContainsKey('Mounts')) {
-        Assert-NoSecretMounts -Mounts $Profile['Mounts'] -Context $Context
+        Assert-NoSecretMounts -Mounts $Profile['Mounts'] -Context $Context -Field 'Mounts'
+    }
+    if ($Profile.ContainsKey('StageAssets')) {
+        Assert-NoSecretMounts -Mounts $Profile['StageAssets'] -Context $Context -Field 'StageAssets'
     }
 
     # --- invariant 2: Tier >= 2 starvation -------------------------------
@@ -304,6 +436,49 @@ function Assert-TierProfileValid {
             throw "Invariant 5 (Linux management): '$Context' GuestImage='$($Profile['GuestImage'])' is Linux but ManagementChannel='$($Profile['ManagementChannel'])'; a Linux guest MUST use ManagementChannel='Com1Serial' (PSDirect is Windows-guest-only)."
         }
     }
+
+    # --- processor rule: Network='None' => EgressMode='None' + empty allowlist ------
+    # A structurally no-NIC processor profile (Network='None') cannot simultaneously
+    # request egress — there is no network interface to route traffic through. Enforced
+    # as a fail-closed consistency check to catch accidental copy-paste from network-
+    # capable profiles (the same mis-copy class that produced fake≠real divergences).
+    if ($Profile['Network'] -eq 'None') {
+        if ($Profile['EgressMode'] -ne 'None') {
+            throw "Processor rule (Network=None): '$Context' sets Network='None' (no NIC) but EgressMode='$($Profile['EgressMode'])'; a no-network processor profile MUST set EgressMode='None'."
+        }
+        if ($allowlist.Count -ne 0) {
+            throw "Processor rule (Network=None): '$Context' sets Network='None' (no NIC) but EgressAllowlist has $($allowlist.Count) entr$(if($allowlist.Count -eq 1){'y'}else{'ies'}); a no-network processor profile MUST have an empty EgressAllowlist (@())."
+        }
+    }
+
+    # --- builder rule: EgressMode='SquidSniProxy' => DepsSpec present + derived-per-fetcher
+    # allowlist completeness (D-1 guarded override + D-2 derived check, brainstorm 2026-06-29).
+    # SquidSniProxy is the BUILDER egress (Pass-5: nftables can't runtime-FQDN-filter). A profile
+    # selecting it MUST carry a non-empty DepsSpec, and its (merged) EgressAllowlist MUST COVER
+    # every representative host for each fetcher the DepsSpec declares — else a live builder run
+    # would reach an un-allowlisted host and stall. Fail closed at load, naming the gap.
+    if ($Profile['EgressMode'] -eq 'SquidSniProxy') {
+        if (-not $Profile.ContainsKey('DepsSpec') -or
+            -not ($Profile['DepsSpec'] -is [System.Collections.IDictionary]) -or
+            $Profile['DepsSpec'].Keys.Count -eq 0) {
+            throw "Builder rule (SquidSniProxy): '$Context' sets EgressMode='SquidSniProxy' (the builder egress) but declares no DepsSpec; a builder profile MUST carry a non-empty DepsSpec hashtable."
+        }
+        $missing = [System.Collections.Generic.List[string]]::new()
+        foreach ($fetcher in $Profile['DepsSpec'].Keys) {
+            $fname = [string]$fetcher
+            if (-not $script:BuilderRequiredHostsByFetcher.ContainsKey($fname)) {
+                throw "Builder rule (SquidSniProxy): '$Context' DepsSpec declares unknown fetcher '$fname' (known: $($script:BuilderRequiredHostsByFetcher.Keys -join ', '))."
+            }
+            foreach ($reqHost in $script:BuilderRequiredHostsByFetcher[$fname]) {
+                if (-not (Test-AllowlistCoversHost -Allowlist $allowlist -HostName $reqHost)) {
+                    $missing.Add("$reqHost (fetcher '$fname')")
+                }
+            }
+        }
+        if ($missing.Count -gt 0) {
+            throw "Builder rule (SquidSniProxy): '$Context' EgressAllowlist is INCOMPLETE for its DepsSpec — missing required host(s): $($missing -join '; '). Add them (or a covering domain suffix, e.g. '.hf.co') to the tier EgressAllowlist or the workload ExtraAllowlist."
+        }
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -317,6 +492,47 @@ function ConvertTo-StringArray {
     param([AllowNull()] $Value)
     if ($null -eq $Value) { return @() }
     return @($Value)
+}
+
+<#
+.SYNOPSIS
+    Returns the profile's ScreenConfig hashtable with missing defaults applied.
+.DESCRIPTION
+    Processor profiles carry an optional ScreenConfig key. When mode is absent
+    or empty, defaults to 'aggressive'. When categories is absent, defaults to
+    an empty array. StrictMode-safe: guards every key access with ContainsKey.
+.PARAMETER Profile
+    The (merged) profile hashtable.
+.OUTPUTS
+    [hashtable] with at least keys 'mode' and 'categories'.
+#>
+function Resolve-ScreenConfig {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([Parameter(Mandatory)] [hashtable] $Profile)
+
+    # Start from the profile's ScreenConfig when present; otherwise an empty table.
+    $src = @{}
+    if ($Profile.ContainsKey('ScreenConfig') -and ($null -ne $Profile['ScreenConfig']) -and
+        ($Profile['ScreenConfig'] -is [System.Collections.IDictionary])) {
+        foreach ($k in $Profile['ScreenConfig'].Keys) { $src[$k] = $Profile['ScreenConfig'][$k] }
+    }
+
+    # Apply defaults: mode defaults to 'aggressive'; categories defaults to @().
+    if (-not $src.ContainsKey('mode') -or [string]::IsNullOrWhiteSpace([string]$src['mode'])) {
+        $src['mode'] = 'aggressive'
+    }
+    if (-not $src.ContainsKey('categories') -or ($null -eq $src['categories'])) {
+        $src['categories'] = @()
+    }
+    # Explicit array contract (StrictMode .Count safety): the RETURN always exposes
+    # 'categories' as an array regardless of input shape. A hashtable value-copy already
+    # preserves a 1-element array (it does NOT unroll like a function return), so this is
+    # a harmless re-wrap today — it locks the contract against a future refactor that DID
+    # introduce unrolling (single-element unrolling is the repo's documented #1 bug class).
+    $src['categories'] = @($src['categories'])
+
+    return $src
 }
 
 # --------------------------------------------------------------------------
@@ -449,6 +665,15 @@ function Import-WorkloadProfile {
         $merged['EgressAllowlist'] = $baseAllow
     }
 
+    # D-1 (guarded EgressMode override): a workload may override EgressMode ONLY to 'SquidSniProxy'
+    # (the builder egress — strictly stricter than the tiers' nftables/proxy modes, so it can only
+    # TIGHTEN egress, never weaken it). Any other workload-level EgressMode is refused: weakening
+    # the isolation contract from the workload layer is forbidden (EgressMode is otherwise a tier
+    # property). A workload that omits EgressMode inherits the tier's unchanged (ralph/firefox).
+    if ($raw.ContainsKey('EgressMode') -and ([string]$raw['EgressMode'] -ne 'SquidSniProxy')) {
+        throw "Import-WorkloadProfile: workload '$wlName' sets EgressMode='$($raw['EgressMode'])'; a workload may only override EgressMode to 'SquidSniProxy' (the builder egress). Other egress modes are tier-controlled."
+    }
+
     # --- layer scalar/collection workload keys onto the tier --------------
     $merged['BaseTier'] = $baseTier
     $merged['Name']     = $raw['Name']
@@ -457,8 +682,15 @@ function Import-WorkloadProfile {
     # and Inputs / FileSystem / InputLabel / OutputLabel configure the INPUT/OUTPUT data disks that
     # New-WorkloadDisks creates. Without layering these, a 'Disk' workload profile (firefox.psd1)
     # would lose its mode + data-disk config in the merge and silently fall back to Serial.
+    # DepsSpec / ScreenConfig / DepsDiskPath are processor-profile keys: DepsSpec carries the
+    # dependency set the builder stages; ScreenConfig carries gate mode + categories;
+    # DepsDiskPath carries the pre-built deps disk path (optional, resolved at runtime).
+    # OutboxOutput (C1.4) is the transport-only counterpart: a non-processor Disk-mode workload
+    # (firefox) that still wants the Raw-OUTPUT / user-space-outbox-read path (Workload.ps1's
+    # Raw-OUTPUT predicate + Invoke-Voidseal.ps1's post-detach outbox read) without a ScreenConfig.
     foreach ($layerKey in @('Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
-                            'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel')) {
+                            'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
+                            'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput')) {
         if ($raw.ContainsKey($layerKey)) {
             $merged[$layerKey] = $raw[$layerKey]
         }

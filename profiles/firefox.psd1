@@ -27,7 +27,7 @@
     # !!! DATA-ACCESS RULE (BINDING) !!!
     #   This profile DEFAULTS TO SYNTHETIC / SAMPLE bookmark data. Reading your
     #   REAL Firefox profile (bookmarks/history/places.sqlite/etc.) requires EXPLICIT,
-    #   PER-TASK authorization and is NEVER the default. "Personal-only this round"
+    #   PER-TASK authorization and is NEVER the default. "Personal-only in v1"
     #   is NOT standing read-authorization. In the Disk model the input source is the
     #   INPUT data disk (InputFiles -> Inputs -> guest /mnt/in), which defaults to a
     #   SAMPLE/synthetic 'sample-bookmarks.json'; to run against real data, the operator must
@@ -48,7 +48,8 @@
     # onto the host-formatted INPUT-labelled volume via WriteVhdxFile, and the guest mounts that
     # volume read-only at /mnt/in. The Disk-model inputs are (a) the organizer script and (b) the
     # sample bookmark profile — both ride the INPUT disk; the Entrypoint below reads them from
-    # /mnt/in and writes the Netscape-HTML to /mnt/out/result.html (the engine's result inner-name).
+    # /mnt/in and writes the Netscape-HTML to /run/staging/result.html, which the in-guest producer
+    # packs into the outbox (OutboxOutput below; result.html stays the result inner-name).
     #
     # Inputs stays EMPTY here because a .psd1 is static data and inlining a whole Python file as a
     # here-string would be unreadable + brittle. INSTEAD the inputs are populated AT LIVE-RUN TIME
@@ -62,15 +63,39 @@
     Inputs       = @{}
 
     # ------------------------------------------------------------------
+    # OutboxOutput (C1.4) — firefox converges onto the SAME user-space outbox transport a
+    # PROCESSOR uses (Workload.ps1's Raw-OUTPUT predicate; Invoke-Voidseal.ps1's post-detach outbox
+    # read), but WITHOUT a ScreenConfig — so it is transport-only, NEVER screened (LOCKED design,
+    # Allen 2026-07-01). Effect: the OUTPUT data disk is created Raw (no filesystem — NewOutputVhdx
+    # FileSystem='Raw'); the host NEVER Mount-VHDs it. Instead, post-detach, the host reads the outbox
+    # in user-space (ReadVhdxRawRegion -> read_outbox.py — never mounts untrusted guest data) and, for
+    # a transport-only profile like this one, materializes the sole candidate (result.html) verbatim
+    # to Destination as ExtractedArtifact — no sensitivity-gate partition (Released/Held stay $null;
+    # that partition is a PROCESSOR-only concept). The in-guest seed runner that packs the outbox is
+    # guest/run_disk_workload.py --transport-only (delivered below via InputFiles, same mechanism as
+    # the organizer script itself), which writes a well-formed placeholder verdicts.json ([]) so the
+    # SAME container format (guest/outbox.py) the host read path expects parses cleanly.
+    # ------------------------------------------------------------------
+    OutboxOutput = $true
+
+    # ------------------------------------------------------------------
     # InputFiles (Disk-mode, live-acceptance) — innerName -> host FILE PATH. This is DOC-ONLY
     # metadata: New-WorkloadDisks consumes `Inputs` (innerName -> CONTENT), NOT this map, so the
     # live-acceptance step reads each of these host files and folds them into `Inputs` before the
     # deploy (do NOT add a new loader path — just populate Inputs from these). The organizer script
     # + the sample profile both land on the INPUT disk and mount read-only at /mnt/in in the guest.
+    #
+    # C1.4: run_disk_workload.py + outbox.py ride the SAME INPUT disk, delivered the SAME way — the
+    # seed's OutboxOutput disk-mode runner (SeedBuilder.ps1 CidataOutboxDiskRunnerTemplate) invokes
+    # `python3 /mnt/in/run_disk_workload.py --transport-only` after the Entrypoint populates staging,
+    # and run_disk_workload.py imports `outbox` off its OWN directory (sys.path.insert(0, HERE)) — so
+    # outbox.py must land alongside it at /mnt/in, not just organize_bookmarks.py's own dependencies.
     # ------------------------------------------------------------------
     InputFiles = @{
         'organize_bookmarks.py' = 'C:\sandbox\organizer-src\organize_bookmarks.py'
         'sample-bookmarks.json' = 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json'
+        'run_disk_workload.py'  = 'C:\sandbox\organizer-src\run_disk_workload.py'
+        'outbox.py'             = 'C:\sandbox\organizer-src\outbox.py'
     }
 
     # ------------------------------------------------------------------
@@ -85,20 +110,30 @@
 
     # ------------------------------------------------------------------
     # Entrypoint (Disk model) — the organizer script + the sample profile both ride the INPUT
-    # data disk (mounted read-only at /mnt/in); the result is written to the OUTPUT data disk
-    # (mounted read-write at /mnt/out). The inner-name MUST be result.html — the engine default
-    # Read-WorkloadResult reads back (changing it would mean changing the orchestrator /
-    # Read-WorkloadResult -ResultInnerName defaults too). The seed builder injects this string in place
-    # of __ENTRYPOINT__ in the Disk-mode runner (guest-images/debian-12-cloud.md §2a). `--out
-    # /mnt/out/result.html` is the SOLE writer of result.html: the script writes the Netscape-HTML there
-    # itself, and the runner does NOT also redirect stdout into result.html (that double-write —
-    # shell `>` plus the script's --out on the same path — is undefined-order and could 0-byte/corrupt
-    # the file; the runner sends stdout/stderr to separate /mnt/out/{stdout.log,stderr.txt} logs).
-    # Operates on the read-only input copy at /mnt/in; emits to /mnt/out. NEVER mutates the input.
-    # (Superseded the serial/container-era form: /opt/organizer + /mnt/firefox-profile +
-    # /work/out/bookmarks.html — replaced by the INPUT/OUTPUT data disks for Disk mode.)
+    # data disk (mounted read-only at /mnt/in); the result is written into the in-guest STAGING dir
+    #
+    # C1.4 CORRECTION (live 2026-07-21) — OutboxOutput=$true means the OUTPUT disk is RAW and is
+    # NEVER mounted. SeedBuilder's CidataOutboxDiskRunnerTemplate creates only /mnt/in + /run/staging,
+    # runs this Entrypoint INTO /run/staging, then hands staging to run_disk_workload.py, which packs
+    # the outbox and writes it to the raw OUTPUT device. This string previously targeted the exFAT-era
+    # /mnt/out/result.html. The organizer auto-creates its --out parent, but the runner executes the
+    # entrypoint as the NON-ROOT sandbox user and /mnt is root-owned, so creating /mnt/out was denied
+    # -> the organizer aborted (rc=1), staging stayed EMPTY,
+    # and the outbox shipped carrying only its placeholder verdicts.json -> the host read failed with
+    # "transport-only outbox has no 'result.html' candidate". C1.4 converged the transport but never
+    # moved the Entrypoint, and Profiles.Tests.ps1 asserted the stale path, keeping the suite green.
+    # The inner-name MUST be result.html - that is what the host outbox read extracts as this
+    # transport-only profile's artifact (ResultInnerName). The seed builder injects this string in
+    # place of __ENTRYPOINT__ in the OutboxOutput runner. `--out /run/staging/result.html` is the
+    # SOLE writer of result.html: the script writes the Netscape-HTML there itself, and the runner
+    # does NOT also redirect stdout into it (that double-write - shell `>` plus the script's --out on
+    # the same path - is undefined-order and could 0-byte/corrupt the file; the runner sends
+    # stdout/stderr to separate /run/{stdout.log,stderr.txt}, which die with the guest at poweroff).
+    # Operates on the read-only input copy at /mnt/in; emits to /run/staging. NEVER mutates the input.
+    # (Superseded: first the serial/container-era /opt/organizer + /work/out/bookmarks.html form,
+    # then the exFAT /mnt/out/result.html form that the OutboxOutput transport replaced.)
     # ------------------------------------------------------------------
-    Entrypoint = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+    Entrypoint = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
 
     # ------------------------------------------------------------------
     # ExtraAllowlist — DELIBERATELY EMPTY. The Tier-0 default is offline (tier0's
@@ -114,7 +149,7 @@
     # Mounts (SUPERSEDED for Disk mode — SERIAL/CONTAINER-ERA, kept for shape/history).
     # In the DISK model these bind mounts NO LONGER deliver inputs/collect output: inputs
     # arrive on the INPUT data disk (guest /mnt/in) and the result lands on the OUTPUT data disk
-    # (guest /mnt/out/result.html) — see WorkloadMode/Inputs/InputFiles/Entrypoint above. These
+    # (guest /run/staging/result.html, packed into the outbox) — see WorkloadMode/Inputs/InputFiles/Entrypoint above. These
     # entries are retained only because the loader still secret-screens them (regression guard)
     # and to document the pre-Disk mechanism; the Disk-mode runner does not consult them.
     #
@@ -129,16 +164,11 @@
         'C:\sandbox\firefox-organizer-out'  = '/work/out'
     }
 
-    # ------------------------------------------------------------------
-    # StageAssets (SUPERSEDED for Disk mode — SERIAL/CONTAINER-ERA, kept for shape/history).
-    # In the Disk model the organizer script is NOT staged as an ISO to /opt/organizer; it rides
-    # the INPUT data disk (Inputs/InputFiles -> /mnt/in/organize_bookmarks.py). Retained only as
-    # documentation of the pre-Disk staging mechanism + as a loader secret-screen regression guard.
-    # The KEY is the host source the Importer attached; the VALUE documents it. Not secret-shaped.
-    # ------------------------------------------------------------------
-    StageAssets = @{
-        'C:\sandbox\assets\firefox-organizer.iso' = 'organize_bookmarks.py + helpers (reads a places.sqlite COPY + mozlz4 backups, emits <!DOCTYPE NETSCAPE-Bookmark-file-1> HTML). [SUPERSEDED by the INPUT data disk for Disk mode — the script now rides /mnt/in.]'
-    }
+    # StageAssets: REMOVED 2026-06-25 (post-live-acceptance tidy). In Disk mode the organizer rides the
+    # INPUT data disk (Inputs -> /mnt/in/organize_bookmarks.py), so the superseded firefox-organizer.iso
+    # DVD was being imported-then-ejected-by-the-seal for nothing. The loader's secret-screen regression
+    # coverage lives in the ProfileLoader tests (synthetic profiles), not in a profile carrying a
+    # placeholder StageAssets. Pre-Disk staging history is in git.
 
     # ------------------------------------------------------------------
     # SeedIso — STILL APPLIES in Disk mode. The cloud-init NoCloud CIDATA seed is attached

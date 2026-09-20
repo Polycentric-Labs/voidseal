@@ -289,26 +289,47 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         # STAGED is a clean no-op against the fake). WorkloadMode='Disk' routes the orchestrator down the
         # data-disk path: New-WorkloadDisks creates+attaches+records the INPUT/OUTPUT disks BEFORE the
         # seal, the VM starts, the host waits for self-power-off, detaches the data disks, then reads +
-        # classifies the OUTPUT volume. The fake guest writes no sentinel -> Read-WorkloadResult honestly
-        # classifies Failed (no-sentinel), which still proves the whole wiring traversed.
+        # classifies the OUTPUT volume.
+        # D (structural C1 no-mount): a non-processor Disk-mode profile MUST now be OutboxOutput-shaped
+        # (or a processor, or the builder) to run through Invoke-Voidseal at all — the legacy
+        # Read-WorkloadResult -> ReadVhdxFile -> Mount-VHD branch is structurally refused. This fixture
+        # was previously a plain non-outbox Disk-mode profile (exercising that now-refused branch
+        # directly); it is OutboxOutput=$true here so these tests exercise the still-legal path. The
+        # host-mount branch itself stays covered at the unit level (Workload.Tests.ps1's own
+        # 'Read-WorkloadResult' Describe block calls it directly) and the DENY test above proves the
+        # orchestrator refuses to reach it end-to-end.
         $script:Tier0Disk = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
         $script:Tier0Disk = @{} + $script:Tier0Disk          # mutable copy
         $script:Tier0Disk['Name']         = 'firefox-test'
         $script:Tier0Disk['WorkloadMode'] = 'Disk'
         $script:Tier0Disk['Inputs']       = @{}              # empty inputs -> input disk created with no files
         $script:Tier0Disk['FileSystem']   = 'exFAT'
+        $script:Tier0Disk['OutboxOutput'] = $true
         Assert-TierProfileValid -Profile $script:Tier0Disk -Context 'TEST Tier-0 Disk-mode fixture'
 
+        # A minimal valid outbox blob (mirrors the firefox-outbox fixture) for tests that need a clean
+        # SUCCESS run through the post-detach outbox read.
+        $diskStaging = Join-Path $script:TmpRoot ("disk-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $diskStaging -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $diskStaging 'result.html'), [System.Text.Encoding]::UTF8.GetBytes('<!DOCTYPE NETSCAPE-Bookmark-file-1><DL></DL>'))
+        $diskVerdicts = Join-Path $script:TmpRoot ("disk-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        '[]' | Set-Content -LiteralPath $diskVerdicts -Encoding utf8 -NoNewline
+        $diskBlobFile = Join-Path $script:TmpRoot ("disk-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$diskStaging', r'$diskVerdicts', r'$diskBlobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $script:DiskBlob = [System.IO.File]::ReadAllBytes($diskBlobFile)
+
         # SimulateSelfPowerOff: the guest boots, runs, self-powers-off before the first poll, so
-        # Wait-WorkloadComplete reads the happy (Off, not-timed-out) branch and Read-WorkloadResult runs.
-        $script:DiskB = New-FakeHyperVBackend -SimulateSelfPowerOff
+        # Wait-WorkloadComplete reads the happy (Off, not-timed-out) branch and the outbox read runs.
+        # -SimulateOutboxBlob supplies a clean outbox, so a normal run classifies Success.
+        $script:DiskB = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:DiskBlob
         $script:Art   = Join-Path $script:TmpRoot ("art-disk-{0}"  -f ([guid]::NewGuid().ToString('N')))
         $script:Dest  = Join-Path $script:TmpRoot ("dest-disk-{0}" -f ([guid]::NewGuid().ToString('N')))
     }
 
-    It 'Invoke-Voidseal Disk mode: full lifecycle runs, seals, detaches+reads, classifies (fake guest = no sentinel = Failed)' {
+    It 'Invoke-Voidseal Disk mode: full lifecycle runs, seals, detaches+reads, classifies (clean outbox = Success)' {
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
-            -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'result.html'; SentinelInnerName = 'result.exitcode' } `
+            -Workload @{ WorkloadMode = 'Disk' } `
             -Name 'sbx-disk' -ArtifactRoot $script:Art -Destination $script:Dest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:DiskB
         $report                  | Should -Not -BeNullOrEmpty
@@ -318,8 +339,8 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         $report.States           | Should -Contain 'CAPTURED'
         $report.States           | Should -Contain 'DESTROYED'
         $report.RunResult        | Should -Not -BeNullOrEmpty
-        $report.RunResult.Status | Should -Be 'Failed' -Because 'the fake guest wrote no sentinel; Read-WorkloadResult honestly classifies Failed'
-        $report.RunResult.Reason | Should -Match '(?i)sentinel' -Because 'the no-sentinel reason proves the host-read path ran (not the timeout path)'
+        $report.RunResult.Status | Should -Be 'Success' -Because 'a clean outbox read materializes the transport-only result'
+        $report.ExtractedArtifact | Should -Not -BeNullOrEmpty -Because 'the outbox read path (not Read-WorkloadResult) produced the artifact'
     }
 
     It 'Disk mode resolves WorkloadMode from the PROFILE (no -Workload override needed)' {
@@ -334,7 +355,8 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
 
     It 'Disk mode attaches BOTH data disks before the seal, folds them into CreatedDisks, and DETACHES them before the host read (proven via the call log)' {
         # The data disks are recorded on the descriptor and attached pre-seal; after the run they are
-        # detached (RemoveHardDiskDrive) BEFORE the host reads the OUTPUT volume (ReadVhdxFile) — the
+        # detached (RemoveHardDiskDrive) BEFORE the host reads the OUTPUT volume (ReadVhdxRawRegion, the
+        # user-space outbox read — this fixture is OutboxOutput, so it never calls ReadVhdxFile) — the
         # host must never read a disk still attached to a (possibly live) guest. The VM is destroyed at
         # the end, so we cannot read the VM's .HardDrives post-run; instead prove the detach actually
         # RAN — and ran before the read — via the fake's persistent call log (survives RemoveVM).
@@ -355,34 +377,33 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         $detached | Should -Contain $inDisk  -Because 'the INPUT data disk must be detached before the host read'
         $detached | Should -Contain $outDisk -Because 'the OUTPUT data disk must be detached before the host read'
 
-        # PROVE THE ORDERING: the OUTPUT disk is detached BEFORE the host reads it (ReadVhdxFile).
+        # PROVE THE ORDERING: the OUTPUT disk is detached BEFORE the host reads it (ReadVhdxRawRegion,
+        # never ReadVhdxFile — C1.2 user-space outbox read).
         $detachOutIdx = [array]::FindIndex([object[]]$log, [Predicate[object]]{ param($e) $e.Op -eq 'RemoveHardDiskDrive' -and $e.Path -eq $outDisk })
-        $readOutIdx   = [array]::FindIndex([object[]]$log, [Predicate[object]]{ param($e) $e.Op -eq 'ReadVhdxFile' -and $e.Path -eq $outDisk })
+        $readOutIdx   = [array]::FindIndex([object[]]$log, [Predicate[object]]{ param($e) $e.Op -eq 'ReadVhdxRawRegion' -and $e.Path -eq $outDisk })
         $detachOutIdx | Should -BeGreaterThan -1 -Because 'the OUTPUT disk detach must be logged'
         $readOutIdx   | Should -BeGreaterThan -1 -Because 'the host read of the OUTPUT disk must be logged'
         $detachOutIdx | Should -BeLessThan $readOutIdx -Because 'the host must detach the OUTPUT disk BEFORE it reads the OUTPUT volume'
+
+        $mountOps = @($log | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.Path -eq $outDisk })
+        $mountOps.Count | Should -Be 0 -Because 'an OutboxOutput profile must NEVER take the Read-WorkloadResult host-mount path (D, C1)'
     }
 
-    It 'Disk mode SUCCESS path: a guest-seeded sentinel+result drives Read-WorkloadResult to Success and extracts the artifact (EXTRACTED)' {
-        # The Failed-path e2e above never exercises the orchestrator's happy artifact-extraction wiring
-        # (if ($runResult.ArtifactPath) { $report.ExtractedArtifact = ... } + the EXTRACTED state). This
-        # seeds the OUTPUT disk with a sentinel (exitcode 0) + a result file when the guest "self-powers-
-        # off": -SimulateWorkloadOutput makes StartVM write those inner files onto the OUTPUT-labelled
-        # disk (modelling the guest writing output then powering off), so Read-WorkloadResult classifies
-        # Success and the extraction path runs end-to-end through Invoke-Voidseal.
-        $html   = '<!DOCTYPE NETSCAPE-Bookmark-file-1><DL><DT>seeded</DL>'
-        $okB = New-FakeHyperVBackend -SimulateSelfPowerOff `
-            -SimulateWorkloadOutput @{ 'result.exitcode' = '0'; 'result.html' = $html }
+    It 'Disk mode SUCCESS path: a guest-written outbox drives the post-detach read to Success and extracts the artifact (EXTRACTED)' {
+        # Proves the orchestrator's happy artifact-extraction wiring end-to-end via the C1.2 user-space
+        # outbox read (D: this fixture is OutboxOutput, so Read-WorkloadResult/ReadVhdxFile is never
+        # reached — see the BeforeEach's $script:DiskBlob, built the same way as the firefox-outbox
+        # fixture below).
         $art  = Join-Path $script:TmpRoot ("art-disk-ok-{0}"  -f ([guid]::NewGuid().ToString('N')))
         $dest = Join-Path $script:TmpRoot ("dest-disk-ok-{0}" -f ([guid]::NewGuid().ToString('N')))
 
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
-            -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'result.html'; SentinelInnerName = 'result.exitcode' } `
+            -Workload @{ WorkloadMode = 'Disk' } `
             -Name 'sbx-disk-ok' -ArtifactRoot $art -Destination $dest `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $okB
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:DiskB
 
-        $report.States           | Should -Contain 'EXTRACTED' -Because 'a Success run reaches the EXTRACTED state'
-        $report.RunResult.Status   | Should -Be 'Success' -Because 'the seeded sentinel (0) + result file classify Success'
+        $report.States             | Should -Contain 'EXTRACTED' -Because 'a Success run reaches the EXTRACTED state'
+        $report.RunResult.Status   | Should -Be 'Success' -Because 'the clean outbox read classifies Success'
         $report.RunResult.ExitCode | Should -Be 0
         $report.ExtractedArtifact  | Should -Not -BeNullOrEmpty -Because 'the orchestrator records the extracted artifact path on a Success run'
         Test-Path -LiteralPath $report.ExtractedArtifact | Should -BeTrue -Because 'the result file was copied to the host destination'
@@ -440,15 +461,12 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         # A real Remove-VMHardDiskDrive can throw transiently right after a force-stop. That must NOT
         # propagate to the outer catch (which would record a lifecycle .Error and mis-report a successful
         # guest run as a hard abort, sending the operator hunting a guest bug that doesn't exist). The
-        # orchestrator's detach try/catch records a Failed run, SKIPS the host read (never read a disk that
-        # may still be attached), and teardown still runs. The guest "succeeded" here (seeded sentinel +
-        # result) to prove that even a would-be Success is honestly downgraded to Failed when we cannot
-        # safely detach-then-read — the seam is RemoveHardDiskDrive, which teardown does not use.
-        $html  = '<!DOCTYPE NETSCAPE-Bookmark-file-1><DL></DL>'
-        $failB = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDetachError `
-            -SimulateWorkloadOutput @{ 'result.exitcode' = '0'; 'result.html' = $html }
+        # orchestrator's detach try/catch records a Failed run, SKIPS the host read entirely (never read a
+        # disk that may still be attached — the detach failure short-circuits BEFORE the outbox read is
+        # even attempted, so this test does not need a valid outbox), and teardown still runs.
+        $failB = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDetachError
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
-            -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'result.html'; SentinelInnerName = 'result.exitcode' } `
+            -Workload @{ WorkloadMode = 'Disk' } `
             -Name 'sbx-disk-detachfail' -ArtifactRoot $script:Art -Destination $script:Dest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $failB
         $report.Error            | Should -BeNullOrEmpty -Because 'a transient detach failure must NOT abort the lifecycle via the outer catch (.Error stays null)'
@@ -460,22 +478,31 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         (& $failB.GetVM @{ Name = 'sbx-disk-detachfail' }) | Should -BeNullOrEmpty -Because 'the VM is torn down even on the detach-failure path (no orphan)'
     }
 
-    It 'Disk mode: a guest-written EMPTY result.html (sentinel rc=0) is classified Failed, NOT a false-green Success' {
-        # A 0-byte result.html (a guest double-write or a truncated-flush race) must NOT classify Success
-        # just because the sentinel says 0 — an empty artifact imports nothing. SimulateWorkloadOutput
-        # seeds the OUTPUT disk's Files table directly (the guest "wrote" an empty result.html + rc 0), so
-        # Read-WorkloadResult sees a present sentinel (0) but empty content -> Failed, and no artifact is
-        # extracted. (This is the realistic path: the GUEST writes the empty file; the host's WriteVhdxFile
-        # rejects empty content as a caller bug, so this scenario only arises guest-side.)
-        $emptyB = New-FakeHyperVBackend -SimulateSelfPowerOff `
-            -SimulateWorkloadOutput @{ 'result.exitcode' = '0'; 'result.html' = '' }
+    It 'Disk mode: a validly-packed outbox with NO result.html candidate is classified Failed, NOT a false-green Success (C1.2 transport-only guard)' {
+        # A guest that self-powers-off and packs a well-formed outbox (verdicts.json present, container
+        # parses cleanly) but never staged a result.html candidate must NOT be materialized as a Success —
+        # the transport-only read (Invoke-Voidseal.ps1's C1.2 branch) explicitly throws when its expected
+        # ResultInnerName is absent from the unpacked candidates; the orchestrator's outer catch on that
+        # block records the honest Failed outcome. Equivalent in spirit to the pre-D "empty result.html"
+        # DENY (no false-green on a guest that didn't actually produce a usable artifact), now expressed
+        # in outbox terms since this fixture no longer reaches Read-WorkloadResult.
+        $noCandidateStaging = Join-Path $script:TmpRoot ("disk-nocandidate-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $noCandidateStaging -Force | Out-Null   # deliberately empty — no result.html
+        $noCandidateVerdicts = Join-Path $script:TmpRoot ("disk-nocandidate-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        '[]' | Set-Content -LiteralPath $noCandidateVerdicts -Encoding utf8 -NoNewline
+        $noCandidateBlobFile = Join-Path $script:TmpRoot ("disk-nocandidate-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$noCandidateStaging', r'$noCandidateVerdicts', r'$noCandidateBlobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'a verdicts-only outbox (no candidate files) must still pack cleanly — the container format allows it'
+        $noCandidateBlob = [System.IO.File]::ReadAllBytes($noCandidateBlobFile)
+
+        $emptyB = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $noCandidateBlob
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
-            -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'result.html'; SentinelInnerName = 'result.exitcode' } `
+            -Workload @{ WorkloadMode = 'Disk' } `
             -Name 'sbx-disk-empty' -ArtifactRoot $script:Art -Destination $script:Dest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $emptyB
-        $report.RunResult.Status  | Should -Be 'Failed' -Because 'sentinel rc=0 but an EMPTY result.html is not a usable artifact (no false-green)'
-        $report.RunResult.Reason  | Should -Match '(?i)empty|absent' -Because 'the reason explains the empty result'
-        $report.ExtractedArtifact | Should -BeNullOrEmpty -Because 'an empty result is not extracted as an artifact'
+        $report.RunResult.Status  | Should -Be 'Failed' -Because 'a validly-packed outbox with no result.html candidate is not a usable artifact (no false-green)'
+        $report.RunResult.Reason  | Should -Match "(?i)no 'result.html' candidate|candidate" -Because 'the reason explains the missing candidate'
+        $report.ExtractedArtifact | Should -BeNullOrEmpty -Because 'no candidate means nothing is extracted as an artifact'
     }
 }
 
@@ -501,11 +528,26 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
         $script:Tier0Seed['WorkloadMode'] = 'Disk'
         $script:Tier0Seed['Inputs']       = @{}
         $script:Tier0Seed['FileSystem']   = 'exFAT'
-        $script:Tier0Seed['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /mnt/out/result.html'
+        $script:Tier0Seed['OutboxOutput'] = $true   # D: a non-processor Disk-mode fixture MUST be outbox/processor/builder-shaped now (structural C1 no-mount)
+        $script:Tier0Seed['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
         $script:Tier0Seed['SeedIso']      = 'C:\sandbox\assets\cidata-seed.iso'   # declared; disk mode must NOT attach it as a DVD
         Assert-TierProfileValid -Profile $script:Tier0Seed -Context 'TEST Tier-0 Disk-mode seed fixture'
 
-        $script:SeedB = New-FakeHyperVBackend -SimulateSelfPowerOff
+        # D: OutboxOutput=$true routes the RUNNING/CAPTURED read through the post-detach outbox block
+        # (Read-OutboxToGateInput), not Read-WorkloadResult. Build a minimal valid outbox blob (mirrors
+        # the firefox-outbox fixture below) so a clean guest run genuinely SUCCEEDS end-to-end — these
+        # tests assert seal/seed-disk/teardown plumbing, not outbox content, so any valid outbox suffices.
+        $seedStaging = Join-Path $script:TmpRoot ("seed-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $seedStaging -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $seedStaging 'result.html'), [System.Text.Encoding]::UTF8.GetBytes('<!DOCTYPE NETSCAPE-Bookmark-file-1><TITLE>Bookmarks</TITLE>'))
+        $seedVerdicts = Join-Path $script:TmpRoot ("seed-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        '[]' | Set-Content -LiteralPath $seedVerdicts -Encoding utf8 -NoNewline
+        $seedBlobFile = Join-Path $script:TmpRoot ("seed-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$seedStaging', r'$seedVerdicts', r'$seedBlobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $script:SeedBlob = [System.IO.File]::ReadAllBytes($seedBlobFile)
+
+        $script:SeedB = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:SeedBlob
         $script:Art2  = Join-Path $script:TmpRoot ("art-seed-{0}"  -f ([guid]::NewGuid().ToString('N')))
         $script:Dest2 = Join-Path $script:TmpRoot ("dest-seed-{0}" -f ([guid]::NewGuid().ToString('N')))
     }
@@ -569,6 +611,1007 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
             -WarningVariable seedWarnings -WarningAction SilentlyContinue | Out-Null
         $dualDvd = @($seedWarnings | Where-Object { [string]$_ -match '(?i)single DVD slot|StageAssets ISO that must|SeedIso takes the boot DVD' })
         @($dualDvd).Count | Should -Be 0 -Because 'RC6: disk mode delivers the seed on a data disk, so the single-DVD-slot warning must not fire'
+    }
+}
+
+# ===========================================================================
+#  Task 1.4 — processor (gate) wiring: Invoke-Voidseal attaches+records the DEPS
+#  disk BEFORE the seal (so Assert-Sealed accepts it) and wires the POST-DETACH
+#  Sensitivity Gate (processor workloads only). The gate runs HOST-SIDE after the
+#  OUTPUT disk is detached, partitioning the in-guest screener's candidates into
+#  Released (auto-certified SAFE) vs Held (everything else), and stamps GateRan
+#  on the descriptor + Released/Held/SensitivityReport on the report.
+# ===========================================================================
+Describe 'Invoke-Voidseal — processor (gate) wiring' {
+
+    BeforeEach {
+        # A Tier-0 PROCESSOR profile: Network='None' (structurally no-NIC; Tier-0 Container substrate
+        # wires no NIC, so it seals clean) + a ScreenConfig (mode='aggressive') that routes the post-
+        # detach gate, + WorkloadMode='Disk' (a processor IS a Disk-mode workload) + an Entrypoint (so
+        # the disk-mode CIDATA seed disk is built, exactly like the RC6 path). EgressMode/EgressAllowlist
+        # MUST be 'None'/@() for a Network='None' profile (the loader's processor rule).
+        $script:Proc = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $script:Proc = @{} + $script:Proc                    # mutable copy
+        $script:Proc['Name']            = 'firefox-proc-test'
+        $script:Proc['WorkloadMode']    = 'Disk'
+        $script:Proc['Inputs']          = @{}
+        $script:Proc['FileSystem']      = 'exFAT'
+        $script:Proc['Network']         = 'None'             # processor: structurally no-NIC
+        $script:Proc['EgressMode']      = 'None'             # processor rule: Network=None => EgressMode=None
+        $script:Proc['EgressAllowlist'] = @()                # processor rule: empty allowlist
+        $script:Proc['ScreenConfig']    = @{ mode = 'aggressive' }   # routes the post-detach gate
+        $script:Proc['Entrypoint']      = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
+        Assert-TierProfileValid -Profile $script:Proc -Context 'TEST Tier-0 processor fixture'
+
+        # SimulateSelfPowerOff: the guest self-powers-off before the first poll, so Wait-WorkloadComplete
+        # reads the happy (Off, not-timed-out) branch and the detach+read+gate path runs.
+        $script:ProcB = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $script:ProcArt  = Join-Path $script:TmpRoot ("art-proc-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:ProcDest = Join-Path $script:TmpRoot ("dest-proc-{0}" -f ([guid]::NewGuid().ToString('N')))
+
+        # TEST ISOLATION (fix: shared-ledger flakiness): Invoke-Voidseal now ALWAYS defaults
+        # -RateLedgerPath to a SHARED, PERSISTENT host path ('<temp>\Voidseal\state\release-ledger.json')
+        # when the caller omits it — by design, so the runs/day cap actually accumulates across separate
+        # live Invoke-Voidseal calls on the same host (see Invoke-Voidseal.ps1's -RateLedgerPath doc). But
+        # that means every processor test in THIS Describe block that reaches the gate (Invoke-SensitivityGate
+        # is called whenever the outbox parses, per Invoke-Voidseal.ps1:~697-701) reads/writes that SAME
+        # shared file unless it supplies its own path — and several release SAFE candidates for the SAME
+        # profile name ('firefox-proc-test'), so repeated same-day full-suite runs accumulate real release
+        # counts against the shared ledger and eventually trip the default cap (5), turning a should-release
+        # test into a false DENY. Generate a fresh per-It, GUID-named ledger path under $TestDrive here so
+        # EVERY It in this block starts from a clean, isolated ledger and NEVER touches the shared %TEMP%
+        # default — mirrors the isolation the two dedicated C2.6-wiring tests already use for their own
+        # explicit ledgers below.
+        $script:ProcLedger = Join-Path $TestDrive ("ratecap-ledger-proc-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+
+        # The HOST-readable gate inputs the orchestrator consumes via -Workload (Phase-1 mock injection;
+        # Phase-2 derives these from host-mounting the detached OUTPUT VHDX). The staging dir is a real
+        # temp dir with the messy-drive fixture copied in; the verdicts.json is hand-written to cover all
+        # seven staged files (the gate's completeness guard refuses an unaccounted staged file).
+        # C2.1/C2.4 locked schema: verdict in {SAFE, HELD, ERROR}, error_code in the fixed enum, flags a
+        # bounded closed vocabulary, sha256 the content-binding field C2.4's re-hash-at-release checks
+        # against — computed HERE from the actual staged bytes so it can never silently desync.
+        $script:GateStaging = Join-Path $script:TmpRoot ("gate-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:GateStaging -Force | Out-Null
+        Copy-Item (Join-Path $script:SkillRoot 'tests/fixtures/messy-drive/*') $script:GateStaging
+        function script:GateHashOf($name) {
+            (Get-FileHash -LiteralPath (Join-Path $script:GateStaging $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+
+        $script:GateVerdicts = Join-Path $script:TmpRoot ("gate-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        @(
+            [pscustomobject]@{ name = 'creds.txt';             sha256 = (GateHashOf 'creds.txt');             verdict = 'HELD'; error_code = 'NONE';        flags = @('aws_key') }
+            [pscustomobject]@{ name = 'finance-statement.txt'; sha256 = (GateHashOf 'finance-statement.txt'); verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+            [pscustomobject]@{ name = 'health-note.txt';       sha256 = (GateHashOf 'health-note.txt');       verdict = 'HELD'; error_code = 'NONE';        flags = @('health') }
+            [pscustomobject]@{ name = 'prose-essay.txt';       sha256 = (GateHashOf 'prose-essay.txt');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+            [pscustomobject]@{ name = 'prose-letter.md';       sha256 = (GateHashOf 'prose-letter.md');       verdict = 'SAFE'; error_code = 'NONE';        flags = @() }
+            [pscustomobject]@{ name = 'spreadsheet-dump.csv';  sha256 = (GateHashOf 'spreadsheet-dump.csv');  verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+            [pscustomobject]@{ name = 'prose-with-token.md';   sha256 = (GateHashOf 'prose-with-token.md');   verdict = 'HELD'; error_code = 'NONE';        flags = @('credential') }
+        ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:GateVerdicts -Encoding utf8
+
+        # A mock DEPS disk: a pre-existing VHDX the builder would have produced (Phase 2). The fake's
+        # AddHardDiskDrive requires the VHD to exist in its state (real Add-VMHardDiskDrive requires the
+        # file), so we create it on the backend with NewVHD first — mirroring how a real deps.vhdx exists
+        # on disk before the orchestrator attaches it.
+        # D3-B (Phase 3): the shared BeforeAll also pre-computes the whole-image hash so each It that
+        # needs to PASS the verify step can supply DepsImageHash = $script:DepsDiskHash without a per-It
+        # NewVHD call. Tests that override the hash (mismatch) or omit it (missing) create their own
+        # local backend + disk so the shared fixture stays unaffected.
+        $script:DepsDisk = Join-Path $script:TmpRoot ("deps-{0}.vhdx" -f ([guid]::NewGuid().ToString('N')))
+        & $script:ProcB.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $script:DepsDiskHash = [string](& $script:ProcB.GetVhdxImageHash @{ Path = $script:DepsDisk })   # the (empty) fixture's whole-image hash
+    }
+
+    It 'releases the SAFE candidates end-to-end: detached OUTPUT outbox -> ReadVhdxRawRegion -> read_outbox.py -> gate' {
+        # Build a REAL outbox blob from the SAME staging + verdicts the old test injected, via guest/outbox.py.
+        $blobFile = Join-Path $script:TmpRoot ("outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        # The guest "wrote" that blob to the OUTPUT disk's raw region (SelfPowerOff = clean flush). Build a
+        # fresh backend with the blob + re-create the DEPS disk on it (fake state is per-instance).
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })   # the (empty) fixture's whole-image hash
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-outbox' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        @($report.States) | Should -Contain 'SEALED'
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'the processor gate ran off the OUTPUT outbox'
+        # C2.7: .Released carries HOST-DERIVED (sha256) names now, never the guest's original
+        # name — recover WHICH original files released via the regenerated report's
+        # 'released_audit' mapping (SensitivityReport is the gate's on-disk manifest path).
+        $gateReport = Get-Content $report.SensitivityReport -Raw | ConvertFrom-Json
+        $relNames = @($gateReport.released_audit | ForEach-Object { $_.original_name })
+        $helNames = @($report.Held     | ForEach-Object { $_.name })
+        $relNames | Should -Contain 'prose-essay.txt' -Because 'a SAFE prose file is released'
+        $relNames | Should -Contain 'prose-letter.md'
+        $relNames | Should -Not -Contain 'creds.txt'  -Because 'a SENSITIVE credential file is NEVER released'
+        $helNames | Should -Contain 'creds.txt'
+        $report.SensitivityReport | Should -Not -BeNullOrEmpty
+        # C2.7 sanity: the in-memory .Released surface never carries a producer-chosen name.
+        @($report.Released | ForEach-Object { $_.name }) | Should -Not -Contain 'creds.txt'
+        foreach ($n in @($report.Released | ForEach-Object { $_.name })) { $n | Should -Match '^[0-9a-f]{64}$' }
+    }
+
+    It 'DENY-on-tamper: a corrupted OUTPUT outbox -> read_outbox.py exits non-zero -> gate releases NOTHING' {
+        $blobFile = Join-Path $script:TmpRoot ("outbox-bad-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $bad = [System.IO.File]::ReadAllBytes($blobFile)
+        $bad[$bad.Length - 1] = $bad[$bad.Length - 1] -bxor 0xFF   # flip a payload byte -> SHA mismatch
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $bad
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })   # the (empty) fixture's whole-image hash
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-tamper' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Released          | Should -BeNullOrEmpty -Because 'a tampered outbox fails closed — nothing is released'
+        $report.SensitivityReport | Should -BeNullOrEmpty
+        $report.Error             | Should -Match '(?i)gate|outbox|read'
+        # GateRan must NOT be stamped (the gate never partitioned).
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue
+    }
+
+    It 'DENY-on-timeout: a hung processor (SimulateNeverOff) -> gate does NOT run, Released stays $null' {
+        $b = New-FakeHyperVBackend -SimulateNeverOff   # never self-powers-off -> Wait-WorkloadComplete force-stops -> TimedOut
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })   # the (empty) fixture's whole-image hash
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-timeout' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Released | Should -BeNullOrEmpty -Because 'a timed-out run releases nothing (DENY-on-timeout)'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue -Because 'the gate must not run on a timeout'
+    }
+
+    It '(a) DENY-on-no-outbox: a clean power-off that wrote NO outbox (in-guest screener aborted) -> header-magic probe fails closed, Released $null' {
+        # The guest self-powered-off cleanly (SelfPowerOff) but produced NO outbox (its screener aborted;
+        # producer fail-closed is locked separately by test_run_disk_workload.py:34). No SimulateOutboxBlob
+        # -> the OUTPUT base region reads as ZEROS -> the orchestrator's 24-byte header magic check
+        # (Read-OutboxToGateInput's 24-byte header magic check in Invoke-Voidseal.ps1 — locate by the
+        # 'VSOUTBX1' literal) fails 'VSOUTBX1' -> gate catch -> nothing released.
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff       # NOTE: no -SimulateOutboxBlob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-nooutbox' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        @($report.States)         | Should -Contain 'SEALED' -Because 'the VM still sealed + ran; only the outbox is absent'
+        $report.Released          | Should -BeNullOrEmpty -Because 'an empty/absent outbox fails closed — nothing is released'
+        $report.SensitivityReport | Should -BeNullOrEmpty
+        $report.Error             | Should -Match '(?i)outbox|magic|header'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue -Because 'the gate never partitioned'
+        (& $b.GetVM @{ Name = 'sbx-proc-nooutbox' }) | Should -BeNullOrEmpty -Because 'teardown still runs (no orphan)'
+    }
+
+    It '(a-verdict) an outbox whose verdicts are ALL non-SAFE -> the gate runs but releases NOTHING (Held, not Released)' {
+        # Distinct from the happy path (the 'releases the SAFE candidates end-to-end' It, which releases the two SAFE files): here EVERY staged file is
+        # non-SAFE, so the gate runs cleanly (GateRan=$true, no Error) yet Released is EMPTY and everything
+        # is Held. Proves the screener-verdict fail-closed at the partition, separate from a parse failure.
+        $allHeld = Join-Path $script:TmpRoot ("verdicts-allheld-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        @(
+            [pscustomobject]@{ name = 'creds.txt';             sha256 = (GateHashOf 'creds.txt');             verdict = 'HELD'; error_code = 'NONE';        flags = @('aws_key') }
+            [pscustomobject]@{ name = 'finance-statement.txt'; sha256 = (GateHashOf 'finance-statement.txt'); verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+            [pscustomobject]@{ name = 'health-note.txt';       sha256 = (GateHashOf 'health-note.txt');       verdict = 'HELD'; error_code = 'NONE';        flags = @('health') }
+            [pscustomobject]@{ name = 'prose-essay.txt';       sha256 = (GateHashOf 'prose-essay.txt');       verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+            [pscustomobject]@{ name = 'prose-letter.md';       sha256 = (GateHashOf 'prose-letter.md');       verdict = 'HELD'; error_code = 'UNSUPPORTED'; flags = @() }
+            [pscustomobject]@{ name = 'spreadsheet-dump.csv';  sha256 = (GateHashOf 'spreadsheet-dump.csv');  verdict = 'HELD'; error_code = 'NONE';        flags = @('financial') }
+            [pscustomobject]@{ name = 'prose-with-token.md';   sha256 = (GateHashOf 'prose-with-token.md');   verdict = 'HELD'; error_code = 'NONE';        flags = @('credential') }
+        ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $allHeld -Encoding utf8
+
+        $blobFile = Join-Path $script:TmpRoot ("outbox-allheld-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$allHeld', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-allheld' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'a well-formed outbox lets the gate run — this is a verdict outcome, not a parse failure'
+        $report.Error              | Should -BeNullOrEmpty -Because 'an all-non-SAFE verdict set is a normal gate outcome, not an error'
+        @($report.Released)        | Should -BeNullOrEmpty -Because 'not one file is SAFE -> release NOTHING'
+        @($report.Held | ForEach-Object { $_.name }) | Should -Contain 'creds.txt' -Because 'every file is held'
+    }
+
+    It '(b) DENY-on-missing-verdicts: an outbox with candidates but NO verdicts.json -> read_outbox.py exits non-zero -> Released $null' {
+        # write_outbox_from_dir always includes verdicts.json, so pack a LONE candidate directly with
+        # pack_outbox to omit it. read_and_verify raises OutboxError('outbox missing verdicts.json') ->
+        # read_outbox.py exit != 0 -> the orchestrator throws (Read-OutboxToGateInput's non-zero-exit
+        # throw in Invoke-Voidseal.ps1 — locate by '$LASTEXITCODE -ne 0') -> gate catch.
+        $blobFile = Join-Path $script:TmpRoot ("outbox-noverdicts-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox, pathlib; pathlib.Path(r'$blobFile').write_bytes(outbox.pack_outbox([('candidate.txt', b'hello world\n')]))"
+        $LASTEXITCODE | Should -Be 0 -Because 'packing a lone candidate must succeed'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-noverdicts' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Released          | Should -BeNullOrEmpty -Because 'no verdicts.json -> fail closed, release nothing'
+        $report.SensitivityReport | Should -BeNullOrEmpty
+        $report.Error             | Should -Match '(?i)gate|outbox|read|verdicts'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue
+    }
+
+    It '(d) DENY-on-oversize-header: an outbox header claiming count > MAX_ENTRIES -> the header bound check fails closed BEFORE a huge read' {
+        # The disk-full / oversize analogue, testable WITHOUT a new backend switch: craft a valid-magic
+        # 24-byte header whose entry_count exceeds MAX_ENTRIES (256). The orchestrator bounds count/total
+        # (Read-OutboxToGateInput's count/total bound check in Invoke-Voidseal.ps1 — locate by
+        # 'count -gt 256') BEFORE computing $exact + issuing the full ReadVhdxRawRegion, so a
+        # bogus/oversize length-prefix cannot drive an enormous read. (Windows is little-endian, matching
+        # the outbox '<' format; the unit-level bound is covered by test_outbox.py's oversize/truncation.)
+        $hdr = [byte[]]::new(24)
+        [System.Text.Encoding]::ASCII.GetBytes('VSOUTBX1').CopyTo($hdr, 0)
+        [System.BitConverter]::GetBytes([uint16]1).CopyTo($hdr, 8)      # version = 1
+        [System.BitConverter]::GetBytes([uint32]1000).CopyTo($hdr, 12)  # entry_count = 1000 (> 256)
+        [System.BitConverter]::GetBytes([uint64]0).CopyTo($hdr, 16)     # payload_total_len = 0
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $hdr
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-oversize' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Released | Should -BeNullOrEmpty -Because 'an over-bound header fails closed — nothing released'
+        $report.Error    | Should -Match '(?i)bound|count|total|outbox'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue
+    }
+
+    It 'D (structural C1 no-mount): a NON-processor, NON-outbox, NON-builder Disk-mode profile is REFUSED before it runs (would otherwise reach the legacy host-mount branch)' {
+        # This is the fixture that USED TO seal+run via the legacy Read-WorkloadResult -> ReadVhdxFile
+        # -> Mount-VHD path (host-kernel-mounting a guest-written filesystem — the C1 P0). No shipped
+        # profile hits it, but nothing structurally refused it before this test. Now it must be refused
+        # fail-closed, BEFORE any provisioning (no VM should even be created).
+        $nonProc = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $nonProc = @{} + $nonProc
+        $nonProc['Name']         = 'firefox-nonproc-test'
+        $nonProc['WorkloadMode'] = 'Disk'
+        $nonProc['Inputs']       = @{}
+        $nonProc['FileSystem']   = 'exFAT'
+        Assert-TierProfileValid -Profile $nonProc -Context 'TEST Tier-0 non-processor Disk-mode fixture'
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        {
+            Invoke-Voidseal -Tier 0 -Profile $nonProc `
+                -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'result.html'; SentinelInnerName = 'result.exitcode' } `
+                -Name 'sbx-nonproc' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+                -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        } | Should -Throw -ExpectedMessage '*host-mount*'
+
+        # Non-vacuousness: refused BEFORE provisioning ever touches the backend — no VM created.
+        (& $b.GetVM @{ Name = 'sbx-nonproc' }) | Should -BeNullOrEmpty -Because 'the refusal must happen before any provisioning — never a create-then-abort'
+    }
+
+    It 'D (no builder exemption): a builder-shaped profile (EgressMode=SquidSniProxy) MISROUTED directly into Invoke-Voidseal is REFUSED with the same host-mount message (its real entry point is Invoke-BuilderVM, which never reaches this code at all)' {
+        # A future caller could mistakenly pass the builder profile straight to Invoke-Voidseal instead
+        # of Invoke-BuilderVM (its real, hash-verified, never-mount entry point). The builder is a
+        # Disk-mode profile that is neither a processor nor OutboxOutput, so it gets NO special
+        # exemption from the structural validator — it is refused exactly like any other non-outbox,
+        # non-processor Disk profile would be. (The builder's LEGITIMATE path, Invoke-BuilderVM, has its
+        # own separate lifecycle and never calls Invoke-Voidseal or Read-WorkloadResult — see
+        # BuilderVM.Tests.ps1 for that coverage; this test proves the MISROUTE is caught, not that the
+        # legitimate builder path is unaffected.)
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        {
+            Invoke-Voidseal -Tier 1 -Profile 'builder' `
+                -Workload @{ WorkloadMode = 'Disk' } `
+                -Name 'sbx-builder-misroute' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+                -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        } | Should -Throw -ExpectedMessage '*host-mount*'
+    }
+
+    It 'D (override path): a Serial-profile refused into Disk mode via -Workload.WorkloadMode (not the profile) is ALSO caught — the validator reads the fully-resolved mode, not just the profile field' {
+        # $workloadMode resolves from -Workload FIRST, then the profile's own WorkloadMode (see
+        # Invoke-Voidseal.ps1's Get-WorkloadField call above the D validator). A caller could force Disk
+        # mode via the -Workload override on an otherwise-Serial profile that carries none of the outbox/
+        # processor markers. Prove the validator catches this path too — it reads the fully-resolved
+        # $workloadMode (post-override), not merely $resolved['WorkloadMode'].
+        $serialProfile = $script:Tier1.Clone()
+        $serialProfile['Name'] = 'tier1-serial-forced-disk-test'
+        # tier1.psd1 has no WorkloadMode key (defaults to Serial) and carries none of the outbox/
+        # processor markers (no Network='None'+ScreenConfig, no OutboxOutput).
+        $serialProfile.ContainsKey('WorkloadMode') | Should -BeFalse -Because 'this fixture must rely on the -Workload override, not a profile-declared Disk mode'
+        Assert-TierProfileValid -Profile $serialProfile -Context 'TEST Tier-1 Serial-profile-forced-to-Disk fixture'
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        {
+            Invoke-Voidseal -Tier 1 -Profile $serialProfile `
+                -Workload @{ WorkloadMode = 'Disk' } `
+                -Name 'sbx-serial-forced-disk' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+                -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        } | Should -Throw -ExpectedMessage '*host-mount*'
+        (& $b.GetVM @{ Name = 'sbx-serial-forced-disk' }) | Should -BeNullOrEmpty -Because 'refused before any provisioning'
+    }
+
+    It 'DENY-on-deps-mismatch: a deps disk whose hash != the expected (builder-recorded) hash is REFUSED (no attach, no run)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        # wrong hash — 64 zero hex chars; the actual hash of an empty VHDX is non-zero
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = ('0' * 64) } `
+            -Name 'sbx-proc-depsmismatch' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'a tampered/substituted deps disk aborts BEFORE the seal'
+        $report.Error | Should -Match '(?i)deps.*(integrity|hash)|integrity check' -Because 'the abort names the deps integrity failure'
+        $report.Released | Should -BeNullOrEmpty
+    }
+
+    It 'DENY-on-missing-deps-hash: a deps disk with NO DepsImageHash is REFUSED (mandatory verification)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        # NO DepsImageHash supplied — should trigger mandatory-verification refusal
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Name 'sbx-proc-nodepshash' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+        @($report.States) | Should -Not -Contain 'SEALED'
+        $report.Error | Should -Match '(?i)DepsImageHash|no .*hash|unverified' -Because 'a deps disk without a verified hash is refused'
+        $report.Released | Should -BeNullOrEmpty -Because 'a missing-hash abort is fail-closed — nothing is released (symmetry with DENY-on-deps-mismatch)'
+    }
+
+    It 'DENY-on-deps-unreadable: a deps disk path GetVHDInfo cannot read (never registered on the backend) is REFUSED before attach (I1 follow-up)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        # A plausible DepsDiskPath that is NEVER registered in the fake's VHD state (no NewVHD call) —
+        # GetVHDInfo (HyperVBackend.ps1) returns $null for any unknown path, modelling a deps hand-off
+        # naming a disk the host cannot actually read. A DepsImageHash IS supplied (per the task brief) so
+        # the refusal under test — the null-GetVHDInfo refusal (Invoke-Voidseal.ps1 — the 'unreadable via
+        # GetVHDInfo' throw) — fires, not
+        # the sibling DENY-on-missing-deps-hash refusal above.
+        $unreadableDepsDisk = Join-Path $script:TmpRoot ("deps-unregistered-{0}.vhdx" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $unreadableDepsDisk; DepsImageHash = ('0' * 64) } `
+            -Name 'sbx-proc-depsunreadable' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'an unreadable (never-registered) deps disk aborts BEFORE the seal'
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'a pre-seal abort must never reach the workload-run state'
+        $report.SealVerdict | Should -Not -Be $true -Because 'Assert-Sealed never ran on this aborted deploy'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0 -Because 'the run aborted before ever reaching StartVM — full parity with the sibling DiskFull DENY tests'
+        $report.Error | Should -Match '(?i)unreadable via GetVHDInfo' -Because 'the abort names the specific GetVHDInfo-unreadable refusal, not a generic throw'
+        $report.Released | Should -BeNullOrEmpty -Because 'an unreadable-deps abort is fail-closed — nothing is released (symmetry with the sibling DENY tests)'
+        (& $b.GetVM @{ Name = 'sbx-proc-depsunreadable' }) | Should -BeNullOrEmpty -Because 'teardown must still run cleanly — no orphaned VM'
+    }
+
+    It 'I1 DENY-on-differencing-deps: a DEPS disk that is a DIFFERENCING disk (container-swap / attacker-parent) is REFUSED before attach' {
+        # Arrange: a deps disk whose GetVHDInfo reports Differencing=$true + a ParentPath (footer/parent-
+        # locator rewrite — a container-swap attack that pulls real blocks from an attacker-controlled
+        # parent at attach time). Seed via the fake's real NewVHD seam (-Differencing/-ParentPath), the
+        # same idiom the sibling DENY-on-deps-mismatch/DENY-on-missing-deps-hash tests use to seed a
+        # normal deps disk — NewVHD requires -Dynamic for a Differencing disk (real New-VHD constraint).
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $diffDepsDisk = Join-Path $script:TmpRoot ("deps-diff-{0}.vhdx" -f ([guid]::NewGuid().ToString('N')))
+        & $b.NewVHD @{ Path = $diffDepsDisk; SizeBytes = 1GB; Differencing = $true; ParentPath = 'C:\atk\parent.vhdx'; Dynamic = $true }
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $diffDepsDisk; DepsImageHash = ('0' * 64) } `
+            -Name 'sbx-proc-depsdiff' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        # Assert: aborted BEFORE the seal, differencing/parent named in the failure, nothing released.
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'a differencing/parent-bearing deps disk aborts BEFORE the seal'
+        $report.Error | Should -Match '(?i)differencing|parent' -Because 'the abort names the differencing/parent-bearing deps disk'
+        $report.Released | Should -BeNullOrEmpty -Because 'a differencing-deps abort is fail-closed — nothing is released'
+    }
+
+    # ---- I2b follow-up: a host-side ENOSPC during New-WorkloadDisks must abort the WHOLE
+    # Invoke-Voidseal run PRE-SEAL ("a DiskFull throw never reaches Assert-Sealed"). Previously this
+    # crossing was only argued structurally (via the SimulateStartVMError analogue); these tests drive
+    # it directly. ----
+    It 'I2b lifecycle abort: a host-side ENOSPC (SimulateWriteEnospc) during New-WorkloadDisks Inputs-populate aborts the WHOLE run PRE-SEAL, with clean teardown' {
+        # A Disk-mode processor-profile COPY whose Inputs carries a NON-empty [byte[]] value, so the
+        # populate path deterministically routes through WriteVhdxFileBytes (the byte-clean I2b path,
+        # Workload.ps1) — the ENOSPC throw lands on the New-WorkloadDisks-wrapped classify-then-rethrow
+        # site ("writing Input '<k>' onto the INPUT disk"), never a generic/unclassified throw.
+        $diskFullProfile = @{} + $script:Proc
+        $diskFullProfile['Inputs'] = @{ 'seed.bin' = [byte[]](1, 2, 3, 4) }
+        Assert-TierProfileValid -Profile $diskFullProfile -Context 'TEST Tier-0 processor DiskFull fixture'
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWriteEnospc
+        $report = Invoke-Voidseal -Tier 0 -Profile $diskFullProfile `
+            -Name 'sbx-proc-diskfull' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Error | Should -Match '(?i)DiskFull' -Because 'a host-side ENOSPC populating the INPUT disk must classify DiskFull, never a generic/unclassified throw'
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'the DiskFull throw fires inside New-WorkloadDisks, strictly BEFORE Lock-Sandbox/Assert-Sealed'
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'a pre-seal abort must never reach the workload-run state'
+        $report.SealVerdict | Should -Not -Be $true -Because 'Assert-Sealed never ran on this aborted deploy'
+        (& $b.GetVM @{ Name = 'sbx-proc-diskfull' }) | Should -BeNullOrEmpty -Because 'teardown must still run cleanly on a DiskFull abort — no orphaned VM'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0 -Because 'the run aborted before ever reaching StartVM — RUNNING was never entered'
+    }
+
+    It 'I2b lifecycle abort (CreateEnospc variant): a host-side ENOSPC (SimulateCreateEnospc) creating the INPUT disk in New-WorkloadDisks ALSO aborts PRE-SEAL with the same DiskFull classification' {
+        # VERIFICATION (per the task brief's precondition): in the FULL Disk-mode lifecycle, NewOutputVhdx
+        # is called ONLY from Workload.ps1 (New-WorkloadDisks: INPUT then OUTPUT; New-WorkloadSeedDisk:
+        # CIDATA — which runs only AFTER New-WorkloadDisks, and only when an Entrypoint is set). So the
+        # backend's FIRST NewOutputVhdx call in ANY Disk-mode lifecycle is unambiguously New-WorkloadDisks'
+        # INPUT-disk create — the SAME classify-then-rethrow site the populate-path It above exercises —
+        # never an earlier unwrapped call site. (Confirmed: no other production file ever calls
+        # `& $Backend.NewOutputVhdx`.) This It proves that verified landing site directly.
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateCreateEnospc
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Name 'sbx-proc-createenospc' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.Error | Should -Match '(?i)DiskFull' -Because 'a host-side ENOSPC creating the INPUT disk must classify DiskFull, never a generic/unclassified throw'
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'the DiskFull throw fires inside New-WorkloadDisks, strictly BEFORE Lock-Sandbox/Assert-Sealed'
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'a pre-seal abort must never reach the workload-run state'
+        $report.SealVerdict | Should -Not -Be $true -Because 'Assert-Sealed never ran on this aborted deploy'
+        (& $b.GetVM @{ Name = 'sbx-proc-createenospc' }) | Should -BeNullOrEmpty -Because 'teardown must still run cleanly on a DiskFull abort — no orphaned VM'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0 -Because 'the run aborted before ever reaching StartVM — RUNNING was never entered'
+    }
+
+    # ---- whole-branch-review Fix B: the C2.6 runs/day rate cap is now WIRED into the orchestrator's
+    # sole Invoke-SensitivityGate call (processor gate only) — these two tests prove it is actually
+    # consulted on a real processor run, not merely available-but-dark. ----
+    It 'C2.6 wiring: a processor run supplies -RateLedgerPath/-RateProfile/-RateToday — the rate cap is consulted (the ledger records the release)' {
+        # An explicit -RateLedgerPath under $TmpRoot (never real host state) proves the orchestrator
+        # actually PASSES the ledger through to Invoke-SensitivityGate: if the wiring were dark (the
+        # pre-fix state), this file would never be created/incremented by a run through Invoke-Voidseal.
+        $ledger = Join-Path $script:TmpRoot ("ratecap-ledger-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        Test-Path -LiteralPath $ledger | Should -BeFalse -Because 'the ledger must not pre-exist — its creation proves the orchestrator wired the call through'
+
+        $blobFile = Join-Path $script:TmpRoot ("outbox-ratecap-wired-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-ratecap-wired' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $ledger
+
+        # The existing green processor e2e behavior is unaffected: the default cap (5) is well above
+        # this single release, so the SAFE candidates still release exactly as the un-rate-capped test does.
+        # C2.7: .Released carries HOST-DERIVED (sha256) names — recover WHICH originals released
+        # via the gate report's 'released_audit' mapping.
+        $gateReport = Get-Content $report.SensitivityReport -Raw | ConvertFrom-Json
+        $relNames = @($gateReport.released_audit | ForEach-Object { $_.original_name })
+        $relNames | Should -Contain 'prose-essay.txt' -Because 'under the default cap, a single release proceeds exactly as before Fix B'
+        $relNames | Should -Contain 'prose-letter.md'
+
+        # Non-vacuousness: the ledger now EXISTS and records the release for the profile's OWN Name
+        # ('firefox-proc-test', $script:Proc's fixture Name) on today's UTC calendar day — proving
+        # -RateProfile/-RateToday were both threaded through, not just -RateLedgerPath.
+        Test-Path -LiteralPath $ledger | Should -BeTrue -Because 'Register-Release only creates the ledger file when the gate was actually called WITH -RateLedgerPath — this is the load-bearing proof the orchestrator wires the rate cap on a real run'
+        $doc = Get-Content -LiteralPath $ledger -Raw | ConvertFrom-Json
+        $today = [datetime]::UtcNow.ToString('yyyy-MM-dd')
+        $profileNode = $doc.PSObject.Properties[[string]$script:Proc['Name']]
+        $profileNode | Should -Not -BeNullOrEmpty -Because 'the ledger must be keyed by the RESOLVED PROFILE name ($resolved[''Name'']), not the per-run VM -Name'
+        [int]$profileNode.Value.$today | Should -Be 1 -Because 'exactly one release event was recorded for today'
+    }
+
+    It 'C2.6 wiring: over-cap (ledger pre-seeded AT the default cap for today) — a 6th same-profile-same-day release is DENIED, nothing released' {
+        # Pre-seed the ledger at the DEFAULT cap (5) for $script:Proc's profile name, for TODAY (the
+        # real host UTC day the orchestrator will compute internally — the orchestrator does not
+        # accept an injected -RateToday, so this test uses the real clock to stay honest to production
+        # wiring, mirroring how the orchestrator itself calls [datetime]::UtcNow).
+        $ledger = Join-Path $script:TmpRoot ("ratecap-ledger-overcap-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        $today  = [datetime]::UtcNow.ToString('yyyy-MM-dd')
+        $profileName = [string]$script:Proc['Name']
+        $seedDoc = [pscustomobject]@{}
+        $seedDoc | Add-Member -NotePropertyName $profileName -NotePropertyValue ([pscustomobject]@{ $today = 5 })
+        $seedDoc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ledger -Encoding utf8
+
+        $blobFile = Join-Path $script:TmpRoot ("outbox-ratecap-overcap-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-ratecap-overcap' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $ledger
+
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'the gate still runs off the outbox — the rate cap is a release-time backstop, not a gate-skip'
+        @($report.Released) | Should -BeNullOrEmpty -Because 'the profile is already AT the default cap (5) for today — the 6th release attempt is DENIED, nothing released'
+        $helEntry = @($report.Held) | Where-Object { $_.name -eq 'prose-essay.txt' } | Select-Object -First 1
+        $helEntry | Should -Not -BeNullOrEmpty -Because 'an otherwise-SAFE candidate is HELD, not silently dropped, when over-cap'
+        $helEntry.heldReason | Should -Be 'over-rate-cap' -Because 'the held reason must name the rate cap specifically, not a coincidental schema/hash failure'
+
+        # The ledger count must NOT have incremented past 5 — a denied run is not itself a release event
+        # (Register-Release is only called when .Released ends up non-empty).
+        $doc = Get-Content -LiteralPath $ledger -Raw | ConvertFrom-Json
+        [int]$doc.$profileName.$today | Should -Be 5 -Because 'a DENIED run must not further inflate the ledger — only an actual release increments it'
+    }
+
+    # ---- Task 4.2 D4-B: processor NEVER calls ReadVhdxFile (host-mount) on its OUTPUT disk ----
+    It 'processor run does NOT host-mount (ReadVhdxFile) its Raw OUTPUT disk — D4-B' {
+        # A processor has a Raw OUTPUT disk (no FS to mount; host-mounting untrusted guest data is P0 risk).
+        # The gate runs via ReadVhdxRawRegion (user-space); ReadVhdxFile must NEVER touch the OUTPUT path.
+        $blobFile = Join-Path $script:TmpRoot ("outbox-nohostmount-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-nohostmount' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        # The run must succeed (gate ran, SAFE candidate released)
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'the gate ran via ReadVhdxRawRegion'
+
+        # The OUTPUT disk path must NOT appear in any ReadVhdxFile call log entry
+        $outPath = [string]$report.Descriptor.OutputDiskPath
+        $hostMountOps = @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and [string]$_.Path -eq $outPath })
+        $hostMountOps.Count | Should -Be 0 -Because 'a processor must NEVER host-mount (ReadVhdxFile) its Raw OUTPUT disk (D4-B, P0 risk)'
+    }
+
+    It 'GC invariant (D3-D): the verified deps.vhdx is NOT in CreatedDisks -> teardown LEAVES it (builder-owned, reusable)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })   # detached -> hashable
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-depsgc' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+        @($report.States) | Should -Contain 'SEALED' -Because 'a verified deps disk attaches + the run proceeds'
+        @($report.Descriptor.CreatedDisks) | Should -Not -Contain $script:DepsDisk -Because 'the builder-owned deps.vhdx is never in CreatedDisks; the Reaper leaves it'
+        $report.Descriptor.DepsImageHash | Should -Be $depsHash -Because 'the verified hash is recorded on the descriptor'
+    }
+
+    # -----------------------------------------------------------------------
+    # Task 5.2 (c / M1) — processor DETACH FAILURE: the explicit M1 coverage item carried
+    # from Phase 1. A VALID outbox proves the gate WOULD have released the SAFE candidates —
+    # but the post-run data-disk detach fails first (Invoke-Voidseal.ps1 — the data-disk detach
+    # try/catch that sets $detachOk=$false and records a Failed RunResult), and the gate block is guarded
+    # by `$detachOk -and -not $wait.TimedOut` — so a failed detach means the gate NEVER runs,
+    # even though the outbox on the (now-unreadable, still-attached-per-the-failed-detach)
+    # OUTPUT disk was perfectly valid. This mirrors the existing NON-processor detach-failure
+    # test above (the 'transient data-disk DETACH failure' It) but for a PROCESSOR, plus asserts the gate did not run.
+    # -----------------------------------------------------------------------
+    It '(c / M1) processor DETACH FAILURE: a VALID outbox proves the gate WOULD have released, but the failed detach skips the gate entirely (Failed run, no lifecycle abort, clean teardown)' {
+        $blobFile = Join-Path $script:TmpRoot ("outbox-detachfail-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDetachError -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-detachfail' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+
+        $report.RunResult        | Should -Not -BeNullOrEmpty
+        $report.RunResult.Status | Should -Be 'Failed' -Because 'a data-disk detach failure is a Failed run (Invoke-Voidseal.ps1 — the detach-catch''s Failed RunResult)'
+        $report.RunResult.Reason | Should -Match '(?i)detach' -Because 'the reason names the detach, pointing the operator host-side'
+        $report.Error            | Should -BeNullOrEmpty -Because 'a caught detach failure is NOT a lifecycle abort (mirrors the non-processor ''transient data-disk DETACH failure'' It) — it is a Failed run, not an .Error'
+        $report.Released         | Should -BeNullOrEmpty -Because 'the gate never ran, so nothing was released, even though the outbox was VALID'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) |
+            Should -BeTrue -Because 'GateRan must NOT be stamped — the failed detach guards the gate block off (the $detachOk guard)'
+        @($report.States) | Should -Contain 'DESTROYED' -Because 'a detach failure does not set .Error, so DESTROYED is recorded as a traversed state (Invoke-Voidseal.ps1 — the teardown block''s ''if ($null -eq $report.Error)'' guard)'
+        (& $b.GetVM @{ Name = 'sbx-proc-detachfail' }) | Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM even though the detach itself failed'
+    }
+
+    # -----------------------------------------------------------------------
+    # Task 5.2 (e) — VM won't boot: StartVM throws inside the try (Invoke-Voidseal.ps1 — the Disk-mode
+    # '& $Backend.StartVM' call) ->
+    # the outer lifecycle catch records .Error and teardown runs. SEALED is reached (the seal
+    # precedes StartVM) but RUNNING/the gate never are.
+    # -----------------------------------------------------------------------
+    It '(e) processor VM WON''T BOOT: StartVM throws -> lifecycle abort, SEALED reached but the gate never runs, clean teardown' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateStartVMError
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-proc-startfail' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -ErrorAction SilentlyContinue
+
+        $report.Error     | Should -Match '(?i)start|boot' -Because 'StartVM''s simulated failure names the guest not booting'
+        $report.Released  | Should -BeNullOrEmpty -Because 'the gate never runs when the VM never started'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) |
+            Should -BeTrue -Because 'GateRan must NOT be stamped — the run aborted before the disk-mode RUNNING block'
+        @($report.States) | Should -Contain 'SEALED'   -Because 'the seal precedes StartVM, so SEALED is reached before the abort'
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'StartVM threw before the RUNNING transition was recorded'
+        (& $b.GetVM @{ Name = 'sbx-proc-startfail' }) | Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM on a mid-flow StartVM failure'
+    }
+
+    # -----------------------------------------------------------------------
+    # Task 5.2 (e) — backend unavailable: New-SandboxVM's TestAvailable preflight
+    # (New-SandboxVM's TestAvailable preflight in Provisioner.ps1) refuses BEFORE any VM/disk is created, so provisioning itself
+    # throws and the outer catch records it. No deps disk is needed here — the abort happens
+    # before New-SandboxVM even returns, well before the disk-mode deps-attach block runs.
+    # -----------------------------------------------------------------------
+    It '(e) backend UNAVAILABLE: the TestAvailable preflight refuses before any VM is created -> abort before SEALED, no orphan' {
+        $b = New-FakeHyperVBackend -SimulateUnavailable
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-proc-unavailable' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -ErrorAction SilentlyContinue
+
+        $report.Error     | Should -Match '(?i)available|unreachable|privilege|Hyper-V' -Because 'New-SandboxVM''s preflight names the unavailable/insufficient-privilege backend'
+        $report.Released  | Should -BeNullOrEmpty -Because 'the gate never runs when provisioning never happened'
+        @($report.States) | Should -Not -Contain 'SEALED' -Because 'the preflight refuses before PROVISIONED is ever reached, let alone SEALED'
+        (& $b.GetVM @{ Name = 'sbx-proc-unavailable' }) | Should -BeNullOrEmpty -Because 'no VM was ever created — nothing to orphan'
+    }
+
+    # -----------------------------------------------------------------------
+    # Task 5.2 (e) — channel-read failure: Assert-Sealed's GetHostChannels throws
+    # (the '& $Backend.GetHostChannels' read in Assert-Sealed, Sealer.ps1 — unconditional for every tier/profile shape, including a processor) ->
+    # a genuine seal-gate abort, exactly like the existing sbx-disk-sealfail It (grep the VM name)
+    # but confirmed here against the PROCESSOR fixture. Assert-Sealed is throw-only (no
+    # SealVerdict=$false return path reaches the report — see the belt-and-braces comment (Invoke-
+    # Voidseal.ps1 — above the '-not $sealOk' throw), so $report.SealVerdict stays at its initial $false.
+    # -----------------------------------------------------------------------
+    It '(e) processor CHANNEL-READ FAILURE: Assert-Sealed''s host-channel read throws -> seal-stage abort, gate never runs, clean teardown' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateChannelReadError
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-proc-channelfail' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -ErrorAction SilentlyContinue
+
+        $report.Released    | Should -BeNullOrEmpty -Because 'the gate never runs — the seal never certified'
+        $report.SealVerdict | Should -BeFalse -Because 'Assert-Sealed is throw-only; it never returned a true verdict for this run'
+        $report.Error       | Should -Match '(?i)host-channel|channel' -Because 'the abort names the unreadable host channel (Assert-Sealed''s channel-read fail-closed path)'
+        @($report.States)   | Should -Not -Contain 'SEALED'  -Because 'the seal gate threw before SEALED was recorded'
+        @($report.States)   | Should -Not -Contain 'RUNNING' -Because 'a seal-gate failure must never reach the workload-run state'
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) |
+            Should -BeTrue -Because 'GateRan must NOT be stamped — the gate block is unreachable on a seal-stage abort'
+        (& $b.GetVM @{ Name = 'sbx-proc-channelfail' }) | Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM on a seal-gate abort'
+    }
+}
+
+# ===========================================================================
+#  C1.2 — non-processor OutboxOutput read-path: user-space outbox, NEVER Mount-VHD
+# ===========================================================================
+#  Intent: a Disk-mode profile
+#  that opts into OutboxOutput=$true (C1.1's Raw-OUTPUT predicate) but is NOT a processor (no
+#  ScreenConfig) must have its result read via the SAME user-space path a processor uses
+#  (ReadVhdxRawRegion -> read_outbox.py), NEVER Read-WorkloadResult/ReadVhdxFile — the Raw OUTPUT has
+#  no filesystem to mount. Unlike a processor, the result is TRANSPORT-ONLY: the outbox's sole
+#  candidate (result.html) is materialized verbatim to $Destination as ExtractedArtifact, with NO
+#  sensitivity-gate partition (Released/Held stay null) — this is firefox's shape, not a screener's.
+Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-space, no Mount-VHD)' {
+
+    BeforeAll {
+        # A Tier-0 firefox-SHAPED profile: OutboxOutput=$true (Raw OUTPUT, C1.1) but NO ScreenConfig
+        # (NOT a processor) and Network stays whatever tier0 declares (a non-processor is not forced
+        # to Network='None'). WorkloadMode='Disk' + an Entrypoint so the disk-mode seed builds.
+        $script:Fx = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $script:Fx = @{} + $script:Fx                    # mutable copy
+        $script:Fx['Name']         = 'firefox-outbox-test'
+        $script:Fx['WorkloadMode'] = 'Disk'
+        $script:Fx['Inputs']       = @{}
+        $script:Fx['FileSystem']   = 'exFAT'
+        $script:Fx['OutboxOutput'] = $true                # C1.1: Raw OUTPUT, no ScreenConfig -> transport-only
+        $script:Fx['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
+        Assert-TierProfileValid -Profile $script:Fx -Context 'TEST Tier-0 firefox-outbox fixture'
+
+        $script:FxArt  = Join-Path $script:TmpRoot ("art-fx-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:FxDest = Join-Path $script:TmpRoot ("dest-fx-{0}" -f ([guid]::NewGuid().ToString('N')))
+
+        # A minimal outbox: verdicts.json is REQUIRED by the container format (guest/outbox.py:96)
+        # even for a transport-only producer with no screener — an empty array is honest (nothing was
+        # screened). staging/result.html is the sole candidate; outbox.write_outbox_from_dir packs
+        # every flat file in the staging dir alongside verdicts.json.
+        $script:FxStaging = Join-Path $script:TmpRoot ("fx-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:FxStaging -Force | Out-Null
+        $script:FxResultBytes = [System.Text.Encoding]::UTF8.GetBytes('<!DOCTYPE NETSCAPE-Bookmark-file-1><TITLE>Bookmarks</TITLE>')
+        [System.IO.File]::WriteAllBytes((Join-Path $script:FxStaging 'result.html'), $script:FxResultBytes)
+
+        $script:FxVerdicts = Join-Path $script:TmpRoot ("fx-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        '[]' | Set-Content -LiteralPath $script:FxVerdicts -Encoding utf8 -NoNewline
+
+        $script:FxBlobFile = Join-Path $script:TmpRoot ("fx-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:FxStaging', r'$script:FxVerdicts', r'$script:FxBlobFile')"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $script:FxBlob = [System.IO.File]::ReadAllBytes($script:FxBlobFile)
+    }
+
+    It 'materializes the outbox result.html to Destination as ExtractedArtifact via ReadVhdxRawRegion, NEVER ReadVhdxFile' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-fx-outbox' -ArtifactRoot $script:FxArt -Destination $script:FxDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        @($report.States) | Should -Contain 'SEALED'
+        $report.ExtractedArtifact | Should -Not -BeNullOrEmpty -Because 'a transport-only outbox still yields an ExtractedArtifact'
+        $artifactPath = @($report.ExtractedArtifact)[0]
+        Test-Path -LiteralPath $artifactPath | Should -BeTrue
+        [System.IO.File]::ReadAllBytes($artifactPath) | Should -Be $script:FxResultBytes -Because 'the materialized bytes must equal the outbox result.html entry verbatim (transport-only, not screened)'
+
+        # Not screened: this is a transport-only read, not a sensitivity-gate partition.
+        $report.Released | Should -BeNullOrEmpty -Because 'a non-processor OutboxOutput profile is NEVER screened/Released'
+        $report.Held     | Should -BeNullOrEmpty
+
+        # The host-mount path (Read-WorkloadResult -> ReadVhdxFile) must NEVER be taken for an OUTPUT
+        # disk with no filesystem. Prove via the fake's CallLog: a ReadVhdxRawRegion op on the OUTPUT
+        # path is present; NO ReadVhdxFile op targets that same path.
+        $outputPath = [string]$report.Descriptor.OutputDiskPath
+        $rawOps  = @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxRawRegion' -and $_.Path -eq $outputPath })
+        $mountOps = @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.Path -eq $outputPath })
+        $rawOps.Count   | Should -BeGreaterThan 0 -Because 'the result must be read user-space via ReadVhdxRawRegion'
+        $mountOps.Count | Should -Be 0 -Because 'the host must NEVER Mount-VHD / ReadVhdxFile a Raw OUTPUT with no filesystem'
+    }
+
+    It 'DENY-on-no-outbox: a clean power-off with NO outbox written -> header-magic probe fails closed, no artifact' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff       # NOTE: no -SimulateOutboxBlob
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-fx-nooutbox' -ArtifactRoot $script:FxArt -Destination $script:FxDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        @($report.States)         | Should -Contain 'SEALED'
+        $report.ExtractedArtifact | Should -BeNullOrEmpty -Because 'no outbox was written — fail closed, nothing materialized'
+        $report.Error             | Should -Match '(?i)outbox|magic|header'
+        $outputPath = [string]$report.Descriptor.OutputDiskPath
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.Path -eq $outputPath }).Count |
+            Should -Be 0 -Because 'still no host-mount read, even on the fail-closed path'
+    }
+}
+
+# ===========================================================================
+#  Task C1.5 — no-Mount security test (AST): the C1 invariant, structurally pinned
+# ===========================================================================
+#  The behavioral test above (FakeCallLog) proves the observed CALLS on one run. This test proves
+#  the STRUCTURAL guarantee: Read-OutboxToGateInput — the ONE function both the processor and the
+#  transport-only OutboxOutput branch use to read the guest-written OUTPUT disk (C1.2) — contains NO
+#  reference to Mount-VHD, Add-VMHardDiskDrive, or ReadVhdxFile anywhere in its body, by parsing
+#  Invoke-Voidseal.ps1 fresh and walking the real AST (mirrors the "Raw skips Format-Volume" AST
+#  canary in HyperVBackend.Tests.ps1, committed fa1c384 — a genuine AST assertion, not a comment/
+#  regex canary that a refactor could silently invalidate).
+Describe 'Invoke-Voidseal — SECURITY (AST): Read-OutboxToGateInput never Mount-VHD / ReadVhdxFile (C1.5)' {
+
+    BeforeAll {
+        $tokens = $null; $parseErrors = $null
+        $script:OrchAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:OrchPath, [ref]$tokens, [ref]$parseErrors)
+        @($parseErrors).Count | Should -Be 0 -Because 'the orchestrator must parse cleanly to be analyzed'
+
+        $script:OutboxReadFn = $script:OrchAst.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                          $n.Name -eq 'Read-OutboxToGateInput'
+            }, $true) | Select-Object -First 1
+        $script:OutboxReadFn | Should -Not -BeNullOrEmpty -Because 'Read-OutboxToGateInput must exist — it is the shared outbox result-read path (C1.2)'
+    }
+
+    It 'the function body references ReadVhdxRawRegion (the user-space read it must use)' {
+        $cmdNames = @($script:OutboxReadFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst]
+            }, $true) | ForEach-Object { $_.Member.Extent.Text })
+        $cmdNames | Should -Contain 'ReadVhdxRawRegion' -Because 'the outbox must be read via the raw user-space region reader'
+    }
+
+    It 'SECURITY: the function body contains ZERO Mount-VHD command references' {
+        $mountCalls = @($script:OutboxReadFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Mount-VHD'
+            }, $true))
+        $mountCalls.Count | Should -Be 0 -Because 'the C1 invariant: the host must NEVER kernel-mount a guest-written OUTPUT filesystem'
+    }
+
+    It 'SECURITY: the function body contains ZERO Add-VMHardDiskDrive command references' {
+        $attachCalls = @($script:OutboxReadFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-VMHardDiskDrive'
+            }, $true))
+        $attachCalls.Count | Should -Be 0 -Because 'a user-space raw-region read never needs to (re)attach the disk to any VM'
+    }
+
+    It 'SECURITY: the function body contains ZERO ReadVhdxFile member-call references' {
+        $memberCalls = @($script:OutboxReadFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst]
+            }, $true) | Where-Object { $_.Member.Extent.Text -eq 'ReadVhdxFile' })
+        $memberCalls.Count | Should -Be 0 -Because 'ReadVhdxFile is the host-mount-backed backend method — the outbox path must use ONLY ReadVhdxRawRegion'
+    }
+
+    # ---- non-vacuousness proof (this test file documents it; the mutation itself is done + reverted
+    #      manually during implementation, per the C1.5 brief — see task report for the transcript) ----
+    It 'non-vacuousness: a synthetic AST WITH an injected Mount-VHD call fails the same assertion shape' {
+        # Parse a scratch scriptblock that mimics the real function shape but adds a Mount-VHD call,
+        # proving the assertion pattern above is not vacuously true (it would catch a real regression).
+        $mutated = @'
+function Read-OutboxToGateInput {
+    param($OutputDiskPath, $Destination, $Backend)
+    $hdr = & $Backend.ReadVhdxRawRegion @{ Path = $OutputDiskPath; Offset = 0; Length = 24 }
+    Mount-VHD -Path $OutputDiskPath
+}
+'@
+        $mTokens = $null; $mErrors = $null
+        $mAst = [System.Management.Automation.Language.Parser]::ParseInput($mutated, [ref]$mTokens, [ref]$mErrors)
+        $mFn = $mAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Read-OutboxToGateInput' }, $true) |
+            Select-Object -First 1
+        $mMountCalls = @($mFn.Body.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Mount-VHD'
+            }, $true))
+        $mMountCalls.Count | Should -BeGreaterThan 0 -Because 'proves the AST walk DOES detect a Mount-VHD call when one is present — the real-file assertion above is non-vacuous'
+    }
+}
+
+# ===========================================================================
+#  Task 5.2 (e / D5-C) — guest-command failure (SERIAL only)
+# ===========================================================================
+#  D5-C: this is deliberately a SERIAL Tier-1 test, NOT a processor test — a Disk-mode processor
+#  has no live guest-command channel (its only "communication" is the OUTPUT outbox read post-
+#  detach), so -SimulateGuestCommandFailure has nothing to attach to there. The serial seam
+#  (Start-SandboxWorkload's boot-readiness probe, Wait-GuestBootReady in Runner.ps1) is the only place a guest-
+#  command fault is observable.
+#
+#  VERIFIED SHAPE (re-confirmed against the fake + Runner.ps1, not the brief's original guess):
+#  -SimulateGuestCommandFailure does NOT make InvokeGuestCommand THROW — it makes it RETURN a
+#  normal (non-throwing) @{ ExitCode = 1; ... } (the fake InvokeGuestCommand's canned-failure result in
+#  HyperVBackend.ps1 — locate by SimulateGuestCommandFailure). Wait-GuestBootReady's
+#  probe (Wait-GuestBootReady's InvokeGuestCommand loop) treats a non-zero probe exit exactly like "not ready yet" and retries
+#  to the deadline; a probe THROW would ALSO be caught and retried the same way (its probe try/catch) — either
+#  shape lands on the same outcome. With -BootWaitSeconds 0 the deadline is met after exactly one
+#  attempt, so Wait-GuestBootReady returns Ready=$false immediately (no real sleep), and
+#  Start-SandboxWorkload (its boot-timeout early-return branch in Runner.ps1) returns EARLY with a boot-timeout run-result
+#  (ExitCode=-1, BootWaitStatus set) WITHOUT ever delivering the entrypoint — this is a reported
+#  Failed run, NOT a thrown lifecycle abort. Invoke-Voidseal's Serial else-branch assigns this
+#  run-result to $report.RunResult verbatim (a raw Runner pscustomobject: it carries ExitCode/
+#  BootWaitStatus, NOT a .Status property — unlike the Disk-mode RunResult hashtables elsewhere in
+#  this file). Under Set-StrictMode -Version Latest, reading a nonexistent .Status on this
+#  pscustomobject would THROW, so assertions below read ExitCode/BootWaitStatus, not .Status.
+#  EXTRACTED IS still reached (re-confirmed empirically, D5-D): the orchestrator's serial EXTRACTED
+#  gate (the Serial-branch ResultPath non-blank check) checks only whether -Workload.ResultPath is non-blank — it does NOT consult
+#  RunResult/ExitCode. $script:NewWorkload pre-stages its result file on the HOST independent of any
+#  guest activity, so Export-SandboxArtifact (Runner.ps1, which just requires -ResultPath to
+#  exist) succeeds regardless of the boot-readiness timeout. Asserting "no EXTRACTED" would be a
+#  false claim the code cannot satisfy, so this test asserts the REAL fault signal instead —
+#  RunResult.ExitCode/BootWaitStatus, proving the boot-readiness probe genuinely never succeeded.
+#  MUST pass -BootWaitSeconds 0 -BootPollDelaySeconds 0 or the probe loop sleeps to the real
+#  ~180s boot-wait deadline (5s poll cadence) — exactly the trap this comment exists to flag.
+Describe 'Invoke-Voidseal — a guest-command failure during boot-readiness is a Failed run, not a lifecycle abort (SERIAL, D5-C)' {
+
+    BeforeEach {
+        # -SimulateGuestCommandFailure: every InvokeGuestCommand call (including the boot-readiness
+        # probe) returns a non-zero exit. Combined with -BootWaitSeconds 0 the probe gets exactly one
+        # attempt, immediately fails the deadline check, and Start-SandboxWorkload reports a clean
+        # boot-timeout run-result rather than ever delivering the entrypoint.
+        $script:BadGuestCmd = New-FakeHyperVBackend -SimulateGuestCommandFailure
+        $script:Workload = & $script:NewWorkload -Tag 'guestcmdfail'
+        $script:Art  = Join-Path $script:TmpRoot ("art-gcf-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:Dest = Join-Path $script:TmpRoot ("dest-gcf-{0}" -f ([guid]::NewGuid().ToString('N')))
+    }
+
+    It '(e / D5-C) SERIAL guest-command failure: boot-readiness never succeeds -> a reported Failed/timed-out RunResult, no lifecycle .Error, no orphan, no gate (serial has none)' {
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
+            -Name 'sbx-guestcmdfail' -ArtifactRoot $script:Art -Destination $script:Dest `
+            -BootWaitSeconds 0 -BootPollDelaySeconds 0 -Backend $script:BadGuestCmd -ErrorAction SilentlyContinue
+
+        $report.Error | Should -BeNullOrEmpty -Because 'a boot-readiness timeout is a REPORTED run outcome (the boot-timeout early-return branch returns, never throws) — not a lifecycle .Error'
+
+        $report.RunResult | Should -Not -BeNullOrEmpty -Because 'Start-SandboxWorkload always returns a run-result, even on a boot-readiness timeout'
+        $report.RunResult.ExitCode | Should -Be -1 -Because 'a boot-readiness timeout reports ExitCode -1 (the boot-timeout RunResult), never a phantom success'
+        $statusField = $report.RunResult.PSObject.Properties['BootWaitStatus']
+        $statusField | Should -Not -BeNullOrEmpty -Because 'the serial run-result carries BootWaitStatus explaining why (no .Status field exists on this shape — StrictMode would throw reading it)'
+        [string]$statusField.Value | Should -Match '(?i)not.*boot-ready|timeout|did not' -Because 'the boot-readiness result names the guest never coming up'
+
+        # NOTE (re-confirmed empirically, D5-D): the orchestrator's serial EXTRACTED gate
+        # (Invoke-Voidseal.ps1 — the Serial-branch ResultPath non-blank check) checks only whether
+        # -Workload.ResultPath is non-blank — it does
+        # NOT consult RunResult/ExitCode. $script:NewWorkload pre-stages its result file on the HOST
+        # independent of any guest activity (a test-harness artifact, not a guest-produced one), so
+        # EXTRACTED IS reached and ExtractedArtifact IS set here even though the entrypoint was never
+        # delivered over the serial seam. Asserting "no EXTRACTED" would be a false claim the code
+        # cannot satisfy — the real, honest fault signal for this scenario is RunResult.ExitCode/
+        # BootWaitStatus above (proving the boot-readiness probe never succeeded), not the
+        # State/ExtractedArtifact fields, which reflect the test harness's pre-staged file, not the
+        # guest-command fault. Serial mode still has no sensitivity gate at all (Released stays null).
+        $report.Released | Should -BeNullOrEmpty -Because 'serial mode has no post-detach sensitivity gate at all'
+
+        (& $script:BadGuestCmd.GetVM @{ Name = 'sbx-guestcmdfail' }) |
+            Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM on a boot-readiness timeout'
+    }
+}
+
+# ===========================================================================
+#  I6a — SERIAL mode overall wall-clock DENY (Disk-mode parity)
+# ===========================================================================
+#  Disk mode already force-stops a hung guest on an OVERALL wall-clock deadline
+#  (Wait-WorkloadComplete -TimeoutSeconds $WorkloadTimeoutSeconds, in Invoke-Voidseal.ps1's Disk-mode
+#  branch — locate by the Wait-WorkloadComplete call).
+#  Serial mode's real mechanism (FIX PASS, superseding a REJECTED placebo — see task-2-report.md):
+#  $WorkloadTimeoutSeconds is passed straight through as Start-SandboxWorkload's -TimeoutSeconds,
+#  the OUTER bound of the single serial guest-command dispatch (Start-SandboxWorkload's
+#  InvokeGuestCommand call). When that guest command reports TimedOut=$true — a REPORTED outcome from
+#  InvokeGuestCommand's TimedOut contract, not a thrown error — Invoke-Voidseal's Serial branch
+#  force-stops the VM and records a Failed RunResult (Invoke-Voidseal.ps1's Serial else-branch).
+#  A PRIOR implementation compared (Get-Date) against (Get-Date).AddSeconds($WorkloadTimeoutSeconds)
+#  BEFORE ever dispatching the guest command: that comparison is tautologically false for any
+#  positive N (both Get-Date calls execute within the same instant), so it NEVER fired in real
+#  operation (default 600s) — it only "passed" because the REJECTED test injected 0. That
+#  pre-dispatch guard + its 0-deadline test are REMOVED here; the fake has no seam to model a real
+#  elapsed-time trip (InvokeGuestCommand always returns synchronously), so the deterministic way to
+#  exercise the REAL mechanism is the fake's -SimulateGuestCommandTimeout switch (mirrors
+#  -SimulateGuestCommandFailure), which makes the dispatched guest command itself report
+#  TimedOut=$true — proving the OBSERVABLE I6a outcome (Failed run + force-stop), not a clock race.
+Describe 'Invoke-Voidseal — I6a: SERIAL mode overall wall-clock DENY (force-stop + Failed on guest-command timeout)' {
+
+    BeforeEach {
+        $script:SerialDdlB    = New-FakeHyperVBackend
+        $script:SerialTimeoutB = New-FakeHyperVBackend -SimulateGuestCommandTimeout
+        $script:Workload = & $script:NewWorkload -Tag 'serialddl'
+        $script:Art  = Join-Path $script:TmpRoot ("art-sddl-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:Dest = Join-Path $script:TmpRoot ("dest-sddl-{0}" -f ([guid]::NewGuid().ToString('N')))
+    }
+
+    It 'Serial mode force-stops + fails a workload whose guest command exceeds the overall wall-clock deadline (SimulateGuestCommandTimeout)' {
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
+            -Name 'sbx-i6-serialddl' -ArtifactRoot $script:Art -Destination $script:Dest `
+            -BootWaitSeconds 0 -BootPollDelaySeconds 0 -WorkloadTimeoutSeconds 5 -Backend $script:SerialTimeoutB
+
+        $report.RunResult | Should -Not -BeNullOrEmpty
+        $report.RunResult.Status | Should -Be 'Failed' -Because 'the dispatched guest command reported TimedOut=$true — this is a reported Failed run'
+        $report.RunResult.ExitCode | Should -Be -1
+        $report.RunResult.Reason | Should -Match '(?i)deadline|wall-clock|timed out'
+        # No lifecycle .Error: a guest-command timeout is a REPORTED run outcome (mirrors the
+        # Disk-mode 'boot/workload timed out' path), not a thrown mid-flow abort.
+        $report.Error | Should -BeNullOrEmpty -Because 'a serial guest-command timeout is a reported Failed run, not a lifecycle .Error'
+        # The run must NOT report success — the primary I6a regression this guards against.
+        $report.RunResult.Status | Should -Not -Be 'Success'
+    }
+
+    It 'force-stops the VM on the Serial guest-command timeout (no orphan, mirroring Disk-mode Wait-WorkloadComplete)' {
+        Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
+            -Name 'sbx-i6-serialddl2' -ArtifactRoot $script:Art -Destination $script:Dest `
+            -BootWaitSeconds 0 -BootPollDelaySeconds 0 -WorkloadTimeoutSeconds 5 -Backend $script:SerialTimeoutB | Out-Null
+        # Teardown always removes the VM in the end, so we cannot observe post-teardown State directly;
+        # instead prove the force-stop fired via the SAME signal the Disk-mode sibling test uses one
+        # layer down (Workload.Tests.ps1's teardown coverage): the VM is gone afterwards (no orphan), and no
+        # lifecycle .Error was recorded (a timeout trip is a REPORTED run outcome, not a thrown abort).
+        (& $script:SerialTimeoutB.GetVM @{ Name = 'sbx-i6-serialddl2' }) |
+            Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM on a serial guest-command timeout'
+    }
+
+    It 'does NOT trip the deadline when the guest command completes normally (Serial happy path unaffected)' {
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
+            -Name 'sbx-i6-serialok' -ArtifactRoot $script:Art -Destination $script:Dest `
+            -BootWaitSeconds 0 -BootPollDelaySeconds 0 -Backend $script:SerialDdlB
+        $report.RunResult.ExitCode | Should -Be 0 -Because 'a normal (non-timed-out) guest command must not trip the I6a force-stop path'
+        $report.RunResult.Entrypoint | Should -Be 'bash run.sh'
     }
 }
 
