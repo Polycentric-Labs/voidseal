@@ -14,7 +14,7 @@ rather than duplicating it.
 > [!IMPORTANT]
 > **Honesty up front (read this before you trust it with anything dangerous).**
 > - **The Tier-0 disk round-trip is live-proven; the full multi-tier acceptance is not.** The whole
->   engine is **mock-proven** (868 Pester tests (866 passed, 2 skipped) plus 56 pytest tests against a fake Hyper-V backend), and the **Tier-0
+>   engine is **mock-proven** (891 Pester tests (889 passed, 2 skipped) plus 56 pytest tests against a fake Hyper-V backend), and the **Tier-0
 >   `firefox` disk-mode round-trip has run end-to-end on real Hyper-V**: provision, host-verified seal,
 >   disk-passing workload, host-read result, clean teardown. Milestone 3 (2026-06-25) proved it with
 >   the legacy exFAT OUTPUT disk, and the current user-space outbox transport passed the same round trip
