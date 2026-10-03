@@ -13,11 +13,13 @@ rather than duplicating it.
 
 > [!IMPORTANT]
 > **Honesty up front (read this before you trust it with anything dangerous).**
-> - **The Tier-0 disk round-trip is live-proven once; the full multi-tier acceptance is not.** The whole
+> - **The Tier-0 disk round-trip is live-proven; the full multi-tier acceptance is not.** The whole
 >   engine is **mock-proven** (868 Pester tests (866 passed, 2 skipped) plus 56 pytest tests against a fake Hyper-V backend), and the **Tier-0
->   `firefox` disk-mode round-trip has run end-to-end on real Hyper-V** (Milestone 3, 2026-06-25 —
->   provision → host-verified seal → disk-passing workload → host-read result → clean teardown). The
->   **Tier-1 `ralph` live run is still pending**, and no tier above 0 has had a live acceptance yet
+>   `firefox` disk-mode round-trip has run end-to-end on real Hyper-V**: provision, host-verified seal,
+>   disk-passing workload, host-read result, clean teardown. Milestone 3 (2026-06-25) proved it with
+>   the legacy exFAT OUTPUT disk, and the current user-space outbox transport passed the same round trip
+>   on 2026-07-21 with a guest-produced result from the synthetic sample. Later changes are mock-tested
+>   only. The **Tier-1 `ralph` live run is still pending**, and no tier above 0 has had a live acceptance yet
 >   (operator-run, elevated — see [`docs/live-smoke-test.md`](docs/live-smoke-test.md)).
 > - **Tier 2 and Tier 3 (disposable no-net / air-gapped detonation) are scaffold-only.** The
 >   cold-VHDX→quarantine extraction sink throws `NotImplemented` in v1. **Do not run live malware or
@@ -132,8 +134,9 @@ $report.Error               # $null   on full success
 $report.TeardownStatus      # OK (VM removed, created disks deleted)
 ```
 
-That is the **Tier-0 `firefox` disk round-trip** success shape — live-proven on real Hyper-V (Milestone 3,
-2026-06-25). If `SealVerdict` is `False` the run **aborted before the workload ran** (the seal gate refused);
+That is the **Tier-0 `firefox` disk round-trip** success shape, live-proven on real Hyper-V with the current
+outbox transport on 2026-07-21 (Milestone 3, on 2026-06-25, proved the legacy exFAT path). If `SealVerdict`
+is `False` the run **aborted before the workload ran** (the seal gate refused);
 `$report.Error` says why, and the VM is still torn down. The full walkthrough — building `$inputs` and a
 failure-triage table — is in [`docs/live-smoke-test.md`](docs/live-smoke-test.md) §4A.
 

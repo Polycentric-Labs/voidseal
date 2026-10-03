@@ -199,8 +199,9 @@ full privileges of whoever invokes it — here, the host operator.
 
 - The Tier-0/1 engine is **mock-proven** (866 Pester tests passed, 0 failed, 2 skipped, plus 56 pytest tests,
   all against the fake backend). The **Tier-0 `firefox` disk round-trip has run end-to-end on real
-  Hyper-V** (2026-06-25). No other tier has had a live acceptance run; Tier 1 remains the operator's
-  elevated step.
+  Hyper-V**: with the legacy exFAT OUTPUT disk on 2026-06-25, and with the current user-space outbox
+  transport on 2026-07-21. Changes made after that run are mock-tested only. No other tier has had a
+  live acceptance run; Tier 1 remains the operator's elevated step.
 - **Tier 2/3 (disposable no-net / air-gapped detonation) and the cold-VHDX→quarantine extraction are
   scaffold-only** in v1 (the quarantine sink throws `NotImplemented`). No live malware or untrusted-plugin
   detonation should be run until verified isolation is in place.

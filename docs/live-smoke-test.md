@@ -424,6 +424,12 @@ never assumes "Off == success".
 > the host mounted read-only. firefox has since converged onto the **user-space outbox transport**
 > (C1.4): OUTPUT is Raw, there is no sentinel, and the host never mounts guest-written data. The steps
 > below are the outbox contract. A *legacy* non-outbox Disk profile still uses the older exFAT runner.
+>
+> **Live result for the outbox contract (2026-07-21).** A firefox run on real Hyper-V returned
+> `SealVerdict=True`, `RunResult.Status=Success` and an empty `Error`, then tore down cleanly. Its
+> `result.html` was produced inside the sealed guest: a Netscape-format file whose three entries came
+> from the four-entry synthetic sample after deduplication. Changes made since then, such as the
+> read-only INPUT fallback (2026-10-03), have run only against the mock backend.
 
 ### 4A.1 Preconditions (mostly reuse Milestone-1 groundwork)
 

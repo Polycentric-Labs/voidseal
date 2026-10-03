@@ -32,9 +32,10 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 
 > **Status (v1):** core engine + the Tier 0/1 Hyper-V provisioning paths built + tested. The whole
 > module is **mock-backed green (866 Pester tests passed, 0 failed, 2 skipped; plus 56 pytest tests)**, AND the **Tier-0 `firefox` disk-mode round-trip is now
-> LIVE-PROVEN on real Hyper-V** (2026-06-25 — Milestone 3: provision → host-verified seal gate →
-> disk-passing workload → host-read result → clean teardown, end to end; the first live run drove out
-> 7 real `fake≠real` host/Hyper-V gaps, all since fixed). The **Tier-1 `ralph` live run is still
+> LIVE-PROVEN on real Hyper-V**: provision, host-verified seal gate, disk-passing workload, host-read
+> result, clean teardown, end to end. Milestone 3 (2026-06-25) proved it with the legacy exFAT OUTPUT
+> disk and drove out 7 real `fake≠real` host/Hyper-V gaps, all since fixed; the current user-space
+> outbox transport passed the same round trip on 2026-07-21. Later changes are mock-tested only. The **Tier-1 `ralph` live run is still
 > pending** (mock-green; not yet exercised on metal — and serial-mode seed delivery needs the same
 > seal-survival treatment disk mode got). Tier 0's **container substrate is not yet built** (v1
 > provisions Tier 0 via the Hyper-V path; the Docker / `docker sbx` / sandbox-runtime substrate is a
@@ -49,7 +50,7 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 
 | Tier | Substrate | Network / egress | Credentials | Extraction | Lifecycle | v1 status |
 |---|---|---|---|---|---|---|
-| **0** | **Hyper-V path / lightweight guest** today (container runtime — Docker / devcontainer / `docker sbx` / sandbox-runtime — is **PLANNED, not yet built**) | host-proxy allowlist (default offline) | none | host reads result dir | `--rm` ephemeral (container tier, when built) | **mock-backed, and LIVE-PROVEN once** (the `firefox` disk round-trip on real Hyper-V, 2026-06-25) — the proof runs the Hyper-V path, not a container |
+| **0** | **Hyper-V path / lightweight guest** today (a container runtime, whether Docker, devcontainer, `docker sbx` or sandbox-runtime, is **PLANNED, not yet built**) | host-proxy allowlist (default offline) | none | host reads result dir | `--rm` ephemeral (container tier, when built) | **mock-backed, and LIVE-PROVEN** (the `firefox` disk round-trip on real Hyper-V: the legacy exFAT path on 2026-06-25, the current outbox transport on 2026-07-21). The proof runs the Hyper-V path, not a container |
 | **1** | Hyper-V Gen2 VM | Internal switch (NIC kept); in-guest egress **defense-in-depth ships** — `EgressMode='InGuestSquid'`: iptables default-DROP + Squid `dstdomain` allowlist, mock-shape-asserted only, NOT a boundary | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal validated (mock-backed; live run = the live smoke test, operator-run, elevated); in-guest egress defense-in-depth ships (mock-shape-asserted), NOT yet live-exercised — the boundary is Phase-6** — `ralph` proof |
 | **2** | Hyper-V VM, disposable | **no NIC** (structurally starved) | **none** (enforced) | **cold output-VHDX → quarantine VM → CDR → inert promote** | create → destroy | **scaffold / benign dry-run only** |
 | **3** | Hyper-V Gen2, **no NIC** + sinkhole VM | **structurally no egress** | **none** (enforced) | same as Tier 2, mandatory | detonate → wipe | **scaffold / benign dry-run only** |

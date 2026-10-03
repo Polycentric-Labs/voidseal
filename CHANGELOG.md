@@ -27,6 +27,7 @@ places where a check is an argument rather than a measurement.
 - Release Governor: a per-profile per-day release rate cap backed by an append-only ledger.
 - Tier-1 builder VM and the `builder` profile; `Get-VoidsealGoldenImage.ps1` and
   `Test-VoidsealPrereqs.ps1`; the user-space outbox transport for Raw OUTPUT disks.
-- Live acceptance status: the **Tier-0 `firefox` disk round-trip ran end-to-end on real Hyper-V**
-  (2026-06-25). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see
+- Live acceptance status: the **Tier-0 `firefox` disk round-trip ran end-to-end on real Hyper-V**,
+  first with the legacy exFAT OUTPUT disk (2026-06-25) and then with the current user-space outbox
+  transport (2026-07-21). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see
   `docs/live-smoke-test.md`). Tier 2 and Tier 3 are scaffold-only and have had no live run.
