@@ -455,9 +455,10 @@ never assumes "Off == success".
   one baked in. The runner runs the entrypoint as `sandbox` when the OUTPUT volume mounted sandbox-owned,
   else as root.
 - **Data-disk mount is robust now** (RC4, 2026-06-24 live): the runner tries the `uid=/gid=` mount and
-  **falls back to a plain `mount LABEL=…`** if it fails, so OUTPUT/INPUT always mount regardless of the
-  filesystem driver. On the live Debian *cloud* kernel `exfat` loaded fine — but FAT32 remains a
-  one-knob fallback (`FileSystem='FAT32'` in the profile) if a future image is exfat-trimmed.
+  **falls back to a mount without those options** if it fails, so OUTPUT/INPUT always mount regardless
+  of the filesystem driver. INPUT's fallback keeps `ro`, so INPUT is read-only whichever arm wins. On the
+  live Debian *cloud* kernel `exfat` loaded fine, but FAT32 remains a one-knob fallback
+  (`FileSystem='FAT32'` in the profile) if a future image is exfat-trimmed.
 - **Boot takes ~125 s, and ~120 s of that is `systemd-networkd-wait-online` — not the datasource**
   (MEASURED 2026-07-21, live serial capture; this bullet previously blamed a "2-5 min datasource
   probe", which the capture disproves). cloud-init resolved `DataSourceNoCloud [seed=/dev/sdd1]` and

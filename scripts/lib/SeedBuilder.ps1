@@ -119,7 +119,11 @@ write_files:
       # the uid/gid mount first, and FALL BACK to a plain mount on failure — OUTPUT must always mount so
       # the result + sentinel can be written. Track whether the sandbox-owned (uid/gid) OUTPUT mount won;
       # only then is it safe to run the entrypoint as the non-root sandbox user (else it can't write).
-      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in  2>/dev/null || mount LABEL=INPUT  /mnt/in  2>/dev/null
+      # INPUT's fallback drops only the uid/gid options and keeps `ro`. Hyper-V cannot attach a data
+      # disk read-only (D3), so this option is the only read-only control INPUT has. It is not a
+      # boundary (the sandbox user has passwordless sudo and could remount), but it keeps a buggy
+      # workload from rewriting its own inputs, and it is what makes "INPUT is read-only" true.
+      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in  2>/dev/null || mount -o ro LABEL=INPUT  /mnt/in  2>/dev/null
       # OUTPUT: try the sandbox-owning uid/gid mount; record whether IT won (so we only run the
       # entrypoint as the non-root user when it can actually write), then fall back to a plain mount.
       OUT_SANDBOX_OWNED=0
@@ -252,7 +256,11 @@ write_files:
       mkdir -p /mnt/in /run/staging
       # The INPUT/OUTPUT SCSI data disks are not in fstab; settle udev so mount-by-LABEL + blkid resolve.
       udevadm settle 2>/dev/null
-      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT /mnt/in 2>/dev/null || mount LABEL=INPUT /mnt/in 2>/dev/null
+      # INPUT is read-only on both arms; the RC4 fallback drops only the uid/gid options. With no
+      # read-only attach on the Hyper-V side (D3), `ro` is INPUT's only read-only control. Not a boundary
+      # (the sandbox user has passwordless sudo), but it stops a buggy entrypoint from overwriting
+      # run_disk_workload.py and outbox.py, which this runner executes from /mnt/in once it returns.
+      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT /mnt/in 2>/dev/null || mount -o ro LABEL=INPUT /mnt/in 2>/dev/null
       # No INPUT -> the entrypoint (which lives on /mnt/in) AND the producer script cannot run. There
       # is no OUTPUT filesystem to record a determinate sentinel on, so simply power off (the host's
       # outbox read fails closed on a missing/empty raw region — same DENY-on-absence contract).
@@ -490,7 +498,8 @@ write_files:
       modprobe exfat 2>/dev/null
       mkdir -p /mnt/in /mnt/out
       udevadm settle 2>/dev/null
-      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in  2>/dev/null || mount LABEL=INPUT  /mnt/in  2>/dev/null
+      # INPUT stays read-only on both arms (see the offline runner's note on the RC4 fallback).
+      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in  2>/dev/null || mount -o ro LABEL=INPUT  /mnt/in  2>/dev/null
       OUT_SANDBOX_OWNED=0
       if mount -o uid=$SBX_UID,gid=$SBX_GID LABEL=OUTPUT /mnt/out 2>/dev/null; then OUT_SANDBOX_OWNED=1; fi
       mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out 2>/dev/null
