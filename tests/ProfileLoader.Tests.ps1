@@ -510,6 +510,55 @@ Describe 'Secret-pattern single source of truth' {
     }
 }
 
+Describe 'Mounts: declared, not wired (the docs must say so while no engine code reads it)' {
+    # The loader screens Mounts source keys (invariant 1 above) and layers the field onto the tier.
+    # Nothing else reads it: no provisioner, runner or backend method attaches a host-guest bind
+    # mount (docs/live-smoke-test.md Gap 2). The authoring guide and the skeleton profile once
+    # presented Mounts as the way to move files in and out. These checks tie the docs to the code in
+    # both directions: a new reader fails the scan, so the docs get revisited, and while there is
+    # none, every place that introduces the field must say it is not wired.
+    BeforeAll {
+        # Each place a script names the Mounts key, as 'file:line'. Index reads ($p['Mounts']), member
+        # reads ($p.Mounts), ContainsKey('Mounts') and literal keys all parse to a string constant
+        # whose value is the bare key. Comments are not in the AST, and a here-string that mentions
+        # mounts never equals the key. The match ignores case because profile hashtables do: $p.mounts
+        # reads the same entry.
+        function script:Find-MountsKeyReference {
+            param([System.IO.FileInfo[]] $Files)
+            foreach ($f in $Files) {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+                $ast.FindAll({ param($n)
+                    $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -eq 'Mounts'
+                }, $true) | ForEach-Object { '{0}:{1}' -f $f.Name, $_.Extent.StartLineNumber }
+            }
+        }
+        $script:MountsScanFiles = @(Get-ChildItem -Path (Join-Path $script:SkillRoot 'scripts') -Recurse -Filter '*.ps1')
+    }
+
+    It 'the scan finds the loader''s own reads, so a clean result elsewhere means something' {
+        $loader = @($script:MountsScanFiles | Where-Object Name -eq 'ProfileLoader.ps1')
+        $loader.Count | Should -Be 1 -Because 'the loader is the one known reader'
+        @(script:Find-MountsKeyReference -Files $loader) | Should -Not -BeNullOrEmpty -Because 'the loader screens and merges Mounts, so a working scan must see it there'
+    }
+
+    It 'no engine script outside the loader reads the Mounts key' {
+        $engine = @($script:MountsScanFiles | Where-Object Name -ne 'ProfileLoader.ps1')
+        $engine.Count | Should -BeGreaterThan 5 -Because 'the scan must actually cover the engine'
+        @(script:Find-MountsKeyReference -Files $engine) | Should -BeNullOrEmpty -Because 'Mounts is unread outside the loader today; a reader means the docs that call it declared-only must change with it'
+    }
+
+    It '<File> says Mounts is not wired' -ForEach @(
+        @{ File = 'tier-profiles/SCHEMA.md';              Intro = '^\|\s*`Mounts`\s*\|' }
+        @{ File = 'docs/authoring-a-workload-profile.md'; Intro = '^\|\s*`Mounts`\s*\|' }
+        @{ File = 'profiles/example-skeleton.psd1';       Intro = '^\s*#\s*Mounts\b' }
+    ) {
+        $intro = @(Get-Content -LiteralPath (Join-Path $script:SkillRoot $File) | Where-Object { $_ -match $Intro })
+        $intro.Count | Should -Be 1 -Because "$File introduces the field in exactly one line (a table row, or the comment heading the key)"
+        $intro[0] | Should -Match '(?i)not wired' -Because "$File must not promise a delivery the engine does not perform"
+        $intro[0] | Should -Not -Match '(?i)delivery mechanism' -Because 'Mounts delivers nothing, in Serial mode or any other'
+    }
+}
+
 Describe 'Invariant 2 — Tier >= 2 starvation' {
 
     It 'throws if Tier 2 has Credentials other than None' {

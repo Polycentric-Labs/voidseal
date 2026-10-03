@@ -33,9 +33,12 @@
                                            # <-- EDIT: the command the Runner delivers into the guest
                                            #     over the COM1 serial seam (Serial mode — the default
                                            #     when WorkloadMode is omitted, as here). Serial mode has
-                                           #     no automatic INPUT/OUTPUT data disks — get your files
-                                           #     in/out via Mounts below (or bake them into the golden
-                                           #     image / a StageAssets ISO).
+                                           #     no data disks and Mounts below is not wired, so the
+                                           #     engine copies no host file into the guest: the command
+                                           #     works with what the golden image holds, and its
+                                           #     stdout/stderr come back in the host-side run capture.
+                                           #     To move files in or out, use Disk mode (see Step 4
+                                           #     of the authoring guide's walkthrough).
 
     # --- OPTIONAL, shown here because almost every real task needs them --
 
@@ -44,17 +47,19 @@
     # your Entrypoint needs.
     Packages = @()                        # <-- EDIT: e.g. @('python3') if your Entrypoint needs it.
 
-    # Mounts — host->guest bind mounts. Use these to get your task's input in and
-    # its output back out under Serial mode (this tier's Extraction='HostReadResultDir' —
-    # the host just reads whatever your Entrypoint wrote here after the run). The
-    # loader REFUSES any secret-shaped SOURCE (.env*, *.pem, *.key, credentials*.json,
-    # id_rsa*, ~/.ssh, ~/.aws/credentials, ~/.kube/config, ~/.docker/config.json,
-    # .npmrc, .pypirc, *-service-account.json, anything under a .secrets/ dir) — point
-    # at a COPY of your real data, never a live secret store or a live personal-data
-    # directory (see the authoring guide's DATA-ACCESS discussion).
+    # Mounts: DECLARED, NOT WIRED. Nothing in the engine attaches a host-guest bind
+    # mount (the backend has no 9p, virtiofs or SMB method; docs/live-smoke-test.md
+    # Gap 2), so these entries move no file in either direction. They stay because the
+    # loader still screens every SOURCE and REFUSES a secret-shaped one (.env*, *.pem,
+    # *.key, credentials*.json, id_rsa*, ~/.ssh, ~/.aws/credentials, ~/.kube/config,
+    # ~/.docker/config.json, .npmrc, .pypirc, *-service-account.json, anything under a
+    # .secrets/ dir), and because they record the intended shape. Point a source at a
+    # COPY, never a live secret store or live personal data. To get files in and out,
+    # use Disk mode; StageAssets and the cloud-init seed do not carry your files to a
+    # running workload either (Step 4 of the authoring guide's walkthrough covers each).
     Mounts = @{
-        'C:\sandbox\example-input'  = '/mnt/task/in:ro'   # <-- EDIT: your host input dir (read-only copy)
-        'C:\sandbox\example-output' = '/mnt/task/out'     # <-- EDIT: your host output dir (read-write)
+        'C:\sandbox\example-input'  = '/mnt/task/in:ro'   # declared only: nothing attaches it
+        'C:\sandbox\example-output' = '/mnt/task/out'     # declared only: nothing attaches it
     }
 
     # ExtraAllowlist — FQDNs unioned onto tier0's EgressAllowlist (which defaults to

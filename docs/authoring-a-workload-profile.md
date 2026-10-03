@@ -86,7 +86,7 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `Name` | **yes** | the profile id | convention: matches the filename (minus `.psd1`) |
 | `Entrypoint` | **yes** | the command the Runner delivers | **Serial mode** (the default): delivered over the COM1 serial seam to the sealed guest. **Disk mode**: injected into the seed's disk-mode runner in place of `__ENTRYPOINT__`; by shipped convention it reads from `/mnt/in` and writes to `/mnt/out/result.html` (the engine's default result inner-name) |
 | `Packages` | no | extra guest packages staged **before** the seal, over the still-open pre-seal allowlist window | array of strings |
-| `Mounts` | no | host→guest bind mounts (the Serial-mode / legacy delivery mechanism for getting files in/out) | every **source** key is refused if secret-shaped (invariant 1 — see §2.3); the loader screens whatever you declare here even on a Disk-mode profile that doesn't actually consume `Mounts` at runtime (a deliberate regression guard, per `firefox.psd1`) |
+| `Mounts` | no | **declared but not wired**: host→guest bind mounts that nothing attaches. The loader screens the field and merges it onto the tier, but no provisioner, runner or backend method reads it (the backend has no 9p, virtiofs or SMB method), so it moves no file in or out in either workload mode. §4 Step 4 lists the channels that do carry data | every **source** key is refused if secret-shaped (invariant 1, see §2.3). The screen runs on every profile even though nothing consumes the field at runtime, a deliberate regression guard (see `firefox.psd1`) |
 | `ExtraAllowlist` | no | FQDNs unioned onto the tier's `EgressAllowlist` | deduped case-insensitively; each entry still passes the tier's hostname-charset check |
 | `StageAssets` | no | host source → pin-documentation string; assets pre-pulled and hash-pinned, attached **read-only before the seal** (one-way IN) | the **key** is the host path the Importer attaches (e.g. an ISO); **DVD-slot caveat**: the backend models one DVD slot, so a `StageAssets` ISO competes with `SeedIso` if both must be present at boot — use a transfer-VHD (or Disk-mode `Inputs`) instead when they must coexist |
 | `SeedIso` | no | host path to a `CIDATA`-labelled cloud-init NoCloud seed ISO | attached read-only as a DVD at provision; configures first boot (serial-getty autologin on ttyS0, run-user, packages); **ejected as part of the seal** — `Assert-Sealed` refuses a still-attached import DVD; not secret-shaped, so a `.iso` path is accepted |
@@ -114,8 +114,9 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
    `credentials*.json`, `.credentials.json`, `.npmrc`, `.pypirc`, `*-service-account.json`,
    anything under a `.secrets/`/`.ssh/` dir, or the adjacent `~/.aws/credentials`,
    `~/.kube/config`, `~/.docker/config.json` pairs) is refused — full stop, regardless of tier.
-   See `ralph.psd1`'s comment block for the documented workaround (copy the real credential to a
-   non-secret-shaped `.token` file, mount *that*, read-only).
+   See `ralph.psd1`'s comment block for the documented workaround: copy the real credential to a
+   non-secret-shaped `.token` file and declare *that*. The copy passes the screen, but like every
+   `Mounts` entry it never reaches the guest (§2.2).
 2. **Tier ≥ 2 starvation** — `Credentials` must be `'None'`, `EgressMode` must be `'None'`,
    `EgressAllowlist` must be empty.
 3. **Extraction by tier** — `Tier ≥ 2` ⇒ `Extraction` must be `'ColdVHDX-Quarantine-CDR'`.
@@ -140,7 +141,7 @@ takes effect:
 | `PROVISIONED` | `New-SandboxVM` creates the substrate | `Substrate`, `Memory`, `Cpu`, `GuestImage`, `SecureBootTemplate`, `Network` |
 | `STAGED` | `Import-SandboxAsset` attaches any `StageAssets` **read-only, one-way IN** — a no-`StageAssets` profile is a recorded no-op transition | `StageAssets` |
 | `SEALED` | `Lock-Sandbox` ejects import media (the `StageAssets` ISO + the `SeedIso` DVD) and disconnects host↔guest channels, then `Assert-Sealed` runs as a **hard gate** — if it throws, the deploy aborts *here*, the workload never runs, and the VM is torn down | `HostChannels`, `Network`, `SeedIso` (must be ejectable) |
-| `RUNNING` | `Start-SandboxWorkload` delivers your `Entrypoint` — **Serial mode**: over the COM1 seam to the sealed guest, reading/writing through whatever `Mounts` you declared; **Disk mode**: the guest boots straight into the seed-injected runner, mounts `INPUT` read-only / `OUTPUT` read-write, runs your `Entrypoint`, writes the result + an exit-code sentinel, and self-powers-off | `Entrypoint`, `Mounts` (Serial) or `WorkloadMode`/`Inputs`/`FileSystem`/`InputLabel`/`OutputLabel` (Disk) |
+| `RUNNING` | your `Entrypoint` runs in the sealed guest. **Serial mode**: `Start-SandboxWorkload` boots the guest and sends the command over the COM1 seam, and the command's stdout and stderr come back the same way into the host-side run capture (there are no data disks, and `Mounts` is not wired); **Disk mode**: the guest boots straight into the seed-injected runner, mounts `INPUT` read-only / `OUTPUT` read-write, runs your `Entrypoint`, writes the result + an exit-code sentinel, and self-powers-off | `Entrypoint` (Serial) or `WorkloadMode`/`Inputs`/`FileSystem`/`InputLabel`/`OutputLabel` (Disk) |
 | `CAPTURED` | the run result + host-side capture artifact are recorded | `Capture` |
 | `EXTRACTED` | `Export-SandboxArtifact` reads the result out, **one-way OUT** — `HostReadResultDir` (Tier 0/1) just reads what your workload wrote; `ColdVHDX-Quarantine-CDR` (Tier ≥ 2) routes to the quarantine sink (throws — not implemented in v1) | `Extraction` |
 | `DESTROYED` | `Remove-Sandbox` tears down per the teardown model — **always runs**, in a `finally`, so a mid-flow failure never leaves an orphaned VM/disk/switch | `Lifecycle` |
@@ -172,15 +173,31 @@ extras your script needs, or any Python at all, depending on the image:
 Packages = @('python3')
 ```
 
-**Step 4 — wire input/output.** Serial mode has no automatic data disks — use `Mounts` to bind a
-host directory in (read-only, a **copy** of your real data) and one out:
+**Step 4: wire input/output.** `Mounts` cannot do this: the field is declared but not wired
+(§2.2). A `Mounts` block loads clean and passes the secret screen, but nothing attaches it, so the
+`/mnt/task/in` and `/mnt/task/out` paths in Step 2 would not exist inside the guest. What does
+carry data today:
 
-```powershell
-Mounts = @{
-    'C:\sandbox\notes-input'  = '/mnt/task/in:ro'
-    'C:\sandbox\notes-output' = '/mnt/task/out'
-}
-```
+- **Disk mode** (`WorkloadMode = 'Disk'`) moves files in and out of a running workload, and it is
+  the mode with a live round-trip. Before the seal, the engine writes each `Inputs` entry onto an
+  INPUT data disk, which the guest's runner mounts at `/mnt/in`; the result comes back on the
+  OUTPUT disk through the outbox transport. `Invoke-Voidseal` refuses a Disk-mode profile that sets
+  neither `OutboxOutput = $true` nor the processor shape (`Network='None'` plus `ScreenConfig`), so
+  start from `firefox.psd1` as §6 describes rather than adding these keys by hand.
+- **Serial mode** attaches no data disks, so the engine copies no host file into the guest. The
+  `Entrypoint` string arrives over COM1, and the command's stdout and stderr come back in the
+  host-side run capture (`run-<timestamp>.json` under the artifact root). On this offline tier,
+  anything else the command reads must already be in the golden image.
+- **`StageAssets`** is attached as a read-only ISO before the seal, and the seal ejects it before
+  the guest's first boot, so it is gone by the time your workload runs.
+- **The cloud-init seed** is not a channel for your files in either mode. Disk mode builds its own
+  seed on a small CIDATA data disk that survives the seal and carries the runner plus your
+  `Entrypoint`; a Serial-mode `SeedIso` is boot configuration (Step 6).
+
+For this walkthrough's task, a notes file in and a summary out, that points to Disk mode: build the
+profile from §6, put `summarize.py` and a synthetic `notes.txt` in `Inputs`, and read them from
+`/mnt/in`. The remaining steps apply to either mode, except Step 6, which only a Serial-mode
+profile uses.
 
 **Step 5 — confirm you're staying offline.** Leave `ExtraAllowlist` unset or `@()` — Tier 0's own
 allowlist is already empty, so the merged result stays offline.
@@ -222,9 +239,13 @@ asserts an exact profile count/set. Adding a fourth profile there breaks nothing
 suite stays green (CI runs it on every push/PR).
 
 The skeleton itself is the **minimal valid Tier-0, Serial-mode, offline** shape: just the three
-required keys plus the optional fields almost every real task needs (`Packages`, `Mounts`,
+required keys plus the optional fields almost every real task needs (`Packages`,
 `ExtraAllowlist`, `SeedIso`), each carrying a `# <-- EDIT` marker. It is deliberately **not** the
 same shape as `firefox.psd1` — see §6.
+
+Its `Mounts` block is labelled declared-only and carries no EDIT marker: the entries show the shape
+and give the secret screen something to check, but editing them changes nothing inside the guest
+(§2.2).
 
 **Honesty note carried in the file itself:** this Serial-mode skeleton shape has not been
 live-run. Only `firefox.psd1`'s Disk-mode Tier-0 shape has a proven live round-trip (see
