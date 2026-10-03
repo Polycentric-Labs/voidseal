@@ -401,7 +401,8 @@ Set-VMFirmware -VMName $vm -SecureBootTemplate MicrosoftUEFICertificateAuthority
 Set-VMComPort  -VMName $vm -Number 1 -Path "\\.\pipe\$vm-com1"   # the serial command seam
 # (Tier 1: Internal vSwitch, NIC kept. For a Serial-mode InGuestSquid profile, Invoke-Voidseal
 #  renders an in-guest iptables + Squid allowlist into the seed it builds; that layer is
-#  defense-in-depth rather than a boundary and has never run live. Tier 2/3: NO NIC at all.)
+#  defense-in-depth rather than a boundary, has never run live, and is enabled at first boot
+#  without being started, so its activation during a run is a Phase-6 question. Tier 2/3: NO NIC.)
 ```
 
 The host reads/writes `\\.\pipe\<vm>-com1` with a pipe-aware serial client to drive the

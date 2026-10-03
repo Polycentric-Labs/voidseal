@@ -136,10 +136,12 @@
     # the Runner drives; Linux management is serial, not PS Direct), the unprivileged run-user,
     # the seed's own hard-coded packages, and, because tier1's EgressMode is 'InGuestSquid', the
     # in-guest egress layer (iptables default-DROP plus a Squid allowlist built from the merged
-    # EgressAllowlist; defense-in-depth, not a boundary). No seed would mean no serial console, and
-    # the Runner's InvokeGuestCommand would time out. A seed DVD cannot work: the seal ejects every
-    # DVD before the guest's only boot (RC6). This path only names where New-CidataSeed writes an
-    # ISO if you build one by hand. Not secret-shaped.
+    # EgressAllowlist; defense-in-depth, not a boundary). The seed enables that layer's unit without
+    # starting it, so whether it is active during a run's single boot is a Phase-6 question.
+    # Autologin does not depend on it: the seed restarts serial-getty before any apt step. No seed
+    # would mean no serial console, and the Runner's InvokeGuestCommand would time out. A seed DVD
+    # cannot work: the seal ejects every DVD before the guest's only boot (RC6). This path only names
+    # where New-CidataSeed writes an ISO if you build one by hand. Not secret-shaped.
     # ------------------------------------------------------------------
     SeedIso = 'C:\sandbox\assets\cidata-seed.iso'
 }

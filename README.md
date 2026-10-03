@@ -38,8 +38,9 @@ rather than duplicating it.
 >   the Serial seed.** No code reads `BlockProtocols`. `EgressAllowlist` is validated, merged and deduped;
 >   for a Serial-mode profile whose `EgressMode` is `InGuestSquid` (Tier 1, as in `ralph`),
 >   `Invoke-Voidseal` renders it into the Squid ACL of the cloud-init seed it builds. That is the
->   in-guest layer described above, and it has never run live. No host firewall, proxy or resolver
->   configuration is emitted.
+>   in-guest layer described above, and it has never run live. The seed enables the layer's systemd
+>   unit at first boot without starting it, so whether it is active during a run's single boot is
+>   still a Phase-6 question. No host firewall, proxy or resolver configuration is emitted.
 
 ## What it is
 
