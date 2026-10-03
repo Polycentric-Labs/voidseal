@@ -22,6 +22,7 @@
                   workload's emitted result. Tier >= 2: routes to the quarantine stub (THROWS).
       DESTROYED   Remove-Sandbox — stop + unregister + delete the created disks. ALWAYS runs
                   (teardown is in a finally), so a mid-flow failure leaves NO orphaned VM/disk/switch.
+                  The per-VM switch the provision created is removed as well (CreatedSwitches).
 
     EVERYTHING that touches Hyper-V goes through the backend abstraction; this orchestrator and
     every component it calls NEVER touch a raw Hyper-V cmdlet. Tests inject `-Backend (New-FakeHyperVBackend)`
@@ -456,6 +457,31 @@ function Invoke-Voidseal {
                "(Invoke-BuilderVM) and must never be passed to Invoke-Voidseal directly. Fail closed.")
     }
 
+    # --- PROCESSOR preflight: the in-guest producer, outbox module and screener must ride INPUT ---
+    # A processor's seed runs `python3 /mnt/in/run_disk_workload.py --mode <mode>`, which imports
+    # outbox.py and runs screener.py from its own directory. If any of the three is missing, the guest
+    # producer exits non-zero and writes no outbox, and all the host can report is "outbox header
+    # missing", which reads like a transport fault. Refuse here instead, before anything is
+    # provisioned. The effective Inputs follow the same rule the Disk branch applies when it folds the
+    # override in: a non-empty -Workload.Inputs wins, otherwise the profile's own Inputs count.
+    # (Transport-only profiles such as firefox are not checked: the mock suite runs them with empty
+    # Inputs by design, and their helper delivery is the documented live-run step.)
+    if ($workloadMode -eq 'Disk' -and (Test-IsProcessorProfile -Profile $resolved)) {
+        $effectiveInputs = Get-WorkloadField -Workload $Workload -Name 'Inputs'
+        if (-not ($effectiveInputs -is [System.Collections.IDictionary] -and $effectiveInputs.Count -gt 0)) {
+            $effectiveInputs = if ($resolved.ContainsKey('Inputs')) { $resolved['Inputs'] } else { $null }
+        }
+        $missingHelpers = @(@('run_disk_workload.py', 'outbox.py', 'screener.py') | Where-Object {
+            -not ($effectiveInputs -is [System.Collections.IDictionary] -and $effectiveInputs.Contains($_))
+        })
+        if ($missingHelpers.Count -gt 0) {
+            throw ("Invoke-Voidseal: REFUSING processor '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
+                   "processor's in-guest runner executes run_disk_workload.py from the INPUT disk, and that script " +
+                   "imports outbox.py and runs screener.py beside it. Stage all three from the repo's guest/ " +
+                   "directory in Inputs (or -Workload.Inputs). Fail closed.")
+        }
+    }
+
     # --- the report, built up as we traverse ----------------------------
     $states     = [System.Collections.Generic.List[string]]::new()
     $report = [pscustomobject]@{
@@ -703,11 +729,12 @@ function Invoke-Voidseal {
             # Read-WorkloadResult OFF for BOTH; their result comes from the shared post-detach outbox
             # block below (Read-OutboxToGateInput -> ReadVhdxRawRegion, never Mount-VHD). Only a legacy
             # non-outbox, non-processor profile keeps the Read-WorkloadResult host-mount path.
-            # $isProcessorProfile stays local: it distinguishes a SCREENED processor from a
-            # transport-only outbox profile further down. Whether the outbox is used AT ALL comes from
-            # the single shared predicate (ProfileLoader.ps1), so this can never disagree with the
-            # OUTPUT disk shape (Workload.ps1) or the in-guest runner (SeedBuilder.ps1).
-            $isProcessorProfile = ($resolved['Network'] -eq 'None') -and $resolved.ContainsKey('ScreenConfig')
+            # $isProcessorProfile distinguishes a SCREENED processor from a transport-only outbox profile
+            # further down. Both predicates are the shared ones (ProfileLoader.ps1): whether the outbox
+            # is used at all agrees with the OUTPUT disk shape (Workload.ps1) and the in-guest runner, and
+            # whether the profile is a processor agrees with the seed builder's choice to screen in the
+            # guest, so the host gates exactly the profiles whose guest produced verdicts.
+            $isProcessorProfile = Test-IsProcessorProfile -Profile $resolved
             $usesOutbox         = Test-UsesOutboxTransport -Profile $resolved
             if ($detachOk -and -not $wait.TimedOut) {
                 if ($usesOutbox) {

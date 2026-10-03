@@ -29,16 +29,18 @@
     Name       = 'ralph'
 
     # ------------------------------------------------------------------
-    # Guest packages staged BEFORE the seal (the tier's import-then-seal ritual
-    # pulls these over the still-open allowlist; then the seed's `voidseal-egress.service`
-    # default-DROP + Squid allowlist activates at the sealed-run boot (Lock-Sandbox cuts
-    # host<->guest channels + import media, not egress — that's the guest's in-guest
-    # defense-in-depth).
+    # Packages: DECLARED, NOT INSTALLED. This lists what Ralph needs in the guest,
+    # but no engine code reads the field, so nothing installs from it. The Serial
+    # seed hard-codes its own apt install (ca-certificates and bubblewrap, plus
+    # squid and iptables for the in-guest egress layer) and does not read this
+    # list either, so git, jq and the claude CLI must already be in the golden
+    # image before a live ralph run.
     # Ralph itself is bash; the runtime deps are git (clone the pinned repo),
     # jq (the loop pipes `claude --output-format json` through jq), ca-certificates
     # (TLS to api.anthropic.com), and bubblewrap (the native-bwrap defense-in-depth
-    # the tier-1 control names). The `claude` CLI (>= 2.0.76) is installed from the
-    # official installer during staging — listed here as the named prerequisite.
+    # the tier-1 control names). The `claude` CLI (>= 2.0.76) comes from Anthropic's
+    # official installer, not apt, so its entry is a named prerequisite rather
+    # than a package name.
     # ------------------------------------------------------------------
     Packages   = @(
         'git',
@@ -133,7 +135,8 @@
     # SeedIso — the cloud-init NoCloud CIDATA seed. Attached READ-ONLY as a DVD at
     # provision so the Debian guest configures itself on FIRST BOOT: serial-getty AUTOLOGIN
     # on ttyS0 (the COM1 serial console the Runner drives — Linux mgmt is serial, not
-    # PS Direct), the unprivileged run-user, and the guest packages. NO seed -> no serial
+    # PS Direct), the unprivileged run-user, and the seed's own hard-coded packages (not the
+    # Packages list above, which nothing reads). NO seed -> no serial
     # console -> the Runner's InvokeGuestCommand finds nothing on \\.\pipe\<vm>-com1 and times
     # out (the first-boot gap). The seed is the boot-config disc (distinct from the
     # StageAssets payload ISO above) and is EJECTED as part of the seal — Assert-Sealed verifies

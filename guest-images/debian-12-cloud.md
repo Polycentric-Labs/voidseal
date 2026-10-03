@@ -78,8 +78,10 @@ local-hostname: sandbox
 
 This enables the **COM1 serial console** (the host's command channel), creates a
 **non-root run-user**, and installs **bubblewrap** for the in-guest defense-in-depth the
-tier-1 control names. Packages/repo for a specific workload (e.g. Ralph) are staged
-*before the seal* over the still-open allowlist; this file just brings the guest up.
+tier-1 control names. A workload's repo (e.g. Ralph's) is attached before the seal through
+`StageAssets`. Its packages are not installed here or by any other engine code (the profile's
+`Packages` field is declared but unread), so they must already be in the golden image. This file
+just brings the guest up.
 
 ```yaml
 #cloud-config
@@ -113,7 +115,7 @@ runcmd:
   - [ apt-get, install, -y, bubblewrap, ca-certificates ]
 
 # Tier-1 keeps egress credential-FREE; no secrets are ever written here.
-# Packages/repo for a specific workload are staged before the seal, not here.
+# A workload's own packages are not installed here; nothing reads the profile's Packages field.
 ```
 
 ### Build the seed ISO on the host
@@ -241,7 +243,11 @@ write_files:
       # the uid/gid mount first, and FALL BACK to a plain mount on failure — OUTPUT must always mount so
       # the result + sentinel can be written. Track whether the sandbox-owned (uid/gid) OUTPUT mount won;
       # only then is it safe to run the entrypoint as the non-root sandbox user (else it can't write).
-      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in  2>/dev/null || mount LABEL=INPUT  /mnt/in  2>/dev/null
+      # INPUT's fallback drops only the uid/gid options and keeps `ro`. Hyper-V cannot attach a data
+      # disk read-only (D3), so this option is the only read-only control INPUT has. It is not a
+      # boundary (the sandbox user has passwordless sudo and could remount), but it keeps a buggy
+      # workload from rewriting its own inputs, and it is what makes "INPUT is read-only" true.
+      mount -o ro,uid=$SBX_UID,gid=$SBX_GID LABEL=INPUT  /mnt/in  2>/dev/null || mount -o ro LABEL=INPUT  /mnt/in  2>/dev/null
       # OUTPUT: try the sandbox-owning uid/gid mount; record whether IT won (so we only run the
       # entrypoint as the non-root user when it can actually write), then fall back to a plain mount.
       OUT_SANDBOX_OWNED=0
@@ -304,10 +310,12 @@ runcmd:
    exFAT unavailability the `OUTPUT` mount fails, no sentinel is ever written, and the host classifies
    `Failed` with a clear reason (the design's FAT32 fallback is a one-knob switch on the host
    `FileSystem` default + this not needing any guest change since both are in-kernel).
-2. `mount -o ro,uid=…,gid=… LABEL=INPUT /mnt/in || mount LABEL=INPUT /mnt/in` — INPUT is mounted
-   **read-only**, *preferring* the `sandbox`-owning `uid=/gid=` form (exFAT is non-POSIX, so ownership is
-   a mount option) but **falling back to a plain mount** if the uid/gid form fails on the live kernel
-   (RC4). The workload never writes its inputs; it reads a copy and emits a fresh result.
+2. `mount -o ro,uid=…,gid=… LABEL=INPUT /mnt/in || mount -o ro LABEL=INPUT /mnt/in`: INPUT is mounted
+   **read-only on both arms**. The runner *prefers* the `sandbox`-owning `uid=/gid=` form (exFAT is
+   non-POSIX, so ownership is a mount option) and, if the live kernel rejects it (RC4), **falls back to a
+   read-only mount without uid/gid**. Hyper-V cannot attach the disk read-only (D3), so `ro` is INPUT's
+   only read-only control, and since the `sandbox` user has passwordless sudo it is not a boundary. The
+   workload never writes its inputs; it reads a copy and emits a fresh result.
 3. OUTPUT mounts **robustly** (RC4): the runner first tries the `sandbox`-owning
    `mount -o uid=…,gid=… LABEL=OUTPUT /mnt/out` and records whether **that** form won
    (`OUT_SANDBOX_OWNED=1`), then `mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out` **falls back to a

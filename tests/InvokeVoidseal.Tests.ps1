@@ -133,6 +133,12 @@ Describe 'Invoke-Voidseal — full Tier-1 happy path runs the whole state machin
         $report.TeardownStatus | Should -Match '(?i)(ok|success|destroyed|removed)' -Because 'the report records a clean teardown'
     }
 
+    It 'removes the per-VM Internal switch at teardown (a Tier-1 run leaves no vSwitch behind)' {
+        $null = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
+            -Name 'sbx-happy-sw' -ArtifactRoot $script:Art -Destination $script:Dest -Backend $script:B
+        (& $script:B.GetSwitch @{ Name = 'sbx-happy-sw-int' }) | Should -BeNullOrEmpty -Because 'the provisioner creates <vm>-int for a HyperV-Gen2 tier; teardown must remove it, or each run strands one more switch on the host'
+    }
+
     It 'the VM was actually sealed (Assert-Sealed would pass) before it ran — the run happened on a sealed VM' {
         # We cannot inspect the (now-destroyed) VM, so assert via the report: SEALED precedes RUNNING.
         $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
@@ -634,7 +640,13 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $script:Proc = @{} + $script:Proc                    # mutable copy
         $script:Proc['Name']            = 'firefox-proc-test'
         $script:Proc['WorkloadMode']    = 'Disk'
+        # A processor's in-guest runner executes run_disk_workload.py from the INPUT disk, which
+        # imports outbox.py and runs screener.py beside it, so the processor preflight refuses a run
+        # whose Inputs lack any of the three. Stage the real files from guest/.
         $script:Proc['Inputs']          = @{}
+        foreach ($helper in @('run_disk_workload.py', 'outbox.py', 'screener.py')) {
+            $script:Proc['Inputs'][$helper] = Get-Content -LiteralPath (Join-Path $script:SkillRoot "guest/$helper") -Raw
+        }
         $script:Proc['FileSystem']      = 'exFAT'
         $script:Proc['Network']         = 'None'             # processor: structurally no-NIC
         $script:Proc['EgressMode']      = 'None'             # processor rule: Network=None => EgressMode=None
@@ -1034,7 +1046,8 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         # Workload.ps1) — the ENOSPC throw lands on the New-WorkloadDisks-wrapped classify-then-rethrow
         # site ("writing Input '<k>' onto the INPUT disk"), never a generic/unclassified throw.
         $diskFullProfile = @{} + $script:Proc
-        $diskFullProfile['Inputs'] = @{ 'seed.bin' = [byte[]](1, 2, 3, 4) }
+        $diskFullProfile['Inputs'] = @{} + $script:Proc['Inputs']          # the guest helpers the processor preflight requires
+        $diskFullProfile['Inputs']['seed.bin'] = [byte[]](1, 2, 3, 4)
         Assert-TierProfileValid -Profile $diskFullProfile -Context 'TEST Tier-0 processor DiskFull fixture'
 
         $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWriteEnospc
@@ -1299,6 +1312,77 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) |
             Should -BeTrue -Because 'GateRan must NOT be stamped — the gate block is unreachable on a seal-stage abort'
         (& $b.GetVM @{ Name = 'sbx-proc-channelfail' }) | Should -BeNullOrEmpty -Because 'teardown ran — no orphaned VM on a seal-gate abort'
+    }
+
+    # -----------------------------------------------------------------------
+    # The processor tests above hand-build the outbox with hand-written verdicts, so none of them
+    # passes through New-CidataUserData and none can see what the in-guest runner actually runs.
+    # This one takes the run_disk_workload.py invocation from the processor's OWN seed, runs the
+    # real guest producer on the host with those flags (guest paths mapped to temp paths), and
+    # hands the resulting outbox to the orchestrator. It asserts the processor contract itself
+    # (clean prose released, the credential file held), which holds whether the screener runs
+    # in-guest or host-side.
+    # -----------------------------------------------------------------------
+    It 'a processor run through its own seed-built producer releases SAFE candidates and holds the rest' {
+        $ud = New-CidataUserData -Profile $script:Proc
+        $producerLine = @(($ud -split "`r?`n") | Where-Object { $_ -match '^\s*python3\s+/mnt/in/run_disk_workload\.py\s' })
+        $producerLine.Count | Should -Be 1 -Because 'the processor seed invokes the shared outbox producer exactly once'
+
+        $verdicts = Join-Path $script:TmpRoot ("seed-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        $blobFile = Join-Path $script:TmpRoot ("seed-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        $argv = [System.Collections.Generic.List[string]]::new()
+        foreach ($tok in @($producerLine[0].Trim() -split '\s+' | Select-Object -Skip 1)) {   # drop 'python3'
+            if ($tok -like '2>*') { break }                                                   # stderr redirect, not an argument
+            $t = $tok.Trim('"')
+            switch -Regex ($t) {
+                '^/mnt/in/(.+)$'        { $argv.Add((Join-Path $script:SkillRoot ("guest/{0}" -f $Matches[1]))); break }
+                '^/run/staging$'        { $argv.Add($script:GateStaging); break }
+                '^/run/verdicts\.json$' { $argv.Add($verdicts); break }
+                '^\$OUTPUT_DEV$'        { $argv.Add($blobFile); break }
+                default                 { $argv.Add($t) }
+            }
+        }
+        & python @argv
+        $LASTEXITCODE | Should -Be 0 -Because 'the guest producer must pack an outbox from the staged candidates'
+        $blob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $blob
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-seedproducer' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -WarningAction SilentlyContinue
+
+        $report.Error | Should -BeNullOrEmpty -Because 'a processor whose candidates were screened must get through the gate'
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'the gate partitioned the outbox'
+        $gateReport = Get-Content $report.SensitivityReport -Raw | ConvertFrom-Json
+        @($gateReport.released_audit | ForEach-Object { $_.original_name }) | Should -Contain 'prose-essay.txt' -Because 'clean prose is released'
+        @($report.Held | ForEach-Object { $_.name }) | Should -Contain 'creds.txt' -Because 'a credential file is held, never released'
+    }
+
+    # The processor preflight: without the guest helpers on INPUT the in-guest producer exits
+    # non-zero, writes no outbox, and the host can only say "outbox header missing", which reads
+    # like a transport fault. The orchestrator refuses such a run up front instead.
+    It 'REFUSES a processor whose Inputs lack the in-guest producer, outbox module or screener, before anything is provisioned' {
+        $bare = @{} + $script:Proc
+        $bare['Inputs'] = @{ 'proc.py' = 'print(1)' }   # the workload alone, no guest helpers
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        { Invoke-Voidseal -Tier 0 -Profile $bare -Name 'sbx-proc-nohelpers' -ArtifactRoot $script:ProcArt `
+            -Destination $script:ProcDest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger } |
+            Should -Throw -ExpectedMessage '*screener.py*' -Because 'a missing screener means no outbox, and a misleading "header missing" error on the host'
+        (& $b.GetVM @{ Name = 'sbx-proc-nohelpers' }) | Should -BeNullOrEmpty -Because 'the refusal comes before provisioning, so no VM is created'
+    }
+
+    It 'the processor preflight honors -Workload.Inputs (the same override the Disk branch folds in)' {
+        $bare = @{} + $script:Proc
+        $bare['Inputs'] = @{}
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        { Invoke-Voidseal -Tier 0 -Profile $bare -Workload @{ WorkloadMode = 'Disk'; Inputs = $script:Proc['Inputs'] } `
+            -Name 'sbx-proc-wlinputs' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -WarningAction SilentlyContinue } |
+            Should -Not -Throw -Because 'helpers supplied through -Workload.Inputs land on the INPUT disk exactly like profile Inputs'
     }
 }
 

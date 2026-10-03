@@ -85,7 +85,7 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `BaseTier` | **yes** | int selecting which `tier-profiles/tier<N>.psd1` to inherit | must resolve to an existing tier file |
 | `Name` | **yes** | the profile id | convention: matches the filename (minus `.psd1`) |
 | `Entrypoint` | **yes** | the command the Runner delivers | **Serial mode** (the default): delivered over the COM1 serial seam to the sealed guest. **Disk mode**: injected into the seed's disk-mode runner in place of `__ENTRYPOINT__`; by shipped convention it reads from `/mnt/in` and writes to `/mnt/out/result.html` (the engine's default result inner-name) |
-| `Packages` | no | extra guest packages staged **before** the seal, over the still-open pre-seal allowlist window | array of strings |
+| `Packages` | no | **declared but not installed**: a record of the guest packages the workload expects. The loader merges it, but no engine code reads it, so nothing installs these packages | array of strings; put the packages themselves in the golden image (a Disk-mode guest runs offline and cannot install anything) |
 | `Mounts` | no | host→guest bind mounts (the Serial-mode / legacy delivery mechanism for getting files in/out) | every **source** key is refused if secret-shaped (invariant 1 — see §2.3); the loader screens whatever you declare here even on a Disk-mode profile that doesn't actually consume `Mounts` at runtime (a deliberate regression guard, per `firefox.psd1`) |
 | `ExtraAllowlist` | no | FQDNs unioned onto the tier's `EgressAllowlist` | deduped case-insensitively; each entry still passes the tier's hostname-charset check |
 | `StageAssets` | no | host source → pin-documentation string; assets pre-pulled and hash-pinned, attached **read-only before the seal** (one-way IN) | the **key** is the host path the Importer attaches (e.g. an ISO); **DVD-slot caveat**: the backend models one DVD slot, so a `StageAssets` ISO competes with `SeedIso` if both must be present at boot — use a transfer-VHD (or Disk-mode `Inputs`) instead when they must coexist |
@@ -106,6 +106,14 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 > guide's table is the accurate superset; treat `SCHEMA.md` as the terser tier-invariant reference
 > and this doc + `ProfileLoader.ps1` as the source of truth for the Disk-mode / builder / processor
 > fields.
+
+**Processor profiles stage three guest helpers.** A processor's seed runs
+`python3 /mnt/in/run_disk_workload.py --mode <ScreenConfig.mode>` inside the guest. That script
+imports `outbox.py` and runs `screener.py` from its own directory, so all three files from the repo's
+`guest/` directory must be in the processor's `Inputs` (or `-Workload.Inputs`). `Invoke-Voidseal`
+refuses a processor run that lacks any of them, before anything is provisioned. `ScreenConfig.mode`
+must be `'aggressive'` (the default) or `'moderate'`: the seed passes it to the screener on a shell
+line, so any other value is refused when the seed is built.
 
 ### 2.3 The five loader invariants (fail closed — these THROW, they never warn)
 
@@ -166,7 +174,9 @@ to show the steps without tying them to any real task.
 This alone is already a **valid** workload profile — every other field is optional.
 
 **Step 3 — add what your entrypoint needs.** The golden image may not carry Python's stdlib
-extras your script needs, or any Python at all, depending on the image:
+extras your script needs, or any Python at all, depending on the image. Record those packages in
+`Packages`, and know that Voidseal does not install them (no engine code reads the field), so they
+must already be in the golden image:
 
 ```powershell
 Packages = @('python3')

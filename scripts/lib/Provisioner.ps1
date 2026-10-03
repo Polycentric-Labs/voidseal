@@ -14,7 +14,7 @@
         New-SandboxVM       -Profile <hashtable> -Name <vmname> [-Backend]
         Checkpoint-Sandbox  -Name <vmname> -SnapshotName <name> [-Backend]
         Restore-Sandbox     -Name <vmname> -SnapshotName <name> [-Backend]
-        Remove-Sandbox      -Name <vmname> [-DeleteDisks] [-Backend]
+        Remove-Sandbox      -Name <vmname> [-DeleteDisks] [-Descriptor] [-Backend]
 
     INJECTION: every public function takes `-Backend <hashtable>` defaulting to
     `(New-RealHyperVBackend)`. Production passes nothing (real Hyper-V). Tests pass
@@ -54,6 +54,8 @@
         provision rollback (above) deletes any vSwitch the provision created so a failed
         provision leaves no orphaned switch. Real backend = Remove-VMSwitch -Force (guarded by
         a Get so it's idempotent); fake = drops its in-memory record. (Also usable by the Sealer.)
+        Teardown uses it as well: Remove-Sandbox removes the switches the descriptor records in
+        CreatedSwitches, so a COMPLETED run leaves no per-VM switch behind either.
     AUTOMATIC CHECKPOINTS (RC7 — gap CLOSED 2026-06-25):
       * Hyper-V defaults `AutomaticCheckpointsEnabled=ON`, which pins a differencing AVHDX per disk at
         VM start: the guest writes its result into the .avhdx while the host reads the empty BASE .vhdx,
@@ -260,6 +262,7 @@ function New-SandboxDescriptor {
         [string]   $DiskPath,                      # the primary / system disk
         [string[]] $DiskPaths   = @(),             # all attached disks
         [string[]] $CreatedDisks = @(),            # disks THIS provision created (Remove -DeleteDisks targets these)
+        [string[]] $CreatedSwitches = @(),         # switches THIS provision created (Remove-Sandbox reaps these, never a pre-existing one)
         [string]   $InputDiskPath  = $null,        # optional host-side INPUT disk handed to the guest
         [string]   $OutputDiskPath = $null,        # optional host-side OUTPUT disk collected from the guest
         [string]   $SeedDiskPath   = $null,        # optional host-side CIDATA seed data disk (RC6: disk-mode cloud-init seed that survives the seal)
@@ -284,6 +287,7 @@ function New-SandboxDescriptor {
         DiskPath                     = $DiskPath
         DiskPaths                    = @($DiskPaths)
         CreatedDisks                 = @($CreatedDisks)
+        CreatedSwitches              = @($CreatedSwitches)
         InputDiskPath                = $InputDiskPath
         OutputDiskPath               = $OutputDiskPath
         SeedDiskPath                 = $SeedDiskPath
@@ -531,6 +535,7 @@ function New-SandboxVM {
             -DiskPath           $systemDisk `
             -DiskPaths          @($systemDisk) `
             -CreatedDisks       @($createdDisks) `
+            -CreatedSwitches    @($createdSwitches) `
             -MemoryStartupBytes $memoryBytes `
             -ProcessorCount     $cpuCount `
             -NestedVirt         $nestedVirt `
@@ -638,13 +643,20 @@ function Restore-Sandbox {
     -DeleteDisks targets the disks recorded on the sandbox descriptor's CreatedDisks if a
     -Descriptor is supplied; otherwise it falls back to this VM's currently-attached disks
     (read from the VM before removal) so a caller without the descriptor can still clean up.
+
+    SWITCHES: with a -Descriptor, the per-VM switches recorded on its CreatedSwitches are removed
+    after the VM is gone, whether or not -DeleteDisks is set (a disk can be worth keeping for
+    inspection; a switch whose only VM is gone serves nothing). Only switches New-SandboxVM itself
+    created are listed there, so a pre-existing or shared switch it reused is never reaped. Without
+    a -Descriptor no switch is touched, because ownership cannot be established from a name alone.
 .PARAMETER Name
     The VM name.
 .PARAMETER DeleteDisks
     Also delete the VHD files (the explicit cleanup step RemoveVM does NOT do).
 .PARAMETER Descriptor
     (Optional) The New-SandboxVM descriptor; its CreatedDisks list is the authoritative
-    set of disks to delete under -DeleteDisks.
+    set of disks to delete under -DeleteDisks, and its CreatedSwitches list is the set of
+    switches to remove.
 .PARAMETER Backend
     The Hyper-V backend.
 #>
@@ -657,6 +669,15 @@ function Remove-Sandbox {
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
+    # The switches this sandbox owns (see SWITCHES above). Read through PSObject.Properties so a
+    # descriptor built without the field (by hand, or before it existed) yields none rather than a
+    # StrictMode property-not-found throw in the middle of teardown.
+    $switchesToRemove = @()
+    if ($null -ne $Descriptor) {
+        $csProp = $Descriptor.PSObject.Properties['CreatedSwitches']
+        if ($null -ne $csProp -and $null -ne $csProp.Value) { $switchesToRemove = @($csProp.Value) }
+    }
+
     $vm = & $Backend.GetVM @{ Name = $Name }
     if ($null -eq $vm) {
         # Idempotent no-op. If asked to delete disks for a VM that no longer exists, still
@@ -665,6 +686,8 @@ function Remove-Sandbox {
         if ($DeleteDisks -and $null -ne $Descriptor) {
             Remove-SandboxDisks -Disks @($Descriptor.CreatedDisks) -Backend $Backend
         }
+        # Likewise the switch: an earlier teardown may have removed the VM and stopped before it.
+        Remove-SandboxSwitches -Switches $switchesToRemove -Backend $Backend
         return
     }
 
@@ -700,6 +723,36 @@ function Remove-Sandbox {
     # Explicit, opt-in disk deletion — the step RemoveVM intentionally does NOT do.
     if ($DeleteDisks -and @($disksToDelete).Count -gt 0) {
         Remove-SandboxDisks -Disks @($disksToDelete) -Backend $Backend
+    }
+
+    # The per-VM switch goes last, once the VM and its NIC are gone, so nothing is bound to it.
+    Remove-SandboxSwitches -Switches $switchesToRemove -Backend $Backend
+}
+
+<#
+.SYNOPSIS
+    Remove a set of vSwitches through the backend's RemoveSwitch method. Idempotent per switch.
+.DESCRIPTION
+    The teardown counterpart of the mid-provision rollback's switch cleanup, and best-effort in the
+    same way as Remove-SandboxDisks: one switch that fails to go is a warning, not an abort of the
+    rest of teardown. RemoveSwitch is idempotent on both backends (an absent switch is a no-op).
+    The caller passes only switches the provision created (the descriptor's CreatedSwitches).
+#>
+function Remove-SandboxSwitches {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Switches,
+        [hashtable] $Backend = (New-RealHyperVBackend)
+    )
+
+    foreach ($sw in @($Switches)) {
+        if ([string]::IsNullOrWhiteSpace($sw)) { continue }
+        try {
+            $null = & $Backend.RemoveSwitch @{ Name = $sw }
+        }
+        catch {
+            Write-Warning "Remove-SandboxSwitches: failed to remove switch '$sw': $($_.Exception.Message)"
+        }
     }
 }
 

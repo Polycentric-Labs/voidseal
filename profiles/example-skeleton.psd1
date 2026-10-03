@@ -39,10 +39,10 @@
 
     # --- OPTIONAL, shown here because almost every real task needs them --
 
-    # Packages — extra guest packages staged BEFORE the seal (over the still-open
-    # pre-seal allowlist window). Leave @() if the golden image already has what
-    # your Entrypoint needs.
-    Packages = @()                        # <-- EDIT: e.g. @('python3') if your Entrypoint needs it.
+    # Packages: DECLARED, NOT INSTALLED. A record of the guest packages your
+    # Entrypoint expects. The loader merges it, but no engine code reads it, so
+    # nothing installs them; they must already be in the golden image.
+    Packages = @()                        # <-- EDIT: e.g. @('python3') to record that your Entrypoint needs it.
 
     # Mounts — host->guest bind mounts. Use these to get your task's input in and
     # its output back out under Serial mode (this tier's Extraction='HostReadResultDir' —

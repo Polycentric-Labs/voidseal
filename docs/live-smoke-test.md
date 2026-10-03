@@ -7,7 +7,7 @@
 >
 > **What it proves:** milestones **4** (Tier-0 Firefox proof) and **5** (Tier-1
 > Ralph proof) — the Tier 0/1 lifecycle end-to-end, on a **live** Hyper-V backend, after a
-> mock-backed green suite (866 passed, 0 failed, 2 skipped as of the last local run). It does **NOT** exercise Tier 2/3 (harness-only this
+> mock-backed green suite (889 passed, 0 failed, 2 skipped as of the last local run). It does **NOT** exercise Tier 2/3 (harness-only this
 > round) and does **NOT** touch your real personal data (synthetic-by-default).
 >
 > **Safe by default:** synthetic Firefox data; a bounded Ralph loop; no auto-push; manual
@@ -156,7 +156,7 @@ Prove the logic is green and watch the state machine before any real VM exists.
 
 ```powershell
 Invoke-Pester -Path tests/
-# Expect: Failed: 0, Errors: 0. The passed count is 866 as of the last local run
+# Expect: Failed: 0, Errors: 0. The passed count is 889 as of the last local run
 # (2 skipped); it grows as features land, so gate on Failed: 0, never on an exact total.
 python -m pytest tests/guest tests/host -q
 # Expect: 56 passed, 0 failed.
@@ -416,7 +416,7 @@ never assumes "Off == success".
 
 > **Why this exists:** Milestone 1 reached `INIT…DESTROYED` + `SealVerdict=True` but its
 > `bookmarks.html` was a stand-in because the serial command channel raced the boot. The
-> disk-passing model replaces that fragile handshake. The engine is **mock-proven (866 passed, 0 failed, 2 skipped)**;
+> disk-passing model replaces that fragile handshake. The engine is **mock-proven (889 passed, 0 failed, 2 skipped)**;
 > this milestone is its first *live* exercise.
 
 > **Note — this section describes the CURRENT contract, not Milestone 3's original one.** Milestone 3
@@ -424,6 +424,12 @@ never assumes "Off == success".
 > the host mounted read-only. firefox has since converged onto the **user-space outbox transport**
 > (C1.4): OUTPUT is Raw, there is no sentinel, and the host never mounts guest-written data. The steps
 > below are the outbox contract. A *legacy* non-outbox Disk profile still uses the older exFAT runner.
+>
+> **Live result for the outbox contract (2026-07-21).** A firefox run on real Hyper-V returned
+> `SealVerdict=True`, `RunResult.Status=Success` and an empty `Error`, then tore down cleanly. Its
+> `result.html` was produced inside the sealed guest: a Netscape-format file whose three entries came
+> from the four-entry synthetic sample after deduplication. Changes made since then, such as the
+> read-only INPUT fallback (2026-10-03), have run only against the mock backend.
 
 ### 4A.1 Preconditions (mostly reuse Milestone-1 groundwork)
 
@@ -455,9 +461,10 @@ never assumes "Off == success".
   one baked in. The runner runs the entrypoint as `sandbox` when the OUTPUT volume mounted sandbox-owned,
   else as root.
 - **Data-disk mount is robust now** (RC4, 2026-06-24 live): the runner tries the `uid=/gid=` mount and
-  **falls back to a plain `mount LABEL=…`** if it fails, so OUTPUT/INPUT always mount regardless of the
-  filesystem driver. On the live Debian *cloud* kernel `exfat` loaded fine — but FAT32 remains a
-  one-knob fallback (`FileSystem='FAT32'` in the profile) if a future image is exfat-trimmed.
+  **falls back to a mount without those options** if it fails, so OUTPUT/INPUT always mount regardless
+  of the filesystem driver. INPUT's fallback keeps `ro`, so INPUT is read-only whichever arm wins. On the
+  live Debian *cloud* kernel `exfat` loaded fine, but FAT32 remains a one-knob fallback
+  (`FileSystem='FAT32'` in the profile) if a future image is exfat-trimmed.
 - **Boot takes ~125 s, and ~120 s of that is `systemd-networkd-wait-online` — not the datasource**
   (MEASURED 2026-07-21, live serial capture; this bullet previously blamed a "2-5 min datasource
   probe", which the capture disproves). cloud-init resolved `DataSourceNoCloud [seed=/dev/sdd1]` and
@@ -597,7 +604,7 @@ Whatever the outcome, **teardown still runs** (the `finally`), so you won't accu
 
 ### 4A.6 The live-only-unproven list (what this milestone is actually testing for the first time)
 
-The 866 passing mock tests prove the *host orchestration* + *classification* logic. These pieces run for
+The 889 passing mock tests prove the *host orchestration* + *classification* logic. These pieces run for
 the **first time** on real hardware here — if something snags, it's most likely one of these,
 **not** a containment failure:
 
@@ -694,13 +701,16 @@ Manual reap (any orphan from an interrupted run) — idempotent, safe to re-run:
 . .\scripts\lib\ProfileLoader.ps1
 . .\scripts\lib\Provisioner.ps1
 Remove-Sandbox -Name '<orphan vm name>' -DeleteDisks
-# If a vSwitch lingers (rare — the provisioner reaps switches it created on rollback):
+# Teardown and the provisioning rollback both remove the switch a run created, so a lingering
+# vSwitch means an interrupted run. Without a descriptor Remove-Sandbox leaves switches alone:
 Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows it
 ```
 
 > `Remove-Sandbox` stops the VM if running, unregisters it, and (with `-DeleteDisks`) deletes
 > the disks. Without a `-Descriptor` it deletes whatever disks were attached; the **golden
-> parent** is never touched (the run only ever creates a **differencing child**).
+> parent** is never touched (the run only ever creates a **differencing child**). With a
+> `-Descriptor` it also removes the switch the provision created (`CreatedSwitches`), and it never
+> removes a switch it did not create.
 
 ---
 
@@ -759,7 +769,7 @@ any gap-related friction observed).
 - [ ] CIDATA seed ISO built (label exactly `CIDATA`; `meta-data`+`user-data`; serial-getty autologin) — §1
 
 **Dry run**
-- [ ] `Invoke-Pester -Path tests/` → **0 failed** (866 passed / 2 skipped as of the last local run; gate on Failed: 0, not on a total) — §2.1
+- [ ] `Invoke-Pester -Path tests/` → **0 failed** (889 passed / 2 skipped as of the last local run; gate on Failed: 0, not on a total), see §2.1
 - [ ] `python -m pytest tests/guest tests/host -q` → **56 passed, 0 failed** — §2.1
 - [ ] Fake-backend `Invoke-Voidseal` shows `INIT..DESTROYED`, `SealVerdict=$true`, clean teardown — §2.2
 

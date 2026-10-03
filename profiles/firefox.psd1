@@ -99,9 +99,14 @@
     }
 
     # ------------------------------------------------------------------
-    # Guest packages — Tier 0 is a lightweight Debian container. The organizer is
-    # Python (sqlite3 stdlib for the places.sqlite read; `lz4` for mozlz4 backups).
-    # No browser is installed — we never launch Firefox, we read a closed COPY.
+    # Packages: DECLARED, NOT INSTALLED. No engine code reads this field, and this
+    # Disk-mode guest runs offline, so nothing installs these; they must already be
+    # in the golden image. In v1 Tier 0 runs as a no-NIC Hyper-V VM, not a container.
+    # The organizer is Python (sqlite3 stdlib for the places.sqlite read; `lz4` for
+    # mozlz4 backups). The Debian cloud image ships python3. python3-lz4 is only for
+    # mozlz4 (*.jsonlz4) backups, a format the synthetic sample-bookmarks.json input
+    # does not use; bake it into the image before pointing the organizer at one.
+    # No browser is installed: we never launch Firefox, we read a closed COPY.
     # ------------------------------------------------------------------
     Packages   = @(
         'python3',

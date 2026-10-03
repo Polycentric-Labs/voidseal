@@ -122,9 +122,7 @@ Describe 'New-CidataUserData — disk-mode runner' {
         $ud | Should -BeLike '*|| mount LABEL=OUTPUT*' -Because 'RC4: a uid/gid OUTPUT mount must fall back to a plain mount so OUTPUT always mounts'
     }
 
-    It 'RC4: INPUT mount also has a plain-mount fallback' {
-        New-CidataUserData -Profile $script:DiskProfile | Should -BeLike '*|| mount LABEL=INPUT*' -Because 'RC4: the read-only INPUT mount must also fall back to a plain mount'
-    }
+    # The INPUT fallback is covered for every Disk runner by the read-only Describe below.
 
     It 'RC3: the seed still carries the wait-online mask directive (INEFFECTIVE for this boot — see below)' {
         # HONESTY (corrected 2026-07-21): this asserts only that the directive is PRESENT. It does NOT
@@ -162,6 +160,44 @@ Describe 'New-CidataUserData — disk-mode runner' {
     It 'FAILS CLOSED on a blank entrypoint for a disk profile' {
         $bad = $script:DiskProfile.Clone(); $bad['Entrypoint'] = '   '
         { New-CidataUserData -Profile $bad } | Should -Throw -Because 'a disk runner with no command cannot produce a result'
+    }
+}
+
+Describe 'New-CidataUserData: INPUT stays read-only on every mount arm of every Disk runner' {
+    # Hyper-V cannot attach a data disk read-only (D3), so the guest's `ro` mount option is the only
+    # read-only control INPUT has. RC4 (2026-06-24 live) gave the uid/gid INPUT mount a fallback arm
+    # for kernels that reject those options, but the arm was a bare `mount LABEL=INPUT`, which mounts
+    # read-write. All three Disk runners carried it, and the test this replaces pinned the bare form.
+    # The fallback stays (RC4's reason still holds); what changes is that every arm must pass `ro`.
+    BeforeAll {
+        # Each `mount` command (a line split at || && ;) that targets LABEL=INPUT, skipping comment
+        # lines. `mountpoint` never matches because the pattern needs whitespace right after `mount`.
+        function script:Get-InputMountCommand {
+            param([string] $UserData)
+            foreach ($line in ($UserData -split "`r?`n")) {
+                if ($line.TrimStart().StartsWith('#')) { continue }
+                foreach ($seg in ($line -split '\|\||&&|;')) {
+                    if ($seg -match '^\s*mount\s.*\bLABEL=INPUT\b') { $seg.Trim() }
+                }
+            }
+        }
+    }
+
+    It '<Runner>: every mount of LABEL=INPUT passes ro, the RC4 fallback arm included' -ForEach @(
+        @{ Runner = 'exFAT disk runner';  SeedProfile = @{ WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/job.py --out /mnt/out/result.html' } }
+        @{ Runner = 'outbox disk runner'; SeedProfile = @{ WorkloadMode = 'Disk'; OutboxOutput = $true; Entrypoint = 'python3 /mnt/in/job.py --out /run/staging/result.html' } }
+        @{ Runner = 'builder runner';     SeedProfile = @{ WorkloadMode = 'Disk'; EgressMode = 'SquidSniProxy'; Entrypoint = 'python3 /mnt/in/fetch_deps.py --out /mnt/out'; EgressAllowlist = @('pypi.org') } }
+    ) {
+        $ud     = New-CidataUserData -Profile $SeedProfile
+        $mounts = @(Get-InputMountCommand -UserData $ud)
+        $mounts.Count | Should -BeGreaterOrEqual 2 -Because 'RC4: the uid/gid INPUT mount keeps a fallback arm (a plain mount worked live where the uid/gid form failed)'
+        foreach ($m in $mounts) {
+            $optMatch = [regex]::Match($m, '\s-o\s+(\S+)')
+            $optMatch.Success | Should -BeTrue -Because "'$m' passes no option list, so it would mount INPUT read-write"
+            $opts = $optMatch.Groups[1].Value -split ','
+            $opts | Should -Contain 'ro' -Because "'$m' must mount INPUT read-only; the host cannot enforce that from its side (D3)"
+            $opts | Should -Not -Contain 'rw' -Because "'$m' must not ask for a writable INPUT mount"
+        }
     }
 }
 
@@ -328,6 +364,38 @@ Describe 'New-CidataUserData — OutboxOutput disk runner (C1.3, firefox transpo
         $ud = New-CidataUserData -Profile $proc
         $ud | Should -BeLike '*run_disk_workload.py*' -Because 'a processor releases through the SAME user-space outbox as an OutboxOutput profile — its OUTPUT disk is Raw'
         $ud | Should -Not -BeLike '*LABEL=OUTPUT*'    -Because 'a Raw OUTPUT disk has no filesystem to mount; the exFAT runner would fail closed and write nothing'
+    }
+
+    # --- in-guest screening (decided 2026-10-03) ---------------------------------------------------
+    # The outbox runner used to hard-code --transport-only. That is right for a transport-only profile
+    # like firefox and wrong for a PROCESSOR: its outbox shipped a placeholder verdicts.json ([]), and
+    # the host gate refuses every staged file that has no verdict, so no processor run could release
+    # anything. A processor now runs the screener in the guest, in the mode its ScreenConfig names.
+    It 'a PROCESSOR seed runs the screener in the guest: --mode from ScreenConfig, never --transport-only' {
+        $proc = @{ Tier = 0; Name = 'proc-mode'; WorkloadMode = 'Disk'; Network = 'None'
+                   ScreenConfig = @{ mode = 'moderate' }; Entrypoint = 'python3 /mnt/in/proc.py --out /run/staging/result.html' }
+        $line = @((New-CidataUserData -Profile $proc) -split "`r?`n" | Where-Object { $_ -match '^\s*python3\s+/mnt/in/run_disk_workload\.py\s' })
+        $line.Count | Should -Be 1
+        $line[0] | Should -Match '\s--mode\s+moderate(\s|$)' -Because 'the in-guest screener runs in the mode the processor''s ScreenConfig names'
+        $line[0] | Should -Not -Match '--transport-only' -Because 'a processor''s outbox must carry real verdicts, or the host gate refuses every staged file'
+    }
+
+    It 'a PROCESSOR with no ScreenConfig.mode screens in aggressive mode (the same default the host gate uses)' {
+        $proc = @{ Tier = 0; Name = 'proc-default'; WorkloadMode = 'Disk'; Network = 'None'
+                   ScreenConfig = @{}; Entrypoint = 'python3 /mnt/in/proc.py --out /run/staging/result.html' }
+        (New-CidataUserData -Profile $proc) | Should -Match 'run_disk_workload\.py[^\r\n]*\s--mode\s+aggressive(\s|$)'
+    }
+
+    It 'REFUSES a processor ScreenConfig.mode other than aggressive or moderate (the value lands on a shell line)' {
+        $proc = @{ Tier = 0; Name = 'proc-badmode'; WorkloadMode = 'Disk'; Network = 'None'
+                   ScreenConfig = @{ mode = 'aggressive; poweroff' }; Entrypoint = 'python3 /mnt/in/proc.py --out /run/staging/result.html' }
+        { New-CidataUserData -Profile $proc } | Should -Throw -ExpectedMessage '*mode*' -Because 'only the two screener modes may reach the runner''s shell line'
+    }
+
+    It 'a transport-only OutboxOutput seed still skips the screener (no --mode)' {
+        $line = @((New-CidataUserData -Profile $script:OutboxProfile) -split "`r?`n" | Where-Object { $_ -match '^\s*python3\s+/mnt/in/run_disk_workload\.py\s' })
+        $line[0] | Should -Match '--transport-only'
+        $line[0] | Should -Not -Match '\s--mode\s' -Because 'a transport-only profile is never screened (LOCKED design for firefox)'
     }
 
     It 'FAILS CLOSED when an outbox-transport entrypoint writes to /mnt/out (there is no such mount)' {
