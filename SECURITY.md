@@ -46,6 +46,11 @@ artifact and a host-side gate (`Invoke-SensitivityGate`, `scripts/lib/Sensitivit
 the result into `released/` (host-approved) and `held/` (everything else). Firefox (Tier-0, transport-
 only) is a separate, unscreened path — see the note at the end of this section.
 
+The screener runs **inside the guest**, in the `ScreenConfig` mode the seed passes to the in-guest
+producer, so its verdicts come from the same workload whose output they judge. A compromised workload
+can mark anything `SAFE`. The guarantee below therefore rests on what the host regenerates and caps,
+not on the screener's verdicts.
+
 **What this control is not.** An earlier design implicitly framed the screener as an *information-level
 data diode* — as if a passing "SAFE" verdict meant the released bytes were provably free of adversary-
 chosen content. That framing over-claims. An offline content screen cannot give an information-theoretic

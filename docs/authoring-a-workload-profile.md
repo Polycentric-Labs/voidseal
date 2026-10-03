@@ -107,6 +107,14 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 > and this doc + `ProfileLoader.ps1` as the source of truth for the Disk-mode / builder / processor
 > fields.
 
+**Processor profiles stage three guest helpers.** A processor's seed runs
+`python3 /mnt/in/run_disk_workload.py --mode <ScreenConfig.mode>` inside the guest. That script
+imports `outbox.py` and runs `screener.py` from its own directory, so all three files from the repo's
+`guest/` directory must be in the processor's `Inputs` (or `-Workload.Inputs`). `Invoke-Voidseal`
+refuses a processor run that lacks any of them, before anything is provisioned. `ScreenConfig.mode`
+must be `'aggressive'` (the default) or `'moderate'`: the seed passes it to the screener on a shell
+line, so any other value is refused when the seed is built.
+
 ### 2.3 The five loader invariants (fail closed — these THROW, they never warn)
 
 1. **Secret-file mount refusal** — any `Mounts` **source** matching a secret-shaped pattern

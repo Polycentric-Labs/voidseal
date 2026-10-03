@@ -366,6 +366,38 @@ Describe 'New-CidataUserData — OutboxOutput disk runner (C1.3, firefox transpo
         $ud | Should -Not -BeLike '*LABEL=OUTPUT*'    -Because 'a Raw OUTPUT disk has no filesystem to mount; the exFAT runner would fail closed and write nothing'
     }
 
+    # --- in-guest screening (decided 2026-10-03) ---------------------------------------------------
+    # The outbox runner used to hard-code --transport-only. That is right for a transport-only profile
+    # like firefox and wrong for a PROCESSOR: its outbox shipped a placeholder verdicts.json ([]), and
+    # the host gate refuses every staged file that has no verdict, so no processor run could release
+    # anything. A processor now runs the screener in the guest, in the mode its ScreenConfig names.
+    It 'a PROCESSOR seed runs the screener in the guest: --mode from ScreenConfig, never --transport-only' {
+        $proc = @{ Tier = 0; Name = 'proc-mode'; WorkloadMode = 'Disk'; Network = 'None'
+                   ScreenConfig = @{ mode = 'moderate' }; Entrypoint = 'python3 /mnt/in/proc.py --out /run/staging/result.html' }
+        $line = @((New-CidataUserData -Profile $proc) -split "`r?`n" | Where-Object { $_ -match '^\s*python3\s+/mnt/in/run_disk_workload\.py\s' })
+        $line.Count | Should -Be 1
+        $line[0] | Should -Match '\s--mode\s+moderate(\s|$)' -Because 'the in-guest screener runs in the mode the processor''s ScreenConfig names'
+        $line[0] | Should -Not -Match '--transport-only' -Because 'a processor''s outbox must carry real verdicts, or the host gate refuses every staged file'
+    }
+
+    It 'a PROCESSOR with no ScreenConfig.mode screens in aggressive mode (the same default the host gate uses)' {
+        $proc = @{ Tier = 0; Name = 'proc-default'; WorkloadMode = 'Disk'; Network = 'None'
+                   ScreenConfig = @{}; Entrypoint = 'python3 /mnt/in/proc.py --out /run/staging/result.html' }
+        (New-CidataUserData -Profile $proc) | Should -Match 'run_disk_workload\.py[^\r\n]*\s--mode\s+aggressive(\s|$)'
+    }
+
+    It 'REFUSES a processor ScreenConfig.mode other than aggressive or moderate (the value lands on a shell line)' {
+        $proc = @{ Tier = 0; Name = 'proc-badmode'; WorkloadMode = 'Disk'; Network = 'None'
+                   ScreenConfig = @{ mode = 'aggressive; poweroff' }; Entrypoint = 'python3 /mnt/in/proc.py --out /run/staging/result.html' }
+        { New-CidataUserData -Profile $proc } | Should -Throw -ExpectedMessage '*mode*' -Because 'only the two screener modes may reach the runner''s shell line'
+    }
+
+    It 'a transport-only OutboxOutput seed still skips the screener (no --mode)' {
+        $line = @((New-CidataUserData -Profile $script:OutboxProfile) -split "`r?`n" | Where-Object { $_ -match '^\s*python3\s+/mnt/in/run_disk_workload\.py\s' })
+        $line[0] | Should -Match '--transport-only'
+        $line[0] | Should -Not -Match '\s--mode\s' -Because 'a transport-only profile is never screened (LOCKED design for firefox)'
+    }
+
     It 'FAILS CLOSED when an outbox-transport entrypoint writes to /mnt/out (there is no such mount)' {
         # The live 2026-07-21 defect in profile form: the outbox runner creates only /mnt/in and
         # /run/staging, so an entrypoint aimed at /mnt/out cannot work — and fails in the worst way

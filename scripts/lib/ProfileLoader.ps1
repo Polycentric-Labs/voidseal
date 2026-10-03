@@ -214,9 +214,32 @@ function Test-UsesOutboxTransport {
         return $null
     }
 
-    $isProcessor = ([string](& $getField $Profile 'Network') -eq 'None') -and (& $hasField $Profile 'ScreenConfig')
+    $isProcessor = Test-IsProcessorProfile -Profile $Profile
     $wantsOutbox = (& $hasField $Profile 'OutboxOutput') -and [bool](& $getField $Profile 'OutboxOutput')
     return [bool]($isProcessor -or $wantsOutbox)
+}
+
+# --------------------------------------------------------------------------
+# Test-IsProcessorProfile: THE single predicate for "is this a processor?", i.e. Network='None' AND
+# a ScreenConfig: a profile whose release is screener-governed. Test-UsesOutboxTransport (above),
+# SeedBuilder.ps1 (whether the seed runs the screener in the guest) and Invoke-Voidseal.ps1 (the gate
+# routing and the processor preflight) all read it. The seed that screens and the host that gates
+# have to agree on which profiles are processors, so this truth lives in one place for the same
+# reason Test-UsesOutboxTransport does. Accepts the same two profile shapes.
+# --------------------------------------------------------------------------
+function Test-IsProcessorProfile {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [AllowNull()] $Profile)
+
+    if ($null -eq $Profile) { return $false }
+    if ($Profile -is [System.Collections.IDictionary]) {
+        $network = if ($Profile.Contains('Network')) { [string]$Profile['Network'] } else { '' }
+        return [bool](($network -eq 'None') -and $Profile.Contains('ScreenConfig'))
+    }
+    $networkProp = $Profile.PSObject.Properties['Network']
+    $screenProp  = $Profile.PSObject.Properties['ScreenConfig']
+    return [bool]((($null -ne $networkProp) -and ([string]$networkProp.Value -eq 'None')) -and ($null -ne $screenProp))
 }
 
 function Test-IsSecretPath {

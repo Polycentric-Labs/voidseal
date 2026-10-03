@@ -198,6 +198,14 @@ runcmd:
 # like the entrypoint script itself (firefox.psd1's organize_bookmarks.py) — no new delivery
 # mechanism; they are read-only-mounted at /mnt/in alongside the workload's own inputs.
 #
+# PROCESSORS share this runner (Test-UsesOutboxTransport is TRUE for them as well) but are screened.
+# The producer's flags come from __PRODUCER_SCREEN_ARGS__, which New-CidataUserData fills with
+# --transport-only for a transport-only profile and with --mode <ScreenConfig.mode> for a processor
+# (decided 2026-10-03). This runner used to hard-code --transport-only for both, so a processor's
+# outbox carried the [] placeholder and the host gate refused every staged file for lack of a
+# verdict. A processor's INPUT disk therefore also carries screener.py beside the producer, and
+# Invoke-Voidseal refuses a processor run whose Inputs lack any of the three helpers.
+#
 # RAW-OUTPUT DEVICE IDENTIFICATION: OUTPUT carries no filesystem/label to mount by, so the runner
 # identifies it structurally — enumerate the whole-disk block devices, exclude the root/boot disk and
 # any INPUT-labelled (exFAT) disk, and take the sole remaining candidate. FAIL-CLOSED: if that does
@@ -205,7 +213,8 @@ runcmd:
 # the "no OUTPUT -> poweroff" guard in the exFAT runner above).
 #
 # Single-quoted here-string: NOTHING is interpolated by PowerShell ($rc, $(...), __ENTRYPOINT__ all
-# stay literal). The builder substitutes __ENTRYPOINT__ with the profile's Entrypoint.
+# stay literal). The builder substitutes __ENTRYPOINT__ with the profile's Entrypoint and
+# __PRODUCER_SCREEN_ARGS__ with the producer's screening flags (see PROCESSORS above).
 # --------------------------------------------------------------------------
 $script:CidataOutboxDiskRunnerTemplate = @'
 #cloud-config
@@ -235,7 +244,7 @@ write_files:
       #!/bin/sh
       # Voidseal OutboxOutput disk-mode runner: mount the host-formatted exFAT INPUT disk read-only,
       # run the entrypoint into a STAGING dir, then hand staging to the shared outbox-producer
-      # template (run_disk_workload.py --transport-only), which packs it into the outbox container
+      # template (run_disk_workload.py), which packs it into the outbox container
       # and writes it to the raw OUTPUT block device. No OUTPUT filesystem is ever mounted/formatted.
       set +e
       # SERIAL DIAGNOSTICS (D4-D live-debug observability). Every fail-closed branch below is otherwise
@@ -322,9 +331,11 @@ write_files:
       # staging file COUNT only (never names/bytes) — did the entrypoint actually produce a result?
       diag "entrypoint_rc=$erc staging_count=$(ls -1 /run/staging 2>/dev/null | wc -l)"
       # The shared outbox-producer template packs /run/staging into the outbox container and writes
-      # it to the raw OUTPUT device. --transport-only: no screener invocation (LOCKED design) — a
-      # well-formed placeholder verdicts.json rides the outbox so the host read path parses cleanly.
-      python3 /mnt/in/run_disk_workload.py --staging /run/staging --verdicts /run/verdicts.json --out "$OUTPUT_DEV" --transport-only 2> /run/producer.err
+      # it to the raw OUTPUT device. The seed builder fills in its screening flags: --transport-only
+      # for a transport-only profile (no screener; a placeholder verdicts.json keeps the container
+      # parseable), or --mode <mode> for a processor, whose screener runs here so the outbox carries
+      # the verdict the host gate requires for every staged file.
+      python3 /mnt/in/run_disk_workload.py --staging /run/staging --verdicts /run/verdicts.json --out "$OUTPUT_DEV" __PRODUCER_SCREEN_ARGS__ 2> /run/producer.err
       prc=$?
       diag "producer_rc=$prc"
       # The producer's stderr is FIXED structural strings (run_disk_workload/outbox raise SystemExit /
@@ -822,7 +833,7 @@ function New-CidataUserData {
         # C1.3: a profile that opts into the user-space outbox transport (OutboxOutput=$true — same
         # predicate as Workload.ps1's Raw-OUTPUT selection) gets the OutboxOutput runner: the OUTPUT
         # disk is Raw (no filesystem), so the entrypoint runs into a staging dir and the shared
-        # outbox-producer template (run_disk_workload.py --transport-only) packs + writes the outbox.
+        # outbox-producer template (run_disk_workload.py) packs + writes the outbox.
         # Everything else (legacy non-outbox Disk profiles) keeps the direct exFAT result.html runner.
         # Test-UsesOutboxTransport (ProfileLoader.ps1) is the SINGLE source of this truth, shared with
         # Workload.ps1's Raw-OUTPUT selection and Invoke-Voidseal's structural validator. It is TRUE for
@@ -841,7 +852,25 @@ function New-CidataUserData {
                        "into the staging dir instead (e.g. --out /run/staging/result.html); the in-guest producer packs " +
                        "staging into the outbox. Fail closed.")
             }
-            $ud = $script:CidataOutboxDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint)
+            # The producer's screening flags (decided 2026-10-03). A transport-only profile skips the
+            # screener (LOCKED design for firefox). A PROCESSOR screens in the guest, in its ScreenConfig
+            # mode, so its outbox carries the verdict the host gate requires for every staged file; this
+            # runner used to pass --transport-only for processors too, and the gate refused all their
+            # output. Resolve-ScreenConfig supplies the same default the host gate uses. The mode lands
+            # on the runner's shell line, so only the screener's two values get through, case-normalized
+            # (the host gate's ValidateSet ignores case; the guest's argparse does not).
+            $screenArgs = '--transport-only'
+            if (Test-IsProcessorProfile -Profile $Profile) {
+                $screen  = Resolve-ScreenConfig -Profile @{ ScreenConfig = (Get-SeedProfileField -Profile $Profile -Name 'ScreenConfig') }
+                $rawMode = [string]$screen['mode']
+                $mode    = $rawMode.Trim().ToLowerInvariant()
+                if ($mode -cnotin @('aggressive', 'moderate')) {
+                    throw ("New-CidataUserData: processor ScreenConfig.mode '$rawMode' is not a screener mode. Use 'aggressive' " +
+                           "or 'moderate'; the value is passed to the in-guest screener on the runner's shell line. Fail closed.")
+                }
+                $screenArgs = "--mode $mode"
+            }
+            $ud = $script:CidataOutboxDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__PRODUCER_SCREEN_ARGS__', $screenArgs)
             return (ConvertTo-LfText -Text $ud)
         }
         $ud = $script:CidataDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint)

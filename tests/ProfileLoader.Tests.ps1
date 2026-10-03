@@ -889,3 +889,37 @@ Describe 'Test-UsesOutboxTransport — the single outbox predicate' {
         Test-UsesOutboxTransport -Profile $ff | Should -BeTrue
     }
 }
+
+# ===========================================================================
+# Test-IsProcessorProfile: THE single predicate for "is this a processor?" (Network=None plus a
+# ScreenConfig). Test-UsesOutboxTransport, SeedBuilder.ps1 (whether the seed screens in the guest)
+# and Invoke-Voidseal.ps1 (the gate routing and the processor preflight) all read it. The seed that
+# screens and the host that gates must agree on which profiles are processors, so the truth lives in
+# one function instead of several hand-copied expressions.
+# ===========================================================================
+Describe 'Test-IsProcessorProfile: the single processor predicate' {
+
+    It 'is TRUE for Network=None plus a ScreenConfig' {
+        Test-IsProcessorProfile -Profile @{ Network = 'None'; ScreenConfig = @{ mode = 'aggressive' } } | Should -BeTrue
+    }
+
+    It 'needs BOTH halves (Network=None alone, or a ScreenConfig alone, is not a processor)' {
+        Test-IsProcessorProfile -Profile @{ Network = 'None' } | Should -BeFalse
+        Test-IsProcessorProfile -Profile @{ Network = 'Internal'; ScreenConfig = @{} } | Should -BeFalse
+    }
+
+    It 'is FALSE for a transport-only OutboxOutput profile (the firefox shape)' {
+        Test-IsProcessorProfile -Profile @{ WorkloadMode = 'Disk'; OutboxOutput = $true } | Should -BeFalse
+    }
+
+    It 'accepts a pscustomobject as well as a hashtable, and is FALSE for $null (no throw)' {
+        Test-IsProcessorProfile -Profile ([pscustomobject]@{ Network = 'None'; ScreenConfig = @{} }) | Should -BeTrue
+        Test-IsProcessorProfile -Profile $null | Should -BeFalse
+    }
+
+    It 'every processor also uses the outbox transport (the two predicates agree)' {
+        $p = @{ Network = 'None'; ScreenConfig = @{} }
+        Test-IsProcessorProfile -Profile $p | Should -BeTrue
+        Test-UsesOutboxTransport -Profile $p | Should -BeTrue -Because 'a processor releases through the outbox; if these disagreed, the seed and the host would route it differently'
+    }
+}
