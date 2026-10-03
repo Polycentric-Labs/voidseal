@@ -34,10 +34,12 @@ rather than duplicating it.
 >   is validated (its source keys are secret-path-screened) and otherwise inert. The wired delivery
 >   channels are `StageAssets` (read-only ISO), Disk-mode `Inputs` (the INPUT data disk), and the
 >   cloud-init seed. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
-> - **`EgressAllowlist` and `BlockProtocols` are declarative on the `Invoke-Voidseal` path.** They are
->   validated, merged and deduped; no firewall, proxy or resolver configuration is emitted for a run
->   started through `Invoke-Voidseal`. The Squid allowlist text exists in `SeedBuilder.ps1` and is
->   rendered only by `New-CidataSeed`, which an operator runs by hand to build a seed ISO.
+> - **On the `Invoke-Voidseal` path, `BlockProtocols` is declarative and `EgressAllowlist` reaches only
+>   the Serial seed.** No code reads `BlockProtocols`. `EgressAllowlist` is validated, merged and deduped;
+>   for a Serial-mode profile whose `EgressMode` is `InGuestSquid` (Tier 1, as in `ralph`),
+>   `Invoke-Voidseal` renders it into the Squid ACL of the cloud-init seed it builds. That is the
+>   in-guest layer described above, and it has never run live. No host firewall, proxy or resolver
+>   configuration is emitted.
 
 ## What it is
 

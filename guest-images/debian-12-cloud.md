@@ -1,8 +1,9 @@
 # Guest image recipe — Debian 12 (bookworm) cloud + cloud-init NoCloud
 
 > **This is a RECIPE, not a binary.** It documents how to turn a stock Debian 12 cloud
-> image into the `debian-12-cloud` guest the Tier-1 profile names, and how to build the
-> first-boot **NoCloud `CIDATA` seed ISO** that provisions it with **no network**.
+> image into the `debian-12-cloud` guest the Tier-1 profile names, and what the first-boot
+> **NoCloud `CIDATA` seed** that provisions it with **no network** contains. `Invoke-Voidseal`
+> builds that seed itself, on a data disk; packing it into an ISO by hand is optional (§2).
 
 The Tier-1 isolation contract (`tier-profiles/tier1.psd1`) declares:
 
@@ -52,7 +53,7 @@ installer). They ship as `.qcow2`/`.raw`; Hyper-V needs **`.vhdx`**.
 
 ---
 
-## 2. The NoCloud `CIDATA` seed ISO (first-boot provisioning, no network)
+## 2. The NoCloud `CIDATA` seed (first-boot provisioning, no network)
 
 cloud-init's **NoCloud** datasource reads config from a small attached disk/ISO **with no
 network access**. The rules that MUST be exact (getting them wrong = the datasource is
@@ -64,8 +65,10 @@ silently skipped):
 - Root-level files: **`meta-data`** (required — holds `instance-id`) and **`user-data`**
   (the cloud-config). Optional: `network-config`, `vendor-data`.
 
-The seed ISO is the natural **one-way IN** channel (a Hyper-V DVD drive is read-only to the
-guest), and it is also what the importer uses for asset staging.
+`Invoke-Voidseal` does not use an ISO for this. The seal ejects every DVD before the guest's only
+boot, so the engine writes `meta-data` + `user-data` onto a small vfat data disk labelled `CIDATA`
+(`New-WorkloadSeedDisk`), recorded on the descriptor so the seal leaves it attached. The ISO steps
+below are for hand use, such as trying a recipe on a VM you boot yourself.
 
 ### `meta-data`
 
@@ -116,7 +119,7 @@ runcmd:
 # Packages/repo for a specific workload are staged before the seal, not here.
 ```
 
-### Build the seed ISO on the host
+### Build the seed ISO on the host (hand use only)
 
 Use any ISO builder that lets you set the volume label to `CIDATA`. Two common options:
 
@@ -131,17 +134,19 @@ oscdimg.exe -lCIDATA -m -n C:\sandbox\seed-src C:\sandbox\assets\cidata-seed.iso
 genisoimage -output cidata-seed.iso -volid CIDATA -joliet -rock meta-data user-data
 ```
 
-Attach it read-only to the VM as a DVD drive (`Set-VMDvdDrive`), boot once so cloud-init
-consumes it, then it is detached as part of the import-then-seal ritual.
+`Invoke-Voidseal` never attaches this ISO. It helps only when you boot a VM by hand with the ISO in
+its DVD drive (`Set-VMDvdDrive`), so cloud-init reads it on that boot. `New-CidataSeed` builds the
+same two documents into an ISO for you.
 
 ---
 
 ## 2a. Disk-mode workload runner
 
 > **This is the `user-data` the seed builder emits for a `WorkloadMode = 'Disk'` profile**
-> (`firefox.psd1`). The canonical emitter is **`New-CidataSeed`** (`scripts/lib/SeedBuilder.ps1`,
-> dot-sourced by `scripts/Invoke-Voidseal.ps1`): it holds this runner as a template, substitutes the
-> profile's `Entrypoint` for `__ENTRYPOINT__`, and writes the `CIDATA` ISO via built-in Windows IMAPI2.
+> (`firefox.psd1`). The canonical emitter is **`New-CidataUserData`** (`scripts/lib/SeedBuilder.ps1`,
+> dot-sourced by `scripts/Invoke-Voidseal.ps1`): it holds this runner as a template and substitutes the
+> profile's `Entrypoint` for `__ENTRYPOINT__`. `Invoke-Voidseal` writes the result onto the `CIDATA`
+> data disk (`New-WorkloadSeedDisk`); `New-CidataSeed` can pack the same documents into an ISO by hand.
 > The block below is the human-readable mirror of that template
 > (`SeedBuilder.ps1`'s `$script:CidataDiskRunnerTemplate` is the source of truth that actually ships in a
 > seed). It replaces the COM1-serial command channel with the **disk-passing model**: the host creates +
@@ -342,7 +347,8 @@ runcmd:
 ### `meta-data` (Disk mode)
 
 Unchanged from §2 — the same `instance-id` / `local-hostname` pair. NoCloud still requires both
-`meta-data` and `user-data` at the seed ISO root with the volume label `CIDATA`.
+`meta-data` and `user-data` at the root of the seed volume (the `CIDATA` data disk `Invoke-Voidseal`
+builds, or an ISO built by hand) with the volume label `CIDATA`.
 
 ### Boot-time dead wait — MEASURED 2026-07-21 (read this before reaching for `ds=nocloud`)
 
@@ -393,9 +399,9 @@ raw cmdlet). For reference, the equivalent raw Hyper-V calls are:
 # Gen2 VM (UEFI), Linux Secure Boot template, COM1 over a host named pipe.
 Set-VMFirmware -VMName $vm -SecureBootTemplate MicrosoftUEFICertificateAuthority
 Set-VMComPort  -VMName $vm -Number 1 -Path "\\.\pipe\$vm-com1"   # the serial command seam
-# (Tier 1: Internal vSwitch, NIC kept. An in-guest iptables + Squid allowlist exists as a seed
-#  template but is rendered only by the hand-run New-CidataSeed, never by Invoke-Voidseal, and is
-#  defense-in-depth rather than a boundary. Tier 2/3: NO NIC at all.)
+# (Tier 1: Internal vSwitch, NIC kept. For a Serial-mode InGuestSquid profile, Invoke-Voidseal
+#  renders an in-guest iptables + Squid allowlist into the seed it builds; that layer is
+#  defense-in-depth rather than a boundary and has never run live. Tier 2/3: NO NIC at all.)
 ```
 
 The host reads/writes `\\.\pipe\<vm>-com1` with a pipe-aware serial client to drive the
@@ -405,6 +411,11 @@ optional metadata transport only (not an interactive shell).
 ---
 
 ## 4. Import-then-seal ritual (asset staging)
+
+> **Not what `Invoke-Voidseal` does.** The engine never boots the guest before the seal, so steps 2
+> and 3 below do not happen on that path: the cloud-init seed rides a recorded `CIDATA` data disk that
+> survives the seal (§2), and any `StageAssets` ISO is attached and then ejected before the guest's
+> only boot. Read this section as a manual recipe.
 
 For one-way asset import on Win11 Pro Hyper-V, the reliable sequence is **VM-off, no active
 checkpoints, single-attach VHDX**:

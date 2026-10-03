@@ -88,8 +88,8 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `Packages` | no | extra guest packages staged **before** the seal, over the still-open pre-seal allowlist window | array of strings |
 | `Mounts` | no | **declared but not wired**: host→guest bind mounts that nothing attaches. The loader screens the field and merges it onto the tier, but no provisioner, runner or backend method reads it (the backend has no 9p, virtiofs or SMB method), so it moves no file in or out in either workload mode. §4 Step 4 lists the channels that do carry data | every **source** key is refused if secret-shaped (invariant 1, see §2.3). The screen runs on every profile even though nothing consumes the field at runtime, a deliberate regression guard (see `firefox.psd1`) |
 | `ExtraAllowlist` | no | FQDNs unioned onto the tier's `EgressAllowlist` | deduped case-insensitively; each entry still passes the tier's hostname-charset check |
-| `StageAssets` | no | host source → pin-documentation string; assets pre-pulled and hash-pinned, attached **read-only before the seal** (one-way IN) | the **key** is the host path the Importer attaches (e.g. an ISO); **DVD-slot caveat**: the backend models one DVD slot, so a `StageAssets` ISO competes with `SeedIso` if both must be present at boot — use a transfer-VHD (or Disk-mode `Inputs`) instead when they must coexist |
-| `SeedIso` | no | host path to a `CIDATA`-labelled cloud-init NoCloud seed ISO | attached read-only as a DVD at provision; configures first boot (serial-getty autologin on ttyS0, run-user, packages); **ejected as part of the seal** — `Assert-Sealed` refuses a still-attached import DVD; not secret-shaped, so a `.iso` path is accepted |
+| `StageAssets` | no | host source → pin-documentation string; assets pre-pulled and hash-pinned, attached **read-only before the seal** (one-way IN) | the **key** is the host path the Importer attaches (e.g. an ISO) |
+| `SeedIso` | no | **not read by `Invoke-Voidseal`**: only the default output path for `New-CidataSeed` when you build a seed ISO by hand | the engine builds the cloud-init seed itself, from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (see §4 Step 6); a seed DVD would be ejected by the seal before the guest's only boot; not secret-shaped, so a `.iso` path is accepted |
 | `WorkloadMode` | no — default `'Serial'` | selects the delivery mechanism: `'Serial'` (COM1 entrypoint delivery) or `'Disk'` (seed-injected disk-mode runner + INPUT/OUTPUT data disks) | **not yet listed in `tier-profiles/SCHEMA.md`** — ProfileLoader-only today. `ralph.psd1` uses the implicit `'Serial'` default; `firefox.psd1`/`builder.psd1` set `'Disk'` explicitly |
 | `Inputs` | no (Disk-mode) | innerName → CONTENT written onto the INPUT data disk by `New-WorkloadDisks` | ships `@{}` in both shipped Disk-mode profiles — real content is folded in at run/live-acceptance time, not baked into the `.psd1` (a `.psd1` is static data; inlining a whole script as a here-string is unreadable/brittle) |
 | `InputFiles` | no (Disk-mode convention) | innerName → **host file path** — a documentation-only convention some Disk-mode profiles use to record where the live-acceptance step should read real file content from | **not consumed by the loader at all** — it is absent from `Import-WorkloadProfile`'s merge/layer list, so it never survives into the merged profile. A human (or the live-acceptance script) reads these host files and folds them into `Inputs` manually before deploy — see `firefox.psd1`'s `InputFiles` header comment |
@@ -139,8 +139,8 @@ takes effect:
 |---|---|---|
 | `INIT` | your workload profile loads, merges onto its `BaseTier`, and is re-validated against every invariant above | all of §2.1/§2.2 |
 | `PROVISIONED` | `New-SandboxVM` creates the substrate | `Substrate`, `Memory`, `Cpu`, `GuestImage`, `SecureBootTemplate`, `Network` |
-| `STAGED` | `Import-SandboxAsset` attaches any `StageAssets` **read-only, one-way IN** — a no-`StageAssets` profile is a recorded no-op transition | `StageAssets` |
-| `SEALED` | `Lock-Sandbox` ejects import media (the `StageAssets` ISO + the `SeedIso` DVD) and disconnects host↔guest channels, then `Assert-Sealed` runs as a **hard gate** — if it throws, the deploy aborts *here*, the workload never runs, and the VM is torn down | `HostChannels`, `Network`, `SeedIso` (must be ejectable) |
+| `STAGED` | `Import-SandboxAsset` attaches any `StageAssets` **read-only, one-way IN**, and `New-WorkloadSeedDisk` builds the cloud-init seed on a `CIDATA` data disk for any run that will boot (Disk mode also builds its INPUT/OUTPUT disks here) | `StageAssets`; the seed comes from the resolved profile |
+| `SEALED` | `Lock-Sandbox` ejects import media (any `StageAssets` ISO; the seed disk stays attached) and disconnects host↔guest channels, then `Assert-Sealed` runs as a **hard gate**: if it throws, the deploy aborts *here*, the workload never runs, and the VM is torn down | `HostChannels`, `Network` |
 | `RUNNING` | your `Entrypoint` runs in the sealed guest. **Serial mode**: `Start-SandboxWorkload` boots the guest and sends the command over the COM1 seam, and the command's stdout and stderr come back the same way into the host-side run capture (there are no data disks, and `Mounts` is not wired); **Disk mode**: the guest boots straight into the seed-injected runner, mounts `INPUT` read-only / `OUTPUT` read-write, runs your `Entrypoint`, writes the result + an exit-code sentinel, and self-powers-off | `Entrypoint` (Serial) or `WorkloadMode`/`Inputs`/`FileSystem`/`InputLabel`/`OutputLabel` (Disk) |
 | `CAPTURED` | the run result + host-side capture artifact are recorded | `Capture` |
 | `EXTRACTED` | `Export-SandboxArtifact` reads the result out, **one-way OUT** — `HostReadResultDir` (Tier 0/1) just reads what your workload wrote; `ColdVHDX-Quarantine-CDR` (Tier ≥ 2) routes to the quarantine sink (throws — not implemented in v1) | `Extraction` |
@@ -190,25 +190,22 @@ carry data today:
   anything else the command reads must already be in the golden image.
 - **`StageAssets`** is attached as a read-only ISO before the seal, and the seal ejects it before
   the guest's first boot, so it is gone by the time your workload runs.
-- **The cloud-init seed** is not a channel for your files in either mode. Disk mode builds its own
-  seed on a small CIDATA data disk that survives the seal and carries the runner plus your
-  `Entrypoint`; a Serial-mode `SeedIso` is boot configuration (Step 6).
+- **The cloud-init seed** is not a channel for your files in either mode. The engine builds it from
+  your profile on a small CIDATA data disk that survives the seal; it carries boot configuration and,
+  in Disk mode, the runner plus your `Entrypoint` (Step 6).
 
 For this walkthrough's task, a notes file in and a summary out, that points to Disk mode: build the
 profile from §6, put `summarize.py` and a synthetic `notes.txt` in `Inputs`, and read them from
-`/mnt/in`. The remaining steps apply to either mode, except Step 6, which only a Serial-mode
-profile uses.
+`/mnt/in`. The remaining steps apply to either mode.
 
 **Step 5 — confirm you're staying offline.** Leave `ExtraAllowlist` unset or `@()` — Tier 0's own
 allowlist is already empty, so the merged result stays offline.
 
-**Step 6 — (usually needed) a seed ISO** so the guest actually has a serial console listening on
-first boot — point it at the same cloud-init recipe the shipped profiles use
-(`guest-images/debian-12-cloud.md`); you don't normally need a bespoke one per profile:
-
-```powershell
-SeedIso = 'C:\sandbox\assets\cidata-seed.iso'
-```
+**Step 6: nothing to add for the seed.** The guest still needs a cloud-init seed on its first boot
+(in Serial mode it is what turns on serial-getty autologin on ttyS0, so the Runner finds a shell on
+COM1), but `Invoke-Voidseal` builds it for you from the resolved profile, on a small CIDATA data disk
+that survives the seal. You do not need `SeedIso`: the engine does not read it. That field only names
+where `New-CidataSeed` writes an ISO if you build one by hand (`guest-images/debian-12-cloud.md`).
 
 **Step 7 — sanity-check it loads clean**, without running the full test suite:
 
@@ -240,12 +237,13 @@ suite stays green (CI runs it on every push/PR).
 
 The skeleton itself is the **minimal valid Tier-0, Serial-mode, offline** shape: just the three
 required keys plus the optional fields almost every real task needs (`Packages`,
-`ExtraAllowlist`, `SeedIso`), each carrying a `# <-- EDIT` marker. It is deliberately **not** the
+`ExtraAllowlist`), each carrying a `# <-- EDIT` marker. It is deliberately **not** the
 same shape as `firefox.psd1` — see §6.
 
 Its `Mounts` block is labelled declared-only and carries no EDIT marker: the entries show the shape
 and give the secret screen something to check, but editing them changes nothing inside the guest
-(§2.2).
+(§2.2). Its `SeedIso` line is unmarked for a similar reason: the engine builds the seed itself and
+never reads that path (Step 6).
 
 **Honesty note carried in the file itself:** this Serial-mode skeleton shape has not been
 live-run. Only `firefox.psd1`'s Disk-mode Tier-0 shape has a proven live round-trip (see
@@ -283,7 +281,3 @@ moving parts than the from-scratch skeleton.
   copy the secret to a non-secret-shaped path first (see §2.3, invariant 1).
 - **Pairing `ScreenConfig` with `OutboxOutput=$true`.** These are two different transport
   contracts (screened processor vs. transport-only outbox) — never both.
-- **Forgetting `SeedIso` on a Serial-mode profile.** Without it, the guest has no serial console
-  configured on first boot and Entrypoint delivery times out.
-- **A `StageAssets` ISO *and* a `SeedIso` DVD on a Serial-mode profile.** The backend models one
-  DVD slot — use a transfer-VHD (or switch to Disk mode) if both must be present at boot.

@@ -514,7 +514,8 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
 #  no datasource and the disk-mode runner never ran. In disk mode the orchestrator must now create the
 #  CIDATA seed DATA DISK (New-WorkloadSeedDisk) instead of attaching the SeedIso DVD (Add-SandboxSeed),
 #  so the seed survives the seal as a recorded data disk. A disk-mode profile that declares a SeedIso
-#  must NOT take the DVD path (and so must NOT emit the dual-DVD warning). Serial mode is UNCHANGED.
+#  must NOT take the DVD path (and so must NOT emit the dual-DVD warning). Serial mode followed on
+#  2026-10-03 (see the Serial Describe below), and the DVD helper Add-SandboxSeed is gone.
 Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk that survives the seal (RC6)' {
 
     BeforeEach {
@@ -596,10 +597,10 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
             -Name 'sbx-seed-nodvd' -ArtifactRoot $script:Art2 -Destination $script:Dest2 `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:SeedB
         # SetDvdDrive is not logged by the fake's CallLog, but the descriptor's SeedIso field must NOT be
-        # set by the disk path (Add-SandboxSeed sets it; the disk path must not call Add-SandboxSeed).
+        # set: only the DVD path ever recorded it, and that path (Add-SandboxSeed) no longer exists.
         $seedIsoField = $report.Descriptor.PSObject.Properties['SeedIso']
         ($null -eq $seedIsoField -or [string]::IsNullOrWhiteSpace([string]$seedIsoField.Value)) |
-            Should -BeTrue -Because 'RC6: the disk path must NOT call Add-SandboxSeed (which records SeedIso for the DVD); the seed is a data disk'
+            Should -BeTrue -Because 'RC6: nothing records SeedIso for a DVD any more; the seed is a data disk'
     }
 
     It 'disk mode does NOT emit the dual-DVD warning even when a SeedIso is declared (RC6)' {

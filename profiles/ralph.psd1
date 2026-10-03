@@ -130,17 +130,16 @@
     }
 
     # ------------------------------------------------------------------
-    # SeedIso — the cloud-init NoCloud CIDATA seed. Attached READ-ONLY as a DVD at
-    # provision so the Debian guest configures itself on FIRST BOOT: serial-getty AUTOLOGIN
-    # on ttyS0 (the COM1 serial console the Runner drives — Linux mgmt is serial, not
-    # PS Direct), the unprivileged run-user, and the guest packages. NO seed -> no serial
-    # console -> the Runner's InvokeGuestCommand finds nothing on \\.\pipe\<vm>-com1 and times
-    # out (the first-boot gap). The seed is the boot-config disc (distinct from the
-    # StageAssets payload ISO above) and is EJECTED as part of the seal — Assert-Sealed verifies
-    # no import DVD remains, so a still-attached seed fails the gate. Not secret-shaped -> the
-    # loader accepts the .iso path. DVD-SLOT NOTE: the backend has ONE DVD slot; the seed takes
-    # the boot DVD, so the StageAssets payload that must coexist with the seed at boot should be
-    # delivered as a transfer-VHD for a live coexistence run.
+    # SeedIso: NOT READ by Invoke-Voidseal. For every run with an entrypoint the engine builds
+    # ralph's cloud-init seed itself, from the resolved profile, on a small CIDATA data disk that
+    # survives the seal (New-WorkloadSeedDisk): serial-getty AUTOLOGIN on ttyS0 (the COM1 console
+    # the Runner drives; Linux management is serial, not PS Direct), the unprivileged run-user,
+    # the seed's own hard-coded packages, and, because tier1's EgressMode is 'InGuestSquid', the
+    # in-guest egress layer (iptables default-DROP plus a Squid allowlist built from the merged
+    # EgressAllowlist; defense-in-depth, not a boundary). No seed would mean no serial console, and
+    # the Runner's InvokeGuestCommand would time out. A seed DVD cannot work: the seal ejects every
+    # DVD before the guest's only boot (RC6). This path only names where New-CidataSeed writes an
+    # ISO if you build one by hand. Not secret-shaped.
     # ------------------------------------------------------------------
     SeedIso = 'C:\sandbox\assets\cidata-seed.iso'
 }

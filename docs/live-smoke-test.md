@@ -114,7 +114,7 @@ $probe   # expect: Available=True ; Elevated=True ; Reason='Hyper-V reachable.'
 
 ---
 
-## 1. Build the golden Debian-12 `.vhdx` + CIDATA seed ISO
+## 1. Build the golden Debian-12 `.vhdx` (the seed is built for you)
 
 Follow [`../guest-images/debian-12-cloud.md`](../guest-images/debian-12-cloud.md) end to
 end. It is the source of truth; this is the **acceptance checklist** for "done":
@@ -125,15 +125,16 @@ end. It is the source of truth; this is the **acceptance checklist** for "done":
 - [ ] The image contains **`grub-efi-amd64-signed`** (Secure Boot dependency — the
       provisioner always provisions with Secure Boot **ON**; there is **no** CLI flag to
       disable it). The `MicrosoftUEFICertificateAuthority` template is the verified path.
-- [ ] A **CIDATA seed ISO** is built with the volume label **exactly `CIDATA`** (uppercase,
-      case-sensitive — non-negotiable) containing root-level **`meta-data`** + **`user-data`**.
-- [ ] The `user-data` enables **`serial-getty@ttyS0`** with **autologin** for the non-root
-      `sandbox` user (Gap 4 — the Runner's serial client does not authenticate; a password
-      prompt makes it time out), the grub `console=ttyS0,115200n8` params, and installs
-      **bubblewrap** + **ca-certificates**.
-- [ ] A **non-root run-user** (`sandbox`) exists (the workload never runs as root).
+- **No seed ISO to build.** `Invoke-Voidseal` builds the cloud-init seed for every run, from the
+  resolved profile, on a `CIDATA`-labelled data disk that survives the seal (an ISO would be
+  ejected by the seal before the guest's only boot). For a Serial run its `user-data` creates the
+  non-root **`sandbox`** run-user, turns on **`serial-getty@ttyS0`** with **autologin** for it
+  (Gap 4: the Runner's serial client does not authenticate, so a password prompt makes it time
+  out), sets the grub `console=ttyS0,115200n8` params, and runs `apt-get install` for
+  **bubblewrap** + **ca-certificates**, which needs the guest to have a network path. Build an ISO
+  with `New-CidataSeed` only if you want to boot a VM by hand.
 
-Then fill the profile placeholders that point at these host artifacts:
+Then record where the golden disk lives:
 
 ```powershell
 # The golden parent disk path you just built — used as -ParentDiskPath on every live run.
@@ -384,9 +385,11 @@ $report.ExtractedArtifact    # the extracted workspace diff/output dir, copied t
   nftables/ipset allowlists don't survive CDN IP rotation) is **defense-in-depth
   only**: a compromised/root guest can disable it. The **host-verified boundary is Phase-6**
   (see [`phase-6-live-runbook.md`](phase-6-live-runbook.md)).
-- The Ralph loop is **bounded** — rate/iteration caps (`MAX_CALLS_PER_HOUR`,
-  `CLAUDE_TIMEOUT_MINUTES`, etc.) are set via env in the **guest** (cloud-init / seed), not in
-  the profile. Confirm your seed sets a small cap for the smoke test so it can't run away.
+- The Ralph loop is **bounded**: rate/iteration caps (`MAX_CALLS_PER_HOUR`,
+  `CLAUDE_TIMEOUT_MINUTES`, etc.) are env settings in the **guest**, not profile fields. The
+  engine-built seed does not set them, so put a small cap on the command itself for the smoke test
+  (e.g. `Entrypoint = 'CLAUDE_TIMEOUT_MINUTES=5 bash /opt/ralph/ralph-claude-code/ralph_loop.sh'`)
+  so it can't run away.
   Also bound the host-side wait with `-TimeoutSeconds` if you call the Runner directly.
 - **No auto-push.** Ralph commits land in the in-guest workspace; the diff is extracted for
   you to **review and cherry-pick** into the real repo. There is no remote and no push —
@@ -440,8 +443,8 @@ never assumes "Off == success".
   OUTPUT carries **no filesystem**, so there is no `/mnt/out` mount and no `result.exitcode`
   sentinel — the host reads the outbox in user space, never `Mount-VHD`. A *legacy* non-outbox
   Disk profile still gets the older exFAT runner that does mount `LABEL=OUTPUT` at `/mnt/out`.)
-  - (Serial mode — Ralph, Tier 1, §4 — STILL uses a DVD seed ISO via `New-CidataSeed`; that path is
-    unchanged. Only disk mode moved to the inline data-disk seed.)
+  - (Serial mode, Ralph at Tier 1 in §4, now uses the same inline data-disk seed. Its DVD seed was
+    ejected by the seal before the guest's only boot in exactly this way.)
 - **Automatic checkpoints are disabled at provision** (RC7, 2026-06-25 live): Hyper-V defaults
   `AutomaticCheckpointsEnabled=ON`, which pins a differencing `.avhdx` per disk so the guest's writes
   land in the `.avhdx` while the host reads the empty base `.vhdx`. The provisioner now calls
@@ -756,7 +759,6 @@ any gap-related friction observed).
 
 **Golden image**
 - [ ] Debian-12 golden `.vhdx` built; `$GoldenVhdx` resolves; `grub-efi-amd64-signed` present — §1
-- [ ] CIDATA seed ISO built (label exactly `CIDATA`; `meta-data`+`user-data`; serial-getty autologin) — §1
 
 **Dry run**
 - [ ] `Invoke-Pester -Path tests/` → **0 failed** (866 passed / 2 skipped as of the last local run; gate on Failed: 0, not on a total) — §2.1

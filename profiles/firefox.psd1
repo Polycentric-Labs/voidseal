@@ -171,16 +171,14 @@
     # placeholder StageAssets. Pre-Disk staging history is in git.
 
     # ------------------------------------------------------------------
-    # SeedIso — STILL APPLIES in Disk mode. The cloud-init NoCloud CIDATA seed is attached
-    # READ-ONLY as a DVD at provision so the guest configures itself on FIRST BOOT. For a Disk-mode
-    # profile the seed carries the DISK-MODE WORKLOAD RUNNER (guest-images/debian-12-cloud.md §2a):
-    # the systemd oneshot that mounts LABEL=INPUT ro + LABEL=OUTPUT rw, runs the Entrypoint (injected
-    # in place of __ENTRYPOINT__), writes result.html + result.exitcode, umounts, and self-powers-off.
-    # It is the boot-config disc — distinct from the INPUT/OUTPUT data disks (workload payload + result)
-    # — and is EJECTED as part of the seal (Assert-Sealed verifies no import DVD remains). Not
-    # secret-shaped -> the loader accepts the .iso path. DVD-SLOT NOTE: the backend has ONE DVD slot;
-    # the seed takes the boot DVD, so the inputs ride a SCSI DATA DISK (not a second DVD), avoiding the
-    # single-DVD-slot conflict the serial-era StageAssets ISO would have had.
+    # SeedIso: NOT READ by Invoke-Voidseal (Disk mode never read it). The engine builds the
+    # cloud-init seed itself on a small CIDATA data disk that survives the seal (RC6,
+    # New-WorkloadSeedDisk). For this OutboxOutput profile the seed carries the outbox disk runner
+    # (guest-images/debian-12-cloud.md §2a): it mounts LABEL=INPUT at /mnt/in, runs the Entrypoint
+    # (substituted for __ENTRYPOINT__) into /run/staging, has the in-guest producer pack staging
+    # into the outbox on the raw OUTPUT disk, and self-powers-off. A seed DVD could not work: the
+    # seal ejects every DVD before the guest's only boot. This path only names where New-CidataSeed
+    # writes an ISO if you build one by hand. Not secret-shaped.
     # ------------------------------------------------------------------
     SeedIso = 'C:\sandbox\assets\cidata-seed.iso'
 }

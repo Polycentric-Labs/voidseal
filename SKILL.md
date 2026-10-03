@@ -35,8 +35,8 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 > LIVE-PROVEN on real Hyper-V** (2026-06-25 — Milestone 3: provision → host-verified seal gate →
 > disk-passing workload → host-read result → clean teardown, end to end; the first live run drove out
 > 7 real `fake≠real` host/Hyper-V gaps, all since fixed). The **Tier-1 `ralph` live run is still
-> pending** (mock-green; not yet exercised on metal — and serial-mode seed delivery needs the same
-> seal-survival treatment disk mode got). Tier 0's **container substrate is not yet built** (v1
+> pending** (mock-green; not yet exercised on metal. Since 2026-10-03 its serial-mode seed rides the same
+> seal-surviving data disk as disk mode, which is mock-tested only). Tier 0's **container substrate is not yet built** (v1
 > provisions Tier 0 via the Hyper-V path; the Docker / `docker sbx` / sandbox-runtime substrate is a
 > planned future addition). Tier 2/3 are **scaffolded code paths validated with benign inputs only** —
 > no untrusted plugin or malware is run until you explicitly green-light verified isolation.
@@ -166,7 +166,7 @@ elevation (that is the live smoke test, operator-run, elevated).
 - **[`docs/tier-reference.md`](docs/tier-reference.md)** — the full tier model + the
   **P1–P10 containment rubric** (the per-tier acceptance checklist).
 - **[`guest-images/debian-12-cloud.md`](guest-images/debian-12-cloud.md)** — the Debian 12
-  cloud-init NoCloud recipe (Secure Boot template, COM1 serial-getty, the `CIDATA` seed ISO).
+  cloud-init NoCloud recipe (Secure Boot template, COM1 serial-getty, the `CIDATA` seed).
 - **[`tier-profiles/SCHEMA.md`](tier-profiles/SCHEMA.md)** — the tier + workload profile
   schema (the build contract every profile targets).
 

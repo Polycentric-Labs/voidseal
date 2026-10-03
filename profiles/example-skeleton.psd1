@@ -68,12 +68,12 @@
     # or a '.sub.domain' suffix, no whitespace/quotes/newlines).
     ExtraAllowlist = @()                   # <-- EDIT only if your task needs specific network egress.
 
-    # SeedIso — a cloud-init NoCloud CIDATA seed ISO, attached read-only as a DVD at
-    # provision so the guest configures itself on FIRST BOOT (serial-getty autologin
-    # on ttyS0 — required for Serial-mode Entrypoint delivery to find anything
-    # listening; without it, first boot has no serial console and delivery times
-    # out). Ejected as part of the seal. Point this at the SAME seed recipe the
-    # shipped profiles use (guest-images/debian-12-cloud.md) — you do not normally
-    # need a bespoke seed per profile.
-    SeedIso = 'C:\sandbox\assets\cidata-seed.iso'   # <-- EDIT if your seed lives elsewhere.
+    # SeedIso: NOT READ by Invoke-Voidseal. The engine builds the cloud-init seed itself,
+    # from the resolved profile, on a small CIDATA data disk that survives the seal; for
+    # this Serial-mode profile it sets up serial-getty autologin on ttyS0, which Entrypoint
+    # delivery over COM1 needs. A seed DVD could not work: the seal ejects every DVD before
+    # the guest's only boot. This path only names where New-CidataSeed writes an ISO if you
+    # build one by hand (guest-images/debian-12-cloud.md). Keeping or deleting it changes
+    # nothing in a run.
+    SeedIso = 'C:\sandbox\assets\cidata-seed.iso'   # not read by Invoke-Voidseal
 }
