@@ -31,15 +31,20 @@ rather than duplicating it.
 >   compromised/root guest can disable it. The host-verified boundary is Phase-6. Don't rely on the
 >   in-guest layer against a hostile guest (see the Egress note in
 >   [`docs/tier-reference.md`](docs/tier-reference.md)).
-> - **A profile's `Mounts` block does not deliver anything into the guest.** Nothing in the Provisioner
->   or Runner attaches a host-guest bind mount; the backend has no 9p, virtiofs or SMB method. `Mounts`
->   is validated (its source keys are secret-path-screened) and otherwise inert. The wired delivery
->   channels are `StageAssets` (read-only ISO), Disk-mode `Inputs` (the INPUT data disk), and the
->   cloud-init seed. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
-> - **`EgressAllowlist` and `BlockProtocols` are declarative on the `Invoke-Voidseal` path.** They are
->   validated, merged and deduped; no firewall, proxy or resolver configuration is emitted for a run
->   started through `Invoke-Voidseal`. The Squid allowlist text exists in `SeedBuilder.ps1` and is
->   rendered only by `New-CidataSeed`, which an operator runs by hand to build a seed ISO.
+> - **A profile's `Mounts` block does not deliver anything into the guest, and neither does
+>   `StageAssets`.** Nothing in the Provisioner or Runner attaches a host-guest bind mount; the backend
+>   has no 9p, virtiofs or SMB method, so `Mounts` is validated (its source keys are
+>   secret-path-screened) and otherwise inert. A `StageAssets` ISO is attached before the seal and
+>   ejected by it before the guest's only boot. Files reach a running workload only through Disk-mode
+>   `Inputs` (the INPUT data disk); the cloud-init seed is built from the profile and carries none of
+>   yours. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
+> - **On the `Invoke-Voidseal` path, `BlockProtocols` is declarative and `EgressAllowlist` reaches only
+>   the Serial seed.** No code reads `BlockProtocols`. `EgressAllowlist` is validated, merged and deduped;
+>   for a Serial-mode profile whose `EgressMode` is `InGuestSquid` (Tier 1, as in `ralph`),
+>   `Invoke-Voidseal` renders it into the Squid ACL of the cloud-init seed it builds. That is the
+>   in-guest layer described above, and it has never run live. The seed enables the layer's systemd
+>   unit at first boot without starting it, so whether it is active during a run's single boot is
+>   still a Phase-6 question. No host firewall, proxy or resolver configuration is emitted.
 
 ## What it is
 

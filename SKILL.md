@@ -36,8 +36,8 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 > result, clean teardown, end to end. Milestone 3 (2026-06-25) proved it with the legacy exFAT OUTPUT
 > disk and drove out 7 real `fake≠real` host/Hyper-V gaps, all since fixed; the current user-space
 > outbox transport passed the same round trip on 2026-07-21. Later changes are mock-tested only. The **Tier-1 `ralph` live run is still
-> pending** (mock-green; not yet exercised on metal — and serial-mode seed delivery needs the same
-> seal-survival treatment disk mode got). Tier 0's **container substrate is not yet built** (v1
+> pending** (mock-green; not yet exercised on metal. Since 2026-10-03 its serial-mode seed rides the same
+> seal-surviving data disk as disk mode, which is mock-tested only). Tier 0's **container substrate is not yet built** (v1
 > provisions Tier 0 via the Hyper-V path; the Docker / `docker sbx` / sandbox-runtime substrate is a
 > planned future addition). Tier 2/3 are **scaffolded code paths validated with benign inputs only** —
 > no untrusted plugin or malware is run until you explicitly green-light verified isolation.
@@ -103,7 +103,7 @@ mismatch is a caller error and throws). See the full parameter list in the
 
 - **INIT** — load + validate the tier/workload profile (fail-closed on a bad/unknown profile).
 - **PROVISIONED** — `New-SandboxVM` creates the substrate (Gen2, Secure Boot template, COM1 serial, Internal switch) from the profile. Left **powered off**.
-- **STAGED** — `Import-SandboxAsset` for each `StageAssets` entry (one-way IN, read-only ISO, **before** the seal). The loader screens both the `StageAssets` and the `Mounts` source keys against the secret-shaped-path list at load time, so a source whose *name* looks like a credential is refused before anything is attached. That screen is a path-shape lint, not a content scan: it catches the common accident, not a caller who renamed the file.
+- **STAGED**: `Import-SandboxAsset` attaches each `StageAssets` entry as a read-only ISO **before** the seal, and the seal ejects it before the guest's only boot, so it never reaches a running workload; `New-WorkloadSeedDisk` builds the cloud-init seed here too. The loader screens both the `StageAssets` and the `Mounts` source keys against the secret-shaped-path list at load time, so a source whose *name* looks like a credential is refused before anything is attached. That screen is a path-shape lint, not a content scan: it catches the common accident, not a caller who renamed the file.
 - **SEALED** — `Lock-Sandbox` cuts the VM to the tier's isolation, then **`Assert-Sealed` is a HARD GATE**. If it fails, the deploy **aborts here** — the workload never runs and the VM is torn down.
 - **RUNNING** — `Start-SandboxWorkload` boots the sealed VM and delivers the entrypoint over the **COM1 named-pipe serial seam** (PowerShell Direct is Windows-guest-only; the Debian guest is driven over serial).
 - **CAPTURED** — the run-result + its host-side capture artifact are recorded **out-of-band** (P8 — never trust the guest to self-report).
@@ -168,7 +168,7 @@ elevation (that is the live smoke test, operator-run, elevated).
 - **[`docs/tier-reference.md`](docs/tier-reference.md)** — the full tier model + the
   **P1–P10 containment rubric** (the per-tier acceptance checklist).
 - **[`guest-images/debian-12-cloud.md`](guest-images/debian-12-cloud.md)** — the Debian 12
-  cloud-init NoCloud recipe (Secure Boot template, COM1 serial-getty, the `CIDATA` seed ISO).
+  cloud-init NoCloud recipe (Secure Boot template, COM1 serial-getty, the `CIDATA` seed).
 - **[`tier-profiles/SCHEMA.md`](tier-profiles/SCHEMA.md)** — the tier + workload profile
   schema (the build contract every profile targets).
 

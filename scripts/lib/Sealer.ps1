@@ -378,71 +378,6 @@ function Import-SandboxAsset {
 }
 
 # --------------------------------------------------------------------------
-# Public: Add-SandboxSeed (attach the cloud-init NoCloud CIDATA seed ISO)
-# --------------------------------------------------------------------------
-
-<#
-.SYNOPSIS
-    Attach the cloud-init NoCloud SEED ISO (a CIDATA-labelled .iso) as a READ-ONLY DVD so the guest
-    configures itself on FIRST BOOT (serial-getty autologin on ttyS0 = the Runner's command channel;
-    run-user; packages). Records it on the descriptor so the seal ejects it + the gate verifies it.
-.DESCRIPTION
-    The SeedIso is the BOOT-CONFIG disc — distinct from StageAssets (workload payload). It must be
-    present at the VERY FIRST boot (before the seal powers nothing on — the seal runs pre-boot — so it
-    is attached at provision/STAGE, then the Runner powers the sealed VM on with the seed having been
-    consumed by cloud-init on that first boot). It is IMPORT-ONLY: it rides the same one-way ISO import
-    path as Import-SandboxAsset -As Iso, so it lands on the descriptor's ImportedMedia and the existing
-    seal (Lock-Sandbox detaches the live DVD) + gate (Assert-Sealed refuses any attached import DVD)
-    treat it correctly — the seed is EJECTED as part of the seal and a STILL-attached seed post-seal
-    fails the gate. We additionally record the path under the descriptor's SeedIso field for audit /
-    so the seal+gate know the seed by name.
-
-    DVD-SLOT NOTE: the backend models a SINGLE DVD slot (the VM record's DvdDrive scalar). The seed
-    is the disc in that slot at first boot. A StageAssets ISO that must COEXIST with the seed cannot
-    share the one DVD slot and must be a transfer-VHD for a real coexistence run — the orchestrator
-    gives the SEED the boot DVD slot (attaching it AFTER any StageAssets ISO so the seed occupies the
-    slot at boot) and warns when both ISOs are present.
-
-    A $null / blank -SeedIso is a documented NO-OP (so the orchestrator can call this unconditionally;
-    a profile without a SeedIso changes nothing). Optional -ExpectedSha256 hash-verifies the host-side
-    seed before attach (a mismatch refuses + attaches nothing) — same gate as Import-SandboxAsset.
-.PARAMETER Descriptor
-    The New-SandboxVM descriptor (consumed + updated: ImportedMedia + SeedIso).
-.PARAMETER SeedIso
-    Host-side path to the CIDATA NoCloud seed .iso. $null/blank = no-op.
-.PARAMETER ExpectedSha256
-    (Optional) verify the host-side seed hash before attaching.
-.PARAMETER Backend
-    The Hyper-V backend. Defaults to the real one; tests inject the fake.
-#>
-function Add-SandboxSeed {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [AllowNull()] $Descriptor,
-        [Parameter(Mandatory)] [AllowNull()] [AllowEmptyString()] [string] $SeedIso,
-        [string] $ExpectedSha256,
-        [hashtable] $Backend = (New-RealHyperVBackend)
-    )
-    if ($null -eq $Descriptor) {
-        throw "Add-SandboxSeed: -Descriptor is null. Pass a New-SandboxVM descriptor."
-    }
-    # A blank/absent seed is a deliberate NO-OP — a profile without a SeedIso changes nothing.
-    if ([string]::IsNullOrWhiteSpace($SeedIso)) { return }
-
-    $importArgs = @{ Descriptor = $Descriptor; Source = $SeedIso; As = 'Iso'; Backend = $Backend }
-    if ($PSBoundParameters.ContainsKey('ExpectedSha256') -and -not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
-        $importArgs.ExpectedSha256 = $ExpectedSha256
-    }
-    # Reuse the one-way ISO import: attaches read-only via SetDvdDrive + records on ImportedMedia so
-    # the existing seal detaches it and Assert-Sealed verifies no import DVD remains. The seed is the
-    # boot-config disc in the single DVD slot at first boot.
-    Import-SandboxAsset @importArgs
-
-    # Record the seed by name on the descriptor (audit + the seal/gate know it as the seed).
-    Set-DescriptorField -Descriptor $Descriptor -Name 'SeedIso' -Value $SeedIso
-}
-
-# --------------------------------------------------------------------------
 # Public: Dismount-SandboxAsset (scripted transfer-VHD detach — a seal step)
 # --------------------------------------------------------------------------
 
@@ -531,18 +466,18 @@ function Lock-Sandbox {
     }
 
     # --- 1. detach the system's currently-attached import DVD (if any) ----
-    # This ejects EITHER a StageAssets import ISO OR the cloud-init NoCloud SEED ISO — both ride
-    # the single DVD slot as import-only media; the seed is the boot-config disc consumed by cloud-init
-    # on the guest's first boot and is ejected here as part of the seal (Assert-Sealed then verifies no
-    # import DVD remains, so a still-attached seed fails the gate — the seed opens no hole).
+    # This ejects any StageAssets import ISO, which rides the single DVD slot as import-only media;
+    # Assert-Sealed then verifies no import DVD remains. The cloud-init seed used to ride this slot
+    # too, and this step ejected it before the guest's only boot, so cloud-init never read it. That is
+    # why the seed now travels on a recorded CIDATA data disk the seal leaves attached (RC6, both modes).
     #
     # The attached-DVD read MUST come from HOST TRUTH via the backend's
     # GetDvdDrives — NOT off the GetVM object's `DvdDrive` field. A real Get-VM object has no DvdDrive
     # property (DVD state is the DVDDrives collection / Get-VMDvdDrive); the old scalar read returned
     # $null on real Hyper-V, so RemoveDvdDrive was NEVER called and the seed survived the seal. We now
     # (a) read host truth and RemoveDvdDrive for EACH attached DVD, AND (b) belt-and-braces detach the
-    # seed/import media RECORDED on the descriptor (ImportedMedia) regardless of the read — RemoveDvd-
-    # Drive is idempotent on both backends — so the detach does not depend solely on the host read.
+    # import media RECORDED on the descriptor (ImportedMedia) regardless of the read. RemoveDvdDrive
+    # is idempotent on both backends, so the detach does not depend solely on the host read.
     # (The host-truth read remains the gate's authority in Assert-Sealed.)
     $vm = & $Backend.GetVM @{ Name = $vmName }
     if ($null -eq $vm) {
@@ -551,7 +486,7 @@ function Lock-Sandbox {
     $attachedDvds = @(Get-AttachedDvdPath -VMName $vmName -Backend $Backend)
     # Belt-and-braces: the import media this provision RECORDED. RemoveDvdDrive clears the (single)
     # DVD slot, so a single call detaches everything; we drive it from the union of host-truth +
-    # recorded media so an unread-but-recorded seed is still ejected on every backend.
+    # recorded media so unread-but-recorded import media is still ejected on every backend.
     $importedMedia = @(Get-DescriptorField -Descriptor $Descriptor -Name 'ImportedMedia' -Default @())
     # Effect-only backend calls in the seal are suppressed ($null = ...) so a REAL-backend stream
     # emission can't leak into Lock-Sandbox's output (output-stream-pollution class).
@@ -782,7 +717,7 @@ function Assert-Sealed {
     # HashSet so they are compared exactly like the system/created disks (case-folding Windows paths).
     $inputDisk  = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'InputDiskPath')
     $outputDisk = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'OutputDiskPath')
-    # RC6: the disk-mode cloud-init seed rides a recorded CIDATA DATA DISK (SeedDiskPath) instead of an
+    # RC6: the cloud-init seed (both workload modes) rides a recorded CIDATA DATA DISK (SeedDiskPath) instead of an
     # ejected DVD — the seal ejects DVDs, so the seed would never survive to the guest's only boot. The
     # seed disk is attached BEFORE the seal and recorded on the descriptor, so it is EXPECTED to remain
     # attached through the seal exactly like INPUT/OUTPUT — NOT a residual. It joins the recorded-data-

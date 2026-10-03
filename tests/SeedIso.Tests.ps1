@@ -1,29 +1,25 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 <#
 .SYNOPSIS
-    Pester 5 tests for the cloud-init CIDATA seed ISO + guest boot-wait.
+    Pester 5 tests for the cloud-init CIDATA seed + guest boot-wait.
 
 .DESCRIPTION
     Two first-boot gaps the MOCK backend can't model surfaced while prepping the first LIVE boot:
 
-    PART A — the cloud-init NoCloud SEED ISO (a first-class `SeedIso` workload/tier key):
-        The orchestrator's STAGED step imports StageAssets ISOs (workload payload) but NOTHING
-        attached the CIDATA NoCloud seed ISO cloud-init needs at FIRST BOOT to configure the guest
-        (serial-getty AUTOLOGIN on ttyS0 = the Runner's command channel; run-user; packages). No
-        seed -> no serial console -> InvokeGuestCommand finds nothing on the COM1 pipe and times out.
+    PART A: the cloud-init NoCloud SEED (what the guest reads on its FIRST boot):
+        cloud-init needs the seed at first boot to configure the guest (serial-getty AUTOLOGIN on
+        ttyS0 = the Runner's command channel; run-user; packages). No seed -> no serial console ->
+        InvokeGuestCommand finds nothing on the COM1 pipe and times out.
 
-        Contract: when the resolved profile declares `SeedIso`, the orchestrator attaches it as a
-        READ-ONLY DVD (via the existing one-way Import-SandboxAsset -As Iso machinery) BEFORE the
-        seal, so it is present at first boot. It is import-only: Lock-Sandbox detaches/ejects it as
-        part of the seal, and Assert-Sealed must NOT fail on it being gone (expected, ejected) but
-        MUST still fail if it is STILL attached post-seal (a sealed VM has no import DVD). The seed
-        is recorded on the descriptor (ImportedMedia / SeedIso) so the seal + gate know about it.
-
-        DVD-SLOT NOTE: the backend models a SINGLE DVD slot (the VM record's `DvdDrive` scalar).
-        The SeedIso is the BOOT-CONFIG disc — it is the disc in the DVD slot at first boot. A
-        StageAssets ISO that must coexist with the seed cannot share the one DVD slot and must be a
-        transfer-VHD for a real coexistence run; the orchestrator emits a caveat when both are
-        present and gives the SEED the boot DVD slot (attached LAST so it occupies the slot at boot).
+        The seal runs BEFORE that first boot and ejects every import DVD, so the seed cannot ride
+        the DVD slot (RC6: proven live for Disk mode on 2026-06-25; Serial mode followed on
+        2026-10-03, after its seed DVD turned out to be ejected the same way). Contract: the
+        orchestrator builds the seed itself from the resolved profile (New-WorkloadSeedDisk ->
+        New-CidataUserData) on a recorded CIDATA DATA DISK that survives the seal, for every run that
+        boots a guest. It never reads the profile's SeedIso path (that is only New-CidataSeed's
+        default output path), and the old DVD helper Add-SandboxSeed is gone. The first-boot
+        assertions themselves (the seed is attached when StartVM fires) live in
+        InvokeVoidseal.Tests.ps1; the host-truth DVD walk moved to Sealer.Tests.ps1.
 
     PART B — the guest BOOT-WAIT in the Runner:
         Start-SandboxWorkload called StartVM then IMMEDIATELY InvokeGuestCommand with no delay. A
@@ -59,8 +55,9 @@ BeforeAll {
 
     $script:Tier1 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier1.psd1')
 
-    # Build a real CIDATA seed ISO file on disk (the host source the SeedIso key points at). The fake
-    # backend never reads it, but Import-SandboxAsset -As Iso does a host-side Test-Path before attach.
+    # A placeholder file at the path the SeedIso key points at, so the fixture mirrors a real profile.
+    # Invoke-Voidseal never opens it (it builds the seed itself); InvokeVoidseal.Tests.ps1 proves that
+    # with a SeedIso that points at a missing file.
     $script:TmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("vmdep-t8-{0}" -f ([guid]::NewGuid().ToString('N')))
     New-Item -ItemType Directory -Path $script:TmpRoot -Force | Out-Null
     $script:SeedIso = Join-Path $script:TmpRoot 'cidata-seed.iso'
@@ -132,10 +129,10 @@ Describe 'Part A — Import-WorkloadProfile carries the SeedIso key onto the mer
 }
 
 # ===========================================================================
-#  PART A — the orchestrator attaches the SeedIso as a read-only DVD at provision/stage
-#           (present at FIRST BOOT) and the seal ejects it; the gate stays correct.
+#  PART A: the orchestrator builds the seed itself on a recorded CIDATA DATA
+#          DISK that survives the seal. Nothing attaches a seed DVD any more.
 # ===========================================================================
-Describe 'Part A — Invoke-Voidseal attaches a SeedIso read-only DVD before the seal, then ejects it on seal' {
+Describe 'Part A: Invoke-Voidseal seeds the guest on a data disk; nothing attaches a seed DVD' {
 
     BeforeEach {
         $script:B = New-FakeHyperVBackend
@@ -144,119 +141,30 @@ Describe 'Part A — Invoke-Voidseal attaches a SeedIso read-only DVD before the
         $script:Dest = Join-Path $script:TmpRoot ("dest-seed-{0}" -f ([guid]::NewGuid().ToString('N')))
     }
 
-    It 'runs the WHOLE state machine with a SeedIso profile (INIT..DESTROYED) — the seal ejected the seed so the gate passes' {
+    It 'Add-SandboxSeed no longer exists (no helper attaches a seed DVD that the seal would eject before boot)' {
+        Get-Command -Name 'Add-SandboxSeed' -ErrorAction SilentlyContinue |
+            Should -BeNullOrEmpty -Because 'the seal ejects every DVD before the guest''s only boot, so a DVD seed can never reach cloud-init'
+    }
+
+    It 'a profile WITH a SeedIso runs INIT..DESTROYED with its seed on a data disk, not in the DVD slot' {
         $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1Seed -Workload $script:Workload `
             -Name 'sbx-seed1' -ArtifactRoot $script:Art -Destination $script:Dest -Backend $script:B
         $expected = @('INIT', 'PROVISIONED', 'STAGED', 'SEALED', 'RUNNING', 'CAPTURED', 'EXTRACTED', 'DESTROYED')
-        @($report.States) | Should -Be $expected -Because 'a SeedIso must be attached then ejected by the seal so the lifecycle completes'
-        $report.SealVerdict | Should -BeTrue -Because 'the seed is ejected as part of the seal, so Assert-Sealed certifies'
+        @($report.States) | Should -Be $expected
+        $report.SealVerdict | Should -BeTrue -Because 'the recorded seed disk is an expected disk for the gate'
         $report.Error | Should -BeNullOrEmpty
+        [string]$report.Descriptor.SeedDiskPath | Should -Not -BeNullOrEmpty -Because 'the seed rides a recorded CIDATA data disk'
+        # ImportedMedia only exists once something has been imported, so read it without assuming it.
+        $imported = $report.Descriptor.PSObject.Properties['ImportedMedia']
+        @(if ($null -ne $imported) { $imported.Value }) | Should -Not -Contain $script:SeedIso -Because 'the SeedIso file is not imported as a DVD any more'
     }
 
-    It 'attaches the SeedIso as a read-only DVD at provision time (present at FIRST BOOT, recorded on ImportedMedia)' {
-        # Provision + stage WITHOUT sealing, to observe the boot-time DVD state. Mirror the
-        # orchestrator's pre-seal steps directly so we can inspect the live VM before Lock-Sandbox.
-        $d = New-SandboxVM -Profile $script:Tier1Seed -Name 'sbx-seed-attach' -Backend $script:B
-        Add-SandboxSeed -Descriptor $d -SeedIso $script:Tier1Seed['SeedIso'] -Backend $script:B
-        (& $script:B.GetVM @{ Name = 'sbx-seed-attach' }).DvdDrive |
-            Should -Be $script:SeedIso -Because 'the seed is the boot-config disc in the single DVD slot at FIRST BOOT'
-        @($d.ImportedMedia) | Should -Contain $script:SeedIso -Because 'the seed is import-only; the seal must later detach it, so it is recorded'
-    }
-
-    It 'records the SeedIso on the descriptor so the seal + gate know about it' {
-        $d = New-SandboxVM -Profile $script:Tier1Seed -Name 'sbx-seed-rec' -Backend $script:B
-        Add-SandboxSeed -Descriptor $d -SeedIso $script:Tier1Seed['SeedIso'] -Backend $script:B
-        [string]$d.SeedIso | Should -Be $script:SeedIso -Because 'the descriptor must record the seed path for audit + the seal/gate'
-    }
-
-    It 'EJECTS the seed DVD as part of the seal (no import DVD remains after Lock-Sandbox)' {
-        $d = New-SandboxVM -Profile $script:Tier1Seed -Name 'sbx-seed-eject' -Backend $script:B
-        Add-SandboxSeed -Descriptor $d -SeedIso $script:Tier1Seed['SeedIso'] -Backend $script:B
-        (& $script:B.GetVM @{ Name = 'sbx-seed-eject' }).DvdDrive | Should -Be $script:SeedIso -Because 'precondition: the seed is attached before the seal'
-        Lock-Sandbox -Descriptor $d -Backend $script:B
-        (& $script:B.GetVM @{ Name = 'sbx-seed-eject' }).DvdDrive |
-            Should -BeNullOrEmpty -Because 'the seal must eject the import-only seed DVD'
-    }
-
-    It 'Assert-Sealed PASSES once the seed is ejected (its absence is EXPECTED, not a failure)' {
-        $d = New-SandboxVM -Profile $script:Tier1Seed -Name 'sbx-seed-pass' -Backend $script:B
-        Add-SandboxSeed -Descriptor $d -SeedIso $script:Tier1Seed['SeedIso'] -Backend $script:B
-        Lock-Sandbox -Descriptor $d -Backend $script:B
-        { Assert-Sealed -Descriptor $d -Backend $script:B } |
-            Should -Not -Throw -Because 'an ejected seed is the sealed state; the gate must NOT fail on the seed being gone'
-        Assert-Sealed -Descriptor $d -Backend $script:B | Should -BeTrue
-    }
-
-    It 'Assert-Sealed FAILS if the seed DVD is STILL attached post-seal (a sealed VM has no import DVD)' {
-        $d = New-SandboxVM -Profile $script:Tier1Seed -Name 'sbx-seed-fail' -Backend $script:B
-        Add-SandboxSeed -Descriptor $d -SeedIso $script:Tier1Seed['SeedIso'] -Backend $script:B
-        Lock-Sandbox -Descriptor $d -Backend $script:B
-        # Re-attach the seed AFTER the seal to simulate a botched/incomplete seal — the gate must catch it.
-        & $script:B.SetDvdDrive @{ VMName = 'sbx-seed-fail'; Path = $script:SeedIso }
-        { Assert-Sealed -Descriptor $d -Backend $script:B } |
-            Should -Throw -ExpectedMessage '*DVD*' -Because 'a still-attached seed DVD MUST fail the gate — the seed handling must not open a hole'
-    }
-
-    # ---- HOST-TRUTH DVD path — the seal/gate must route through GetDvdDrives ----
-    # CRITICAL real-backend bug found during live debugging: the Sealer read DVD state off the
-    # GetVM object's .DvdDrive field. The FAKE carries that scalar, but a REAL Get-VM object has
-    # NO DvdDrive property (DVD state lives in the DVDDrives collection / Get-VMDvdDrive). So on
-    # real Hyper-V the seal NEVER detached the seed and the gate NEVER saw it — a still-attached
-    # seed would PASS. The fix routes the seal + gate through the backend's GetDvdDrives collection
-    # method (host truth). This test walks the WHOLE host-truth DVD lifecycle through GetDvdDrives
-    # so the fake now exercises the same collection seam the real backend uses end to end.
-    It 'walks the seed through the host-truth GetDvdDrives collection: attach->1, seal->0, re-attach->gate throws *DVD*' {
-        $d = New-SandboxVM -Profile $script:Tier1Seed -Name 'sbx-seed-hosttruth' -Backend $script:B
-        Add-SandboxSeed -Descriptor $d -SeedIso $script:Tier1Seed['SeedIso'] -Backend $script:B
-
-        # Host truth BEFORE the seal: the seed is the one disc in the DVD slot (read as a collection).
-        $before = & $script:B.GetDvdDrives @{ VMName = 'sbx-seed-hosttruth' }
-        $before.Count | Should -Be 1 -Because 'the seed is attached at first boot; host-truth GetDvdDrives reports it'
-        $before[0] | Should -Be $script:SeedIso
-
-        # The seal must EJECT it — read host truth again (the gate''s authority, not the GetVM scalar).
-        Lock-Sandbox -Descriptor $d -Backend $script:B
-        (& $script:B.GetDvdDrives @{ VMName = 'sbx-seed-hosttruth' }).Count |
-            Should -Be 0 -Because 'the seal detaches the seed; host-truth GetDvdDrives now reports NO attached DVD'
-        { Assert-Sealed -Descriptor $d -Backend $script:B } |
-            Should -Not -Throw -Because 'with the seed ejected (host-verified via GetDvdDrives) the gate certifies'
-
-        # Re-attach post-seal -> host truth shows 1 again -> the gate MUST refuse on *DVD*.
-        & $script:B.SetDvdDrive @{ VMName = 'sbx-seed-hosttruth'; Path = $script:SeedIso }
-        (& $script:B.GetDvdDrives @{ VMName = 'sbx-seed-hosttruth' }).Count |
-            Should -Be 1 -Because 'the re-attached seed is host-visible again'
-        { Assert-Sealed -Descriptor $d -Backend $script:B } |
-            Should -Throw -ExpectedMessage '*DVD*' -Because 'the gate reads host-truth DVD state via GetDvdDrives; a still-attached seed fails it'
-    }
-}
-
-# ===========================================================================
-#  PART A — a profile WITHOUT SeedIso behaves exactly as today (no regression)
-# ===========================================================================
-Describe 'Part A — a profile WITHOUT a SeedIso behaves exactly as before (no DVD attached at provision)' {
-
-    BeforeEach {
-        $script:B = New-FakeHyperVBackend
-        $script:Workload = & $script:NewWorkload -Tag 'noseed'
-        $script:Art  = Join-Path $script:TmpRoot ("art-noseed-{0}" -f ([guid]::NewGuid().ToString('N')))
-        $script:Dest = Join-Path $script:TmpRoot ("dest-noseed-{0}" -f ([guid]::NewGuid().ToString('N')))
-    }
-
-    It 'no SeedIso -> no DVD attached at provision (the existing behavior is unchanged)' {
-        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-noseed-attach' -Backend $script:B
-        # The orchestrator would call Add-SandboxSeed only when SeedIso is present; with a tier
-        # profile that declares none, the helper is a no-op given a $null/blank seed.
-        Add-SandboxSeed -Descriptor $d -SeedIso ([string]$null) -Backend $script:B
-        (& $script:B.GetVM @{ Name = 'sbx-noseed-attach' }).DvdDrive |
-            Should -BeNullOrEmpty -Because 'with no SeedIso the boot DVD slot stays empty, exactly as today'
-        $d.PSObject.Properties['SeedIso'] | Should -BeNullOrEmpty -Because 'no seed recorded when none is declared'
-    }
-
-    It 'a full deploy with no SeedIso still traverses INIT..DESTROYED' {
+    It 'a profile WITHOUT a SeedIso gets the same seed disk (the field is not needed)' {
         $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
             -Name 'sbx-noseed-full' -ArtifactRoot $script:Art -Destination $script:Dest -Backend $script:B
-        @($report.States)[-1] | Should -Be 'DESTROYED' -Because 'the no-seed lifecycle is the existing happy path'
+        @($report.States)[-1] | Should -Be 'DESTROYED'
         $report.Error | Should -BeNullOrEmpty
+        [string]$report.Descriptor.SeedDiskPath | Should -Not -BeNullOrEmpty -Because 'every Serial run with an entrypoint is seeded from the profile'
     }
 }
 
@@ -370,13 +278,13 @@ Describe 'Part C — the shipped firefox + ralph profiles declare a SeedIso and 
 
     It 'ralph.psd1 declares a SeedIso and merges cleanly' {
         $ralph = Import-WorkloadProfile -Path $script:RalphPath -TierProfileDir $script:TierDir
-        $ralph.ContainsKey('SeedIso') | Should -BeTrue -Because 'ralph needs a cloud-init seed for serial-getty autologin on first boot'
+        $ralph.ContainsKey('SeedIso') | Should -BeTrue -Because 'ralph keeps SeedIso as New-CidataSeed''s default output path (Invoke-Voidseal builds the seed itself)'
         [string]$ralph['SeedIso'] | Should -Match '(?i)cidata-seed\.iso' -Because 'the smoke-test seed path'
     }
 
     It 'firefox.psd1 declares a SeedIso and merges cleanly' {
         $firefox = Import-WorkloadProfile -Path $script:FirefoxPath -TierProfileDir $script:TierDir
-        $firefox.ContainsKey('SeedIso') | Should -BeTrue -Because 'firefox needs a cloud-init seed for first-boot config'
+        $firefox.ContainsKey('SeedIso') | Should -BeTrue -Because 'firefox keeps SeedIso as New-CidataSeed''s default output path (Invoke-Voidseal builds the seed itself)'
         [string]$firefox['SeedIso'] | Should -Match '(?i)cidata-seed\.iso' -Because 'the smoke-test seed path'
     }
 }

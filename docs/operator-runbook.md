@@ -80,8 +80,11 @@ If the host is below the floor, **stop** and patch before running any tier.
 - Build the Debian 12 golden `.vhdx` — run `pwsh scripts/Get-VoidsealGoldenImage.ps1` (downloads the pinned
   image, verifies its SHA-512, converts to VHDX; `-Plan` previews the pinned URL + hash), or follow
   [`../guest-images/debian-12-cloud.md`](../guest-images/debian-12-cloud.md) by hand.
-- Stage workload assets (the pinned Ralph repo ISO, the organizer ISO) at the host paths the
-  profiles' `StageAssets` reference, with the SHA pinned (Ralph has no tags — pin a commit SHA).
+- Put a file at every host path a profile's `StageAssets` names (today only ralph's
+  `ralph-claude-code.iso`; Ralph has no tags, so its pin note is a commit SHA): the import fails
+  closed on a missing file. The ISO does not reach the guest, because the seal ejects it before the
+  guest's only boot, so a live ralph run needs the pinned repo already in the golden image at
+  `/opt/ralph/ralph-claude-code`.
 
 ### 0.4 Builder deps: what is (and isn't) verified
 

@@ -33,9 +33,12 @@
                                            # <-- EDIT: the command the Runner delivers into the guest
                                            #     over the COM1 serial seam (Serial mode — the default
                                            #     when WorkloadMode is omitted, as here). Serial mode has
-                                           #     no automatic INPUT/OUTPUT data disks — get your files
-                                           #     in/out via Mounts below (or bake them into the golden
-                                           #     image / a StageAssets ISO).
+                                           #     no data disks and Mounts below is not wired, so the
+                                           #     engine copies no host file into the guest: the command
+                                           #     works with what the golden image holds, and its
+                                           #     stdout/stderr come back in the host-side run capture.
+                                           #     To move files in or out, use Disk mode (see Step 4
+                                           #     of the authoring guide's walkthrough).
 
     # --- OPTIONAL, shown here because almost every real task needs them --
 
@@ -44,17 +47,19 @@
     # nothing installs them; they must already be in the golden image.
     Packages = @()                        # <-- EDIT: e.g. @('python3') to record that your Entrypoint needs it.
 
-    # Mounts — host->guest bind mounts. Use these to get your task's input in and
-    # its output back out under Serial mode (this tier's Extraction='HostReadResultDir' —
-    # the host just reads whatever your Entrypoint wrote here after the run). The
-    # loader REFUSES any secret-shaped SOURCE (.env*, *.pem, *.key, credentials*.json,
-    # id_rsa*, ~/.ssh, ~/.aws/credentials, ~/.kube/config, ~/.docker/config.json,
-    # .npmrc, .pypirc, *-service-account.json, anything under a .secrets/ dir) — point
-    # at a COPY of your real data, never a live secret store or a live personal-data
-    # directory (see the authoring guide's DATA-ACCESS discussion).
+    # Mounts: DECLARED, NOT WIRED. Nothing in the engine attaches a host-guest bind
+    # mount (the backend has no 9p, virtiofs or SMB method; docs/live-smoke-test.md
+    # Gap 2), so these entries move no file in either direction. They stay because the
+    # loader still screens every SOURCE and REFUSES a secret-shaped one (.env*, *.pem,
+    # *.key, credentials*.json, id_rsa*, ~/.ssh, ~/.aws/credentials, ~/.kube/config,
+    # ~/.docker/config.json, .npmrc, .pypirc, *-service-account.json, anything under a
+    # .secrets/ dir), and because they record the intended shape. Point a source at a
+    # COPY, never a live secret store or live personal data. To get files in and out,
+    # use Disk mode; StageAssets and the cloud-init seed do not carry your files to a
+    # running workload either (Step 4 of the authoring guide's walkthrough covers each).
     Mounts = @{
-        'C:\sandbox\example-input'  = '/mnt/task/in:ro'   # <-- EDIT: your host input dir (read-only copy)
-        'C:\sandbox\example-output' = '/mnt/task/out'     # <-- EDIT: your host output dir (read-write)
+        'C:\sandbox\example-input'  = '/mnt/task/in:ro'   # declared only: nothing attaches it
+        'C:\sandbox\example-output' = '/mnt/task/out'     # declared only: nothing attaches it
     }
 
     # ExtraAllowlist — FQDNs unioned onto tier0's EgressAllowlist (which defaults to
@@ -63,12 +68,12 @@
     # or a '.sub.domain' suffix, no whitespace/quotes/newlines).
     ExtraAllowlist = @()                   # <-- EDIT only if your task needs specific network egress.
 
-    # SeedIso — a cloud-init NoCloud CIDATA seed ISO, attached read-only as a DVD at
-    # provision so the guest configures itself on FIRST BOOT (serial-getty autologin
-    # on ttyS0 — required for Serial-mode Entrypoint delivery to find anything
-    # listening; without it, first boot has no serial console and delivery times
-    # out). Ejected as part of the seal. Point this at the SAME seed recipe the
-    # shipped profiles use (guest-images/debian-12-cloud.md) — you do not normally
-    # need a bespoke seed per profile.
-    SeedIso = 'C:\sandbox\assets\cidata-seed.iso'   # <-- EDIT if your seed lives elsewhere.
+    # SeedIso: NOT READ by Invoke-Voidseal. The engine builds the cloud-init seed itself,
+    # from the resolved profile, on a small CIDATA data disk that survives the seal; for
+    # this Serial-mode profile it sets up serial-getty autologin on ttyS0, which Entrypoint
+    # delivery over COM1 needs. A seed DVD could not work: the seal ejects every DVD before
+    # the guest's only boot. This path only names where New-CidataSeed writes an ISO if you
+    # build one by hand (guest-images/debian-12-cloud.md). Keeping or deleting it changes
+    # nothing in a run.
+    SeedIso = 'C:\sandbox\assets\cidata-seed.iso'   # not read by Invoke-Voidseal
 }

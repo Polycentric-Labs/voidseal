@@ -160,6 +160,30 @@ Describe 'Import-SandboxAsset -As Iso — attaches a read-only ISO (DVD)' {
         Import-SandboxAsset -Descriptor $script:Desc -Source $script:IsoSrc -As Iso -ExpectedSha256 $script:IsoSrcSha -Backend $script:B
         (& $script:B.GetVM @{ Name = 'sbx-iso' }).DvdDrive | Should -Be $script:IsoSrc
     }
+
+    # Moved here from SeedIso.Tests.ps1 when Add-SandboxSeed was removed (the seed now rides a data
+    # disk). It is the one test that walks DVD state through the backend's HOST-TRUTH GetDvdDrives
+    # collection, the seam the seal and the gate depend on: a real Get-VM object has no DvdDrive
+    # property, so an earlier Sealer that read the GetVM scalar never detached a DVD on real Hyper-V.
+    It 'walks an imported ISO through the host-truth GetDvdDrives collection: attach->1, seal->0, re-attach->gate throws *DVD*' {
+        Import-SandboxAsset -Descriptor $script:Desc -Source $script:IsoSrc -As Iso -Backend $script:B
+
+        $before = & $script:B.GetDvdDrives @{ VMName = 'sbx-iso' }
+        $before.Count | Should -Be 1 -Because 'host-truth GetDvdDrives reports the attached ISO'
+        $before[0] | Should -Be $script:IsoSrc
+
+        Lock-Sandbox -Descriptor $script:Desc -Backend $script:B
+        (& $script:B.GetDvdDrives @{ VMName = 'sbx-iso' }).Count |
+            Should -Be 0 -Because 'the seal detaches the ISO; host-truth GetDvdDrives now reports no attached DVD'
+        { Assert-Sealed -Descriptor $script:Desc -Backend $script:B } |
+            Should -Not -Throw -Because 'with the ISO ejected (host-verified via GetDvdDrives) the gate certifies'
+
+        & $script:B.SetDvdDrive @{ VMName = 'sbx-iso'; Path = $script:IsoSrc }
+        (& $script:B.GetDvdDrives @{ VMName = 'sbx-iso' }).Count |
+            Should -Be 1 -Because 'the re-attached ISO is host-visible again'
+        { Assert-Sealed -Descriptor $script:Desc -Backend $script:B } |
+            Should -Throw -ExpectedMessage '*DVD*' -Because 'the gate reads host-truth DVD state; a still-attached import DVD fails it'
+    }
 }
 
 # ===========================================================================

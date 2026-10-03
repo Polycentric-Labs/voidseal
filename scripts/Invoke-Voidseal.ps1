@@ -10,8 +10,9 @@
       INIT        load + validate the tier/workload profile (Import-TierProfile / a passed
                   normalized profile). Fail-closed on a bad/unknown profile.
       PROVISIONED New-SandboxVM — create the substrate from the profile.
-      STAGED      Import-SandboxAsset for any StageAssets the profile declares (one-way IN,
-                  BEFORE the seal). With nothing to stage this is a recorded no-op transition.
+      STAGED      before the seal: Import-SandboxAsset for any StageAssets the profile declares,
+                  and New-WorkloadSeedDisk for the cloud-init seed of any run that will boot (Disk
+                  mode also builds its INPUT/OUTPUT disks here).
       SEALED      Lock-Sandbox then Assert-Sealed as a **HARD GATE**. If Assert-Sealed
                   THROWS, the deploy ABORTS here: the workload-run state is NEVER reached, and the
                   VM is torn down. A profile that fails the seal gate must never run its workload.
@@ -520,39 +521,30 @@ function Invoke-Voidseal {
         # screens these KEYS (and the Mounts keys) against Test-IsSecretPath at load time, so a
         # secret-SHAPED source is refused before the lifecycle starts. That screen is a path-shape
         # lint, not a content scan: it stops the common accident, not a caller who renames a
-        # credential. With no StageAssets this is a recorded no-op transition (the state is still
-        # traversed).
-        $seedIso       = if ($resolved.ContainsKey('SeedIso')) { [string]$resolved['SeedIso'] } else { $null }
-        $hasSeed       = -not [string]::IsNullOrWhiteSpace($seedIso)
-        $stageIsoCount = 0
+        # credential. With no StageAssets nothing is imported (the state is still traversed).
         if ($resolved.ContainsKey('StageAssets') -and $resolved['StageAssets'] -is [System.Collections.IDictionary]) {
             foreach ($src in @($resolved['StageAssets'].Keys)) {
                 # StageAssets values describe how to attach; default to a read-only ISO import.
                 Import-SandboxAsset -Descriptor $descriptor -Source ([string]$src) -As Iso -Backend $Backend
-                $stageIsoCount++
             }
         }
 
-        # --- the cloud-init NoCloud SEED: how it is delivered depends on the workload MODE -----
-        # SERIAL mode: the seed is the BOOT-CONFIG DVD cloud-init consumes on the guest's first boot
-        #   (serial-getty autologin on ttyS0 = the Runner's command channel, run-user, packages). It is
-        #   the disc in the single DVD slot at boot, attached AFTER any StageAssets ISO. DVD-SLOT CAVEAT:
-        #   the backend models ONE DVD slot — a StageAssets ISO that must COEXIST with the seed cannot
-        #   share it and must be a transfer-VHD. Warn when both ISOs are present so the live run knows the
-        #   seed took the boot DVD. The seed rides the import-only path, so the seal ejects it and
-        #   Assert-Sealed verifies it is gone.
-        # DISK mode (RC6): the seal EJECTS the seed DVD before the guest's ONLY boot, so a DVD seed never
-        #   survives to the boot cloud-init reads it on. Instead the seed rides a recorded CIDATA DATA
-        #   DISK (New-WorkloadSeedDisk, built below alongside the INPUT/OUTPUT disks) that survives the
-        #   seal. So in disk mode we do NOT call Add-SandboxSeed (the DVD path) and emit NO dual-DVD
-        #   warning — the seed is not a DVD here.
-        if ($workloadMode -ne 'Disk' -and $hasSeed) {
-            if ($stageIsoCount -gt 0) {
-                Write-Warning ("Invoke-Voidseal: '$Name' declares BOTH a SeedIso and $stageIsoCount StageAssets ISO(s). " +
-                    "The backend has a single DVD slot; the SeedIso takes the boot DVD. A StageAssets ISO that must " +
-                    "coexist with the seed at boot should be a transfer-VHD for the live run.")
-            }
-            Add-SandboxSeed -Descriptor $descriptor -SeedIso $seedIso -Backend $Backend
+        # --- the cloud-init NoCloud SEED rides a recorded CIDATA DATA DISK in both modes (RC6) -----
+        # The seal ejects every DVD before the guest's ONLY boot, so a DVD seed never reaches cloud-init
+        # (RC6, proven live for Disk mode on 2026-06-25; Serial mode had the same flaw until it moved here
+        # too). New-WorkloadSeedDisk writes user-data + meta-data from New-CidataUserData(resolved) onto a
+        # small CIDATA disk recorded on the descriptor (SeedDiskPath + CreatedDisks), so the seal leaves it
+        # attached, Assert-Sealed accepts it and teardown deletes it. The profile's SeedIso is never read
+        # here: it is only New-CidataSeed's default output path for an ISO built by hand.
+        # SERIAL: built here, for every run with an entrypoint (a run without one never boots the guest).
+        #   The user-data is the serial-getty AUTOLOGIN baseline the Runner's COM1 client needs, plus the
+        #   in-guest egress layer for an EgressMode='InGuestSquid' profile (New-CidataUserData fails closed
+        #   on an empty allowlist). The Entrypoint itself still travels over COM1, not in the seed.
+        # DISK: built below, alongside the INPUT/OUTPUT disks; there the seed carries the disk-mode runner.
+        if ($workloadMode -ne 'Disk' -and -not [string]::IsNullOrWhiteSpace($entrypoint)) {
+            $descriptor = New-WorkloadSeedDisk -Descriptor $descriptor -Profile $resolved `
+                -StorageRoot (Get-SandboxStorageRoot -Name $Name) -Backend $Backend
+            $report.Descriptor = $descriptor
         }
 
         # --- Disk-mode: create + attach + RECORD the workload data disks (+ the CIDATA seed disk) BEFORE the seal ---

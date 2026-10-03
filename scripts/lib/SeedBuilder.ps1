@@ -1,9 +1,12 @@
 <#
 .SYNOPSIS
-    Voidseal — CIDATA NoCloud seed-ISO builder (the host-side tool that produces the cloud-init seed).
+    Voidseal, CIDATA NoCloud seed builder: the host-side code that produces the cloud-init seed.
 
 .DESCRIPTION
-    Builds the first-boot **NoCloud `CIDATA` seed ISO** a sandbox guest consumes on its FIRST boot.
+    Builds the NoCloud `CIDATA` seed documents (`user-data` + `meta-data`) a sandbox guest reads on its
+    FIRST boot. Invoke-Voidseal (both modes) and Invoke-BuilderVM write them onto a recorded CIDATA
+    data disk (New-WorkloadSeedDisk, RC6). New-CidataSeed packs the same two documents into an ISO for
+    hand use only: the seal ejects every DVD before the guest's only boot, so the engine attaches none.
     Three shapes, selected by the profile's `WorkloadMode` (+ `EgressMode` for the builder variant):
 
       * DISK-OFFLINE — the disk-passing workload runner (guest-images/debian-12-cloud.md §2a). A
