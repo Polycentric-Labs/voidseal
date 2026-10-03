@@ -31,7 +31,7 @@
 |---|---|---|
 | `BaseTier` | int | which tier profile to inherit |
 | `Name` | string | profile id (matches filename) |
-| `Packages` | string[] | (opt) extra guest packages staged before seal |
+| `Packages` | string[] | (opt) **declared but NOT installed.** The loader layers it onto the tier, but no engine code reads it, so no package is installed or staged from this list. What the workload needs must already be in the golden image (a Disk-mode guest runs offline and cannot install anything). The list still records what the workload expects |
 | `Mounts` | hashtable | (opt) **declared but NOT wired into the guest** — nothing in the Provisioner or Runner attaches a host-guest bind mount (`docs/live-smoke-test.md` Gap 2). The loader still screens its source keys for secret-shaped paths. Use `StageAssets`, Disk-mode `Inputs`, or the seed to actually deliver files |
 | `Entrypoint` | string | workload command run by the Runner |
 | `ExtraAllowlist` | string[] | (opt) additional FQDNs unioned onto the tier allowlist |

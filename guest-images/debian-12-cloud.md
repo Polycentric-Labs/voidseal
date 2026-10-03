@@ -78,8 +78,10 @@ local-hostname: sandbox
 
 This enables the **COM1 serial console** (the host's command channel), creates a
 **non-root run-user**, and installs **bubblewrap** for the in-guest defense-in-depth the
-tier-1 control names. Packages/repo for a specific workload (e.g. Ralph) are staged
-*before the seal* over the still-open allowlist; this file just brings the guest up.
+tier-1 control names. A workload's repo (e.g. Ralph's) is attached before the seal through
+`StageAssets`. Its packages are not installed here or by any other engine code (the profile's
+`Packages` field is declared but unread), so they must already be in the golden image. This file
+just brings the guest up.
 
 ```yaml
 #cloud-config
@@ -113,7 +115,7 @@ runcmd:
   - [ apt-get, install, -y, bubblewrap, ca-certificates ]
 
 # Tier-1 keeps egress credential-FREE; no secrets are ever written here.
-# Packages/repo for a specific workload are staged before the seal, not here.
+# A workload's own packages are not installed here; nothing reads the profile's Packages field.
 ```
 
 ### Build the seed ISO on the host

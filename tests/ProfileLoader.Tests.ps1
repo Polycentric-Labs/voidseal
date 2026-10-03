@@ -682,6 +682,39 @@ Describe 'Import-WorkloadProfile — merge + re-validation' {
     }
 }
 
+Describe 'Packages: declared, not installed (the docs must say so while no engine code reads it)' {
+    # The loader layers a workload's Packages onto its tier (tested above), and nothing else in the
+    # engine reads the key: no seed, provisioner or runner installs from it. The schema and the
+    # authoring guide used to say packages were "staged before the seal". These checks tie the docs
+    # to the code in both directions: a new reader fails the first It, so the docs get revisited,
+    # and while there is none, the docs must say the field installs nothing.
+    It 'no engine script outside the loader reads the Packages key' {
+        $engineScripts = @(Get-ChildItem -Path (Join-Path $script:SkillRoot 'scripts') -Recurse -Filter '*.ps1' |
+                           Where-Object { $_.Name -ne 'ProfileLoader.ps1' })
+        $engineScripts.Count | Should -BeGreaterThan 5 -Because 'the scan must actually cover the engine'
+        $readers = foreach ($f in $engineScripts) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+            # Index reads ($p['Packages']), member reads ($p.Packages) and quoted names all parse to a
+            # string constant whose value is exactly 'Packages'. Comments are not in the AST, and a
+            # here-string that merely mentions packages never equals the bare key.
+            $ast.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -ceq 'Packages'
+            }, $true) | ForEach-Object { '{0}:{1}' -f $f.Name, $_.Extent.StartLineNumber }
+        }
+        @($readers) | Should -BeNullOrEmpty -Because 'Packages is unread today; a reader means the docs that call it declared-only must change with it'
+    }
+
+    It '<Doc> says Packages installs nothing' -ForEach @(
+        @{ Doc = 'tier-profiles/SCHEMA.md' }
+        @{ Doc = 'docs/authoring-a-workload-profile.md' }
+    ) {
+        $row = @(Get-Content -LiteralPath (Join-Path $script:SkillRoot $Doc) | Where-Object { $_ -match '^\|\s*`Packages`\s*\|' })
+        $row.Count | Should -Be 1 -Because "$Doc documents the field in exactly one table row"
+        $row[0] | Should -Match '(?i)not installed' -Because "$Doc must not claim an effect the engine does not have"
+        $row[0] | Should -Not -Match '(?i)staged before' -Because 'nothing stages these packages, before the seal or after it'
+    }
+}
+
 Describe 'Processor profile (Network=None) + DepsSpec/ScreenConfig' {
     BeforeAll {
         . "$PSScriptRoot/../scripts/lib/ProfileLoader.ps1"

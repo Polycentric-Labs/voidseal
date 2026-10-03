@@ -593,8 +593,8 @@ runcmd:
   - [ apt-get, update ]
   - [ apt-get, install, -y, bubblewrap, ca-certificates ]
 
-# Tier keeps egress credential-FREE; no secrets are ever written here. Workload packages/repo are
-# staged before the seal, not in this base seed.
+# Tier keeps egress credential-FREE; no secrets are ever written here. A workload's own packages
+# are not installed here; nothing reads the profile's Packages field, so bake them into the image.
 '@
 
 # --------------------------------------------------------------------------
