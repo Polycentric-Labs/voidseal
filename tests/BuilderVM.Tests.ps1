@@ -158,6 +158,31 @@ Describe 'Invoke-BuilderVM — RC7: SetAutomaticCheckpoints called before StartV
 # ===========================================================================
 Describe 'Resolve-PythonExe — robust host python resolution (fold-in #1)' {
 
+    BeforeAll {
+        # The alias tests inject -CommandLookup, so they never read this machine's PATH. Each fake
+        # match carries the fields Get-Command returns for an Application, although the resolver
+        # reads only Source. Paths are listed per name in PATH order, as Get-Command -All yields them.
+        function New-FakeCommandLookup {
+            param([Parameter(Mandatory)] [hashtable] $PathsByName)
+            $matchesByName = @{}
+            foreach ($name in $PathsByName.Keys) {
+                $matchesByName[$name] = @(foreach ($p in $PathsByName[$name]) {
+                    [pscustomobject]@{
+                        Name        = Split-Path -Leaf $p
+                        CommandType = [System.Management.Automation.CommandTypes]::Application
+                        Source      = $p
+                        Path        = $p
+                        Definition  = $p
+                    }
+                })
+            }
+            { param($Name) if ($matchesByName.ContainsKey($Name)) { $matchesByName[$Name] } }.GetNewClosure()
+        }
+        $script:AliasPython3 = 'C:\Users\operator\AppData\Local\Microsoft\WindowsApps\python3.exe'
+        $script:AliasPython  = 'C:\Users\operator\AppData\Local\Microsoft\WindowsApps\python.exe'
+        $script:RealPython   = 'C:\Program Files\Python314\python.exe'
+    }
+
     It 'throws a clear fail-closed message naming both python3 and python when neither command resolves' {
         # Mock Get-Command to simulate neither python3 nor python being on PATH.
         # Resolve-PythonExe must throw, naming BOTH missing commands.
@@ -167,5 +192,67 @@ Describe 'Resolve-PythonExe — robust host python resolution (fold-in #1)' {
         }
         { Resolve-PythonExe } | Should -Throw -ExpectedMessage '*python3*'
         { Resolve-PythonExe } | Should -Throw -ExpectedMessage '*python*'
+    }
+
+    It 'skips a WindowsApps App Execution Alias for python3 and returns the first real python on PATH' {
+        # The common Windows shape: python3 exists only as an alias, while python resolves to a real
+        # install that sits ahead of its own alias.
+        $lookup = New-FakeCommandLookup @{
+            python3 = @($script:AliasPython3)
+            python  = @($script:RealPython, $script:AliasPython)
+        }
+        Resolve-PythonExe -CommandLookup $lookup | Should -Be $script:RealPython
+    }
+
+    It 'still prefers python3: a real python3 later on PATH wins over the alias ahead of it' {
+        $realPython3 = 'C:\Tools\Python\python3.exe'
+        $lookup = New-FakeCommandLookup @{
+            python3 = @($script:AliasPython3, $realPython3)
+            python  = @($script:RealPython)
+        }
+        Resolve-PythonExe -CommandLookup $lookup | Should -Be $realPython3
+    }
+
+    It 'recognizes the alias directory in any letter case, under a relocated profile, and in a package subfolder' {
+        $lookup = New-FakeCommandLookup @{
+            python3 = @(
+                'D:\Profiles\operator\AppData\Local\MICROSOFT\windowsapps\python3.exe',
+                'C:\Users\operator\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python3.exe'
+            )
+            python  = @($script:RealPython)
+        }
+        Resolve-PythonExe -CommandLookup $lookup | Should -Be $script:RealPython
+    }
+
+    It 'does not skip a real interpreter whose directory only resembles the alias directory' {
+        $lookAlike = 'C:\Tools\Microsoft\WindowsAppsTools\python3.exe'
+        $lookup = New-FakeCommandLookup @{ python3 = @($lookAlike); python = @($script:RealPython) }
+        Resolve-PythonExe -CommandLookup $lookup | Should -Be $lookAlike
+    }
+
+    It 'fails closed when PATH offers only aliases, naming both commands and each alias it skipped' {
+        $lookup = New-FakeCommandLookup @{ python3 = @($script:AliasPython3); python = @($script:AliasPython) }
+        $err = { Resolve-PythonExe -CommandLookup $lookup } | Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike "*'python3'*'python'*"
+        $err.Exception.Message | Should -BeLike "*$($script:AliasPython3)*" -Because 'the operator needs to see which alias was refused'
+        $err.Exception.Message | Should -BeLike "*$($script:AliasPython)*"
+    }
+
+    It 'by default asks Get-Command for every Application match, so a real python behind an alias is reachable' {
+        # Without -All, Get-Command stops at the first match on PATH; when that match is an alias, a
+        # real interpreter further down would never be seen.
+        Mock Get-Command { }
+        Mock Get-Command {
+            [pscustomobject]@{
+                Name        = 'python.exe'
+                CommandType = [System.Management.Automation.CommandTypes]::Application
+                Source      = $script:RealPython
+                Path        = $script:RealPython
+                Definition  = $script:RealPython
+            }
+        } -ParameterFilter {
+            $Name -eq 'python' -and $All -and $CommandType -eq [System.Management.Automation.CommandTypes]::Application
+        }
+        Resolve-PythonExe | Should -Be $script:RealPython
     }
 }
