@@ -127,7 +127,7 @@ function Resolve-RunnerTier {
     command succeeds or the deadline elapses. Returns a result hashtable; NEVER throws on a not-ready
     guest (it RETURNS Ready=$false so the caller reports a clean timeout instead of crashing).
 .DESCRIPTION
-    A real Debian guest needs ~20-60s to boot + run cloud-init (which the SEED ISO drives) before the
+    A real Debian guest needs ~20-60s to boot + run cloud-init (which the CIDATA seed disk drives) before the
     serial-getty console accepts a command. Calling InvokeGuestCommand immediately after StartVM would
     race the boot, so the Runner probes readiness FIRST. The probe is a cheap command (default 'true')
     whose SUCCESS (ExitCode 0) means the console is up. The wait/poll is INJECTABLE so tests never sleep:
@@ -295,7 +295,7 @@ function Start-SandboxWorkload {
     $null = & $Backend.StartVM @{ Name = $vmName }
 
     # --- 1b. WAIT for the guest to become boot-ready ----------------
-    # A real Debian guest needs ~20-60s to boot + run cloud-init (driven by the SEED ISO) before the
+    # A real Debian guest needs ~20-60s to boot + run cloud-init (driven by the CIDATA seed disk) before the
     # serial-getty console accepts a command. Probe readiness BEFORE delivering the entrypoint so the
     # first command never races the boot. The wait is INJECTABLE (BootWaitSeconds / BootPollDelaySeconds)
     # so tests don't sleep: 0 makes a single instant probe the fake passes immediately. If the guest

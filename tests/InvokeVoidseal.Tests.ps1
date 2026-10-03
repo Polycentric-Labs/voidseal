@@ -615,6 +615,141 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
 }
 
 # ===========================================================================
+#  RC6, the Serial half: Serial mode seeds the guest on a CIDATA DATA DISK that
+#  survives the seal. It used to attach the SeedIso as a DVD, which the seal
+#  ejects before the guest's only boot, so cloud-init never saw it (no autologin
+#  on ttyS0, no sandbox user, no in-guest egress layer).
+# ===========================================================================
+#  The fake never boots a guest and its InvokeGuestCommand succeeds whether or not a seed was present,
+#  so a missing seed is invisible to every lifecycle assertion. These tests wrap StartVM to record what
+#  is attached at the moment the guest would first boot, which is the fact cloud-init depends on.
+Describe 'Invoke-Voidseal: Serial mode seeds the guest on a CIDATA data disk that survives the seal' {
+
+    BeforeAll {
+        # Wrap the fake's StartVM so it records the attached disks and DVDs at the guest's FIRST boot.
+        function script:New-FirstBootProbe {
+            param($Backend)
+            $snap = [ordered]@{ Taken = $false; HardDrives = @(); DvdDrives = @() }
+            $origStartVM = $Backend.StartVM
+            $Backend.StartVM = {
+                param($P)
+                $vm = & $Backend.GetVM @{ Name = $P.Name }
+                $snap.HardDrives = @($vm.HardDrives)
+                $snap.DvdDrives  = @(& $Backend.GetDvdDrives @{ VMName = $P.Name } | ForEach-Object { $_ } | Where-Object { $_ })
+                $snap.Taken      = $true
+                & $origStartVM $P
+            }.GetNewClosure()
+            return $snap
+        }
+
+        # The user-data the run wrote onto its seed disk (the disk itself is gone after teardown, so read
+        # the fake's persistent write log).
+        function script:Get-SeedUserData {
+            param($Backend, [string] $SeedPath)
+            $write = @($Backend.FakeCallLog | Where-Object {
+                $_.Op -eq 'WriteVhdxFile' -and $_.Path -eq $SeedPath -and $_.InnerPath -eq 'user-data' }) | Select-Object -First 1
+            if ($null -eq $write) { return $null }
+            return [string]$write.Content
+        }
+    }
+
+    BeforeEach {
+        $script:SerialB   = New-FakeHyperVBackend
+        $script:FirstBoot = script:New-FirstBootProbe -Backend $script:SerialB
+        # Tier 1 is EgressMode='InGuestSquid' with a non-empty allowlist, so its seed carries the egress
+        # layer. The SeedIso file EXISTS here, so a run that still took the old DVD path would complete
+        # and these tests would fail on the seed itself, not on a missing file.
+        $script:SerialSeedIso = Join-Path $script:TmpRoot ("serial-seed-{0}.iso" -f ([guid]::NewGuid().ToString('N')))
+        Set-Content -LiteralPath $script:SerialSeedIso -Value 'placeholder-seed' -NoNewline -Encoding ascii
+        $script:SerialProfile = $script:Tier1.Clone()
+        $script:SerialProfile['SeedIso'] = $script:SerialSeedIso
+        $script:SerialWl   = & $script:NewWorkload -Tag 'serial-seed'
+        $script:SerialArt  = Join-Path $script:TmpRoot ("art-serialseed-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:SerialDest = Join-Path $script:TmpRoot ("dest-serialseed-{0}" -f ([guid]::NewGuid().ToString('N')))
+    }
+
+    It 'the CIDATA seed disk is attached when the guest first boots, and no DVD is' {
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
+            -Name 'sbx-serialseed-boot' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
+        $report.Error | Should -BeNullOrEmpty
+        $script:FirstBoot.Taken | Should -BeTrue -Because 'the Serial run must reach StartVM'
+        $seedPath = [string]$report.Descriptor.SeedDiskPath
+        $seedPath | Should -Not -BeNullOrEmpty -Because 'Serial mode must build the CIDATA seed disk'
+        @($script:FirstBoot.HardDrives) | Should -Contain $seedPath -Because 'cloud-init reads the seed at first boot, which comes AFTER the seal, so the seed must still be attached when StartVM fires'
+        @($script:FirstBoot.DvdDrives).Count | Should -Be 0 -Because 'the seed no longer rides the DVD slot that the seal empties'
+    }
+
+    It 'records the seed disk on SeedDiskPath and CreatedDisks, with autologin user-data and meta-data' {
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
+            -Name 'sbx-serialseed-rec' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
+        $seedPath = [string]$report.Descriptor.SeedDiskPath
+        $seedPath | Should -Not -BeNullOrEmpty
+        @($report.Descriptor.CreatedDisks) | Should -Contain $seedPath -Because 'the Reaper deletes what CreatedDisks lists'
+        $ud = script:Get-SeedUserData -Backend $script:SerialB -SeedPath $seedPath
+        $ud | Should -Match '#cloud-config'
+        $ud | Should -Match '--autologin sandbox' -Because 'the Runner''s COM1 client does not authenticate, so the seed must configure autologin on ttyS0'
+        @($script:SerialB.FakeCallLog | Where-Object {
+            $_.Op -eq 'WriteVhdxFile' -and $_.Path -eq $seedPath -and $_.InnerPath -eq 'meta-data' }).Count |
+            Should -Be 1 -Because 'NoCloud needs meta-data next to user-data'
+    }
+
+    It 'a Tier-1 (InGuestSquid) seed carries the in-guest egress layer built from the merged allowlist' {
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
+            -Name 'sbx-serialseed-egress' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
+        $ud = script:Get-SeedUserData -Backend $script:SerialB -SeedPath ([string]$report.Descriptor.SeedDiskPath)
+        $ud | Should -Match 'acl allowed_domains dstdomain .*api\.anthropic\.com' -Because 'the Squid ACL is rendered from the merged EgressAllowlist'
+        $ud | Should -Match 'iptables -P OUTPUT DROP' -Because 'the in-guest layer is default-DROP'
+    }
+
+    It 'a Tier-0 Serial profile (HostProxy) gets the autologin seed without the egress layer' {
+        $tier0 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $report = Invoke-Voidseal -Tier 0 -Profile $tier0 -Workload $script:SerialWl `
+            -Name 'sbx-serialseed-t0' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
+        $report.Error | Should -BeNullOrEmpty
+        $ud = script:Get-SeedUserData -Backend $script:SerialB -SeedPath ([string]$report.Descriptor.SeedDiskPath)
+        $ud | Should -Match '--autologin sandbox' -Because 'every Serial run with an entrypoint gets the seed, with or without a SeedIso'
+        $ud | Should -Not -Match 'iptables -P OUTPUT DROP' -Because 'only an InGuestSquid profile gets the egress layer'
+    }
+
+    It 'a SeedIso that points at a missing file does not stop the run (Invoke-Voidseal no longer reads it)' {
+        $script:SerialProfile['SeedIso'] = Join-Path $script:TmpRoot ("missing-{0}\cidata-seed.iso" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
+            -Name 'sbx-serialseed-missing' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
+        $report.Error | Should -BeNullOrEmpty -Because 'the engine builds the seed from the profile and never opens the SeedIso path'
+        @($report.States) | Should -Contain 'DESTROYED'
+        [string]$report.Descriptor.SeedDiskPath | Should -Not -BeNullOrEmpty
+    }
+
+    It 'emits no single-DVD-slot warning, even with both a SeedIso and a StageAssets ISO declared' {
+        $asset = Join-Path $script:TmpRoot ("stage-{0}.iso" -f ([guid]::NewGuid().ToString('N')))
+        Set-Content -LiteralPath $asset -Value 'placeholder-asset' -NoNewline -Encoding ascii
+        $script:SerialProfile['StageAssets'] = @{ $asset = 'synthetic test payload' }
+        Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
+            -Name 'sbx-serialseed-nowarn' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB `
+            -WarningVariable serialWarnings -WarningAction SilentlyContinue | Out-Null
+        @($serialWarnings | Where-Object { [string]$_ -match '(?i)single DVD slot|StageAssets ISO that must|SeedIso takes the boot DVD' }).Count |
+            Should -Be 0 -Because 'the seed is not a DVD any more, so nothing competes with a StageAssets ISO for the slot'
+    }
+
+    It 'the seal certifies with the seed disk attached, and teardown deletes it' {
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
+            -Name 'sbx-serialseed-teardown' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
+        $report.SealVerdict | Should -BeTrue -Because 'a recorded SeedDiskPath is an expected disk for the gate'
+        $seedPath = [string]$report.Descriptor.SeedDiskPath
+        $seedPath | Should -Not -BeNullOrEmpty
+        (& $script:SerialB.GetVHDInfo @{ Path = $seedPath }) |
+            Should -BeNullOrEmpty -Because 'the Reaper -DeleteDisks pass deletes the seed disk (it is on CreatedDisks)'
+    }
+
+    It 'a Serial run with no entrypoint builds no seed disk (nothing will boot)' {
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload @{ Name = 'no-entrypoint' } `
+            -Name 'sbx-serialseed-noentry' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
+        [string]$report.Descriptor.SeedDiskPath | Should -BeNullOrEmpty -Because 'without an entrypoint the Serial run never boots the guest'
+        $script:FirstBoot.Taken | Should -BeFalse
+    }
+}
+
+# ===========================================================================
 #  Task 1.4 — processor (gate) wiring: Invoke-Voidseal attaches+records the DEPS
 #  disk BEFORE the seal (so Assert-Sealed accepts it) and wires the POST-DETACH
 #  Sensitivity Gate (processor workloads only). The gate runs HOST-SIDE after the

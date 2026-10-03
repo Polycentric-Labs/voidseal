@@ -261,20 +261,20 @@ function New-WorkloadDisks {
 
 <#
 .SYNOPSIS
-    Voidseal — RC6: deliver the disk-mode cloud-init NoCloud seed on a CIDATA DATA DISK that survives
-    the seal (the seal ejects DVDs; a recorded data disk stays attached through it).
+    Voidseal, RC6: deliver the cloud-init NoCloud seed (either workload mode) on a CIDATA DATA DISK
+    that survives the seal (the seal ejects DVDs; a recorded data disk stays attached through it).
 
 .DESCRIPTION
     RC6 (2026-06-25 live): the seal EJECTS the seed DVD before the guest's ONLY boot, so cloud-init had
     no datasource and the disk-mode runner never ran (the sealed deploy timed out). E8 proved cloud-init
-    NoCloud reads `user-data` + `meta-data` off a vfat DATA DISK labelled `CIDATA`. So in disk mode the
-    seed must ride a recorded data disk, NOT an ejected DVD.
+    NoCloud reads `user-data` + `meta-data` off a vfat DATA DISK labelled `CIDATA`. So the seed must
+    ride a recorded data disk, NOT an ejected DVD, in Disk mode and (since 2026-10-03) Serial mode.
 
         New-WorkloadSeedDisk -Descriptor <descriptor> -Profile <hashtable> -StorageRoot <dir> [-Backend]
 
     Creates a small CIDATA-labelled data disk (NewOutputVhdx, FAT32 — a vfat cloud-init reads), writes
-    `user-data` (= New-CidataUserData -Profile <resolved>, the disk-mode runner with the Entrypoint
-    substituted) and `meta-data` (= New-CidataMetaData) at the disk ROOT (WriteVhdxFile), ATTACHES it
+    `user-data` (= New-CidataUserData -Profile <resolved>; -Profile below says what each mode gets)
+    and `meta-data` (= New-CidataMetaData) at the disk ROOT (WriteVhdxFile), ATTACHES it
     (AddHardDiskDrive), and RECORDS it on the descriptor (a SeedDiskPath field AND a deduped append to
     CreatedDisks) BEFORE the seal — exactly like the INPUT/OUTPUT data disks — so:
       * teardown (Remove-Sandbox -DeleteDisks, CreatedDisks-authoritative) deletes it, and
@@ -297,7 +297,11 @@ function New-WorkloadDisks {
 .PARAMETER Descriptor
     The sandbox descriptor (consumed + mutated: SeedDiskPath + CreatedDisks).
 .PARAMETER Profile
-    The resolved profile (must declare WorkloadMode='Disk' + a non-blank Entrypoint).
+    The resolved profile. New-CidataUserData picks the user-data from it: in Disk mode the runner with
+    the Entrypoint substituted (so a non-blank Entrypoint is required); in Serial mode the serial-getty
+    autologin baseline, plus the in-guest egress layer for EgressMode='InGuestSquid'. A Serial
+    Entrypoint is not part of the seed; the Runner delivers it over COM1. (Serial mode joined RC6 on
+    2026-10-03: its DVD seed had been ejected by the seal before the guest's only boot, too.)
 .PARAMETER StorageRoot
     The host-side storage dir the seed disk lands in (beside the INPUT/OUTPUT data disks).
 .PARAMETER Backend
