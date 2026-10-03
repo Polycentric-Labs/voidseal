@@ -133,6 +133,12 @@ Describe 'Invoke-Voidseal — full Tier-1 happy path runs the whole state machin
         $report.TeardownStatus | Should -Match '(?i)(ok|success|destroyed|removed)' -Because 'the report records a clean teardown'
     }
 
+    It 'removes the per-VM Internal switch at teardown (a Tier-1 run leaves no vSwitch behind)' {
+        $null = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
+            -Name 'sbx-happy-sw' -ArtifactRoot $script:Art -Destination $script:Dest -Backend $script:B
+        (& $script:B.GetSwitch @{ Name = 'sbx-happy-sw-int' }) | Should -BeNullOrEmpty -Because 'the provisioner creates <vm>-int for a HyperV-Gen2 tier; teardown must remove it, or each run strands one more switch on the host'
+    }
+
     It 'the VM was actually sealed (Assert-Sealed would pass) before it ran — the run happened on a sealed VM' {
         # We cannot inspect the (now-destroyed) VM, so assert via the report: SEALED precedes RUNNING.
         $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `

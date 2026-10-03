@@ -22,6 +22,7 @@
                   workload's emitted result. Tier >= 2: routes to the quarantine stub (THROWS).
       DESTROYED   Remove-Sandbox — stop + unregister + delete the created disks. ALWAYS runs
                   (teardown is in a finally), so a mid-flow failure leaves NO orphaned VM/disk/switch.
+                  The per-VM switch the provision created is removed as well (CreatedSwitches).
 
     EVERYTHING that touches Hyper-V goes through the backend abstraction; this orchestrator and
     every component it calls NEVER touch a raw Hyper-V cmdlet. Tests inject `-Backend (New-FakeHyperVBackend)`

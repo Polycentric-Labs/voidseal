@@ -266,10 +266,12 @@ records it and tears down). Input-validation errors (bad tier, missing profile) 
 ### 1.4 Teardown is automatic
 
 Teardown runs in a `finally` — a seal-gate abort or any mid-flow failure still reaps the
-VM and deletes its created disks. To confirm nothing is orphaned after a run:
+VM, deletes its created disks, and removes the per-VM Internal switch the provision created
+(Tier 1). To confirm nothing is orphaned after a run:
 
 ```powershell
 Get-VM -Name 'sbx-*' -ErrorAction SilentlyContinue   # should not list the run's VM
+Get-VMSwitch -ErrorAction SilentlyContinue | Where-Object Name -like 'sbx-*-int'   # should be empty
 ```
 
 If you ever need a manual reap (e.g. an interrupted session):
@@ -279,6 +281,9 @@ If you ever need a manual reap (e.g. an interrupted session):
 . .\scripts\lib\ProfileLoader.ps1
 . .\scripts\lib\Provisioner.ps1
 Remove-Sandbox -Name '<vm-name>' -DeleteDisks
+# Without the run's descriptor, Remove-Sandbox cannot tell whether it owns a switch, so it leaves
+# switches alone. Remove a leftover per-VM switch by hand:
+Remove-VMSwitch -Name '<vm-name>-int' -Force        # only if Get-VMSwitch still shows it
 ```
 
 ---

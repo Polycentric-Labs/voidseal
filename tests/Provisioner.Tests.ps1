@@ -233,6 +233,11 @@ Describe 'New-SandboxVM — returns a sandbox descriptor the Sealer/Runner/Reape
     It 'descriptor lists the disks it created (so Remove-Sandbox -DeleteDisks knows what to delete)' {
         @($script:Desc.CreatedDisks).Count | Should -BeGreaterThan 0
     }
+
+    It 'descriptor lists the switch it created (teardown can only reap a switch the descriptor records)' {
+        $script:Desc.PSObject.Properties.Name | Should -Contain 'CreatedSwitches' -Because 'teardown reads CreatedSwitches to know which switch this sandbox owns'
+        @($script:Desc.CreatedSwitches) | Should -Be @('sbx-desc-int') -Because 'a Tier-1 provision creates exactly one per-VM Internal switch'
+    }
 }
 
 # ===========================================================================
@@ -718,6 +723,35 @@ Describe 'Reaper — Remove-Sandbox' {
     It 'is idempotent: calling Remove-Sandbox twice does not throw on the second call' {
         Remove-Sandbox -Name 'sbx-rm' -Backend $script:B
         { Remove-Sandbox -Name 'sbx-rm' -Backend $script:B } | Should -Not -Throw -Because 'a second teardown of the same VM is a no-op'
+    }
+
+    # The per-VM Internal switch: New-SandboxVM creates '<vm>-int' for a HyperV-Gen2 tier. Before this
+    # was recorded on the descriptor, only the mid-provision rollback ever removed it, so every
+    # completed Tier-1 run left one more vSwitch on the host.
+    It 'removes the Internal switch the provision created (a per-VM switch must not outlive its VM)' {
+        (& $script:B.GetSwitch @{ Name = 'sbx-rm-int' }) | Should -Not -BeNullOrEmpty -Because 'precondition: the Tier-1 provision created its switch'
+        Remove-Sandbox -Name 'sbx-rm' -DeleteDisks -Descriptor $script:Desc -Backend $script:B
+        (& $script:B.GetSwitch @{ Name = 'sbx-rm-int' }) | Should -BeNullOrEmpty -Because 'teardown must remove the switch it created, or each Tier-1 run strands one more vSwitch on the host'
+    }
+
+    It 'removes the created switch without -DeleteDisks too (disks may be kept for inspection; a switch with no VM serves nothing)' {
+        Remove-Sandbox -Name 'sbx-rm' -Descriptor $script:Desc -Backend $script:B
+        (& $script:B.GetSwitch @{ Name = 'sbx-rm-int' }) | Should -BeNullOrEmpty
+    }
+
+    It 'still removes the created switch when the VM is already gone (an earlier teardown stopped part-way)' {
+        & $script:B.RemoveVM @{ Name = 'sbx-rm' }
+        (& $script:B.GetSwitch @{ Name = 'sbx-rm-int' }) | Should -Not -BeNullOrEmpty -Because 'precondition: only the VM is gone'
+        Remove-Sandbox -Name 'sbx-rm' -DeleteDisks -Descriptor $script:Desc -Backend $script:B
+        (& $script:B.GetSwitch @{ Name = 'sbx-rm-int' }) | Should -BeNullOrEmpty -Because 'a re-run teardown must converge; the descriptor still says which switch this sandbox owns'
+    }
+
+    It 'leaves a PRE-EXISTING switch the provision did not create (the same ownership rule the rollback follows)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewSwitch @{ Name = 'sbx-shared-int'; SwitchType = 'Internal' }   # exists before the provision
+        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-shared' -Backend $b
+        Remove-Sandbox -Name 'sbx-shared' -DeleteDisks -Descriptor $d -Backend $b
+        (& $b.GetSwitch @{ Name = 'sbx-shared-int' }) | Should -Not -BeNullOrEmpty -Because 'the provision reused a switch it did not create, so teardown must not reap it'
     }
 }
 

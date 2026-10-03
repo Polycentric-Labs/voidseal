@@ -695,13 +695,16 @@ Manual reap (any orphan from an interrupted run) — idempotent, safe to re-run:
 . .\scripts\lib\ProfileLoader.ps1
 . .\scripts\lib\Provisioner.ps1
 Remove-Sandbox -Name '<orphan vm name>' -DeleteDisks
-# If a vSwitch lingers (rare — the provisioner reaps switches it created on rollback):
+# Teardown and the provisioning rollback both remove the switch a run created, so a lingering
+# vSwitch means an interrupted run. Without a descriptor Remove-Sandbox leaves switches alone:
 Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows it
 ```
 
 > `Remove-Sandbox` stops the VM if running, unregisters it, and (with `-DeleteDisks`) deletes
 > the disks. Without a `-Descriptor` it deletes whatever disks were attached; the **golden
-> parent** is never touched (the run only ever creates a **differencing child**).
+> parent** is never touched (the run only ever creates a **differencing child**). With a
+> `-Descriptor` it also removes the switch the provision created (`CreatedSwitches`), and it never
+> removes a switch it did not create.
 
 ---
 

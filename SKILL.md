@@ -108,6 +108,7 @@ mismatch is a caller error and throws). See the full parameter list in the
 - **CAPTURED** — the run-result + its host-side capture artifact are recorded **out-of-band** (P8 — never trust the guest to self-report).
 - **EXTRACTED** — `Export-SandboxArtifact`, one-way OUT. Tier 0/1: a trusting host-read of the emitted result. **Tier ≥ 2: routes to the quarantine sink, which THROWS** (the cold-VHDX/CDR flow is post-v1) — a hostile-tier artifact is never trustingly copied to the host.
 - **DESTROYED** — `Remove-Sandbox` stops + unregisters + deletes the created disks. Teardown **always runs** (in a `finally`), so a mid-flow failure leaves no orphan.
+  Teardown also removes the per-VM Internal switch the provision created (Tier 1).
 
 ## The two v1 workload profiles
 
