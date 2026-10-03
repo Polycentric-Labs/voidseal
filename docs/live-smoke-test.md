@@ -29,7 +29,7 @@ hand. **Read all four before milestone 1.**
 | # | Gap (verified against the built code) | What it means for a live run |
 |---|---|---|
 | **Gap 1** | **Tier 0 provisions a Hyper-V VM, not a container.** `New-SandboxVM` is Hyper-V-only; the `Substrate='Container'` value in `tier0.psd1` only causes the network block (`if ($Profile['Substrate'] -eq 'HyperV-Gen2')`) to be **skipped** — so a Tier-0 VM is a real **Gen2 VM with no NIC**. Documented in SKILL.md + tier-reference.md. | The `firefox` proof boots a **Debian Gen2 VM** (offline, no NIC), *not* `docker sbx`. You **must** pass `-ParentDiskPath` to the same golden Debian `.vhdx` you build for Tier 1 (tier0's `GuestImage='debian-12-slim'` is a container-image label the engine ignores — there is no container runtime to honor it). |
-| **Gap 2** | **Profile `Mounts` are NOT wired into the guest.** The only consumer of `Mounts` is `Assert-NoSecretMounts` (secret-shape validation). Nothing in the Provisioner/Runner attaches a host↔guest bind mount (the backend has no 9p/virtiofs/SMB mount method). | The firefox input/output dirs and Ralph's OAuth-token + workdir mounts **will not appear inside the guest automatically.** You must get those files in by a channel the engine *does* wire: **`StageAssets`** (each key attaches as a **read-only ISO**) or a manually-attached transfer VHDX, or bake them into the **CIDATA seed**. Plan the data path before you run. |
+| **Gap 2** | **Profile `Mounts` are NOT wired into the guest.** The only consumer of `Mounts` is `Assert-NoSecretMounts` (secret-shape validation). Nothing in the Provisioner/Runner attaches a host↔guest bind mount (the backend has no 9p/virtiofs/SMB mount method). | The firefox input/output dirs and Ralph's OAuth-token + workdir mounts **will not appear inside the guest.** Only Disk-mode **`Inputs`** (the INPUT data disk) reaches a running workload, which is how firefox works now (§4A). A **`StageAssets`** ISO is attached and then ejected by the seal before the guest's only boot; a transfer VHDX attached by hand is an unrecorded disk that `Assert-Sealed` refuses; and the engine builds the **CIDATA seed** from the profile, so it cannot carry your files. A Serial profile such as Ralph has no file channel at all today. Plan the data path before you run. |
 | **Gap 3** | **The result must land on a host-readable path for extraction.** `Export-SandboxArtifact` (Tier 0/1) does a host **filesystem** read of `-Workload.ResultPath`. Because of Gap 2 there is no automatic shared dir, so a `ResultPath` like `C:\sandbox\...\out\bookmarks.html` is **not** populated by the guest through a bind mount. | Decide how the guest's output reaches a host path: e.g. the workload writes to an **attached output VHDX** you then mount/read on the host, or you copy it out over the serial seam. For this smoke test you may stage a **pre-seeded `ResultPath` file** to drive the extraction step to green (see §3/§2) while you validate the *boundary*, and treat real guest-produced output as a follow-up once a transfer-out path is wired. |
 | **Gap 4** | **The COM1 serial transport is live-only and best-effort v1.** `InvokeGuestCommand` (the real backend) opens `\\.\pipe\<vm>-com1` as a `NamedPipeClientStream`, writes `<cmd>; echo "__VMDEP_RC__:$?"`, and parses the RC marker. It is **never** exercised against a real guest (the fake carries all behavioral tests). It has **no per-command nonce** yet (deferred). | This is the single biggest live unknown. The guest **must** have `serial-getty@ttyS0` enabled with **autologin** (no password prompt — the client doesn't authenticate) and a shell that echoes the marker. If the pipe is unreachable or there's a login prompt, the Runner **times out** (`TimeoutSeconds`, default 300) and the run is reported as a failure — teardown still runs. |
 
@@ -243,12 +243,12 @@ at the live profile, and never at `logins.json` / `key4.db` / `cookies.sqlite`.
 
 ### 3.2 Stage the data path (Gap 2 / Gap 3)
 
-Because `Mounts` are not wired (Gap 2), get the organizer script + the sample profile into the
-guest via **`StageAssets`** (read-only ISO) — the organizer ISO key in `firefox.psd1`
-(`C:\sandbox\assets\firefox-organizer.iso`) must **exist on disk** for the live run. Decide
-how the guest's emitted HTML reaches a host path (Gap 3); for this smoke test you may pre-seed
-the `ResultPath` to drive the extraction boundary to green while the transfer-out path is a
-follow-up.
+Neither `Mounts` (Gap 2) nor `StageAssets` gets the organizer script or the sample profile into
+the guest: a `StageAssets` ISO is attached before the seal and ejected by it before the guest's
+only boot, and `firefox.psd1` no longer declares one. They reach the guest only on Disk mode's
+INPUT disk, which is how firefox runs now (§4A). For this boundary-focused milestone, decide how
+the guest's emitted HTML reaches a host path (Gap 3); you may pre-seed the `ResultPath` to drive
+the extraction boundary to green while the transfer-out path is a follow-up.
 
 ```powershell
 # Pre-create the host-side result path so the EXTRACTED step has a file to read (Gap 3 stand-in).
@@ -326,11 +326,13 @@ what this milestone is the first live test of (see §5.2).
 ### 4.1 Pin the upstream SHA (placeholder in `ralph.psd1`)
 
 `frankbria/ralph-claude-code` is **bash, has no tags** → pin a **commit SHA**, never a tag.
-In `profiles/ralph.psd1`, the `StageAssets` value documents `@ <PIN-COMMIT-SHA>` — replace
-that with the exact commit you vendored, then build the read-only ISO the key points at
-(`C:\sandbox\assets\ralph-claude-code.iso`) from the repo at that SHA. The ISO **must exist
-on disk** for the live run (Gap 2 — this is the wired channel that actually lands the repo in
-the guest, read-only to `/opt/ralph`).
+In `profiles/ralph.psd1`, the `StageAssets` value records `@ <PIN-COMMIT-SHA>` as a note; replace
+it with the exact commit you vendored. A file must exist at the key's path
+(`C:\sandbox\assets\ralph-claude-code.iso`) or the STAGED import fails closed, but that ISO does
+**not** land the repo in the guest: the seal ejects it before the guest's only boot, and nothing in
+the guest mounts it. Ralph's `Entrypoint` runs `/opt/ralph/ralph-claude-code/ralph_loop.sh`, so for
+a live run the repo at that SHA must already be in the golden image at that path, or this milestone
+waits for a wired delivery channel.
 
 ### 4.2 The Claude OAuth token — file-to-file, **never** paste a token
 
@@ -348,10 +350,11 @@ Copy-Item "$env:USERPROFILE\.claude\.credentials.json" "$dest\agent.token"
 
 The `ralph.psd1` profile references **that** `.token` path (`C:\sandbox\agent-cred\agent.token`).
 The `.token` leaf is not on the refusal list, so the profile loads. **Caveat (Gap 2):** the
-profile's `Mounts` are validated but **not wired into the guest**, so getting the token file
-*into* the sealed VM is **not** automatic — bake it into the CIDATA seed or a StageAssets ISO
-by hand (read-only), or accept that the live loop authenticates only once a token-delivery
-channel is wired. Either way: **rotate the token after any session that touched it.**
+profile's `Mounts` are validated but **not wired into the guest**, and no other channel can carry
+the token today: a `StageAssets` ISO is ejected by the seal before the guest's only boot, the
+engine builds the CIDATA seed from the profile, and a Serial profile gets no INPUT disk. Until a
+token-delivery channel is wired, the live loop cannot authenticate. **Rotate the token after any
+session that touched it.**
 
 ### 4.3 The live invocation
 
@@ -499,8 +502,8 @@ copy for the live run.
 > as a transport fault rather than a workload one. `New-CidataUserData` now refuses to build a seed
 > for an outbox-transport profile whose entrypoint names `/mnt/out`.
 
-(Don't worry about the OLD `firefox.psd1` `Mounts`/`StageAssets`/`/work/out`
-comments — those are the superseded serial/container-era mechanism; Disk mode uses the data disks.)
+(Ignore the `Mounts` block in `firefox.psd1`: it is declared only and moves nothing, including its
+`/work/out` target. Disk mode uses the data disks.)
 
 > **★ HARD PRE-RUN GATE — validate the organizer on the host first.** The organizer lives *outside*
 > this repo (`C:\sandbox\organizer-src\`); no test and no reviewer has exercised it, yet it is the

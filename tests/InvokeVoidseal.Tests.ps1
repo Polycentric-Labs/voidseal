@@ -76,6 +76,24 @@ BeforeAll {
         Set-Content -LiteralPath $resFile -Value "artifact-for-$Tag" -NoNewline -Encoding utf8
         return @{ Entrypoint = 'bash run.sh'; ResultPath = $resFile; Name = $Tag }
     }
+
+    # Wrap a fake backend's StartVM so it records the attached disks and DVDs at the moment the guest
+    # would FIRST boot. The fake never boots a guest, so this snapshot is how a test sees what cloud-init
+    # or a workload could actually find (used by the Serial-seed and StageAssets Describes below).
+    function script:New-FirstBootProbe {
+        param($Backend)
+        $snap = [ordered]@{ Taken = $false; HardDrives = @(); DvdDrives = @() }
+        $origStartVM = $Backend.StartVM
+        $Backend.StartVM = {
+            param($P)
+            $vm = & $Backend.GetVM @{ Name = $P.Name }
+            $snap.HardDrives = @($vm.HardDrives)
+            $snap.DvdDrives  = @(& $Backend.GetDvdDrives @{ VMName = $P.Name } | ForEach-Object { $_ } | Where-Object { $_ })
+            $snap.Taken      = $true
+            & $origStartVM $P
+        }.GetNewClosure()
+        return $snap
+    }
 }
 
 AfterAll {
@@ -627,22 +645,6 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
 Describe 'Invoke-Voidseal: Serial mode seeds the guest on a CIDATA data disk that survives the seal' {
 
     BeforeAll {
-        # Wrap the fake's StartVM so it records the attached disks and DVDs at the guest's FIRST boot.
-        function script:New-FirstBootProbe {
-            param($Backend)
-            $snap = [ordered]@{ Taken = $false; HardDrives = @(); DvdDrives = @() }
-            $origStartVM = $Backend.StartVM
-            $Backend.StartVM = {
-                param($P)
-                $vm = & $Backend.GetVM @{ Name = $P.Name }
-                $snap.HardDrives = @($vm.HardDrives)
-                $snap.DvdDrives  = @(& $Backend.GetDvdDrives @{ VMName = $P.Name } | ForEach-Object { $_ } | Where-Object { $_ })
-                $snap.Taken      = $true
-                & $origStartVM $P
-            }.GetNewClosure()
-            return $snap
-        }
-
         # The user-data the run wrote onto its seed disk (the disk itself is gone after teardown, so read
         # the fake's persistent write log).
         function script:Get-SeedUserData {
@@ -747,6 +749,67 @@ Describe 'Invoke-Voidseal: Serial mode seeds the guest on a CIDATA data disk tha
             -Name 'sbx-serialseed-noentry' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
         [string]$report.Descriptor.SeedDiskPath | Should -BeNullOrEmpty -Because 'without an entrypoint the Serial run never boots the guest'
         $script:FirstBoot.Taken | Should -BeFalse
+    }
+}
+
+# ===========================================================================
+#  StageAssets reach no running workload. Invoke-Voidseal attaches each key as a
+#  read-only ISO before the seal, the seal ejects every DVD before the guest's only
+#  boot, and nothing in the guest would mount it anyway. Several docs presented
+#  StageAssets as a delivery channel (one as the channel that lands ralph's repo in
+#  the guest). These checks pin the behavior and tie the field's doc rows to it.
+# ===========================================================================
+Describe 'StageAssets: attached before the seal, gone when the guest first boots (the docs must say so)' {
+
+    BeforeEach {
+        $script:StageIso  = Join-Path $script:TmpRoot ("stage-asset-{0}.iso" -f ([guid]::NewGuid().ToString('N')))
+        Set-Content -LiteralPath $script:StageIso -Value 'placeholder-asset' -NoNewline -Encoding ascii
+        $script:StageArt  = Join-Path $script:TmpRoot ("art-stage-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $script:StageDest = Join-Path $script:TmpRoot ("dest-stage-{0}" -f ([guid]::NewGuid().ToString('N')))
+    }
+
+    It 'Serial mode: a declared StageAssets ISO is attached at STAGED but not when the guest first boots' {
+        $b = New-FakeHyperVBackend
+        $firstBoot = script:New-FirstBootProbe -Backend $b
+        $p = $script:Tier1.Clone()
+        $p['StageAssets'] = @{ $script:StageIso = 'synthetic test payload' }
+        $report = Invoke-Voidseal -Tier 1 -Profile $p -Workload (& $script:NewWorkload -Tag 'stage-serial') `
+            -Name 'sbx-stage-serial' -ArtifactRoot $script:StageArt -Destination $script:StageDest -Backend $b
+        $report.Error | Should -BeNullOrEmpty
+        $imported = $report.Descriptor.PSObject.Properties['ImportedMedia']
+        @(if ($null -ne $imported) { $imported.Value }) | Should -Contain $script:StageIso -Because 'precondition: STAGED did attach the ISO'
+        $firstBoot.Taken | Should -BeTrue -Because 'the Serial run must reach StartVM'
+        @($firstBoot.DvdDrives).Count | Should -Be 0 -Because 'the seal ejects every DVD before the guest''s only boot, so the workload never sees the ISO'
+    }
+
+    It 'Disk mode: a declared StageAssets ISO is not attached when the guest first boots' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $firstBoot = script:New-FirstBootProbe -Backend $b
+        $p = @{} + (Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1'))
+        $p['Name']         = 'stage-disk-test'
+        $p['WorkloadMode'] = 'Disk'
+        $p['OutboxOutput'] = $true
+        $p['Inputs']       = @{}
+        $p['Entrypoint']   = 'python3 /mnt/in/task.py --out /run/staging/result.html'
+        $p['StageAssets']  = @{ $script:StageIso = 'synthetic test payload' }
+        # No outbox blob is simulated, so the run fails its result read after StartVM; only the media
+        # present at first boot matter here.
+        Invoke-Voidseal -Tier 0 -Profile $p -Name 'sbx-stage-disk' -ArtifactRoot $script:StageArt `
+            -Destination $script:StageDest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b `
+            -WarningAction SilentlyContinue | Out-Null
+        $firstBoot.Taken | Should -BeTrue -Because 'the Disk run must reach StartVM'
+        @($firstBoot.DvdDrives).Count | Should -Be 0 -Because 'the seal ejects every DVD before the guest''s only boot; Disk-mode files travel on the INPUT disk instead'
+    }
+
+    It '<File> says a StageAssets ISO is ejected before the guest boots' -ForEach @(
+        @{ File = 'tier-profiles/SCHEMA.md' }
+        @{ File = 'docs/authoring-a-workload-profile.md' }
+    ) {
+        $row = @(Get-Content -LiteralPath (Join-Path $script:SkillRoot $File) | Where-Object { $_ -match '^\|\s*`StageAssets`\s*\|' })
+        $row.Count | Should -Be 1 -Because "$File documents the field in exactly one table row"
+        $row[0] | Should -Match '(?i)eject' -Because "$File must say the seal ejects the ISO"
+        $row[0] | Should -Match '(?i)before the guest''s (only|first) boot' -Because "$File must say it happens before the guest ever runs"
+        $row[0] | Should -Not -Match '(?i)one-way IN|delivery field|hash-pin' -Because 'nothing in a StageAssets ISO reaches the guest, and no hash is checked on this path'
     }
 }
 

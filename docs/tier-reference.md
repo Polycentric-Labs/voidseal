@@ -101,6 +101,9 @@ until verified-isolation green-light).
   (read-only ISO, large transfer-VHDX attach→copy→**scripted detach**) → hash/sig verify
   in-guest → checkpoint golden → **seal**. Small/known-good = read-only ISO; large =
   transfer-VHDX (not inherently one-way → scripted detach).
+  **Not built in v1:** `Invoke-Voidseal` never boots the guest before the seal, so nothing is staged
+  into it this way; a `StageAssets` ISO is attached and then ejected before the guest's only boot.
+  The only file channel that reaches a running workload is Disk mode's INPUT disk (`Inputs`).
 - **Extraction (one-way OUT):**
   - **T0/T1** — host reads a designated result dir / the workload writes artifacts the host
     collects out-of-band. (Low risk: these tiers aren't running presumed-hostile code.)

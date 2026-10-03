@@ -84,11 +84,11 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 |---|---|---|---|
 | `BaseTier` | **yes** | int selecting which `tier-profiles/tier<N>.psd1` to inherit | must resolve to an existing tier file |
 | `Name` | **yes** | the profile id | convention: matches the filename (minus `.psd1`) |
-| `Entrypoint` | **yes** | the command the Runner delivers | **Serial mode** (the default): delivered over the COM1 serial seam to the sealed guest. **Disk mode**: injected into the seed's disk-mode runner in place of `__ENTRYPOINT__`; by shipped convention it reads from `/mnt/in` and writes to `/mnt/out/result.html` (the engine's default result inner-name) |
+| `Entrypoint` | **yes** | the command the Runner delivers | **Serial mode** (the default): delivered over the COM1 serial seam to the sealed guest. **Disk mode**: substituted for `__ENTRYPOINT__` in the runner the engine writes into the seed. For an `OutboxOutput` or processor profile (the only Disk shapes `Invoke-Voidseal` accepts) it reads `/mnt/in` and writes its result into `/run/staging/` (`result.html` unless you pass `ResultInnerName`), which the in-guest producer packs into the outbox; `/mnt/out` is never mounted there, and a seed whose `Entrypoint` names it is refused |
 | `Packages` | no | extra guest packages staged **before** the seal, over the still-open pre-seal allowlist window | array of strings |
 | `Mounts` | no | **declared but not wired**: host→guest bind mounts that nothing attaches. The loader screens the field and merges it onto the tier, but no provisioner, runner or backend method reads it (the backend has no 9p, virtiofs or SMB method), so it moves no file in or out in either workload mode. §4 Step 4 lists the channels that do carry data | every **source** key is refused if secret-shaped (invariant 1, see §2.3). The screen runs on every profile even though nothing consumes the field at runtime, a deliberate regression guard (see `firefox.psd1`) |
 | `ExtraAllowlist` | no | FQDNs unioned onto the tier's `EgressAllowlist` | deduped case-insensitively; each entry still passes the tier's hostname-charset check |
-| `StageAssets` | no | host source → pin-documentation string; assets pre-pulled and hash-pinned, attached **read-only before the seal** (one-way IN) | the **key** is the host path the Importer attaches (e.g. an ISO) |
+| `StageAssets` | no | host source path → a free-text pin note (for example a commit SHA). `Invoke-Voidseal` attaches each key as a read-only ISO before the seal, and the seal **ejects it before the guest's only boot**, so nothing in it reaches a running workload; use Disk-mode `Inputs` for files | the **key** must exist on the host (the import fails closed on a missing file) and is screened by invariant 1; no hash is checked on this path |
 | `SeedIso` | no | **not read by `Invoke-Voidseal`**: only the default output path for `New-CidataSeed` when you build a seed ISO by hand | the engine builds the cloud-init seed itself, from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (see §4 Step 6); a seed DVD would be ejected by the seal before the guest's only boot; not secret-shaped, so a `.iso` path is accepted |
 | `WorkloadMode` | no — default `'Serial'` | selects the delivery mechanism: `'Serial'` (COM1 entrypoint delivery) or `'Disk'` (seed-injected disk-mode runner + INPUT/OUTPUT data disks) | **not yet listed in `tier-profiles/SCHEMA.md`** — ProfileLoader-only today. `ralph.psd1` uses the implicit `'Serial'` default; `firefox.psd1`/`builder.psd1` set `'Disk'` explicitly |
 | `Inputs` | no (Disk-mode) | innerName → CONTENT written onto the INPUT data disk by `New-WorkloadDisks` | ships `@{}` in both shipped Disk-mode profiles — real content is folded in at run/live-acceptance time, not baked into the `.psd1` (a `.psd1` is static data; inlining a whole script as a here-string is unreadable/brittle) |
@@ -109,11 +109,12 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 
 ### 2.3 The five loader invariants (fail closed — these THROW, they never warn)
 
-1. **Secret-file mount refusal** — any `Mounts` **source** matching a secret-shaped pattern
-   (`.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`,
+1. **Secret-file mount refusal:** any `Mounts` or `StageAssets` **source** matching a secret-shaped
+   pattern (for example `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`,
    `credentials*.json`, `.credentials.json`, `.npmrc`, `.pypirc`, `*-service-account.json`,
    anything under a `.secrets/`/`.ssh/` dir, or the adjacent `~/.aws/credentials`,
-   `~/.kube/config`, `~/.docker/config.json` pairs) is refused — full stop, regardless of tier.
+   `~/.kube/config`, `~/.docker/config.json` pairs; `tier-profiles/SCHEMA.md` has the full list) is
+   refused, full stop, regardless of tier.
    See `ralph.psd1`'s comment block for the documented workaround: copy the real credential to a
    non-secret-shaped `.token` file and declare *that*. The copy passes the screen, but like every
    `Mounts` entry it never reaches the guest (§2.2).
@@ -139,7 +140,7 @@ takes effect:
 |---|---|---|
 | `INIT` | your workload profile loads, merges onto its `BaseTier`, and is re-validated against every invariant above | all of §2.1/§2.2 |
 | `PROVISIONED` | `New-SandboxVM` creates the substrate | `Substrate`, `Memory`, `Cpu`, `GuestImage`, `SecureBootTemplate`, `Network` |
-| `STAGED` | `Import-SandboxAsset` attaches any `StageAssets` **read-only, one-way IN**, and `New-WorkloadSeedDisk` builds the cloud-init seed on a `CIDATA` data disk for any run that will boot (Disk mode also builds its INPUT/OUTPUT disks here) | `StageAssets`; the seed comes from the resolved profile |
+| `STAGED` | `Import-SandboxAsset` attaches any `StageAssets` as a read-only ISO (ejected again at `SEALED`, before the guest boots), and `New-WorkloadSeedDisk` builds the cloud-init seed on a `CIDATA` data disk for any run that will boot (Disk mode also builds its INPUT/OUTPUT disks here) | `StageAssets`; the seed comes from the resolved profile |
 | `SEALED` | `Lock-Sandbox` ejects import media (any `StageAssets` ISO; the seed disk stays attached) and disconnects host↔guest channels, then `Assert-Sealed` runs as a **hard gate**: if it throws, the deploy aborts *here*, the workload never runs, and the VM is torn down | `HostChannels`, `Network` |
 | `RUNNING` | your `Entrypoint` runs in the sealed guest. **Serial mode**: `Start-SandboxWorkload` boots the guest and sends the command over the COM1 seam, and the command's stdout and stderr come back the same way into the host-side run capture (there are no data disks, and `Mounts` is not wired); **Disk mode**: the guest boots straight into the seed-injected runner, mounts `INPUT` read-only / `OUTPUT` read-write, runs your `Entrypoint`, writes the result + an exit-code sentinel, and self-powers-off | `Entrypoint` (Serial) or `WorkloadMode`/`Inputs`/`FileSystem`/`InputLabel`/`OutputLabel` (Disk) |
 | `CAPTURED` | the run result + host-side capture artifact are recorded | `Capture` |
@@ -258,12 +259,15 @@ from-scratch skeleton above, copy `profiles/firefox.psd1` and strip it down:
 
 1. `Copy-Item profiles/firefox.psd1 profiles/<your-name>.psd1`.
 2. Change `Name` to `<your-name>`.
-3. Replace `InputFiles` (and the content your live-acceptance step folds into `Inputs`) with your
-   own script(s) + sample/synthetic input data — never real personal data by default (see the
-   DATA-ACCESS rule in `firefox.psd1`'s header).
-4. Change `Entrypoint` to invoke your script, keeping the `/mnt/in` → `/mnt/out/result.html`
-   contract (or pass a different `ResultInnerName` via a `-Workload` override — see
-   `docs/operator-runbook.md` §1.1).
+3. Replace the organizer entries in `InputFiles` (and the content your live-acceptance step folds
+   into `Inputs`) with your own script(s) + sample/synthetic input data, but keep
+   `run_disk_workload.py` and `outbox.py`: the outbox runner runs the first from `/mnt/in`, and it
+   needs the second beside it. Never use real personal data by default (see the DATA-ACCESS rule in
+   `firefox.psd1`'s header).
+4. Change `Entrypoint` to invoke your script: read from `/mnt/in` and write the result into
+   `/run/staging/` (`/run/staging/result.html` by default; pass a different `ResultInnerName` via a
+   `-Workload` override, as in `docs/operator-runbook.md` §1.1). `/mnt/out` is never mounted for an
+   outbox profile, and a seed whose `Entrypoint` names it is refused.
 5. Drop the firefox-specific comments/`ExtraAllowlist` if your task doesn't need them.
 
 This gets you the Disk-mode shape with the INPUT/OUTPUT-disk plumbing, the shared outbox producer

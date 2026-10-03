@@ -32,10 +32,10 @@
 | `BaseTier` | int | which tier profile to inherit |
 | `Name` | string | profile id (matches filename) |
 | `Packages` | string[] | (opt) extra guest packages staged before seal |
-| `Mounts` | hashtable | (opt) **declared but NOT wired into the guest** — nothing in the Provisioner or Runner attaches a host-guest bind mount (`docs/live-smoke-test.md` Gap 2). The loader still screens its source keys for secret-shaped paths. Use `StageAssets`, Disk-mode `Inputs`, or the seed to actually deliver files |
+| `Mounts` | hashtable | (opt) **declared but NOT wired into the guest**: nothing in the Provisioner or Runner attaches a host-guest bind mount (`docs/live-smoke-test.md` Gap 2). The loader still screens its source keys for secret-shaped paths. Files reach a running workload only through Disk-mode `Inputs`: a `StageAssets` ISO is ejected by the seal before the guest's only boot, and the seed is built from the profile |
 | `Entrypoint` | string | workload command run by the Runner |
 | `ExtraAllowlist` | string[] | (opt) additional FQDNs unioned onto the tier allowlist |
-| `StageAssets` | hashtable | (opt) weights/caches/repos to pre-pull + hash-pin before seal. This is the delivery field the orchestrator actually imports (`Import-SandboxAsset`), and its source keys are screened by invariant 1 below |
+| `StageAssets` | hashtable | (opt) host source path → a free-text pin note (for example a commit SHA; no hash is checked on this path). `Invoke-Voidseal` attaches each key as a read-only ISO before the seal (`Import-SandboxAsset -As Iso`, which fails closed on a missing file), and the seal ejects it before the guest's only boot, so nothing in it reaches a running workload; use Disk-mode `Inputs` for that. Its source keys are still screened by invariant 1 below |
 | `SeedIso` | string | (opt) **not read by `Invoke-Voidseal`.** Only `New-CidataSeed` uses it, as the default output path for a `CIDATA` seed ISO built by hand. The engine builds the cloud-init seed itself from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (`New-WorkloadSeedDisk`), for every run that boots a guest: in Serial mode serial-getty autologin on ttyS0 (the Runner's command channel), the run-user and the seed's packages, plus the in-guest egress layer for an `InGuestSquid` profile; in Disk mode the disk-mode runner. A seed DVD would be ejected by the seal before the guest's only boot. |
 
 ## Loader invariants (MUST be enforced by `Import-TierProfile` / `Import-WorkloadProfile`; these are must-pass tests)

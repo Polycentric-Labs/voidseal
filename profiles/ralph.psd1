@@ -17,8 +17,8 @@
     #   via --allowedTools). The VM is the real trust boundary; --allowedTools is
     #   defense-in-depth, not the containment. Ralph state lives in `.ralph/` in the
     #   target repo (PROMPT.md, logs/, status.json). Loop config via env in the guest
-    #   (MAX_CALLS_PER_HOUR, CLAUDE_TIMEOUT_MINUTES, etc.) — set in the seed/cloud-init,
-    #   not here.
+    #   (MAX_CALLS_PER_HOUR, CLAUDE_TIMEOUT_MINUTES, etc.), set on the Entrypoint command
+    #   line because the engine-built seed does not set them; not here.
     #
     # RUNTIME: Claude Code runs on the BARE Debian VM — NO nested
     #   devcontainer. The VM boundary replaces the privileged-devcontainer-for-bwrap
@@ -51,8 +51,10 @@
     # ------------------------------------------------------------------
     # Entrypoint — the Runner delivers this over the COM1 serial seam to the
     # sealed Debian guest (PowerShell Direct is Windows-guest-only). It runs
-    # the loop from where StageAssets dropped the pinned repo. `bash ralph_loop.sh`
-    # is the verified invocation (NOT npm, NOT a binary).
+    # the loop from /opt/ralph/ralph-claude-code, which nothing in Voidseal puts
+    # there today: the StageAssets ISO below never reaches the guest. A live run
+    # needs the pinned repo already in the golden image at that path.
+    # `bash ralph_loop.sh` is the verified invocation (NOT npm, NOT a binary).
     # ------------------------------------------------------------------
     Entrypoint = 'bash /opt/ralph/ralph-claude-code/ralph_loop.sh'
 
@@ -71,19 +73,21 @@
     )
 
     # ------------------------------------------------------------------
-    # StageAssets — pre-pulled + hash-pinned BEFORE the seal (one-way IN). The
-    # KEY is the host source the Importer attaches (read-only ISO) into the guest;
-    # the VALUE documents the pin. Ralph has NO tags so we pin a COMMIT SHA.
+    # StageAssets: does NOT reach the guest. Invoke-Voidseal attaches the KEY (a host
+    # file) as a read-only ISO before the seal, and the seal ejects it before the
+    # guest's only boot; nothing in the guest mounts it either. The file must still
+    # exist, or the STAGED import fails closed. The VALUE is a free-text pin note
+    # (no hash is checked). Ralph has NO tags, so the note pins a COMMIT SHA.
     #
     # >>> PIN THE SHA before a live run <<<  Replace <PIN-COMMIT-SHA> with the
     # exact frankbria/ralph-claude-code commit you vendored (e.g. the `main` HEAD
-    # you verified). The host-side prep clones the repo at that SHA, verifies it,
-    # and builds the read-only ISO this key points at. The path below is a
-    # PLACEHOLDER host location for that prepared, SHA-pinned asset bundle — it is
-    # NOT secret-shaped, so the loader accepts it.
+    # you verified), and put the repo at that SHA into the golden image at
+    # /opt/ralph/ralph-claude-code: that is the path the Entrypoint runs, and this
+    # ISO cannot deliver it. The key below is a PLACEHOLDER host path; it is NOT
+    # secret-shaped, so the loader accepts it.
     # ------------------------------------------------------------------
     StageAssets = @{
-        'C:\sandbox\assets\ralph-claude-code.iso' = 'frankbria/ralph-claude-code @ <PIN-COMMIT-SHA> (bash; NO tags exist -> pin a SHA, never a tag). Verify SHA before build; mounts read-only to /opt/ralph.'
+        'C:\sandbox\assets\ralph-claude-code.iso' = 'frankbria/ralph-claude-code @ <PIN-COMMIT-SHA> (bash; NO tags exist -> pin a SHA, never a tag). Pin note only: this ISO is ejected before the guest boots and is never mounted at /opt/ralph.'
     }
 
     # ------------------------------------------------------------------
@@ -114,10 +118,11 @@
     #   The mount KEY below points at THAT copied token file. IMPORTANT: nothing attaches it.
     #   Mounts are declared and secret-path-screened but NOT wired into the guest (no component
     #   attaches a host-guest bind mount; see docs/live-smoke-test.md Gap 2), so the ':ro' suffix
-    #   records intent only and the token does NOT reach the guest through this block. A live ralph
-    #   run must deliver the token by a wired channel (bake it into the CIDATA seed or a StageAssets
-    #   ISO, read-only) or authenticate some other way. Rotate the token after any session that
-    #   touched it.
+    #   records intent only and the token does NOT reach the guest through this block. No other
+    #   channel carries it today either: a StageAssets ISO is ejected by the seal before the guest's
+    #   only boot, and the engine builds the CIDATA seed from the profile. Until a token-delivery
+    #   channel is wired, a live ralph run cannot authenticate. Rotate the token after any session
+    #   that touched it.
     #
     #   This passes Import-WorkloadProfile because the SOURCE path is not
     #   secret-shaped (a `.token` leaf in a `claude-oauth` dir — neither the leaf
