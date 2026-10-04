@@ -348,6 +348,28 @@ function Get-DataDiskLabel {
 
 <#
 .SYNOPSIS
+    Why a data disk path is unacceptable as written, or $null when its shape is fine.
+.DESCRIPTION
+    The path-shape rules shared by the DataDisks declaration and scripts/New-VoidsealDataDisk.ps1:
+    a local, fully qualified drive-letter path (no UNC, device namespace or relative form), no
+    control character, no alternate data stream, ending in .vhdx before and after canonicalization.
+    Pure string inspection. Secret-shaped paths are checked separately (Test-IsSecretPath).
+#>
+function Get-DataDiskPathProblem {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()] [AllowEmptyString()] [string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'it is blank' }
+    if ($Path -match '[\x00-\x1f]')          { return 'it contains a control character' }
+    if ($Path -notmatch '^[A-Za-z]:\\')      { return 'it is not a local, fully qualified drive-letter path (UNC, device and relative paths are refused)' }
+    if ($Path.IndexOf(':', 2) -ge 0)         { return 'it names an alternate data stream' }
+    if ($Path -notmatch '(?i)\.vhdx$')       { return 'it does not end in .vhdx' }
+    if ([System.IO.Path]::GetFullPath($Path) -notmatch '(?i)\.vhdx$') { return 'it does not resolve to a .vhdx file' }
+    return $null
+}
+
+<#
+.SYNOPSIS
     Validate a DataDisks declaration and return it normalized (fail-closed, path strings only).
 .DESCRIPTION
     Accepts $null (no data disks), one hashtable, or an array of hashtables. Each entry must carry
@@ -391,19 +413,11 @@ function ConvertTo-DataDiskList {
         }
 
         $path = if ($e.Contains('Path')) { [string]$e['Path'] } else { '' }
-        $why = $null
-        if ([string]::IsNullOrWhiteSpace($path))                   { $why = 'it is blank' }
-        elseif ($path -match '[\x00-\x1f]')                         { $why = 'it contains a control character' }
-        elseif ($path -notmatch '^[A-Za-z]:\\')                     { $why = 'it is not a local, fully qualified drive-letter path (UNC, device and relative paths are refused)' }
-        elseif ($path.IndexOf(':', 2) -ge 0)                        { $why = 'it names an alternate data stream' }
-        elseif ($path -notmatch '(?i)\.vhdx$')                      { $why = 'it does not end in .vhdx' }
+        $why = Get-DataDiskPathProblem -Path $path
         if ($null -ne $why) {
             throw "DataDisks: '$Context' data disk '$name' Path '$path' is refused: $why. Failing closed."
         }
         $canon = [System.IO.Path]::GetFullPath($path)
-        if ($canon -notmatch '(?i)\.vhdx$') {
-            throw "DataDisks: '$Context' data disk '$name' Path '$path' does not resolve to a .vhdx file ('$canon'). Failing closed."
-        }
         if (Test-IsSecretPath -Path $canon) {
             throw ("Invariant 1 (secret-file refusal): '$Context' data disk '$name' Path '$canon' is secret-shaped. " +
                    "A secret-shaped path must never be attached to a sandbox. Failing closed.")

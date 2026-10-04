@@ -720,3 +720,193 @@ Describe 'Guest runners mount each data disk read-only and fail closed' {
         $ud | Should -Match 'LABEL=VSDCORPUS /mnt/data/corpus'
     }
 }
+
+Describe 'CopyDirectoryToVhdx backend method' {
+
+    BeforeAll {
+        $script:Corpus = Join-Path $TestDrive 'sample-corpus'
+        New-Item -ItemType Directory -Path (Join-Path $script:Corpus 'chapters') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:Corpus 'readme.txt') -Value 'A synthetic sample corpus.' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $script:Corpus 'chapters\one.txt') -Value 'The quick brown fox.' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $script:Corpus 'chapters\two.txt') -Value 'Jumps over the lazy dog.' -Encoding utf8
+    }
+
+    It 'is in the manifest with Path and SourceDir, and both factories implement it' {
+        (Get-HyperVBackendMethodManifest)['CopyDirectoryToVhdx'] | Should -Be @('Path', 'SourceDir')
+        (New-FakeHyperVBackend).CopyDirectoryToVhdx | Should -BeOfType [scriptblock]
+        (New-RealHyperVBackend).CopyDirectoryToVhdx | Should -BeOfType [scriptblock]
+    }
+
+    It 'fake: records the sorted relative file list and folds the content into the image hash' {
+        $b = New-FakeHyperVBackend
+        $p = 'C:\vs\copy.vhdx'
+        & $b.NewOutputVhdx @{ Path = $p; Label = 'VSDCOPY'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+        $empty = [string](& $b.GetVhdxImageHash @{ Path = $p })
+        & $b.CopyDirectoryToVhdx @{ Path = $p; SourceDir = $script:Corpus }
+        $log = @($b.FakeCallLog | Where-Object { $_.Op -eq 'CopyDirectoryToVhdx' })
+        $log.Count | Should -Be 1
+        $log[0].FileCount | Should -Be 3
+        [string](& $b.GetVhdxImageHash @{ Path = $p }) | Should -Not -Be $empty
+
+        $b2 = New-FakeHyperVBackend
+        & $b2.NewOutputVhdx @{ Path = $p; Label = 'VSDCOPY'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+        & $b2.CopyDirectoryToVhdx @{ Path = $p; SourceDir = $script:Corpus }
+        [string](& $b2.GetVhdxImageHash @{ Path = $p }) | Should -Be ([string](& $b.GetVhdxImageHash @{ Path = $p })) -Because 'same content, same hash'
+    }
+
+    It 'fake: refuses a missing disk, an unformatted or Raw disk, and a missing source' {
+        $b = New-FakeHyperVBackend
+        { & $b.CopyDirectoryToVhdx @{ Path = 'C:\vs\none.vhdx'; SourceDir = $script:Corpus } } | Should -Throw -ExpectedMessage '*does not exist*'
+        & $b.NewVHD @{ Path = 'C:\vs\bare.vhdx'; SizeBytes = 64MB; Dynamic = $true }
+        { & $b.CopyDirectoryToVhdx @{ Path = 'C:\vs\bare.vhdx'; SourceDir = $script:Corpus } } | Should -Throw -ExpectedMessage '*partition*'
+        & $b.NewOutputVhdx @{ Path = 'C:\vs\raw.vhdx'; Label = 'X'; FileSystem = 'Raw'; SizeBytes = 64MB }
+        { & $b.CopyDirectoryToVhdx @{ Path = 'C:\vs\raw.vhdx'; SourceDir = $script:Corpus } } | Should -Throw -ExpectedMessage '*partition*'
+        & $b.NewOutputVhdx @{ Path = 'C:\vs\ok.vhdx'; Label = 'X'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+        { & $b.CopyDirectoryToVhdx @{ Path = 'C:\vs\ok.vhdx'; SourceDir = (Join-Path $TestDrive 'nope') } } | Should -Throw -ExpectedMessage '*does not exist*'
+    }
+
+    It 'fake: refuses a disk attached to a running VM (the real Mount-VHD would hit a lock)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewVM @{ Name = 'vm-copy' }
+        & $b.NewOutputVhdx @{ Path = 'C:\vs\busy.vhdx'; Label = 'X'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+        & $b.AddHardDiskDrive @{ VMName = 'vm-copy'; Path = 'C:\vs\busy.vhdx' }
+        & $b.StartVM @{ Name = 'vm-copy' }
+        { & $b.CopyDirectoryToVhdx @{ Path = 'C:\vs\busy.vhdx'; SourceDir = $script:Corpus } } | Should -Throw -ExpectedMessage '*locked*'
+    }
+
+    Context 'real body (out-of-process capture; no Hyper-V, no elevation)' {
+        BeforeAll {
+            $harness = Join-Path $PSScriptRoot 'fixtures/Invoke-RealCopyDirectoryCapture.ps1'
+            $lib = Join-Path $script:SkillRoot 'scripts/lib/HyperVBackend.ps1'
+            $pwsh = (Get-Process -Id $PID).Path
+            if ([string]::IsNullOrWhiteSpace($pwsh)) { $pwsh = 'pwsh' }
+            $raw = & $pwsh -NoProfile -File $harness -LibPath $lib 2>&1
+            $line = (($raw | Out-String) -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+            $line | Should -Not -BeNullOrEmpty -Because "the harness must emit JSON; got: $raw"
+            $script:CopyCap = $line | ConvertFrom-Json
+        }
+
+        It 'mounts, copies with the pinned robocopy flags onto the resolved volume, then dismounts' {
+            $ok = $script:CopyCap.Ok
+            $ok.err | Should -BeNullOrEmpty
+            $ok.mounted | Should -Be 'C:\vs\data\corpus.vhdx'
+            @($ok.robocopy)[0] | Should -Be $script:CopyCap.Root -Because 'the trailing separator is trimmed so robocopy never sees an escaped quote'
+            @($ok.robocopy)[1] | Should -Be 'Q:\'
+            foreach ($flag in '/E', '/COPY:D', '/DCOPY:D', '/R:0', '/W:0', '/XJ') { @($ok.robocopy) | Should -Contain $flag }
+            @($ok.robocopy) | Should -Not -Contain '/MIR' -Because 'nothing on the disk should ever be purged by a copy'
+            $ok.dismounts | Should -Be 1
+        }
+
+        It 'treats robocopy exit 8 as a failure and still dismounts' {
+            $script:CopyCap.Fail.err | Should -Match 'robocopy failed \(exit 8\)'
+            $script:CopyCap.Fail.dismounts | Should -Be 1
+        }
+
+        It 'refuses a missing source before mounting anything' {
+            $script:CopyCap.NoSource.err | Should -Match 'does not exist'
+            $script:CopyCap.NoSource.mounted | Should -BeNullOrEmpty
+            $script:CopyCap.NoSource.robocopy | Should -BeNullOrEmpty
+        }
+    }
+}
+
+Describe 'scripts/New-VoidsealDataDisk.ps1 (fake backend)' {
+
+    BeforeAll {
+        . (Join-Path $script:SkillRoot 'scripts/New-VoidsealDataDisk.ps1') -DotSourceOnly
+        $script:NewCorpus = {
+            param([string] $Tag)
+            $d = Join-Path $TestDrive "corpus-$Tag"
+            New-Item -ItemType Directory -Path (Join-Path $d 'notes') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $d 'a.txt') -Value ('x' * 1000) -Encoding ascii -NoNewline
+            Set-Content -LiteralPath (Join-Path $d 'notes\b.txt') -Value 'synthetic note' -Encoding ascii -NoNewline
+            return $d
+        }
+        $script:OutDir = Join-Path $TestDrive 'disks'
+        New-Item -ItemType Directory -Path $script:OutDir -Force | Out-Null
+    }
+
+    It 'creates an exFAT disk labelled VSD<NAME>, copies the tree and returns the image hash' {
+        $b = New-FakeHyperVBackend
+        $src = & $script:NewCorpus 'ok'
+        $dest = Join-Path $script:OutDir 'corpus.vhdx'
+        $r = New-VoidsealDataDisk -SourceDir $src -Path $dest -Name 'corpus' -Backend $b
+        $r.Label | Should -BeExactly 'VSDCORPUS'
+        $r.FileCount | Should -Be 2
+        $r.ImageHash | Should -Match '^[0-9a-f]{64}$'
+        $r.ImageHash | Should -Be ([string](& $b.GetVhdxImageHash @{ Path = $dest }))
+        $info = & $b.GetVHDInfo @{ Path = $dest }
+        $info.FileSystem | Should -Be 'exFAT'
+        $info.Label | Should -Be 'VSDCORPUS'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'CopyDirectoryToVhdx' }).Count | Should -Be 1
+        # The printed declaration is accepted as-is.
+        $decl = Invoke-Expression $r.Declaration
+        @(ConvertTo-DataDiskList -Value $decl)[0].ImageHash | Should -Be $r.ImageHash
+    }
+
+    It 'sizes by default to clusters x 1.3 + 64 MB, in whole MiB; and refuses a too-small -SizeBytes' {
+        $b = New-FakeHyperVBackend
+        $src = & $script:NewCorpus 'size'
+        $r = New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $script:OutDir 'sized.vhdx') -Name 'sized' -Backend $b
+        $content = 2 * 128KB
+        $r.ContentBytes | Should -Be $content
+        $r.SizeBytes | Should -Be ([long]([math]::Ceiling(([math]::Ceiling($content * 1.3) + 64MB) / [double]1MB)) * 1MB)
+        ($r.SizeBytes % 1MB) | Should -Be 0
+        { New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $script:OutDir 'tiny.vhdx') -Name 'tiny' -SizeBytes 1MB -Backend $b } |
+            Should -Throw -ExpectedMessage '*too small*'
+    }
+
+    It 'refuses a source tree with a secret-shaped file, and creates nothing' {
+        $b = New-FakeHyperVBackend
+        $src = & $script:NewCorpus 'secret'
+        Set-Content -LiteralPath (Join-Path $src 'notes\.env') -Value 'X=1'
+        $dest = Join-Path $script:OutDir 'secret.vhdx'
+        { New-VoidsealDataDisk -SourceDir $src -Path $dest -Name 'secret' -Backend $b } | Should -Throw -ExpectedMessage '*secret-shaped*'
+        (& $b.GetVHDInfo @{ Path = $dest }) | Should -BeNullOrEmpty
+    }
+
+    It 'refuses a source tree with a junction in it' {
+        $b = New-FakeHyperVBackend
+        $src = & $script:NewCorpus 'link'
+        $outside = Join-Path $TestDrive 'outside'
+        New-Item -ItemType Directory -Path $outside -Force | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $src 'escape') -Target $outside | Out-Null
+        { New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $script:OutDir 'link.vhdx') -Name 'link' -Backend $b } |
+            Should -Throw -ExpectedMessage '*junction*'
+    }
+
+    It 'refuses a bad name, a non-vhdx path, an existing file, a missing folder, a path inside the source, and the storage root' {
+        $b = New-FakeHyperVBackend
+        $src = & $script:NewCorpus 'dest'
+        { New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $script:OutDir 'x.vhdx') -Name 'Bad' -Backend $b } | Should -Throw -ExpectedMessage '*does not match*'
+        { New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $script:OutDir 'x.vhd') -Name 'x' -Backend $b } | Should -Throw -ExpectedMessage '*.vhdx*'
+        $exists = Join-Path $script:OutDir 'exists.vhdx'; Set-Content -LiteralPath $exists -Value ''
+        { New-VoidsealDataDisk -SourceDir $src -Path $exists -Name 'x' -Backend $b } | Should -Throw -ExpectedMessage '*already exists*'
+        { New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $TestDrive 'no\such\dir\x.vhdx') -Name 'x' -Backend $b } | Should -Throw -ExpectedMessage '*does not exist*'
+        { New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $src 'notes\self.vhdx') -Name 'x' -Backend $b } | Should -Throw -ExpectedMessage '*inside -SourceDir*'
+        $inRoot = Join-Path (Split-Path -Parent (Get-SandboxStorageRoot -Name 'x')) 'x.vhdx'
+        { New-VoidsealDataDisk -SourceDir $src -Path $inRoot -Name 'x' -Backend $b } | Should -Throw -ExpectedMessage '*storage root*'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'CopyDirectoryToVhdx' }).Count | Should -Be 0
+    }
+
+    It 'removes the half-built disk when the copy fails' {
+        $b = New-FakeHyperVBackend
+        $b.CopyDirectoryToVhdx = { param($P) throw 'simulated robocopy failure (exit 16)' }
+        $src = & $script:NewCorpus 'fail'
+        $dest = Join-Path $script:OutDir 'fail.vhdx'
+        { New-VoidsealDataDisk -SourceDir $src -Path $dest -Name 'fail' -Backend $b } | Should -Throw -ExpectedMessage '*exit 16*'
+        (& $b.GetVHDInfo @{ Path = $dest }) | Should -BeNullOrEmpty
+    }
+
+    It 'end to end: a disk built here verifies, attaches, seals and re-hashes unchanged' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:DdBlob
+        $src = & $script:NewCorpus 'e2e'
+        $r = New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $script:OutDir 'e2e.vhdx') -Name 'corpus' -Backend $b
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = @(Invoke-Expression $r.Declaration) } `
+            -Name 'sbx-dd-e2e' -ArtifactRoot (Join-Path $TestDrive 'art-e2e') -Destination (Join-Path $TestDrive 'dest-e2e') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -BeNullOrEmpty
+        $report.RunResult.Status | Should -Be 'Success'
+        $report.DataDiskChanged | Should -BeFalse
+    }
+}
