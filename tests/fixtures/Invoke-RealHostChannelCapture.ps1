@@ -118,22 +118,51 @@ function Set-VM {
 
 # GuestServices read stub (THE fail-closed channel read). Reports .Enabled = $script:gsiEnabled,
 # or THROWS when $script:gsiThrows (the unreadable-channel fail-closed scenario).
+#
+# Called WITHOUT -Name it models the enumeration the integration-service reads use (design E6): it
+# returns $script:isServices, a list of objects carrying an Id ('Microsoft:<vm id>\<component GUID>'),
+# a deliberately LOCALIZED Name (so a by-name lookup could not find them) and an Enabled value. That
+# enumeration throws when $script:isEnumThrows.
+$script:isEnumThrows = $false
+$script:isServices   = @()
 function Get-VMIntegrationService {
     [CmdletBinding()]
     param([string] $VMName, [string] $Name)
-    if ($script:gsiThrows) {
-        throw "stub: simulated Get-VMIntegrationService failure for '$VMName' (the GuestServices channel is unreadable)."
+    if ($PSBoundParameters.ContainsKey('Name')) {
+        if ($script:gsiThrows) {
+            throw "stub: simulated Get-VMIntegrationService failure for '$VMName' (the GuestServices channel is unreadable)."
+        }
+        return [pscustomobject]@{ Name = $Name; Enabled = $script:gsiEnabled }
     }
-    return [pscustomobject]@{ Name = $Name; Enabled = $script:gsiEnabled }
+    if ($script:isEnumThrows) {
+        throw "stub: simulated Get-VMIntegrationService enumeration failure for '$VMName'."
+    }
+    foreach ($s in $script:isServices) { $s }
 }
 
-# Enable/Disable-VMIntegrationService stubs (the GuestServices SET mechanism — unchanged by this fix).
-# Disable records the VMName so the SetGsiDisable scenario can prove it routed correctly.
-function Enable-VMIntegrationService  { [CmdletBinding()] param([string] $VMName, [string] $Name) }
+# Enable/Disable-VMIntegrationService stubs. Called with -Name they are the GuestServices SET (unchanged).
+# Called with piped service objects they are the ID-matched SET of the integration services; each
+# records the Id it received and whether a -Name was passed (it must not be: names are localized).
+$script:capIsDisable = [System.Collections.Generic.List[object]]::new()
+$script:capIsEnable  = [System.Collections.Generic.List[object]]::new()
+function Enable-VMIntegrationService {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline)] $VMIntegrationService, [string] $VMName, [string] $Name)
+    process {
+        if ($null -ne $VMIntegrationService) {
+            $script:capIsEnable.Add([ordered]@{ Id = [string]$VMIntegrationService.Id; NameGiven = $PSBoundParameters.ContainsKey('Name') })
+        }
+    }
+}
 function Disable-VMIntegrationService {
     [CmdletBinding()]
-    param([string] $VMName, [string] $Name)
-    $script:capDisableGsi = $VMName
+    param([Parameter(ValueFromPipeline)] $VMIntegrationService, [string] $VMName, [string] $Name)
+    process {
+        if ($null -ne $VMIntegrationService) {
+            $script:capIsDisable.Add([ordered]@{ Id = [string]$VMIntegrationService.Id; NameGiven = $PSBoundParameters.ContainsKey('Name') })
+        }
+        else { $script:capDisableGsi = $VMName }
+    }
 }
 
 # Get-CimInstance shadow: model the LIVE-HOST reality — ConsoleMode does NOT flip with
@@ -173,6 +202,64 @@ function Get-VM {
 # Dot-source the lib INTO THIS top-level scope (so the backend closures capture the stubs above).
 . $LibPath
 $b = New-RealHyperVBackend
+
+# --- Integration-service stub objects (design E6) -------------------------------------------------
+# Component GUIDs as Hyper-V writes them into a VM's configuration; the Names are German on purpose, so
+# only an Id-based match can find them. Shutdown and Guest Service Interface are present too, so a match
+# that picked the wrong service would show up.
+$script:vmIdPrefix = 'Microsoft:00000000-0000-0000-0000-000000000ABC\'
+function New-StubServiceSet {
+    param([hashtable] $Enabled = @{})
+    $defs = [ordered]@{
+        Heartbeat        = @('84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47', 'Taktsignal')
+        Shutdown         = @('9F8233AC-BE49-4C79-8EE3-E7E1985B2077', 'Herunterfahren')
+        TimeSync         = @('2497F4DE-E9FA-4204-80E4-4B75C46419C0', 'Zeitsynchronisierung')
+        KeyValueExchange = @('2A34B1C2-FD73-4043-8A5B-DD2159BC743F', 'Austausch von Schluesselwertpaaren')
+        Backup           = @('5CED1297-4598-4915-A5FC-AD21BB4D02A4', 'Sicherung (Volumeschattenkopie)')
+        GuestServices    = @('6C09BB55-D683-4DA0-8931-C9BF705F6480', 'Gastdienstschnittstelle')
+    }
+    foreach ($k in $defs.Keys) {
+        $on = if ($Enabled.ContainsKey($k)) { $Enabled[$k] } else { $true }
+        [pscustomobject]@{ Id = $script:vmIdPrefix + $defs[$k][0]; Name = $defs[$k][1]; Enabled = $on }
+    }
+}
+$script:isServices = @(New-StubServiceSet)
+
+# Read GetHostChannels with a given service set; report the four integration-service values or the error.
+function Invoke-IsGetCapture {
+    param([object[]] $Services, [switch] $EnumThrows)
+    $script:gsiEnabled   = $true
+    $script:isServices   = $Services
+    $script:isEnumThrows = $EnumThrows.IsPresent
+    $err = $null; $ch = $null
+    try { $ch = & $b.GetHostChannels @{ VMName = 'sbx-seal' } } catch { $err = $_.Exception.Message }
+    $script:isEnumThrows = $false
+    $script:isServices   = @(New-StubServiceSet)
+    $res = [ordered]@{ err = $err; keys = if ($ch) { @($ch.Keys | Sort-Object) -join ',' } else { $null } }
+    foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') {
+        $res[$k] = if ($ch -and $ch.ContainsKey($k)) { $ch[$k] } else { $null }
+    }
+    return $res
+}
+
+# Drive the real SetHostChannel for one integration service; report what the piped stubs received.
+function Invoke-IsSetCapture {
+    param([string] $Channel, [bool] $Enabled, [object[]] $Services)
+    $script:isServices   = if ($PSBoundParameters.ContainsKey('Services')) { $Services } else { @(New-StubServiceSet) }
+    $script:capIsDisable = [System.Collections.Generic.List[object]]::new()
+    $script:capIsEnable  = [System.Collections.Generic.List[object]]::new()
+    $script:capDisableGsi = $null
+    $err = $null
+    try { & $b.SetHostChannel @{ VMName = 'sbx-seal'; Channel = $Channel; Enabled = $Enabled } | Out-Null } catch { $err = $_.Exception.Message }
+    $script:isServices = @(New-StubServiceSet)
+    return [ordered]@{
+        err          = $err
+        disabledIds  = @($script:capIsDisable | ForEach-Object { $_.Id })
+        enabledIds   = @($script:capIsEnable  | ForEach-Object { $_.Id })
+        anyNameGiven = [bool](@(@($script:capIsDisable) + @($script:capIsEnable) | Where-Object { $_.NameGiven }).Count)
+        gsiByName    = ($null -ne $script:capDisableGsi)
+    }
+}
 
 # --- SET scenarios -------------------------------------------------------------------------
 function Invoke-SetCapture {
@@ -237,6 +324,21 @@ $out = [ordered]@{
         $script:gsiThrows = $false
         [ordered]@{ err = $err; ch = if ($null -ne $ch) { 'non-null' } else { $null } }
     })
+
+    # ---- integration services (design E6): ID-matched real reads and sets ----
+    IsGetAllOn      = Invoke-IsGetCapture -Services @(New-StubServiceSet)
+    IsGetAllOff     = Invoke-IsGetCapture -Services @(New-StubServiceSet -Enabled @{ TimeSync = $false; KeyValueExchange = $false; Backup = $false; Heartbeat = $false })
+    IsGetMixed      = Invoke-IsGetCapture -Services @(New-StubServiceSet -Enabled @{ TimeSync = $false; KeyValueExchange = $true; Backup = $false; Heartbeat = $false })
+    IsGetMissingKvp = Invoke-IsGetCapture -Services @(New-StubServiceSet | Where-Object { $_.Id -notlike '*2A34B1C2-FD73-4043-8A5B-DD2159BC743F' })
+    IsGetDuplicate  = Invoke-IsGetCapture -Services (@(New-StubServiceSet) + @([pscustomobject]@{ Id = $script:vmIdPrefix + '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'; Name = 'Taktsignal'; Enabled = $false }))
+    IsGetNonBool    = Invoke-IsGetCapture -Services @(New-StubServiceSet -Enabled @{ Backup = 'False' })
+    IsGetEnumThrows = Invoke-IsGetCapture -Services @(New-StubServiceSet) -EnumThrows
+    IsSetTimeSyncOff  = Invoke-IsSetCapture -Channel 'TimeSync'         -Enabled $false
+    IsSetKvpOff       = Invoke-IsSetCapture -Channel 'KeyValueExchange' -Enabled $false
+    IsSetBackupOff    = Invoke-IsSetCapture -Channel 'Backup'           -Enabled $false
+    IsSetHeartbeatOff = Invoke-IsSetCapture -Channel 'Heartbeat'        -Enabled $false
+    IsSetHeartbeatOn  = Invoke-IsSetCapture -Channel 'Heartbeat'        -Enabled $true
+    IsSetMissing      = Invoke-IsSetCapture -Channel 'TimeSync'         -Enabled $false -Services @(New-StubServiceSet | Where-Object { $_.Id -notlike '*2497F4DE-E9FA-4204-80E4-4B75C46419C0' })
 }
 
 $out | ConvertTo-Json -Depth 6 -Compress

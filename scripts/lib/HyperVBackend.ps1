@@ -62,9 +62,51 @@ $script:HyperVUnavailablePrefix =
 # The canonical host<->guest channel names the SEAL controls (matches the tier-profile
 # HostChannels hashtable keys). SINGLE SOURCE OF TRUTH: SetHostChannel
 # validates against this set; GetHostChannels returns exactly these keys; the fake seeds
-# every VM with all four = $true (the UNSEALED default — Hyper-V enables these by default,
+# every VM with all of them = $true (the UNSEALED default — Hyper-V enables these by default,
 # so the Sealer must explicitly turn them off and Assert-Sealed must host-verify they are).
-$script:HostChannelNames = @('Clipboard', 'Shares', 'GuestServices', 'EnhancedSession')
+#
+# The last four are Hyper-V integration services added to the seal on 2026-10-03 (design E6):
+# TimeSync (Time Synchronization), KeyValueExchange (Key-Value Pair Exchange), Backup (Volume Shadow
+# Copy) and Heartbeat. Each is a live VMBus channel between host and guest, and the engine uses none of
+# them. Shutdown is deliberately NOT in the set: Remove-Sandbox, Wait-WorkloadComplete and
+# Invoke-Voidseal call StopVM without TurnOff, which asks the guest to shut down through that service
+# (docs/threat-model.md records the decision).
+$script:HostChannelNames = @(
+    'Clipboard', 'Shares', 'GuestServices', 'EnhancedSession',
+    'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat'
+)
+
+# Stable component GUIDs of the integration services the seal controls by ID. Get-VMIntegrationService
+# objects carry an Id of the form 'Microsoft:<VM id>\<component GUID>'; the trailing GUID is fixed per
+# service type, while the display Name is localized (a German host does not report 'Time
+# Synchronization'). Matching on the GUID keeps the real read correct on a non-English host. The GUIDs
+# are the component IDs Hyper-V writes into a VM's configuration (Heartbeat 84EAAE65, Shutdown 9F8233AC,
+# Time Synchronization 2497F4DE, Key-Value Pair Exchange 2A34B1C2, VSS 5CED1297, Guest Service Interface
+# 6C09BB55). LIVE-UNVERIFIED: no run has yet read these Ids off a real VM. A mismatch fails CLOSED (no
+# match throws), so the worst case is a seal that refuses, never one that certifies a service it did not
+# read. GuestServices keeps its older by-name read (see GetHostChannels).
+$script:IntegrationServiceIds = [ordered]@{
+    TimeSync         = '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
+    KeyValueExchange = '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
+    Backup           = '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
+    Heartbeat        = '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'
+}
+
+# Pick the ONE integration-service object whose Id ends with the given component GUID. A scriptblock
+# variable, not a function, for the closure-capture reason in the helpers' header note below. Throws
+# (fail closed) on zero or several matches: a caller must never fall back to "off".
+$script:SbFindIntegrationService = {
+    param([object[]] $Services, [string] $Channel, [string] $Guid, [string] $VMName)
+    $hits = @($Services | Where-Object {
+        $null -ne $_ -and $null -ne $_.PSObject.Properties['Id'] -and
+        ([string]$_.Id).EndsWith($Guid, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($hits.Count -ne 1) {
+        throw ("HyperVBackend: could not identify the '$Channel' integration service (component id $Guid) " +
+               "on '$VMName': $($hits.Count) matching service(s). Fail closed.")
+    }
+    return $hits[0]
+}
 
 # qemu-img resolve floor for ReadVhdxRawRegion (I5a): PATCH-CURRENCY, not CVE-derived — see the
 # Resolve-QemuImg comment below for the full rationale. Re-resolve the current stable qemu-img
@@ -144,8 +186,10 @@ function Get-HyperVBackendMethodManifest {
         # Follows the RemoveVHD/RemoveSwitch addendum precedent (manifest + both factories +
         # parity/drift tests) — the backend previously had no way to toggle/read these, and the
         # Sealer MUST NOT reach for a raw Set-VM/*-VMIntegrationService.
+        # Since 2026-10-03 the set also holds four integration services (TimeSync, KeyValueExchange, Backup,
+        # Heartbeat); see $script:HostChannelNames for the full list and why Shutdown is not in it.
         SetHostChannel       = @('VMName', 'Channel', 'Enabled')    # set ONE channel on/off
-        GetHostChannels      = @('VMName')                          # -> @{ Clipboard; Shares; GuestServices; EnhancedSession } (bools)
+        GetHostChannels      = @('VMName')                          # -> @{ <each $script:HostChannelNames key> = <bool> }
 
         # ---- disk ----
         NewVHD               = @('Path', 'SizeBytes', 'Differencing', 'ParentPath', 'Dynamic')
@@ -1047,7 +1091,15 @@ function New-RealHyperVBackend {
     # Disable-VMConsoleSupport does NOT change ConsoleMode (it stays 0), so that read reported the
     # facets ON forever and Assert-Sealed could NEVER certify a real Linux VM. The fix reports the
     # ESM facets OFF BY CONSTRUCTION (see GetHostChannels). The SET path here is unchanged.
+    #
+    # TimeSync / KeyValueExchange / Backup / Heartbeat (design E6, 2026-10-03) are integration services
+    # like GuestServices, but are found by their stable component GUID ($script:IntegrationServiceIds)
+    # rather than by the localized display name. The SET enumerates the VM's services, picks the one
+    # matching object (zero or several matches throw, fail closed) and pipes it to
+    # Enable/Disable-VMIntegrationService, so no localized -Name is ever passed.
     $channelNames = $script:HostChannelNames
+    $isIds        = $script:IntegrationServiceIds
+    $FindIS       = $script:SbFindIntegrationService
     $b.SetHostChannel = {
         param([System.Collections.IDictionary] $P)
         $vm      = & $AssertArg $P 'VMName'  'SetHostChannel'
@@ -1057,6 +1109,13 @@ function New-RealHyperVBackend {
         }
         $enabled = [bool](& $GetArg $P 'Enabled' $false)
         & $InvokeOp {
+            if ($isIds.Contains($channel)) {
+                $all = @(Get-VMIntegrationService -VMName $vm -ErrorAction Stop)
+                $svc = & $FindIS $all $channel $isIds[$channel] $vm
+                if ($enabled) { $null = $svc | Enable-VMIntegrationService  -ErrorAction Stop }
+                else          { $null = $svc | Disable-VMIntegrationService -ErrorAction Stop }
+                return
+            }
             switch ($channel) {
                 'GuestServices' {
                     if ($enabled) { Enable-VMIntegrationService  -VMName $vm -Name 'Guest Service Interface' -ErrorAction Stop }
@@ -1124,12 +1183,30 @@ function New-RealHyperVBackend {
             # the facets off is correct for the deployer's Linux-guest target and not unsafe for any
             # other guest (the autonomous boundary is GuestServices + NIC + DVD + disks, all still
             # hard-verified below in Assert-Sealed).
-            return @{
+            $out = @{
                 Clipboard       = $false
                 Shares          = $false
                 GuestServices   = $gsiOn
                 EnhancedSession = $false
             }
+
+            # TimeSync / KeyValueExchange / Backup / Heartbeat: REAL per-VM reads, never constants. One
+            # enumeration of the VM's integration services, then each service is picked by its stable
+            # component GUID (not the localized Name) and its .Enabled is read. FAIL-CLOSED on every
+            # path: the enumeration throws through $InvokeOp, a missing or duplicated service throws in
+            # $FindIS, and an .Enabled that is not a real [bool] throws here. None of these may degrade
+            # to "off".
+            $all = @(Get-VMIntegrationService -VMName $vm -ErrorAction Stop)
+            foreach ($name in $isIds.Keys) {
+                $svc = & $FindIS $all $name $isIds[$name] $vm
+                $enabledProp = $svc.PSObject.Properties['Enabled']
+                if ($null -eq $enabledProp -or $enabledProp.Value -isnot [bool]) {
+                    throw ("HyperVBackend.GetHostChannels: the '$name' integration service on '$vm' reported " +
+                           "no boolean Enabled state. Fail closed.")
+                }
+                $out[$name] = $enabledProp.Value
+            }
+            return $out
         }
     }.GetNewClosure()
 
@@ -1738,6 +1815,12 @@ $script:SbCopyFakeVM = {
     read — e.g. the Guest Service Interface query failing for one channel). Used to prove the
     seal gate fails CLOSED: an unreadable channel must propagate, NEVER be coerced to off. The
     real backend's GetHostChannels rethrows such a read failure for exactly this reason.
+.PARAMETER SimulateChannelStuckOn
+    Host channel names (any of $script:HostChannelNames) whose disable silently does not take:
+    SetHostChannel with Enabled=$false leaves them ON, so GetHostChannels still reads them ON after
+    Lock-Sandbox. Models a service left enabled by a disable that failed quietly or was undone outside
+    the tool, so a test can prove Assert-Sealed reads host truth instead of trusting the seal's own
+    calls. Default: none.
 .PARAMETER SimulateGuestCommandFailure
     Make InvokeGuestCommand return a NON-ZERO ExitCode (simulating a guest workload that exited
     with failure). Used to exercise the Runner's "a non-zero guest exit is a RUN OUTCOME reported
@@ -1827,6 +1910,7 @@ function New-FakeHyperVBackend {
     param(
         [switch] $SimulateUnavailable,
         [switch] $SimulateChannelReadError,
+        [string[]] $SimulateChannelStuckOn = @(),
         [switch] $SimulateGuestCommandFailure,
         [switch] $SimulateGuestCommandTimeout,
         [switch] $SimulateStartVMError,
@@ -1853,6 +1937,13 @@ function New-FakeHyperVBackend {
     $channelNames = $script:HostChannelNames
     # Captured by the GetHostChannels closure to simulate an unreadable channel (see param help).
     $channelReadThrows = $SimulateChannelReadError.IsPresent
+    # Captured by the SetHostChannel closure: channels whose disable does not take (see param help).
+    foreach ($stuck in @($SimulateChannelStuckOn)) {
+        if ($channelNames -notcontains $stuck) {
+            throw "New-FakeHyperVBackend: -SimulateChannelStuckOn names unknown channel '$stuck' (expected one of: $($channelNames -join ', '))."
+        }
+    }
+    $channelsStuckOn = @($SimulateChannelStuckOn)
     # Captured by the relevant method closures (see param help) — test-only failure seams.
     $guestCmdFails     = $SimulateGuestCommandFailure.IsPresent
     $guestCmdTimesOut  = $SimulateGuestCommandTimeout.IsPresent
@@ -1971,7 +2062,12 @@ function New-FakeHyperVBackend {
             # Host<->guest channels seeded to the UNSEALED default (all $true) — Hyper-V enables
             # Guest Services / Enhanced Session by default, so a freshly-provisioned VM is NOT
             # sealed until the Sealer turns them off. Assert-Sealed host-verifies these are off.
-            HostChannels                   = @{ Clipboard = $true; Shares = $true; GuestServices = $true; EnhancedSession = $true }
+            # The four integration services (TimeSync, KeyValueExchange, Backup, Heartbeat) are also ON by
+            # default on real Hyper-V, so they are seeded ON here and the seal's disable is observable.
+            HostChannels                   = @{
+                Clipboard = $true; Shares = $true; GuestServices = $true; EnhancedSession = $true
+                TimeSync = $true; KeyValueExchange = $true; Backup = $true; Heartbeat = $true
+            }
         }
         # Real New-VM ALWAYS creates exactly one virtual network adapter; -SwitchName only decides whether
         # it starts connected (Microsoft Learn's New-VM reference, -SwitchName). The fake once created no
@@ -2196,7 +2292,10 @@ function New-FakeHyperVBackend {
         if ($channelNames -notcontains $channel) {
             throw "HyperVBackend(fake).SetHostChannel: unknown channel '$channel' (expected one of: $($channelNames -join ', '))."
         }
-        $vm.HostChannels[$channel] = [bool](& $GetArg $P 'Enabled' $false)
+        $enabled = [bool](& $GetArg $P 'Enabled' $false)
+        # SimulateChannelStuckOn: the disable of a stuck channel does not take (it stays ON).
+        if (-not $enabled -and $channelsStuckOn -contains $channel) { return }
+        $vm.HostChannels[$channel] = $enabled
     }.GetNewClosure()
 
     $b.GetHostChannels = {

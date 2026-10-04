@@ -513,17 +513,53 @@ Describe 'Fake backend — host channels (the seal surface)' {
     }
 
     It 'a freshly-created VM reports ALL host channels ON (the unsealed default)' {
-        # Hyper-V enables Guest Services / Enhanced Session by default; a new VM is NOT sealed.
+        # Hyper-V enables Enhanced Session and the Time Synchronization, Key-Value Pair Exchange, Backup
+        # and Heartbeat integration services by default; a new VM is NOT sealed.
         $ch = & $script:B.GetHostChannels @{ VMName = 'vm1' }
-        $ch.Clipboard       | Should -BeTrue
-        $ch.Shares          | Should -BeTrue
-        $ch.GuestServices   | Should -BeTrue
-        $ch.EnhancedSession | Should -BeTrue
+        foreach ($name in 'Clipboard', 'Shares', 'GuestServices', 'EnhancedSession', 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') {
+            $ch[$name] | Should -BeTrue -Because "$name starts ON on a fresh VM, so the seal's disable is observable"
+        }
     }
 
-    It 'GetHostChannels returns exactly the four canonical channel keys' {
+    It 'GetHostChannels returns exactly the eight canonical channel keys' {
         $ch = & $script:B.GetHostChannels @{ VMName = 'vm1' }
-        @($ch.Keys | Sort-Object) -join ',' | Should -Be 'Clipboard,EnhancedSession,GuestServices,Shares'
+        @($ch.Keys | Sort-Object) -join ',' |
+            Should -Be 'Backup,Clipboard,EnhancedSession,GuestServices,Heartbeat,KeyValueExchange,Shares,TimeSync'
+    }
+
+    It 'the canonical channel list adds the four integration services and leaves Shutdown out' {
+        # Shutdown stays enabled on purpose: the engine stops VMs with StopVM without TurnOff, which asks
+        # the guest to shut down through that service (docs/threat-model.md).
+        $script:HostChannelNames -join ',' |
+            Should -Be 'Clipboard,Shares,GuestServices,EnhancedSession,TimeSync,KeyValueExchange,Backup,Heartbeat'
+        $script:HostChannelNames | Should -Not -Contain 'Shutdown'
+    }
+
+    It 'SetHostChannel turns each integration service OFF independently' {
+        foreach ($name in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') {
+            $b = New-FakeHyperVBackend
+            & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+            & $b.SetHostChannel @{ VMName = 'vm1'; Channel = $name; Enabled = $false }
+            $ch = & $b.GetHostChannels @{ VMName = 'vm1' }
+            $ch[$name] | Should -BeFalse -Because "$name was turned off"
+            @($ch.Keys | Where-Object { $_ -ne $name -and -not $ch[$_] }).Count |
+                Should -Be 0 -Because "turning $name off must not touch another channel"
+        }
+    }
+
+    It 'SimulateChannelStuckOn: the disable of a stuck channel does not take; the others still turn off' {
+        $b = New-FakeHyperVBackend -SimulateChannelStuckOn 'KeyValueExchange'
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $b.SetHostChannel @{ VMName = 'vm1'; Channel = 'KeyValueExchange'; Enabled = $false }
+        & $b.SetHostChannel @{ VMName = 'vm1'; Channel = 'TimeSync'; Enabled = $false }
+        $ch = & $b.GetHostChannels @{ VMName = 'vm1' }
+        $ch.KeyValueExchange | Should -BeTrue  -Because 'a stuck channel stays ON after its disable'
+        $ch.TimeSync         | Should -BeFalse -Because 'a channel that is not stuck still turns off'
+    }
+
+    It 'SimulateChannelStuckOn rejects a channel name the backend does not know' {
+        { New-FakeHyperVBackend -SimulateChannelStuckOn 'Shutdown' } |
+            Should -Throw -ExpectedMessage "*SimulateChannelStuckOn names unknown channel 'Shutdown'*"
     }
 
     It 'SetHostChannel turns a single channel OFF (others untouched)' {
@@ -784,6 +820,79 @@ Describe 'Real backend — Linux-guest host-channel seal model (invalid-enum SET
         $script:ChCap.GetGsiThrows.err | Should -Not -BeNullOrEmpty -Because 'an unreadable GuestServices channel must propagate so the gate fails closed'
         $script:ChCap.GetGsiThrows.ch  | Should -BeNullOrEmpty -Because 'no channel hashtable should be returned when the real channel read throws'
     }
+
+    # ---- integration services (design E6): REAL reads by stable component GUID ------------------
+    # The harness stubs return services with GERMAN display names, so these pass only if the real body
+    # matches on the Id's trailing component GUID. Shutdown and Guest Service Interface are in the stub
+    # set too, so a match that grabbed the wrong service would read the wrong value.
+    It 'GetHostChannels reads the four integration services from the host (all ON) and returns all eight keys' {
+        $c = $script:ChCap.IsGetAllOn
+        $c.err  | Should -BeNullOrEmpty
+        $c.keys | Should -Be 'Backup,Clipboard,EnhancedSession,GuestServices,Heartbeat,KeyValueExchange,Shares,TimeSync'
+        foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeTrue -Because "$k is enabled on the host" }
+    }
+
+    It 'GetHostChannels reads them OFF when the host reports them disabled (a real read, not a constant)' {
+        $c = $script:ChCap.IsGetAllOff
+        $c.err | Should -BeNullOrEmpty
+        foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeFalse -Because "$k is disabled on the host" }
+    }
+
+    It 'GetHostChannels maps each value to its own service (mixed states, localized names)' {
+        $c = $script:ChCap.IsGetMixed
+        $c.err              | Should -BeNullOrEmpty
+        $c.KeyValueExchange | Should -BeTrue  -Because 'only Key-Value Pair Exchange is enabled in this scenario'
+        $c.TimeSync         | Should -BeFalse
+        $c.Backup           | Should -BeFalse
+        $c.Heartbeat        | Should -BeFalse
+    }
+
+    It 'GetHostChannels THROWS when an integration service is missing from the host enumeration (fail closed)' {
+        $script:ChCap.IsGetMissingKvp.err  | Should -BeLike "*could not identify the 'KeyValueExchange' integration service*0 matching*"
+        $script:ChCap.IsGetMissingKvp.keys | Should -BeNullOrEmpty
+    }
+
+    It 'GetHostChannels THROWS when two services carry the same component id (ambiguous, fail closed)' {
+        $script:ChCap.IsGetDuplicate.err | Should -BeLike "*could not identify the 'Heartbeat' integration service*2 matching*"
+    }
+
+    It 'GetHostChannels THROWS when a service reports a non-boolean Enabled (no truthiness coercion)' {
+        $script:ChCap.IsGetNonBool.err | Should -BeLike "*'Backup' integration service*no boolean Enabled state*"
+    }
+
+    It 'GetHostChannels THROWS when the integration-service enumeration itself fails' {
+        $script:ChCap.IsGetEnumThrows.err  | Should -BeLike '*simulated Get-VMIntegrationService enumeration failure*'
+        $script:ChCap.IsGetEnumThrows.keys | Should -BeNullOrEmpty
+    }
+
+    It 'SetHostChannel disables each integration service by piping the ID-matched object, never by -Name' {
+        $expect = @{
+            IsSetTimeSyncOff  = '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
+            IsSetKvpOff       = '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
+            IsSetBackupOff    = '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
+            IsSetHeartbeatOff = '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'
+        }
+        foreach ($key in $expect.Keys) {
+            $c = $script:ChCap.$key
+            $c.err | Should -BeNullOrEmpty -Because $key
+            @($c.disabledIds) | Should -Be @("Microsoft:00000000-0000-0000-0000-000000000ABC\$($expect[$key])") -Because "$key must disable exactly its own service"
+            @($c.enabledIds).Count | Should -Be 0
+            $c.anyNameGiven | Should -BeFalse -Because 'display names are localized; the set must not pass -Name'
+            $c.gsiByName    | Should -BeFalse -Because 'the integration-service set must not reach the GuestServices by-name path'
+        }
+    }
+
+    It 'SetHostChannel ENABLE pipes the matched object to Enable-VMIntegrationService (symmetric)' {
+        $c = $script:ChCap.IsSetHeartbeatOn
+        $c.err | Should -BeNullOrEmpty
+        @($c.enabledIds) | Should -Be @('Microsoft:00000000-0000-0000-0000-000000000ABC\84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47')
+        @($c.disabledIds).Count | Should -Be 0
+    }
+
+    It 'SetHostChannel THROWS when the service to disable cannot be found (no silent no-op)' {
+        $script:ChCap.IsSetMissing.err | Should -BeLike "*could not identify the 'TimeSync' integration service*0 matching*"
+        @($script:ChCap.IsSetMissing.disabledIds).Count | Should -Be 0
+    }
 }
 
 # ===========================================================================
@@ -832,6 +941,66 @@ Describe 'Real backend — never binds the nonexistent EnhancedSessionTransportT
         $libText = Get-Content -LiteralPath $script:LibPath -Raw
         $libText | Should -Not -Match "EnhancedSessionTransportType\s+'None'" -Because 'the disable path must use Disable-VMConsoleSupport, never an EnhancedSessionTransportType None'
         $libText | Should -Not -Match "EnhancedSessionTransportType\s+\`$transport" -Because 'the computed-transport indirection (which produced None) must be removed'
+    }
+}
+
+# ===========================================================================
+#  Integration services in the seal: matched by component GUID, never by localized name
+# ===========================================================================
+Describe 'Integration-service seal: matched by stable component GUID, never by localized name (AST-pinned real)' {
+
+    It 'the component GUID table names exactly the four sealed services with their Hyper-V component ids' {
+        $script:IntegrationServiceIds.Keys -join ',' | Should -Be 'TimeSync,KeyValueExchange,Backup,Heartbeat'
+        $script:IntegrationServiceIds.TimeSync         | Should -Be '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
+        $script:IntegrationServiceIds.KeyValueExchange | Should -Be '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
+        $script:IntegrationServiceIds.Backup           | Should -Be '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
+        $script:IntegrationServiceIds.Heartbeat        | Should -Be '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'
+        @($script:IntegrationServiceIds.Values) | Should -Not -Contain '9F8233AC-BE49-4C79-8EE3-E7E1985B2077' -Because 'Shutdown (9F8233AC) stays enabled and must never be in the sealed set'
+    }
+
+    It 'neither real SetHostChannel nor real GetHostChannels passes an English integration-service name to a cmdlet' {
+        $english = @('Time Synchronization', 'Key-Value Pair Exchange', 'Backup (volume shadow copy)', 'Heartbeat', 'Shutdown')
+        foreach ($method in 'SetHostChannel', 'GetHostChannels') {
+            $assign = & $script:GetRealBackendAssign $method
+            $assign | Should -Not -BeNullOrEmpty
+            $cmds = $assign.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+            $byName = @($cmds | Where-Object {
+                $els = $_.CommandElements
+                $hit = $false
+                for ($i = 0; $i -lt $els.Count - 1; $i++) {
+                    if ($els[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                        $els[$i].ParameterName -eq 'Name' -and
+                        $english -contains $els[$i + 1].Extent.Text.Trim("'", '"')) { $hit = $true }
+                }
+                $hit
+            })
+            $byName.Count | Should -Be 0 -Because "$method must find the integration services by component GUID; display names are localized"
+        }
+    }
+
+    It 'real GetHostChannels enumerates the services with Get-VMIntegrationService and no -Name (a host read, not a constant)' {
+        $assign = & $script:GetRealBackendAssign 'GetHostChannels'
+        $enum = @($assign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                      $n.GetCommandName() -eq 'Get-VMIntegrationService' -and
+                      -not ($n.CommandElements | Where-Object {
+                          $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Name' })
+        }, $true))
+        $enum.Count | Should -BeGreaterThan 0 -Because 'the four integration services must be read from the host by enumerating the VM''s services'
+    }
+
+    It 'the GUID matcher returns the single match, and throws on zero matches, two matches, or an object with no Id' {
+        $guid = '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'
+        $one  = [pscustomobject]@{ Id = "Microsoft:X\$guid"; Enabled = $true }
+        (& $script:SbFindIntegrationService @($one) 'Heartbeat' $guid 'vm1').Id | Should -Be $one.Id
+        (& $script:SbFindIntegrationService @([pscustomobject]@{ Id = "microsoft:x\$($guid.ToLowerInvariant())" }) 'Heartbeat' $guid 'vm1') |
+            Should -Not -BeNullOrEmpty -Because 'the GUID compare is case-insensitive'
+        { & $script:SbFindIntegrationService @() 'Heartbeat' $guid 'vm1' } |
+            Should -Throw -ExpectedMessage "*'Heartbeat' integration service*0 matching*"
+        { & $script:SbFindIntegrationService @($one, $one) 'Heartbeat' $guid 'vm1' } |
+            Should -Throw -ExpectedMessage "*'Heartbeat' integration service*2 matching*"
+        { & $script:SbFindIntegrationService @([pscustomobject]@{ Name = 'Heartbeat'; Enabled = $true }) 'Heartbeat' $guid 'vm1' } |
+            Should -Throw -ExpectedMessage '*0 matching*' -Because 'an object without an Id is never matched by its Name'
     }
 }
 
