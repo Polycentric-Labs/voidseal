@@ -76,6 +76,8 @@ Set-StrictMode -Version Latest
 
 # The NIC policy predicate shared with Lock-Sandbox and Assert-Sealed (see SealPolicy.ps1).
 . (Join-Path $PSScriptRoot 'SealPolicy.ps1')
+# HostProxy egress: the per-VM address plan, its collision check, and teardown (see HostEgress.ps1).
+. (Join-Path $PSScriptRoot 'HostEgress.ps1')
 
 # --------------------------------------------------------------------------
 # Internal helpers
@@ -320,7 +322,9 @@ function New-SandboxDescriptor {
         [string]   $State = 'Off',
         [bool]     $AutomaticCheckpointsEnabled = $false,
         [string]   $WorkloadDiskStatus       = $null,   # I2b: non-$null only on a HOST-side workload-disk write failure (e.g. 'DiskFull')
-        [string]   $WorkloadDiskStatusReason = $null     # I2b: human-readable detail paired with WorkloadDiskStatus
+        [string]   $WorkloadDiskStatusReason = $null,    # I2b: human-readable detail paired with WorkloadDiskStatus
+        [string]   $EgressMode = $null,            # the profile's EgressMode, recorded so the seal and teardown know it
+        [System.Collections.IDictionary] $Egress = $null   # HostProxy only: the address plan (HostEgress.ps1 Get-EgressAddressPlan)
     )
     return [pscustomobject]@{
         Name                         = $Name
@@ -353,6 +357,15 @@ function New-SandboxDescriptor {
         # ordinary (non-full) case — every existing caller is unaffected.
         WorkloadDiskStatus           = $WorkloadDiskStatus
         WorkloadDiskStatusReason     = $WorkloadDiskStatusReason
+        # Host egress (EgressMode='HostProxy', HostEgress.ps1). Egress is the address plan New-SandboxVM
+        # checked; the next four record what was actually created on the host, each the moment it exists,
+        # so Assert-Sealed can read them back and Remove-Sandbox removes exactly them (like CreatedSwitches).
+        EgressMode                   = $EgressMode
+        Egress                       = $Egress
+        EgressGatewayAddress         = $null
+        EgressFirewallRules          = @()
+        EgressAcls                   = @()
+        EgressProxy                  = $null
     }
 }
 
@@ -451,6 +464,7 @@ function New-SandboxVM {
     # seal gate's processor check unable to fire in production.
     $network   = if ($Profile.ContainsKey('Network')) { [string]$Profile['Network'] } else { $null }
     $nicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
+    $egressMode = if ($Profile.ContainsKey('EgressMode')) { [string]$Profile['EgressMode'] } else { $null }
 
     $nestedVirt = $false
     if ($Profile.ContainsKey('NestedVirt') -and $null -ne $Profile['NestedVirt']) {
@@ -534,6 +548,17 @@ function New-SandboxVM {
         $SystemDiskSizeBytes
     }
     $null = Test-HostFreeSpace -Path $vmStorageDir -RequiredBytes $requiredBytes -Backend $Backend
+
+    # --- HostProxy address plan + collision check (fail-closed, BEFORE any creation) ----------------
+    # A VM that keeps a NIC and declares EgressMode='HostProxy' gets a deterministic /30 from its name
+    # (HostEgress.ps1). Any host address or NAT network overlapping it, or a host that cannot be read,
+    # refuses the provision here, before anything exists. The plan rides the descriptor: the seed takes
+    # the guest's static address from it, Lock-Sandbox installs the host side from it.
+    $egressPlan = $null
+    if ($Profile['Substrate'] -eq 'HyperV-Gen2' -and $nicPolicy -eq 'IsolatedInternalSwitch' -and $egressMode -eq 'HostProxy') {
+        $egressPlan = Get-EgressAddressPlan -VMName $Name -SwitchName ("{0}-int" -f $Name)
+        Assert-EgressAddressFree -Plan $egressPlan -Backend $Backend -Context 'New-SandboxVM'
+    }
 
     # --- artifact tracking for mid-provision ROLLBACK ---------------------
     # If ANY creation step below throws, the catch best-effort tears down EXACTLY what was
@@ -655,7 +680,9 @@ function New-SandboxVM {
             -ProcessorCount     $cpuCount `
             -NestedVirt         $nestedVirt `
             -State              $state `
-            -AutomaticCheckpointsEnabled $autoCheckpoints
+            -AutomaticCheckpointsEnabled $autoCheckpoints `
+            -EgressMode         $egressMode `
+            -Egress             $egressPlan
 
         # BELT-AND-BRACES (a real-backend bug found during live debugging): guarantee this function emits EXACTLY the
         # descriptor and nothing else. If a future edit reintroduces an uncaptured backend emission
@@ -759,6 +786,12 @@ function Restore-Sandbox {
     -Descriptor is supplied; otherwise it falls back to this VM's currently-attached disks
     (read from the VM before removal) so a caller without the descriptor can still clean up.
 
+    HOST EGRESS: with a -Descriptor that records HostProxy objects (EgressProxy, EgressAcls,
+    EgressFirewallRules, EgressGatewayAddress), they are removed after the VM is stopped and before it is
+    unregistered (Remove-SandboxEgress, HostEgress.ps1). Only recorded objects are touched. Anything that
+    cannot be removed stays recorded, the rest of teardown still runs, and Remove-Sandbox then THROWS
+    naming what is left, so the orchestrator's TeardownStatus reports it.
+
     SWITCHES: with a -Descriptor, the per-VM switches recorded on its CreatedSwitches are removed
     after the VM is gone, whether or not -DeleteDisks is set (a disk can be worth keeping for
     inspection; a switch whose only VM is gone serves nothing). Only switches New-SandboxVM itself
@@ -801,8 +834,13 @@ function Remove-Sandbox {
         if ($DeleteDisks -and $null -ne $Descriptor) {
             Remove-SandboxDisks -Disks @($Descriptor.CreatedDisks) -Backend $Backend
         }
+        # Host egress objects the descriptor still records (an earlier teardown may have stopped part way).
+        $egressLeft = @(Remove-SandboxEgress -Descriptor $Descriptor -Backend $Backend)
         # Likewise the switch: an earlier teardown may have removed the VM and stopped before it.
         Remove-SandboxSwitches -Switches $switchesToRemove -Backend $Backend
+        if ($egressLeft.Count -gt 0) {
+            throw "Remove-Sandbox: host egress teardown for '$Name' could not remove: $($egressLeft -join '; ')"
+        }
         return
     }
 
@@ -832,6 +870,12 @@ function Remove-Sandbox {
         $null = & $Backend.StopVM @{ Name = $Name; Force = $true }
     }
 
+    # HostProxy egress (HostEgress.ps1): with the VM stopped, stop its proxy and remove exactly the port
+    # ACL entries, firewall rules and gateway address the descriptor records, while the VM still exists
+    # (its ACLs are settings of its adapter). A failure is collected, the rest of teardown still runs,
+    # and the throw at the end puts it on the report rather than hiding it in a warning.
+    $egressLeft = @(Remove-SandboxEgress -Descriptor $Descriptor -Backend $Backend)
+
     # Unregister the VM. This LEAVES the VHDX files (per the backend contract).
     $null = & $Backend.RemoveVM @{ Name = $Name; Force = $true }
 
@@ -842,6 +886,10 @@ function Remove-Sandbox {
 
     # The per-VM switch goes last, once the VM and its NIC are gone, so nothing is bound to it.
     Remove-SandboxSwitches -Switches $switchesToRemove -Backend $Backend
+
+    if ($egressLeft.Count -gt 0) {
+        throw "Remove-Sandbox: host egress teardown for '$Name' could not remove: $($egressLeft -join '; ')"
+    }
 }
 
 <#

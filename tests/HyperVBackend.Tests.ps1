@@ -147,13 +147,13 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
         }
     }
 
-    It 'documents a non-empty arg-key list for every method that takes args (only TestAvailable and GetHostMemory are arg-less)' {
+    It 'documents a non-empty arg-key list for every method that takes args (only TestAvailable, GetHostMemory, GetHostIPAddresses and GetNetNats are arg-less)' {
         # Arg-key drift guard: if a method silently grew/lost args, this catches the
         # manifest going stale. TestAvailable (the capability probe) and GetHostMemory (a whole-host
         # read) are the documented arg-less methods (@()).
         foreach ($name in $script:ExpectedMethods.Keys) {
             $argKeys = @($script:ExpectedMethods[$name])
-            if ($name -in @('TestAvailable', 'GetHostMemory')) {
+            if ($name -in @('TestAvailable', 'GetHostMemory', 'GetHostIPAddresses', 'GetNetNats')) {
                 $argKeys.Count | Should -Be 0 -Because "$name takes no named args"
             }
             else {
@@ -249,6 +249,10 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
             GetGpuPartitionAdapters = 'VMName'; GetAssignableDevices = 'VMName'
+            AddSwitchHostIPAddress = 'SwitchName'; RemoveSwitchHostIPAddress = 'SwitchName'
+            NewHostFirewallRule = 'Name'; GetHostFirewallRule = 'Name'; RemoveHostFirewallRule = 'Name'
+            AddNetworkAdapterAcl = 'VMName'; GetNetworkAdapterAcls = 'VMName'; RemoveNetworkAdapterAcl = 'VMName'
+            StartEgressProxy = 'PythonExe'; StopEgressProxy = 'ProcessId'
             Checkpoint = 'VMName'; RestoreCheckpoint = 'VMName'; GetCheckpoint = 'VMName'; RemoveCheckpoint = 'VMName'
         }
 
@@ -256,7 +260,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
         # method added to the manifest forces this map, and thus the contract, to update).
         # TestAvailable and GetHostMemory are arg-less, so they have no primary key to drop.
         $covered  = @($primaryKey.Keys | Sort-Object)
-        $expected = @($script:ExpectedMethods.Keys | Where-Object { $_ -notin @('TestAvailable', 'GetHostMemory') } | Sort-Object)
+        $expected = @($script:ExpectedMethods.Keys | Where-Object { $_ -notin @('TestAvailable', 'GetHostMemory', 'GetHostIPAddresses', 'GetNetNats') } | Sort-Object)
         ($covered -join ',') | Should -Be ($expected -join ',') -Because 'every arg-taking manifest method must be in the primary-key drift map'
 
         foreach ($name in $primaryKey.Keys) {

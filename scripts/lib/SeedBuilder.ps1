@@ -43,6 +43,11 @@
 
 Set-StrictMode -Version Latest
 
+# HostProxy seeds validate the address plan with the same IPv4 helpers the host side uses, and apply
+# only to a VM that keeps a NIC (the same predicate the Provisioner and the seal use).
+. (Join-Path $PSScriptRoot 'HostEgress.ps1')
+. (Join-Path $PSScriptRoot 'SealPolicy.ps1')
+
 # --------------------------------------------------------------------------
 # Internal: read a field off a profile (hashtable / IDictionary / pscustomobject) with a default.
 # --------------------------------------------------------------------------
@@ -827,6 +832,165 @@ runcmd:
 '@
 
 # --------------------------------------------------------------------------
+# The SERIAL + HostProxy user-data (EgressMode='HostProxy', docs/phase-6-live-runbook.md section 2).
+# The guest gets NO route and NO resolver: cloud-init's network-config (New-CidataNetworkConfig) gives
+# eth0 one static address in the VM's /30 and nothing else. The only way out is the HOST's CONNECT
+# proxy on the gateway address, which the host firewall and the port ACL leave open and the host
+# enforces. This seed points every client at it (HTTPS_PROXY / https_proxy in /etc/environment and a
+# login profile script, NO_PROXY empty, apt's proxy setting), and keeps an in-guest default-DROP as
+# defense in depth that allows only TCP to the proxy port on the gateway. Unlike the InGuestSquid seed,
+# that lockdown runs before networking on the guest's only boot (it needs no package install first).
+# Single-quoted here-string; New-CidataUserData substitutes __GATEWAY_IP__, __PROXY_PORT__ and
+# __GUEST_CIDR__ from the descriptor's address plan, so only validated dotted IPv4 text and a port
+# number ever reach the shell.
+# --------------------------------------------------------------------------
+$script:CidataSerialHostProxyTemplate = @'
+#cloud-config
+# Voidseal Tier-1 serial-mode seed for EgressMode='HostProxy'. Same COM1 serial command channel as the
+# serial baseline (AUTOLOGIN on ttyS0; the Runner's serial client does NOT authenticate). Egress is
+# enforced on the HOST: this guest has no route and no resolver, and reaches only the host's CONNECT
+# allowlist proxy at __GATEWAY_IP__:__PROXY_PORT__. The in-guest default-DROP below is defense in
+# depth, not the boundary.
+
+users:
+  - name: sandbox
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    lock_passwd: true          # no password login anywhere; serial console + key only
+
+# IPv6 off before the network comes up (bootcmd runs before network-config is applied). The host side
+# blocks IPv6 too; this keeps the guest from even trying.
+bootcmd:
+  - [ sysctl, -w, 'net.ipv6.conf.all.disable_ipv6=1' ]
+  - [ sysctl, -w, 'net.ipv6.conf.default.disable_ipv6=1' ]
+
+write_files:
+  - path: /etc/default/grub.d/99-serial.cfg
+    content: |
+      GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
+      GRUB_TERMINAL="console serial"
+      GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
+  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin sandbox --keep-baud 115200,38400,9600 ttyS0 $TERM
+
+  - path: /etc/sysctl.d/99-voidseal-noipv6.conf
+    permissions: '0644'
+    content: |
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv6.conf.default.disable_ipv6 = 1
+
+  # The host proxy, for every client that honors the proxy variables (pip, the Claude CLI, Hugging Face
+  # clients, curl). pam_env reads /etc/environment at login (the serial autologin shell included); the
+  # profile script covers shells that skip pam_env. NO_PROXY is empty on purpose: nothing is direct.
+  - path: /etc/environment
+    append: true
+    content: |
+      HTTPS_PROXY=http://__GATEWAY_IP__:__PROXY_PORT__
+      https_proxy=http://__GATEWAY_IP__:__PROXY_PORT__
+      NO_PROXY=
+      no_proxy=
+  - path: /etc/profile.d/voidseal-egress-proxy.sh
+    permissions: '0644'
+    content: |
+      export HTTPS_PROXY=http://__GATEWAY_IP__:__PROXY_PORT__
+      export https_proxy=http://__GATEWAY_IP__:__PROXY_PORT__
+      export NO_PROXY=
+      export no_proxy=
+  # apt through the same proxy. The host proxy tunnels only CONNECT to port 443 and refuses plain HTTP
+  # with 405, so runcmd moves the Debian sources to https first. apt still reaches a mirror only when
+  # its name is on the run's EgressAllowlist; tier1 does not list one, so bake packages into the image.
+  - path: /etc/apt/apt.conf.d/99voidseal-proxy
+    permissions: '0644'
+    content: |
+      Acquire::https::Proxy "http://__GATEWAY_IP__:__PROXY_PORT__/";
+      Acquire::http::Proxy "http://__GATEWAY_IP__:__PROXY_PORT__/";
+
+  # In-guest default-DROP, defense in depth only (root in the guest can undo it; the host enforces).
+  # Allows loopback, established traffic, and TCP to the proxy port on the gateway. nftables first
+  # (one inet table covers IPv4 and IPv6), iptables as a fallback, a structural marker either way.
+  - path: /usr/local/sbin/voidseal-egress-lockdown
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set +e
+      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
+      diag "egress-lockdown start mode=hostproxy"
+      if command -v nft >/dev/null 2>&1; then
+        nft delete table inet voidseal 2>/dev/null
+        printf '%s\n' \
+          'table inet voidseal {' \
+          '  chain output {' \
+          '    type filter hook output priority 0; policy drop;' \
+          '    oif "lo" accept' \
+          '    ct state established,related accept' \
+          '    ip daddr __GATEWAY_IP__ tcp dport __PROXY_PORT__ accept' \
+          '  }' \
+          '}' | nft -f -
+        diag "egress_lockdown=hostproxy-applied tool=nft rc=$?"
+      elif command -v iptables >/dev/null 2>&1; then
+        iptables -F OUTPUT 2>/dev/null
+        iptables -P OUTPUT DROP
+        iptables -A OUTPUT -o lo -j ACCEPT
+        iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        iptables -A OUTPUT -p tcp -d __GATEWAY_IP__ --dport __PROXY_PORT__ -j ACCEPT
+        r=$?
+        if command -v ip6tables >/dev/null 2>&1; then ip6tables -P OUTPUT DROP; fi
+        diag "egress_lockdown=hostproxy-applied tool=iptables rc=$r"
+      else
+        diag "egress_lockdown=skipped (no nft or iptables binary; the host still enforces)"
+      fi
+
+  - path: /usr/local/sbin/voidseal-serial-diag
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set +e
+      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
+      diag "serial-seed start"
+      diag "block_devices=$(lsblk -dn -o NAME 2>/dev/null | wc -l) device_mounts=$(grep -c '^/dev/' /proc/mounts 2>/dev/null) cidata_labeled=$(blkid -L CIDATA >/dev/null 2>&1 && echo yes || echo no)"
+      diag "sandbox_user=$(id -u sandbox >/dev/null 2>&1 && echo yes || echo no)"
+      diag "serial_getty_active=$(systemctl is-active serial-getty@ttyS0.service 2>/dev/null) autologin_dropin=$([ -f /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf ] && echo yes || echo no)"
+      diag "grub_ttyS0_lines=$(grep -c ttyS0 /boot/grub/grub.cfg 2>/dev/null) cmdline_ttyS0=$(grep -c 'console=ttyS0' /proc/cmdline 2>/dev/null)"
+      diag "bwrap_present=$(command -v bwrap >/dev/null 2>&1 && echo yes || echo no) ca_certificates=$(dpkg -s ca-certificates >/dev/null 2>&1 && echo yes || echo no)"
+      diag "egress_mode=hostproxy guest_addr=$(ip -4 -o addr show 2>/dev/null | grep -c ' __GUEST_CIDR__ ') default_routes=$(ip -4 route show default 2>/dev/null | wc -l) nameservers=$(grep -c '^nameserver' /etc/resolv.conf 2>/dev/null) proxy_env=$(grep -c '^HTTPS_PROXY=' /etc/environment 2>/dev/null)"
+      diag "egress_unit_enabled=$(systemctl is-enabled voidseal-egress.service 2>/dev/null) ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) proxy_reachable=$(timeout 5 bash -c 'exec 3<>/dev/tcp/__GATEWAY_IP__/__PROXY_PORT__' >/dev/null 2>&1 && echo yes || echo no)"
+      diag "failed_units=$(systemctl --failed --no-legend 2>/dev/null | wc -l)"
+      diag "serial-seed done"
+
+  - path: /etc/systemd/system/voidseal-egress.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Voidseal Tier-1 in-guest egress lockdown for HostProxy (defense in depth, NOT a boundary)
+      DefaultDependencies=no
+      Before=network-pre.target
+      Wants=network-pre.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/voidseal-egress-lockdown
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl daemon-reload
+  # Apply the in-guest lockdown now, on this first and only boot, and on any later boot via the unit.
+  - systemctl enable --now voidseal-egress.service
+  - update-grub
+  - systemctl enable  serial-getty@ttyS0.service
+  - systemctl restart serial-getty@ttyS0.service
+  - [ sh, -c, "sed -i 's#http://deb.debian.org#https://deb.debian.org#g; s#http://security.debian.org#https://security.debian.org#g' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null; true" ]
+  - [ apt-get, update ]
+  - [ apt-get, install, -y, bubblewrap, ca-certificates ]
+  - [ /usr/local/sbin/voidseal-serial-diag ]
+
+# Credential-free. No secret is ever written here.
+'@
+
+# --------------------------------------------------------------------------
 # Internal: normalize any line endings to LF (cloud-init runs an embedded /bin/sh script; a CRLF
 # there yields a `/bin/sh\r` bad-interpreter failure in the guest).
 # --------------------------------------------------------------------------
@@ -888,7 +1052,12 @@ function New-DataDiskMountLines {
 function New-CidataUserData {
     [CmdletBinding()]
     [OutputType([string])]
-    param([Parameter(Mandatory)] $Profile)
+    param(
+        [Parameter(Mandatory)] $Profile,
+        # EgressMode='HostProxy' only: the VM's address plan (HostEgress.ps1 Get-EgressAddressPlan), which
+        # New-WorkloadSeedDisk takes from the descriptor. Required for a Serial HostProxy seed.
+        [System.Collections.IDictionary] $Egress
+    )
 
     $mode       = [string](Get-SeedProfileField -Profile $Profile -Name 'WorkloadMode'  -Default 'Serial')
     $egressMode = [string](Get-SeedProfileField -Profile $Profile -Name 'EgressMode'    -Default '')
@@ -897,6 +1066,17 @@ function New-CidataUserData {
     # branches below it have no idea EgressMode exists and would otherwise silently fall through to a
     # plain disk runner with ZERO egress content for a profile that declared one — the exact
     # "declared but unwired" class this batch retires. Refuse it explicitly instead.
+    # 'HostProxy' means something only for a VM that keeps a NIC (Tier 1, Network 'Internal+Allowlist').
+    # Tier 0 also declares it, but a Tier-0 VM is sealed with no adapter, so its seed stays offline.
+    $hostProxyNic = $false
+    if ($egressMode -eq 'HostProxy') {
+        $seedTier    = [int](Get-SeedProfileField -Profile $Profile -Name 'Tier' -Default 0)
+        $seedNetwork = [string](Get-SeedProfileField -Profile $Profile -Name 'Network' -Default '')
+        $hostProxyNic = ((Get-SealNicPolicy -Tier $seedTier -Network $seedNetwork) -eq 'IsolatedInternalSwitch')
+    }
+    if ($mode -eq 'Disk' -and $hostProxyNic) {
+        throw "New-CidataUserData: 'HostProxy' is wired for SERIAL-mode Tier-1 seeds; no Disk-mode runner points its workload at the host proxy (the builder uses 'SquidSniProxy'). Fail closed."
+    }
     if ($mode -eq 'Disk' -and $egressMode -eq 'InGuestSquid') {
         throw "New-CidataUserData: 'InGuestSquid' is the SERIAL-seed in-guest egress; a Disk-mode egress profile uses the builder's 'SquidSniProxy' (which carries its DepsSpec rule)."
     }
@@ -1013,7 +1193,79 @@ function New-CidataUserData {
         return (ConvertTo-LfText -Text $ud)
     }
 
+    # EgressMode='HostProxy': no route, no resolver, the host's CONNECT proxy as the only way out. The
+    # address plan comes from the descriptor (New-SandboxVM made and checked it). Every value that lands
+    # in shell or YAML text is re-validated here as a dotted IPv4 address or a port number.
+    if ($mode -ne 'Disk' -and $hostProxyNic) {
+        $allowlist = Get-SeedProfileField -Profile $Profile -Name 'EgressAllowlist' -Default @()
+        if ($null -eq $allowlist -or @($allowlist).Count -eq 0) {
+            throw "New-CidataUserData: a Serial+HostProxy profile must have a non-empty EgressAllowlist (fail-closed)."
+        }
+        $values = Get-HostProxySeedValues -Egress $Egress
+        $ud = $script:CidataSerialHostProxyTemplate.Replace('__GATEWAY_IP__', $values.GatewayIP).Replace('__PROXY_PORT__', $values.ProxyPort).Replace('__GUEST_CIDR__', $values.GuestCidr)
+        return (ConvertTo-LfText -Text $ud)
+    }
+
     return (ConvertTo-LfText -Text $script:CidataSerialBaselineTemplate)
+}
+
+<#
+.SYNOPSIS
+    The validated substitution values for a HostProxy seed (gateway, proxy port, guest CIDR).
+.DESCRIPTION
+    Throws unless the plan carries a dotted IPv4 GatewayIP and GuestIP, a PrefixLength from 1 to 32 and
+    a ProxyPort from 1 to 65535, with the gateway and guest in the same prefix. These strings go into
+    shell and YAML text, so nothing else may reach it.
+#>
+function Get-HostProxySeedValues {
+    [CmdletBinding()]
+    param([AllowNull()] [System.Collections.IDictionary] $Egress)
+    if ($null -eq $Egress) {
+        throw "New-CidataUserData: a Serial+HostProxy seed needs the VM's egress address plan (-Egress, from the descriptor); none was given. Fail closed."
+    }
+    $ipRe = '^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$'
+    $gw    = [string]$Egress['GatewayIP']
+    $guest = [string]$Egress['GuestIP']
+    $len   = 0; $port = 0
+    if ($gw -notmatch $ipRe -or $guest -notmatch $ipRe -or
+        -not [int]::TryParse([string]$Egress['PrefixLength'], [ref]$len) -or $len -lt 1 -or $len -gt 32 -or
+        -not [int]::TryParse([string]$Egress['ProxyPort'], [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        throw "New-CidataUserData: the egress address plan is malformed (GatewayIP '$gw', GuestIP '$guest', PrefixLength '$($Egress['PrefixLength'])', ProxyPort '$($Egress['ProxyPort'])'). Fail closed."
+    }
+    if (-not (Test-EgressPrefixOverlap -AddressA $gw -PrefixA $len -AddressB $guest -PrefixB 32) -or $gw -eq $guest) {
+        throw "New-CidataUserData: the egress plan's gateway $gw and guest $guest are not two addresses in one /$len. Fail closed."
+    }
+    return @{ GatewayIP = $gw; GuestIP = $guest; PrefixLength = $len; ProxyPort = [string]$port; GuestCidr = "$guest/$len" }
+}
+
+<#
+.SYNOPSIS
+    The cloud-init NoCloud `network-config` for a HostProxy VM: one static address, no route, no DNS.
+.DESCRIPTION
+    Network config version 2. eth0 (a Hyper-V synthetic NIC has no PCI path, so udev keeps the kernel
+    name; the seal guarantees exactly one NIC) gets the guest address of the VM's /30 with DHCP off.
+    There is deliberately no gateway, no routes and no nameservers: the guest can reach its /30 and
+    nothing else, and the only listener there is the host's proxy. Returns LF-only text.
+.PARAMETER Egress
+    The VM's address plan (HostEgress.ps1 Get-EgressAddressPlan), from the descriptor.
+#>
+function New-CidataNetworkConfig {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()] [System.Collections.IDictionary] $Egress)
+    $values = Get-HostProxySeedValues -Egress $Egress
+    $text = @(
+        '# Voidseal HostProxy network-config: one static address, no default route, no resolver.'
+        'version: 2'
+        'ethernets:'
+        '  eth0:'
+        '    dhcp4: false'
+        '    dhcp6: false'
+        '    addresses:'
+        "      - $($values.GuestCidr)"
+        ''
+    ) -join "`n"
+    return (ConvertTo-LfText -Text $text)
 }
 
 <#

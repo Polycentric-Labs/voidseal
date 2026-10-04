@@ -31,10 +31,11 @@
     # ------------------------------------------------------------------
     # Packages: DECLARED, NOT INSTALLED. This lists what Ralph needs in the guest,
     # but no engine code reads the field, so nothing installs from it. The Serial
-    # seed hard-codes its own apt install (ca-certificates and bubblewrap, plus
-    # squid and iptables for the in-guest egress layer) and does not read this
-    # list either, so git, jq and the claude CLI must already be in the golden
-    # image before a live ralph run.
+    # seed hard-codes its own apt install (ca-certificates and bubblewrap) and does
+    # not read this list either. Under tier1's HostProxy egress that install goes
+    # through the host proxy and only succeeds if a Debian mirror is on the
+    # allowlist, which it is not by default, so git, jq, bubblewrap and the claude
+    # CLI must already be in the golden image before a live ralph run.
     # Ralph itself is bash; the runtime deps are git (clone the pinned repo),
     # jq (the loop pipes `claude --output-format json` through jq), ca-certificates
     # (TLS to api.anthropic.com), and bubblewrap (the native-bwrap defense-in-depth
@@ -61,7 +62,9 @@
     Entrypoint = 'bash /opt/ralph/ralph-claude-code/ralph_loop.sh'
 
     # ------------------------------------------------------------------
-    # ExtraAllowlist: FQDNs unioned onto tier1's EgressAllowlist (which already
+    # ExtraAllowlist: FQDNs unioned onto tier1's EgressAllowlist. The merged list is
+    # exactly what the host proxy enforces (EgressMode='HostProxy', inherited from
+    # tier1; a workload may not set it). tier1's list already
     # carries api.anthropic.com, registry.npmjs.org, github.com + the GitHub raw/
     # codeload hosts, pypi.org, files.pythonhosted.org, all that the clone +
     # cloud-Claude calls need). The two hosts below are the Claude Code CLI
@@ -148,10 +151,10 @@
     # survives the seal (New-WorkloadSeedDisk): serial-getty AUTOLOGIN on ttyS0 (the COM1 console
     # the Runner drives; Linux management is serial, not PS Direct), the unprivileged run-user,
     # the seed's own hard-coded packages (not the Packages list above, which nothing reads), and,
-    # because tier1's EgressMode is 'InGuestSquid', the in-guest egress layer (iptables default-DROP
-    # plus a Squid allowlist built from the merged EgressAllowlist; defense-in-depth, not a
-    # boundary). The seed enables that layer's unit without
-    # starting it, so whether it is active during a run's single boot is a Phase-6 question.
+    # because tier1's EgressMode is 'HostProxy', a network-config with one static address in the
+    # VM's /30 (no route, no resolver), HTTPS_PROXY pointing at the host proxy on the gateway, apt's
+    # proxy setting, and an in-guest default-DROP that allows only the proxy port (defense in depth;
+    # the host enforces). That lockdown is applied on the guest's single boot, before any apt step.
     # Autologin does not depend on it: the seed restarts serial-getty before any apt step. No seed
     # would mean no serial console, and the Runner's InvokeGuestCommand would time out. A seed DVD
     # cannot work: the seal ejects every DVD before the guest's only boot (RC6). This path only names

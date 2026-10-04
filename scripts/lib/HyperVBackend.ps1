@@ -330,6 +330,28 @@ function Get-HyperVBackendMethodManifest {
         GetGpuPartitionAdapters = @('VMName')                      # -> @() of GPU partition adapter records
         GetAssignableDevices    = @('VMName')                      # -> @() of assigned-device records
 
+        # ---- host egress: EgressMode='HostProxy' (Tier 1) ----
+        # The host side of B' (docs/phase-6-live-runbook.md section 2): a gateway address on the VM switch's
+        # vEthernet adapter, host firewall rules scoped to that adapter, a port ACL on the VM's NIC, a NAT
+        # read proving no NAT covers the VM subnet, and the per-VM CONNECT proxy process. HostEgress.ps1
+        # drives them; Assert-Sealed reads them back. Every read returns plain hashtables with string
+        # fields (the real bodies normalize CIM enums such as Enabled, whose 'False' is truthy under a
+        # [bool] cast), and every collection read is unary-comma wrapped like GetNetworkAdapter.
+        # The real bodies are pinned out of process by tests/fixtures/Invoke-RealEgressCapture.ps1;
+        # none of them has run on a live host yet.
+        GetHostIPAddresses      = @()                              # -> @() of @{ IPAddress; PrefixLength; InterfaceAlias } (IPv4)
+        AddSwitchHostIPAddress  = @('SwitchName', 'IPAddress', 'PrefixLength')   # New-NetIPAddress on "vEthernet (<switch>)", active store only
+        RemoveSwitchHostIPAddress = @('SwitchName', 'IPAddress')   # idempotent
+        NewHostFirewallRule     = @('Name', 'Direction', 'Action', 'Protocol', 'LocalAddress', 'LocalPort', 'RemoteAddress', 'InterfaceAlias')
+        GetHostFirewallRule     = @('Name')                        # -> normalized rule record, or $null when no rule has that Name
+        RemoveHostFirewallRule  = @('Name')                        # idempotent
+        AddNetworkAdapterAcl    = @('VMName', 'Action', 'Direction', 'Weight', 'Protocol', 'LocalIPAddress', 'RemoteIPAddress', 'RemotePort', 'Stateful')
+        GetNetworkAdapterAcls   = @('VMName')                      # -> @() of normalized extended-ACL records
+        RemoveNetworkAdapterAcl = @('VMName', 'Action', 'Direction', 'Weight')   # idempotent; a VM that is gone is a no-op
+        GetNetNats              = @()                              # -> @() of @{ Name; InternalIPInterfaceAddressPrefix }
+        StartEgressProxy        = @('PythonExe', 'ScriptPath', 'Arguments', 'ReadyFile', 'ReadyTimeoutSeconds')   # -> @{ ProcessId; StartTime; CommandLine }
+        StopEgressProxy         = @('ProcessId', 'StartTime', 'StopFile', 'TimeoutSeconds')                   # -> @{ Stopped; Killed; AlreadyGone }
+
         # ---- checkpoint ----
         Checkpoint           = @('VMName', 'SnapshotName')
         RestoreCheckpoint    = @('VMName', 'SnapshotName')
@@ -1947,6 +1969,262 @@ function New-RealHyperVBackend {
         return ,@(& $InvokeOp { Get-VMAssignableDevice -VMName $vm -ErrorAction Stop })
     }.GetNewClosure()
 
+    # ---- host egress: EgressMode='HostProxy' -----------------------------
+    # LIVE-ONLY-UNPROVEN: none of these bodies has run against a real host. They are executed out of
+    # process against recording stub cmdlets by tests/fixtures/Invoke-RealEgressCapture.ps1, which pins
+    # the parameters each cmdlet receives and the normalized shapes each read returns. What the stubs
+    # cannot prove (the real CIM objects' property spellings, how Windows renders an address range,
+    # whether a just-added address is still tentative) is listed for the first elevated run in
+    # docs/phase-6-live-runbook.md section 2.
+
+    # Normalize a field read back from a real CIM or Hyper-V object to the shape the fake returns: an
+    # empty value, '*' or 'ANY' becomes 'Any'; a collection becomes a string[] in the order returned.
+    $NormAny = {
+        param($Value)
+        $items = @(@($Value) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ } |
+                   Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($items.Count -eq 0 -or ($items.Count -eq 1 -and ($items[0] -ieq 'Any' -or $items[0] -eq '*'))) { return ,@('Any') }
+        return ,[string[]]$items
+    }
+
+    $b.GetHostIPAddresses = {
+        param([System.Collections.IDictionary] $P)
+        return ,@(& $InvokeOp {
+            Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object {
+                @{ IPAddress = [string]$_.IPAddress; PrefixLength = [int]$_.PrefixLength; InterfaceAlias = [string]$_.InterfaceAlias }
+            }
+        })
+    }.GetNewClosure()
+
+    # The address goes to the ACTIVE store only, so a host reboot after a crash cannot leave it behind.
+    $b.AddSwitchHostIPAddress = {
+        param([System.Collections.IDictionary] $P)
+        $sw     = & $AssertArg $P 'SwitchName'   'AddSwitchHostIPAddress'
+        $ip     = & $AssertArg $P 'IPAddress'    'AddSwitchHostIPAddress'
+        $prefix = [int](& $AssertArg $P 'PrefixLength' 'AddSwitchHostIPAddress')
+        $alias  = "vEthernet ($sw)"
+        & $InvokeOp {
+            $null = New-NetIPAddress -InterfaceAlias $alias -IPAddress $ip -PrefixLength $prefix -AddressFamily IPv4 `
+                        -PolicyStore ActiveStore -ErrorAction Stop
+        }
+    }.GetNewClosure()
+
+    $b.RemoveSwitchHostIPAddress = {
+        param([System.Collections.IDictionary] $P)
+        $sw    = & $AssertArg $P 'SwitchName' 'RemoveSwitchHostIPAddress'
+        $ip    = & $AssertArg $P 'IPAddress'  'RemoveSwitchHostIPAddress'
+        $alias = "vEthernet ($sw)"
+        & $InvokeOp {
+            $present = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                         Where-Object { [string]$_.InterfaceAlias -eq $alias -and [string]$_.IPAddress -eq $ip })
+            if ($present.Count -gt 0) {
+                Remove-NetIPAddress -InterfaceAlias $alias -IPAddress $ip -Confirm:$false -ErrorAction Stop
+            }
+        }
+    }.GetNewClosure()
+
+    $b.NewHostFirewallRule = {
+        param([System.Collections.IDictionary] $P)
+        $name   = & $AssertArg $P 'Name'           'NewHostFirewallRule'
+        $dir    = & $AssertArg $P 'Direction'      'NewHostFirewallRule'
+        $action = & $AssertArg $P 'Action'         'NewHostFirewallRule'
+        $proto  = & $AssertArg $P 'Protocol'       'NewHostFirewallRule'
+        $alias  = & $AssertArg $P 'InterfaceAlias' 'NewHostFirewallRule'
+        $local  = & $NormAny (& $GetArg $P 'LocalAddress')
+        $remote = & $NormAny (& $GetArg $P 'RemoteAddress')
+        $ports  = & $NormAny (& $GetArg $P 'LocalPort')
+        & $InvokeOp {
+            $p = @{
+                Name = $name; DisplayName = $name; Group = 'Voidseal egress'; Direction = $dir; Action = $action
+                Protocol = $proto; InterfaceAlias = $alias; Profile = 'Any'; Enabled = 'True'; ErrorAction = 'Stop'
+            }
+            if ($local[0]  -ne 'Any') { $p.LocalAddress  = [string[]]$local }
+            if ($remote[0] -ne 'Any') { $p.RemoteAddress = [string[]]$remote }
+            if ($ports[0]  -ne 'Any') { $p.LocalPort     = [string[]]$ports }
+            $null = New-NetFirewallRule @p
+        }
+    }.GetNewClosure()
+
+    # A missing rule is $null; any other failure (the firewall service unreadable, two rules sharing the
+    # Name) THROWS, so the seal gate turns it into a refusal instead of a pass.
+    $b.GetHostFirewallRule = {
+        param([System.Collections.IDictionary] $P)
+        $name = & $AssertArg $P 'Name' 'GetHostFirewallRule'
+        & $InvokeOp {
+            $found = $null
+            try { $found = Get-NetFirewallRule -Name $name -ErrorAction Stop }
+            catch {
+                if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) { return $null }
+                throw
+            }
+            $rules = @($found)
+            if ($rules.Count -eq 0) { return $null }
+            if ($rules.Count -ne 1) { throw "HyperVBackend.GetHostFirewallRule: $($rules.Count) rules share the Name '$name'." }
+            $r  = $rules[0]
+            $pf = Get-NetFirewallPortFilter      -AssociatedNetFirewallRule $r -ErrorAction Stop
+            $af = Get-NetFirewallAddressFilter   -AssociatedNetFirewallRule $r -ErrorAction Stop
+            $nf = Get-NetFirewallInterfaceFilter -AssociatedNetFirewallRule $r -ErrorAction Stop
+            @{
+                Name           = [string]$r.Name
+                # Enabled is a CIM enum whose 'False' member is truthy under [bool]; compare the text.
+                Enabled        = ([string]$r.Enabled -eq 'True')
+                Direction      = [string]$r.Direction
+                Action         = [string]$r.Action
+                Protocol       = [string]$pf.Protocol
+                LocalPort      = (& $NormAny $pf.LocalPort)
+                LocalAddress   = (& $NormAny $af.LocalAddress)
+                RemoteAddress  = (& $NormAny $af.RemoteAddress)
+                InterfaceAlias = (& $NormAny $nf.InterfaceAlias)
+            }
+        }
+    }.GetNewClosure()
+
+    $b.RemoveHostFirewallRule = {
+        param([System.Collections.IDictionary] $P)
+        $name = & $AssertArg $P 'Name' 'RemoveHostFirewallRule'
+        & $InvokeOp {
+            $found = $null
+            try { $found = Get-NetFirewallRule -Name $name -ErrorAction Stop }
+            catch {
+                if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) { return }
+                throw
+            }
+            if (@($found).Count -gt 0) { Remove-NetFirewallRule -Name $name -ErrorAction Stop }
+        }
+    }.GetNewClosure()
+
+    $b.AddNetworkAdapterAcl = {
+        param([System.Collections.IDictionary] $P)
+        $vm       = & $AssertArg $P 'VMName'    'AddNetworkAdapterAcl'
+        $action   = & $AssertArg $P 'Action'    'AddNetworkAdapterAcl'
+        $dir      = & $AssertArg $P 'Direction' 'AddNetworkAdapterAcl'
+        $weight   = [int](& $AssertArg $P 'Weight' 'AddNetworkAdapterAcl')
+        $proto    = [string]((& $NormAny (& $GetArg $P 'Protocol'))[0])
+        $localIp  = [string]((& $NormAny (& $GetArg $P 'LocalIPAddress'))[0])
+        $remoteIp = [string]((& $NormAny (& $GetArg $P 'RemoteIPAddress'))[0])
+        $rport    = [string]((& $NormAny (& $GetArg $P 'RemotePort'))[0])
+        $stateful = [bool](& $GetArg $P 'Stateful' $false)
+        & $InvokeOp {
+            $p = @{ VMName = $vm; Action = $action; Direction = $dir; Weight = $weight; ErrorAction = 'Stop' }
+            if ($proto    -ne 'Any') { $p.Protocol        = $proto }
+            if ($localIp  -ne 'Any') { $p.LocalIPAddress  = $localIp }
+            if ($remoteIp -ne 'Any') { $p.RemoteIPAddress = $remoteIp }
+            if ($rport    -ne 'Any') { $p.RemotePort      = $rport }
+            if ($stateful)           { $p.Stateful        = $true }
+            $null = Add-VMNetworkAdapterExtendedAcl @p
+        }
+    }.GetNewClosure()
+
+    $b.GetNetworkAdapterAcls = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $AssertArg $P 'VMName' 'GetNetworkAdapterAcls'
+        return ,@(& $InvokeOp {
+            Get-VMNetworkAdapterExtendedAcl -VMName $vm -ErrorAction Stop | ForEach-Object {
+                @{
+                    Action          = [string]$_.Action
+                    Direction       = [string]$_.Direction
+                    Weight          = [int]$_.Weight
+                    Protocol        = [string]((& $NormAny $_.Protocol)[0])
+                    LocalIPAddress  = [string]((& $NormAny $_.LocalIPAddress)[0])
+                    RemoteIPAddress = [string]((& $NormAny $_.RemoteIPAddress)[0])
+                    RemotePort      = [string]((& $NormAny $_.RemotePort)[0])
+                    Stateful        = ([string]$_.Stateful -eq 'True')
+                }
+            }
+        })
+    }.GetNewClosure()
+
+    $b.RemoveNetworkAdapterAcl = {
+        param([System.Collections.IDictionary] $P)
+        $vm     = & $AssertArg $P 'VMName'    'RemoveNetworkAdapterAcl'
+        $action = & $AssertArg $P 'Action'    'RemoveNetworkAdapterAcl'
+        $dir    = & $AssertArg $P 'Direction' 'RemoveNetworkAdapterAcl'
+        $weight = [int](& $AssertArg $P 'Weight' 'RemoveNetworkAdapterAcl')
+        & $InvokeOp {
+            Get-VM -ErrorAction Stop | Out-Null          # availability probe, like GetVM
+            if ($null -eq (Get-VM -Name $vm -ErrorAction SilentlyContinue)) { return }
+            $match = @(Get-VMNetworkAdapterExtendedAcl -VMName $vm -ErrorAction Stop | Where-Object {
+                [string]$_.Action -eq $action -and [string]$_.Direction -eq $dir -and [int]$_.Weight -eq $weight })
+            if ($match.Count -gt 0) { $match | Remove-VMNetworkAdapterExtendedAcl -ErrorAction Stop }
+        }
+    }.GetNewClosure()
+
+    $b.GetNetNats = {
+        param([System.Collections.IDictionary] $P)
+        return ,@(& $InvokeOp {
+            Get-NetNat -ErrorAction Stop | ForEach-Object {
+                @{ Name = [string]$_.Name; InternalIPInterfaceAddressPrefix = [string]$_.InternalIPInterfaceAddressPrefix }
+            }
+        })
+    }.GetNewClosure()
+
+    # Start the proxy as a plain child process (no shell, so no argument re-parsing) and wait for the
+    # ready file it writes once it is listening. A process that exits first, or a ready file that never
+    # appears, is a throw (the process is killed first), never a half-started proxy.
+    $b.StartEgressProxy = {
+        param([System.Collections.IDictionary] $P)
+        $py      = [string](& $AssertArg $P 'PythonExe'  'StartEgressProxy')
+        $script  = [string](& $AssertArg $P 'ScriptPath' 'StartEgressProxy')
+        $ready   = [string](& $AssertArg $P 'ReadyFile'  'StartEgressProxy')
+        $argv    = @(@(& $GetArg $P 'Arguments' @()) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        $timeout = [double](& $GetArg $P 'ReadyTimeoutSeconds' 30)
+        if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
+            throw "HyperVBackend.StartEgressProxy: proxy script '$script' does not exist."
+        }
+        if (Test-Path -LiteralPath $ready) { Remove-Item -LiteralPath $ready -Force -ErrorAction Stop }
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($py)
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow  = $true
+        $psi.ArgumentList.Add($script)
+        foreach ($a in $argv) { $psi.ArgumentList.Add($a) }
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $deadline = [datetime]::UtcNow.AddSeconds($timeout)
+        while (-not (Test-Path -LiteralPath $ready -PathType Leaf)) {
+            if ($proc.HasExited) {
+                throw "HyperVBackend.StartEgressProxy: the proxy exited with code $($proc.ExitCode) before it was listening."
+            }
+            if ([datetime]::UtcNow -gt $deadline) {
+                try { $proc.Kill() } catch { }
+                throw "HyperVBackend.StartEgressProxy: the proxy did not report ready within $timeout seconds; it was killed."
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        $info = Get-Content -LiteralPath $ready -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ([int]$info.pid -ne $proc.Id) {
+            try { $proc.Kill() } catch { }
+            throw "HyperVBackend.StartEgressProxy: the ready file names pid $($info.pid), not the started process $($proc.Id)."
+        }
+        $cmd = (@($py, $script) + $argv | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
+        return @{ ProcessId = $proc.Id; StartTime = $proc.StartTime.ToUniversalTime().ToString('o'); CommandLine = $cmd }
+    }.GetNewClosure()
+
+    # Stop asks first (the stop file), then kills after the timeout. The recorded StartTime guards against
+    # PID reuse: a process with that id but another start time is not ours and is left alone.
+    $b.StopEgressProxy = {
+        param([System.Collections.IDictionary] $P)
+        $procId  = [int](& $AssertArg $P 'ProcessId' 'StopEgressProxy')
+        $start   = [string](& $GetArg $P 'StartTime')
+        $stop    = [string](& $GetArg $P 'StopFile')
+        $timeout = [int](& $GetArg $P 'TimeoutSeconds' 10)
+        $proc = $null
+        try { $proc = [System.Diagnostics.Process]::GetProcessById($procId) }
+        catch [System.ArgumentException] { return @{ Stopped = $true; Killed = $false; AlreadyGone = $true } }
+        if (-not [string]::IsNullOrWhiteSpace($start)) {
+            # A start time we cannot read (another user's process reusing the id) is not ours either.
+            $actual = $null
+            try { $actual = $proc.StartTime.ToUniversalTime().ToString('o') } catch { $actual = $null }
+            if ($actual -ne $start) { return @{ Stopped = $true; Killed = $false; AlreadyGone = $true } }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($stop)) { Set-Content -LiteralPath $stop -Value 'stop' -ErrorAction Stop }
+        $killed = $false
+        if (-not $proc.WaitForExit($timeout * 1000)) {
+            $proc.Kill()
+            $null = $proc.WaitForExit(5000)
+            $killed = $true
+        }
+        return @{ Stopped = $true; Killed = $killed; AlreadyGone = $false }
+    }.GetNewClosure()
+
     # ---- checkpoint ------------------------------------------------------
     $b.Checkpoint = {
         param([System.Collections.IDictionary] $P)
@@ -2147,6 +2425,17 @@ $script:SbCopyFakeVM = {
     coverage in New-WorkloadDisks (both NewOutputVhdx call sites are wrapped with the same DiskFull
     classify-then-rethrow). Thrown BEFORE any state write, same discipline as SimulateSecondNewOutput-
     VhdxError. A fake-only simulation switch on the EXISTING method — no manifest change.
+.PARAMETER SimulateHostIPAddresses
+    The host's IPv4 addresses GetHostIPAddresses starts with, each @{ IPAddress; PrefixLength;
+    InterfaceAlias }. Default: one LAN address, 192.168.1.20/24 on 'Ethernet'. Pass an address inside
+    the HostProxy range to drive the provisioner's address-collision refusal.
+.PARAMETER SimulateNetNat
+    NAT networks GetNetNats reports, each @{ Name; InternalIPInterfaceAddressPrefix }. Default: none.
+.PARAMETER SimulateEgressMethodError
+    Names of host egress methods (GetHostIPAddresses, AddSwitchHostIPAddress, NewHostFirewallRule,
+    GetHostFirewallRule, AddNetworkAdapterAcl, GetNetworkAdapterAcls, GetNetNats, StartEgressProxy,
+    StopEgressProxy and the Remove* methods) that THROW when called, modeling the host cmdlet failing,
+    so a test can drive each fail-closed and rollback path. Default: none.
 #>
 function New-FakeHyperVBackend {
     [CmdletBinding()]
@@ -2176,7 +2465,10 @@ function New-FakeHyperVBackend {
         [long] $SimulateHostTotalMemoryBytes = 128GB,
         [switch] $SimulateHostMemoryReadError
 ,
-        [string[]] $SimulateGuestDiskWrite = @()
+        [string[]] $SimulateGuestDiskWrite = @(),
+        [hashtable[]] $SimulateHostIPAddresses = @(@{ IPAddress = '192.168.1.20'; PrefixLength = 24; InterfaceAlias = 'Ethernet' }),
+        [hashtable[]] $SimulateNetNat = @(),
+        [string[]] $SimulateEgressMethodError = @()
     )
 
     # Hoist shared helpers into factory-locals so the method closures capture them
@@ -2255,7 +2547,30 @@ function New-FakeHyperVBackend {
         # closures — grep `CallLog.Add` for the current set — so a test can assert invocation-reached /
         # ordering facts (e.g. detach-precedes-read, or a lifecycle abort never reaching StartVM).
         CallLog     = [System.Collections.Generic.List[object]]::new()
+        # Host egress (HostProxy) state: the host's IPv4 addresses (a vEthernet address joins it when
+        # AddSwitchHostIPAddress runs and leaves it when the address or its switch is removed), the host
+        # firewall rules by Name, the host's NAT networks, and the proxy processes by id.
+        HostIPs        = [System.Collections.Generic.List[object]]::new()
+        FirewallRules  = @{}
+        NetNats        = [System.Collections.Generic.List[object]]::new()
+        EgressProcs    = @{}
+        NextProcId     = @(40000)
     }
+    foreach ($ipRec in @($SimulateHostIPAddresses)) {
+        $state.HostIPs.Add(@{ IPAddress = [string]$ipRec['IPAddress']; PrefixLength = [int]$ipRec['PrefixLength']; InterfaceAlias = [string]$ipRec['InterfaceAlias'] })
+    }
+    foreach ($natRec in @($SimulateNetNat)) {
+        $state.NetNats.Add(@{ Name = [string]$natRec['Name']; InternalIPInterfaceAddressPrefix = [string]$natRec['InternalIPInterfaceAddressPrefix'] })
+    }
+    # Captured by the egress methods: the named methods throw (a host cmdlet failing), so a test can drive
+    # every fail-closed and rollback path.
+    $egressErrors = @($SimulateEgressMethodError)
+    $egressFail = {
+        param([string] $Method)
+        if ($egressErrors -contains $Method) {
+            throw "HyperVBackend(fake).${Method}: simulated host failure (SimulateEgressMethodError)."
+        }
+    }.GetNewClosure()
 
     # Helper: fetch a VM record or throw a clear "no such VM" naming it.
     $requireVM = {
@@ -2325,7 +2640,10 @@ function New-FakeHyperVBackend {
             # Voidseal never assigns either. Tests seed one by adding to these lists.
             GpuPartitionAdapters           = [System.Collections.Generic.List[object]]::new()
             AssignableDevices              = [System.Collections.Generic.List[object]]::new()
-            Checkpoints                    = [System.Collections.Generic.List[object]]::new()  # @{ Name; Snapshot=<vm copy> }
+            # Extended port ACLs on the VM's adapter (AddNetworkAdapterAcl). They live and die with the
+            # adapter, as on real Hyper-V: RemoveNetworkAdapter and RemoveVM drop them.
+            NetworkAdapterAcls             = [System.Collections.Generic.List[object]]::new()
+            Checkpoints                   = [System.Collections.Generic.List[object]]::new()  # @{ Name; Snapshot=<vm copy> }
             # Host<->guest channels seeded to the UNSEALED default (all $true) — Hyper-V enables
             # Guest Services / Enhanced Session by default, so a freshly-provisioned VM is NOT
             # sealed until the Sealer turns them off. Assert-Sealed host-verifies these are off.
@@ -3152,6 +3470,9 @@ function New-FakeHyperVBackend {
         # Idempotent — removing an unknown name is a no-op, mirroring the real backend's Get guard.
         $name = & $AssertArg $P 'Name' 'RemoveSwitch'
         if ($state.Switches.ContainsKey($name)) { $state.Switches.Remove($name) | Out-Null }
+        # Real Remove-VMSwitch deletes the host's "vEthernet (<switch>)" adapter, and every address on it.
+        $alias = "vEthernet ($name)"
+        foreach ($ipRec in @($state.HostIPs | Where-Object { $_.InterfaceAlias -eq $alias })) { [void]$state.HostIPs.Remove($ipRec) }
     }.GetNewClosure()
 
     $b.ConnectNetworkAdapter = {
@@ -3190,6 +3511,8 @@ function New-FakeHyperVBackend {
         # branch, so there is no throw to log before.
         $state.CallLog.Add(@{ Op = 'RemoveNetworkAdapter'; Path = $null; VMName = $vm.Name })
         $vm.NetworkAdapters = [System.Collections.Generic.List[object]]::new()
+        # The adapter's extended ACLs go with it (they are settings OF the adapter on real Hyper-V).
+        $vm.NetworkAdapterAcls = [System.Collections.Generic.List[object]]::new()
     }.GetNewClosure()
 
     $b.GetNetworkAdapter = {
@@ -3216,6 +3539,202 @@ function New-FakeHyperVBackend {
         param([System.Collections.IDictionary] $P)
         $vm = & $requireVM (& $GetArg $P 'VMName') 'GetAssignableDevices'
         return ,@($vm.AssignableDevices)
+    }.GetNewClosure()
+
+    # ---- host egress: EgressMode='HostProxy' ----
+    # In-memory models of the host network objects HostEgress.ps1 creates. Each mirrors a real refusal
+    # the engine could otherwise get past on the fake alone: an address on a vEthernet adapter needs the
+    # switch to exist (a Private switch has no host adapter), a rule's interface must exist, a duplicate
+    # address or rule Name is an error, a port filter needs TCP or UDP, an ACL needs an adapter on the VM.
+    # Reads return COPIES, so a caller cannot change host state by editing what it read. Every method
+    # logs to the CallLog and honors -SimulateEgressMethodError.
+    $hostAliases = {
+        $aliases = [System.Collections.Generic.List[string]]::new()
+        foreach ($ipRec in $state.HostIPs) { $aliases.Add([string]$ipRec.InterfaceAlias) }
+        foreach ($sw in $state.Switches.Values) {
+            if ($sw.SwitchType -in @('Internal', 'External')) { $aliases.Add("vEthernet ($($sw.Name))") }
+        }
+        return ,$aliases
+    }.GetNewClosure()
+    $toList = {
+        param($Value)
+        $items = @(@($Value) | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+        if ($items.Count -eq 0) { return ,[string[]]@('Any') }
+        return ,[string[]]$items
+    }
+
+    $b.GetHostIPAddresses = {
+        param([System.Collections.IDictionary] $P)
+        & $egressFail 'GetHostIPAddresses'
+        return ,@($state.HostIPs | ForEach-Object { @{ IPAddress = $_.IPAddress; PrefixLength = $_.PrefixLength; InterfaceAlias = $_.InterfaceAlias } })
+    }.GetNewClosure()
+
+    $b.AddSwitchHostIPAddress = {
+        param([System.Collections.IDictionary] $P)
+        $sw     = & $AssertArg $P 'SwitchName'   'AddSwitchHostIPAddress'
+        $ip     = [string](& $AssertArg $P 'IPAddress' 'AddSwitchHostIPAddress')
+        $prefix = [int](& $AssertArg $P 'PrefixLength' 'AddSwitchHostIPAddress')
+        $state.CallLog.Add(@{ Op = 'AddSwitchHostIPAddress'; Path = $ip; VMName = $null })
+        & $egressFail 'AddSwitchHostIPAddress'
+        if (-not $state.Switches.ContainsKey($sw)) {
+            throw "HyperVBackend(fake).AddSwitchHostIPAddress: no switch '$sw', so there is no 'vEthernet ($sw)' adapter (real New-NetIPAddress fails on an unknown alias)."
+        }
+        if ($state.Switches[$sw].SwitchType -eq 'Private') {
+            throw "HyperVBackend(fake).AddSwitchHostIPAddress: switch '$sw' is Private, which has no host adapter."
+        }
+        $parsed = $null
+        if (-not [System.Net.IPAddress]::TryParse($ip, [ref]$parsed) -or $parsed.AddressFamily -ne 'InterNetwork' -or $prefix -lt 1 -or $prefix -gt 32) {
+            throw "HyperVBackend(fake).AddSwitchHostIPAddress: '$ip/$prefix' is not a valid IPv4 address and prefix."
+        }
+        if (@($state.HostIPs | Where-Object { $_.IPAddress -eq $ip }).Count -gt 0) {
+            throw "HyperVBackend(fake).AddSwitchHostIPAddress: the host already has address $ip (real New-NetIPAddress: the object already exists)."
+        }
+        $state.HostIPs.Add(@{ IPAddress = $ip; PrefixLength = $prefix; InterfaceAlias = "vEthernet ($sw)" })
+    }.GetNewClosure()
+
+    $b.RemoveSwitchHostIPAddress = {
+        param([System.Collections.IDictionary] $P)
+        $sw = & $AssertArg $P 'SwitchName' 'RemoveSwitchHostIPAddress'
+        $ip = [string](& $AssertArg $P 'IPAddress' 'RemoveSwitchHostIPAddress')
+        $state.CallLog.Add(@{ Op = 'RemoveSwitchHostIPAddress'; Path = $ip; VMName = $null })
+        & $egressFail 'RemoveSwitchHostIPAddress'
+        $alias = "vEthernet ($sw)"
+        foreach ($ipRec in @($state.HostIPs | Where-Object { $_.InterfaceAlias -eq $alias -and $_.IPAddress -eq $ip })) { [void]$state.HostIPs.Remove($ipRec) }
+    }.GetNewClosure()
+
+    $b.NewHostFirewallRule = {
+        param([System.Collections.IDictionary] $P)
+        $name   = [string](& $AssertArg $P 'Name' 'NewHostFirewallRule')
+        $dir    = [string](& $AssertArg $P 'Direction' 'NewHostFirewallRule')
+        $action = [string](& $AssertArg $P 'Action' 'NewHostFirewallRule')
+        $proto  = [string](& $AssertArg $P 'Protocol' 'NewHostFirewallRule')
+        $alias  = [string](& $AssertArg $P 'InterfaceAlias' 'NewHostFirewallRule')
+        $ports  = & $toList (& $GetArg $P 'LocalPort')
+        $state.CallLog.Add(@{ Op = 'NewHostFirewallRule'; Path = $name; VMName = $null })
+        & $egressFail 'NewHostFirewallRule'
+        if ($dir -cnotin @('Inbound', 'Outbound')) { throw "HyperVBackend(fake).NewHostFirewallRule: Direction '$dir' must be Inbound or Outbound." }
+        if ($action -cnotin @('Allow', 'Block')) { throw "HyperVBackend(fake).NewHostFirewallRule: Action '$action' must be Allow or Block." }
+        if ($proto -cnotin @('TCP', 'UDP', 'ICMPv4', 'ICMPv6', 'Any')) { throw "HyperVBackend(fake).NewHostFirewallRule: Protocol '$proto' is not modeled." }
+        if ($ports[0] -ne 'Any' -and $proto -notin @('TCP', 'UDP')) {
+            throw "HyperVBackend(fake).NewHostFirewallRule: a LocalPort filter needs Protocol TCP or UDP (real New-NetFirewallRule refuses it for '$proto')."
+        }
+        if ($state.FirewallRules.ContainsKey($name)) { throw "HyperVBackend(fake).NewHostFirewallRule: a rule named '$name' already exists." }
+        if ((& $hostAliases) -notcontains $alias) { throw "HyperVBackend(fake).NewHostFirewallRule: no host interface '$alias'." }
+        $state.FirewallRules[$name] = @{
+            Name = $name; Enabled = $true; Direction = $dir; Action = $action; Protocol = $proto
+            LocalPort = $ports; LocalAddress = (& $toList (& $GetArg $P 'LocalAddress'))
+            RemoteAddress = (& $toList (& $GetArg $P 'RemoteAddress')); InterfaceAlias = [string[]]@($alias)
+        }
+    }.GetNewClosure()
+
+    $b.GetHostFirewallRule = {
+        param([System.Collections.IDictionary] $P)
+        $name = [string](& $AssertArg $P 'Name' 'GetHostFirewallRule')
+        & $egressFail 'GetHostFirewallRule'
+        if (-not $state.FirewallRules.ContainsKey($name)) { return $null }
+        $r = $state.FirewallRules[$name]
+        return @{
+            Name = $r.Name; Enabled = $r.Enabled; Direction = $r.Direction; Action = $r.Action; Protocol = $r.Protocol
+            LocalPort = [string[]]@($r.LocalPort); LocalAddress = [string[]]@($r.LocalAddress)
+            RemoteAddress = [string[]]@($r.RemoteAddress); InterfaceAlias = [string[]]@($r.InterfaceAlias)
+        }
+    }.GetNewClosure()
+
+    $b.RemoveHostFirewallRule = {
+        param([System.Collections.IDictionary] $P)
+        $name = [string](& $AssertArg $P 'Name' 'RemoveHostFirewallRule')
+        $state.CallLog.Add(@{ Op = 'RemoveHostFirewallRule'; Path = $name; VMName = $null })
+        & $egressFail 'RemoveHostFirewallRule'
+        if ($state.FirewallRules.ContainsKey($name)) { $state.FirewallRules.Remove($name) | Out-Null }
+    }.GetNewClosure()
+
+    $b.AddNetworkAdapterAcl = {
+        param([System.Collections.IDictionary] $P)
+        $vm     = & $requireVM (& $GetArg $P 'VMName') 'AddNetworkAdapterAcl'
+        $action = [string](& $AssertArg $P 'Action' 'AddNetworkAdapterAcl')
+        $dir    = [string](& $AssertArg $P 'Direction' 'AddNetworkAdapterAcl')
+        $weight = [int](& $AssertArg $P 'Weight' 'AddNetworkAdapterAcl')
+        $state.CallLog.Add(@{ Op = 'AddNetworkAdapterAcl'; Path = "$dir/$action/$weight"; VMName = $vm.Name })
+        & $egressFail 'AddNetworkAdapterAcl'
+        if ($action -cnotin @('Allow', 'Deny')) { throw "HyperVBackend(fake).AddNetworkAdapterAcl: Action '$action' must be Allow or Deny." }
+        if ($dir -cnotin @('Inbound', 'Outbound')) { throw "HyperVBackend(fake).AddNetworkAdapterAcl: Direction '$dir' must be Inbound or Outbound." }
+        if ($vm.NetworkAdapters.Count -eq 0) { throw "HyperVBackend(fake).AddNetworkAdapterAcl: VM '$($vm.Name)' has no network adapter to carry an ACL." }
+        if (@($vm.NetworkAdapterAcls | Where-Object { $_.Direction -eq $dir -and $_.Weight -eq $weight }).Count -gt 0) {
+            throw "HyperVBackend(fake).AddNetworkAdapterAcl: VM '$($vm.Name)' already has a $dir ACL of weight $weight."
+        }
+        $vm.NetworkAdapterAcls.Add(@{
+            Action = $action; Direction = $dir; Weight = $weight
+            Protocol        = [string]((& $toList (& $GetArg $P 'Protocol'))[0])
+            LocalIPAddress  = [string]((& $toList (& $GetArg $P 'LocalIPAddress'))[0])
+            RemoteIPAddress = [string]((& $toList (& $GetArg $P 'RemoteIPAddress'))[0])
+            RemotePort      = [string]((& $toList (& $GetArg $P 'RemotePort'))[0])
+            Stateful        = [bool](& $GetArg $P 'Stateful' $false)
+        })
+    }.GetNewClosure()
+
+    $b.GetNetworkAdapterAcls = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $requireVM (& $GetArg $P 'VMName') 'GetNetworkAdapterAcls'
+        & $egressFail 'GetNetworkAdapterAcls'
+        return ,@($vm.NetworkAdapterAcls | ForEach-Object { $c = @{}; foreach ($k in $_.Keys) { $c[$k] = $_[$k] }; $c })
+    }.GetNewClosure()
+
+    $b.RemoveNetworkAdapterAcl = {
+        param([System.Collections.IDictionary] $P)
+        $name   = [string](& $AssertArg $P 'VMName' 'RemoveNetworkAdapterAcl')
+        $action = [string](& $AssertArg $P 'Action' 'RemoveNetworkAdapterAcl')
+        $dir    = [string](& $AssertArg $P 'Direction' 'RemoveNetworkAdapterAcl')
+        $weight = [int](& $AssertArg $P 'Weight' 'RemoveNetworkAdapterAcl')
+        $state.CallLog.Add(@{ Op = 'RemoveNetworkAdapterAcl'; Path = "$dir/$action/$weight"; VMName = $name })
+        & $egressFail 'RemoveNetworkAdapterAcl'
+        if (-not $state.VMs.ContainsKey($name)) { return }
+        $vm = $state.VMs[$name]
+        foreach ($acl in @($vm.NetworkAdapterAcls | Where-Object { $_.Action -eq $action -and $_.Direction -eq $dir -and $_.Weight -eq $weight })) {
+            [void]$vm.NetworkAdapterAcls.Remove($acl)
+        }
+    }.GetNewClosure()
+
+    $b.GetNetNats = {
+        param([System.Collections.IDictionary] $P)
+        & $egressFail 'GetNetNats'
+        return ,@($state.NetNats | ForEach-Object { @{ Name = $_.Name; InternalIPInterfaceAddressPrefix = $_.InternalIPInterfaceAddressPrefix } })
+    }.GetNewClosure()
+
+    # The fake never starts Python. It checks what the real body checks before launching (the script
+    # exists), records the process as running, and builds the command line the same way.
+    $b.StartEgressProxy = {
+        param([System.Collections.IDictionary] $P)
+        $py     = [string](& $AssertArg $P 'PythonExe' 'StartEgressProxy')
+        $script = [string](& $AssertArg $P 'ScriptPath' 'StartEgressProxy')
+        $ready  = [string](& $AssertArg $P 'ReadyFile' 'StartEgressProxy')
+        $argv   = @(@(& $GetArg $P 'Arguments' @()) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        $state.CallLog.Add(@{ Op = 'StartEgressProxy'; Path = $script; VMName = $null })
+        & $egressFail 'StartEgressProxy'
+        if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
+            throw "HyperVBackend(fake).StartEgressProxy: proxy script '$script' does not exist."
+        }
+        $procId = $state.NextProcId[0]
+        $state.NextProcId[0] = $procId + 1
+        $start = [datetime]::new(2026, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc).AddSeconds($procId).ToString('o')
+        $cmd = (@($py, $script) + $argv | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
+        $state.EgressProcs[$procId] = @{ ProcessId = $procId; StartTime = $start; Arguments = $argv; ReadyFile = $ready; Running = $true }
+        return @{ ProcessId = $procId; StartTime = $start; CommandLine = $cmd }
+    }.GetNewClosure()
+
+    $b.StopEgressProxy = {
+        param([System.Collections.IDictionary] $P)
+        $procId = [int](& $AssertArg $P 'ProcessId' 'StopEgressProxy')
+        $start  = [string](& $GetArg $P 'StartTime')
+        $state.CallLog.Add(@{ Op = 'StopEgressProxy'; Path = [string]$procId; VMName = $null })
+        & $egressFail 'StopEgressProxy'
+        if (-not $state.EgressProcs.ContainsKey($procId) -or -not $state.EgressProcs[$procId].Running) {
+            return @{ Stopped = $true; Killed = $false; AlreadyGone = $true }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($start) -and $state.EgressProcs[$procId].StartTime -ne $start) {
+            return @{ Stopped = $true; Killed = $false; AlreadyGone = $true }
+        }
+        $state.EgressProcs[$procId].Running = $false
+        return @{ Stopped = $true; Killed = $false; AlreadyGone = $false }
     }.GetNewClosure()
 
     # ---- checkpoint ----
@@ -3267,6 +3786,12 @@ function New-FakeHyperVBackend {
     # call ordering (e.g. detach precedes the host read) AFTER a full Invoke-Voidseal run, when the
     # per-VM HardDrives record is already gone (the VM was torn down).
     $b.FakeCallLog = $state.CallLog
+    # TEST-ONLY, same rule: the proxy processes the fake "started" (id -> @{ Running; Arguments; ... }), so a
+    # test can prove teardown stopped exactly the one it started.
+    $b.FakeEgressProcesses = $state.EgressProcs
+    # TEST-ONLY, same rule: the host firewall rules by Name, so a seal-gate test can model a rule that was
+    # disabled or edited outside the tool (no backend method changes a rule in place).
+    $b.FakeFirewallRules = $state.FirewallRules
 
     return $b
 }

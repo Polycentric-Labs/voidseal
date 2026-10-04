@@ -18,7 +18,7 @@ small. The tier you pick = how much capability you're willing to grant.
 | Tier | Use it for | Substrate | Network | Egress (v1) | Credentials | Extraction | Lifecycle | v1 status |
 |---|---|---|---|---|---|---|---|---|
 | **0** | trusted dev + productivity on copies (e.g. the Firefox organizer) | **Hyper-V path / lightweight guest** in v1 — container runtime (Docker / devcontainer / `docker sbx` / sandbox-runtime) is **PLANNED, not yet built** | host-proxy allowlist | host firewall / proxy (default **offline**) | injected at proxy (none by default) | host reads result dir | `--rm` per task (container tier, when built) | **validated (mock-backed; live run = the live smoke test, operator-run, elevated)** |
-| **1** | agent loops (Ralph), organizers, steady-state services | Hyper-V **Gen2 VM** | Internal switch (NIC kept; switch-isolation + Default-Switch by-name refusal are seal-verified) | **in-guest defense-in-depth SHIPS, NOT a boundary** — `EgressMode='InGuestSquid'`: iptables default-DROP OUTPUT + a transparent Squid `dstdomain` allowlist over `EgressAllowlist`, mock-asserted for SHAPE only; a compromised/root guest can disable it; the **host-verified boundary is Phase-6** | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal: validated (mock-backed; live run = the live smoke test, operator-run, elevated). Egress: in-guest defense-in-depth ships (mock-shape-asserted); NOT yet live-exercised — the host-verified boundary is Phase-6 (host-side).** |
+| **1** | agent loops (Ralph), organizers, steady-state services | Hyper-V **Gen2 VM** | Internal switch (NIC kept; switch-isolation + Default-Switch by-name refusal are seal-verified) | **host-enforced, `EgressMode='HostProxy'`**: no route, NAT or resolver in the guest; a host CONNECT allowlist proxy on the VM's own /30 is the only way out, behind host firewall rules and a port ACL that `Assert-Sealed` verifies; in-guest default-DROP as defense in depth. Mock-green only | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal: validated (mock-backed; live run = the live smoke test, operator-run, elevated). Egress: HostProxy built and gate-verified in the mock suite; NOT yet live-exercised (the first elevated run is Phase 6).** |
 | **2** | disposable analysis of semi-trusted artifacts | Hyper-V VM, disposable | **Private switch, no NIC** | **none** | **none** (enforced) | **cold output-VHDX → quarantine VM → CDR → inert promote** | create → destroy | **scaffold / benign dry-run** |
 | **3** | airgapped detonation (eventually: malware) | Hyper-V Gen2, **no virtual NIC** + sinkhole VM | **structurally no egress** | **none** | **none** (enforced) | same as Tier 2, **mandatory** | detonate → wipe (revert between runs) | **scaffold / benign dry-run** |
 
@@ -31,29 +31,49 @@ small. The tier you pick = how much capability you're willing to grant.
 > Tier-0 `firefox` proof runs through the Hyper-V path / a lightweight guest rather than
 > `docker sbx`.
 
-**Egress note (v1):** the Tier-1 profile **ships** an in-guest allowlist mechanism
-(`EgressMode='InGuestSquid'` in `tier-profiles/tier1.psd1`): the ralph/Serial CIDATA seed's
-`CidataSerialEgressTemplate` (`SeedBuilder.ps1`) installs **iptables default-DROP OUTPUT**
-plus a **transparent Squid `dstdomain` allowlist** over the profile's `EgressAllowlist` —
-ported from the same mechanism the separate builder profile already proved. This retires the
-prior fabricated, schema-only `EgressMode='NftablesAllowlist'` value, which named a
-mechanism that never had any code path behind it. That retirement wasn't just a rename:
-Earlier design work had already **invalidated** the nftables/ipset approach: a
-*static* FQDN allowlist doesn't survive CDN IP rotation (DNS is resolved once, at rule-load,
-and never re-resolved), and tier1's own allowlist targets CDN-fronted hosts
-(`api.anthropic.com`, `pypi.org`, `github.com`). Squid's `dstdomain` ACL matches the
-destination name per request, so CDN IP rotation behind that name is irrelevant to it.
-**This is defense-in-depth, NOT a boundary.** The mock suite asserts the seed's SHAPE only
-(the rendered Squid config text, the iptables rule text, the ACL substitution) — it does
-**not** prove real packet-drop, and the activation-timing ordering against the guest's own
-pre-seal package install (`deb.debian.org` is intentionally not in the allowlist) is unproven
-until a live run exercises it. A compromised/root guest can flush its own iptables or kill its
-own Squid, so **the host-verified boundary is still Phase-6** (host-side NAT/Squid/
-default-DROP — see [`phase-6-live-runbook.md`](phase-6-live-runbook.md)). **No bearer tokens
-flow through egress** in v1 regardless, so the credential-injecting host-Envoy /
-presence-boolean risk stays out of scope (deferred to Phase-1B). (This is also why the Tier-0
-Firefox example workload is the lead proof: the core ships and is validated without depending
-on the riskiest, not-yet-live-proven piece.)
+**Egress note (v1):** the Tier-1 profile ships **host-enforced** egress (`EgressMode='HostProxy'` in
+`tier-profiles/tier1.psd1`, since 2026-10-03; design in `scripts/lib/HostEgress.ps1`):
+
+- **Addressing.** Each VM gets a /30 inside `10.231.0.0/16`, chosen from a SHA-256 of its name. The host
+  holds the gateway address (`.1` of the /30) on `vEthernet (<vm>-int)`; the guest gets `.2` through a
+  cloud-init `network-config` with DHCP off, no route and no nameservers. A host address or NAT network
+  that overlaps the /30, or a host that cannot be read, refuses the provision before anything exists.
+- **The one door.** `scripts/egress/voidseal_egress_proxy.py` (standard-library Python) listens on the
+  gateway address, port 13128. It accepts only `CONNECT <name>:443` for names on the merged
+  `EgressAllowlist` (exact names; a leading-dot entry such as `.example.org` covers the domain and its
+  subdomains), resolves the name on the host, refuses any answer with a private, loopback, link-local,
+  multicast, reserved or non-global address, and dials the address it chose. No plain-HTTP proxying, no
+  TLS interception. One JSON line per connection (name, decision, reason, byte counts, never payload)
+  goes to `egress-proxy.log` in the run's artifact folder (`report.EgressProxyLog`).
+- **Everything else closed, twice.** Host firewall rules on the vEthernet interface admit only TCP from
+  the guest address to the proxy port (a Windows Block rule beats any Allow, so the Blocks are shaped
+  around that one tuple), and a port ACL on the VM's NIC denies all traffic except stateful TCP from the
+  guest to the proxy port. No NAT exists, so there is no route off the switch at all.
+- **Verified at the seal.** `Lock-Sandbox` installs the gateway address, rules and ACL; `Assert-Sealed`
+  refuses unless each is on the host exactly as recorded, the record is complete for the VM's plan, and
+  no NAT covers the subnet. The proxy starts after the gate and before the guest boots; teardown removes
+  exactly what was recorded.
+- **Guest side.** `HTTPS_PROXY` / `https_proxy` (with `NO_PROXY` empty) in `/etc/environment` and a login
+  profile script, apt's proxy setting with https sources, and an in-guest default-DROP that allows only
+  the proxy port, applied on the guest's single boot. The in-guest layer is defense in depth.
+
+**Residual:** an allowlist admits names, not parties, so a name that fronts a shared CDN or a public
+storage service can carry traffic for someone else (`docs/threat-model.md`); keep allowlists narrow.
+**Maturity:** mock-green only. The proxy is tested on loopback sockets and the host bodies against stub
+cmdlets; nothing has crossed a real interface yet ([`phase-6-live-runbook.md`](phase-6-live-runbook.md)
+section 2 lists the checks for the first elevated run).
+
+`EgressMode='InGuestSquid'` still works for a tier file that sets it: the Serial seed's
+`CidataSerialEgressTemplate` (`SeedBuilder.ps1`) installs **iptables default-DROP OUTPUT** plus a
+**transparent Squid `dstdomain` allowlist** over the `EgressAllowlist`, ported from the builder's
+mechanism. That mode is **defense in depth, not a boundary**: a compromised or root guest can flush its
+own iptables or kill its own Squid, and the mock suite asserts the seed's shape only. It retired the
+earlier schema-only `EgressMode='NftablesAllowlist'`, whose static FQDN-to-IP approach could not survive
+CDN IP rotation; both Squid's `dstdomain` and the HostProxy proxy decide per request, by name, so
+rotation behind a name does not matter to them. The builder keeps `SquidSniProxy`. **No bearer tokens
+flow through egress** in v1 regardless, so the credential-injecting host-Envoy / presence-boolean risk
+stays out of scope (deferred to Phase-1B). (This is also why the Tier-0 Firefox example workload is the
+lead proof: the core ships and is validated without depending on the riskiest, not-yet-live-proven piece.)
 
 ### Structural enforcement (not just convention)
 
@@ -89,7 +109,7 @@ row is green across P1–P10.** Use this as the sign-off checklist before trusti
 | # | Principle | Deployer control | T0 | T1 | T2 | T3 |
 |---|---|---|---|---|---|---|
 | **P1** | Supervise **capability**, not behavior | the tier model itself — match isolation strength to task risk | ✅ | ✅ | ✅ | ✅ |
-| **P2** | **Default-deny egress** | allowlist (T0/T1) / **no NIC** (T2/T3) | ✅ offline, no NIC: the seal removes the default adapter and `Assert-Sealed` host-verifies zero adapters (`Get-SealNicPolicy` returns `NoAdapter` for Tier 0); the declared host-proxy allowlist is **not implemented**, tier0's `EgressAllowlist` is empty, and opt-in net steps escalate to Tier 1 | 🛡️ in-guest defense-in-depth ships (iptables default-DROP + Squid `dstdomain` allowlist over `EgressAllowlist`; mock-shape-asserted only, not live-exercised): **not this tier's boundary**; the host-verified boundary is Phase-6 | ✅ no NIC | ✅ no NIC |
+| **P2** | **Default-deny egress** | allowlist (T0/T1) / **no NIC** (T2/T3) | ✅ offline, no NIC: the seal removes the default adapter and `Assert-Sealed` host-verifies zero adapters (`Get-SealNicPolicy` returns `NoAdapter` for Tier 0); the declared `HostProxy` mode has nothing to act on without an adapter, tier0's `EgressAllowlist` is empty, and opt-in net steps escalate to Tier 1 | ✅ host-enforced allowlist (`HostProxy`: host CONNECT proxy, host firewall rules and a port ACL, verified by `Assert-Sealed`; no route, NAT or resolver in the guest); mock-green, not yet live-exercised | ✅ no NIC | ✅ no NIC |
 | **P3** | **Provenance proxy** (request attribution) | Phase-1B (v1 = FQDN + TLS-terminate; provenance deferred with credentials) | ➖ deferred | ➖ deferred | n/a (no egress) | n/a (no egress) |
 | **P4** | **Credentials out of env** | injected-at-proxy (T0) / starved (T2/T3); never `-e`, file bind-mount only | ✅ | ✅ default-none | ✅ none | ✅ none |
 | **P5** | **Least privilege** | non-root run-user, read-only code mounts, **secret-file refusal** | ✅ | ✅ | ✅ | ✅ |
@@ -142,7 +162,7 @@ gate**. Output = a **signed, content-addressed behavior report**, diffable acros
 ## 4. Quick "which tier?" guide
 
 - **Trusted code/data, operating on copies, needs the net or not** → **Tier 0** (container, fast).
-- **An agent loop or organizer you trust, that needs a *restricted* allowlisted net** → **Tier 1** (net-restricted VM; in-guest allowlist now ships as defense-in-depth, mock-shape-asserted — the host-verified boundary is still Phase-6; see the Egress note above).
+- **An agent loop or organizer you trust, that needs a *restricted* allowlisted net** → **Tier 1** (net-restricted VM; host-enforced allowlist egress, mock-green and not yet live-exercised; see the Egress note above).
 - **A semi-trusted artifact you want to analyze with no net** → **Tier 2** (disposable no-net) — *scaffold only in v1.*
 - **Presumed-hostile / malware, full airgap + detonation** → **Tier 3** — *scaffold only in v1; live detonation is gated behind explicit operator approval + verified isolation.*
 

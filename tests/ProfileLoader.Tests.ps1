@@ -150,7 +150,7 @@ Describe 'Import-TierProfile — real example profiles' {
         $p                       | Should -Not -BeNullOrEmpty
         $p.Tier                  | Should -Be 1
         $p.Substrate             | Should -Be 'HyperV-Gen2'
-        $p.EgressMode            | Should -Be 'InGuestSquid'
+        $p.EgressMode            | Should -Be 'HostProxy'
         $p.ManagementChannel     | Should -Be 'Com1Serial'
         @($p.EgressAllowlist)    | Should -Contain 'api.anthropic.com'
         @($p.EgressAllowlist).Count | Should -BeGreaterThan 1

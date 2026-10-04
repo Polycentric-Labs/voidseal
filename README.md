@@ -39,13 +39,13 @@ rather than duplicating it.
 >   `Inputs` (the INPUT data disk) or `DataDisks` (pre-built, hash-verified disks the guest mounts
 >   read-only; build one with `scripts/New-VoidsealDataDisk.ps1`); the cloud-init seed is built from
 >   the profile and carries none of yours. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
-> - **On the `Invoke-Voidseal` path, `BlockProtocols` is declarative and `EgressAllowlist` reaches only
->   the Serial seed.** No code reads `BlockProtocols`. `EgressAllowlist` is validated, merged and deduped;
->   for a Serial-mode profile whose `EgressMode` is `InGuestSquid` (Tier 1, as in `ralph`),
->   `Invoke-Voidseal` renders it into the Squid ACL of the cloud-init seed it builds. That is the
->   in-guest layer described above, and it has never run live. The seed enables the layer's systemd
->   unit at first boot without starting it, so whether it is active during a run's single boot is
->   still a Phase-6 question. No host firewall, proxy or resolver configuration is emitted.
+> - **On the `Invoke-Voidseal` path, `BlockProtocols` is declarative and `EgressAllowlist` is enforced on
+>   the host for a Tier-1 Serial run.** No code reads `BlockProtocols` (HostProxy blocks UDP and
+>   non-443 traffic by construction anyway). `EgressAllowlist` is validated, merged and deduped; with
+>   `EgressMode='HostProxy'` (what `tier1.psd1` ships, so `ralph` uses it) it is the list the host
+>   CONNECT proxy enforces, behind host firewall rules and a port ACL that the seal gate verifies, and
+>   the guest has no route, NAT or resolver of its own. This is mock-green and has never run live. A
+>   profile set to `InGuestSquid` instead gets the in-guest Squid layer, which is defense in depth only.
 
 ## What it is
 
