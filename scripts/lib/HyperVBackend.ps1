@@ -156,6 +156,12 @@ function Get-HyperVBackendMethodManifest {
         # <bool>; FAKE = flips the recorded AutomaticCheckpointsEnabled flag on the VM record. Added per
         # the SetFirmware/RemoveVHD addendum precedent (manifest + both factories + parity/drift tests).
         SetAutomaticCheckpoints = @('VMName', 'Enabled')           # Set-VM -AutomaticCheckpointsEnabled
+        # Host-TRUTH read of the same setting (design E6, 2026-10-03): Assert-Sealed refuses a VM with
+        # automatic checkpoints on. A dedicated getter rather than a field off GetVM, because the fake's VM
+        # record and a real Get-VM object only happen to share this property name (the DvdDrive lesson).
+        # REAL = (Get-VM).AutomaticCheckpointsEnabled, throwing unless it is a real [bool]; FAKE = the
+        # recorded flag. Added per the GetDvdDrives addendum precedent (manifest + both factories).
+        GetAutomaticCheckpoints = @('VMName')                      # -> [bool]; throws when unreadable
         SetComPort           = @('VMName', 'Number', 'Path')        # COM1 named-pipe (Linux mgmt channel)
         # Host-TRUTH read of a VM's COM port (the Runner's COM1 serial command channel). Returns
         # @{ Number; Path } for the requested port, or $null when no port / an empty path. Backs
@@ -941,6 +947,27 @@ function New-RealHyperVBackend {
         $enabled = [bool](& $GetArg $P 'Enabled' $false)
         & $InvokeOp {
             $null = Set-VM -Name $vm -AutomaticCheckpointsEnabled $enabled -ErrorAction Stop
+        }
+    }.GetNewClosure()
+
+    # Host-truth read of the automatic-checkpoint setting for the seal gate. FAIL-CLOSED: a Get-VM failure
+    # throws through $InvokeOp, and a result that is not exactly one VM carrying a [bool]
+    # AutomaticCheckpointsEnabled throws here, so nothing unreadable can come back as "off".
+    # LIVE-UNVERIFIED: Set-VM -AutomaticCheckpointsEnabled has run live (RC7), but no run has yet read the
+    # property back off a real Get-VM object.
+    $b.GetAutomaticCheckpoints = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $AssertArg $P 'VMName' 'GetAutomaticCheckpoints'
+        & $InvokeOp {
+            $found = @(Get-VM -Name $vm -ErrorAction Stop)
+            if ($found.Count -ne 1) {
+                throw "HyperVBackend.GetAutomaticCheckpoints: expected exactly one VM named '$vm', found $($found.Count). Fail closed."
+            }
+            $prop = $found[0].PSObject.Properties['AutomaticCheckpointsEnabled']
+            if ($null -eq $prop -or $prop.Value -isnot [bool]) {
+                throw "HyperVBackend.GetAutomaticCheckpoints: VM '$vm' reported no boolean AutomaticCheckpointsEnabled. Fail closed."
+            }
+            return $prop.Value
         }
     }.GetNewClosure()
 
@@ -1831,6 +1858,13 @@ $script:SbCopyFakeVM = {
     A named-pipe path NewVM records on every new VM's COM2, modeling a second serial channel wired
     outside the tool. Default: none, matching real Hyper-V, where a new Gen2 VM's COM2 has an empty path
     (GetComPort then returns $null).
+.PARAMETER SimulateAutomaticCheckpointsStuckOn
+    Make SetAutomaticCheckpoints with Enabled=$false a no-op, so the Hyper-V default (ON) survives the
+    Provisioner's RC7 call and GetAutomaticCheckpoints still reads $true. Models a setting that did not
+    take or was turned back on outside the tool.
+.PARAMETER SimulateCheckpointPresent
+    NewVM records one checkpoint ('external-checkpoint') on every new VM, modeling a checkpoint taken
+    outside the tool. GetCheckpoint then lists it and RestoreCheckpoint can roll back to it.
 .PARAMETER SimulateGuestCommandFailure
     Make InvokeGuestCommand return a NON-ZERO ExitCode (simulating a guest workload that exited
     with failure). Used to exercise the Runner's "a non-zero guest exit is a RUN OUTCOME reported
@@ -1922,6 +1956,8 @@ function New-FakeHyperVBackend {
         [switch] $SimulateChannelReadError,
         [string[]] $SimulateChannelStuckOn = @(),
         [string] $SimulateCom2Path,
+        [switch] $SimulateAutomaticCheckpointsStuckOn,
+        [switch] $SimulateCheckpointPresent,
         [switch] $SimulateGuestCommandFailure,
         [switch] $SimulateGuestCommandTimeout,
         [switch] $SimulateStartVMError,
@@ -1957,6 +1993,9 @@ function New-FakeHyperVBackend {
     $channelsStuckOn = @($SimulateChannelStuckOn)
     # Captured by the NewVM closure: a COM2 pipe path to seed on every new VM (see param help).
     $com2Seed = $SimulateCom2Path
+    # Captured by SetAutomaticCheckpoints and NewVM respectively (see param help).
+    $autoCheckpointsStuckOn = $SimulateAutomaticCheckpointsStuckOn.IsPresent
+    $seedCheckpoint         = $SimulateCheckpointPresent.IsPresent
     # Captured by the relevant method closures (see param help) — test-only failure seams.
     $guestCmdFails     = $SimulateGuestCommandFailure.IsPresent
     $guestCmdTimesOut  = $SimulateGuestCommandTimeout.IsPresent
@@ -2089,6 +2128,7 @@ function New-FakeHyperVBackend {
         $sw = & $GetArg $P 'SwitchName'
         $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
         if (-not [string]::IsNullOrWhiteSpace($com2Seed)) { $vm.ComPorts[2] = $com2Seed }
+        if ($seedCheckpoint) { $vm.Checkpoints.Add(@{ Name = 'external-checkpoint'; Snapshot = (& $CopyVM $vm) }) }
         $state.VMs[$name] = $vm
     }.GetNewClosure()
 
@@ -2235,7 +2275,17 @@ function New-FakeHyperVBackend {
     $b.SetAutomaticCheckpoints = {
         param([System.Collections.IDictionary] $P)
         $vm = & $requireVM (& $GetArg $P 'VMName') 'SetAutomaticCheckpoints'
-        $vm.AutomaticCheckpointsEnabled = [bool](& $GetArg $P 'Enabled' $false)
+        $enabled = [bool](& $GetArg $P 'Enabled' $false)
+        # SimulateAutomaticCheckpointsStuckOn: turning the setting off does not take.
+        if (-not $enabled -and $autoCheckpointsStuckOn) { return }
+        $vm.AutomaticCheckpointsEnabled = $enabled
+    }.GetNewClosure()
+
+    # The fake's analogue of reading Get-VM's AutomaticCheckpointsEnabled: the recorded flag, as [bool].
+    $b.GetAutomaticCheckpoints = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $requireVM (& $GetArg $P 'VMName') 'GetAutomaticCheckpoints'
+        return [bool]$vm.AutomaticCheckpointsEnabled
     }.GetNewClosure()
 
     $b.SetComPort = {

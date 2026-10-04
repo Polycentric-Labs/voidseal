@@ -1525,3 +1525,100 @@ Describe 'Seal coverage: Assert-Sealed refuses a VM whose COM2 has a path' {
         Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
     }
 }
+
+# ===========================================================================
+#  Seal coverage (design E6): checkpoints
+# ===========================================================================
+#  A checkpoint holds a copy of the VM's state from before the seal, and restoring it would undo the seal
+#  without the gate ever seeing it. Automatic checkpoints also pin a differencing .avhdx per disk (RC7). The
+#  Provisioner turns automatic checkpoints off and never takes a checkpoint, so the gate refuses either at
+#  every tier and fails closed when it cannot read the setting or list the checkpoints.
+Describe 'Seal coverage: Assert-Sealed refuses automatic checkpoints and any existing checkpoint' {
+
+    BeforeAll {
+        $script:NewSealedCp = {
+            param([hashtable] $Backend, [int] $Tier, [string] $Name)
+            $p = $script:Tier1
+            if ($Tier -eq 0) {
+                $p = $script:Tier1.Clone()
+                $p['Tier']        = 0
+                $p['Description'] = 'TEST FIXTURE: Tier 0 for the checkpoint gate.'
+            }
+            elseif ($Tier -eq 2) { $p = $script:Tier2 }
+            $d = New-SandboxVM -Profile $p -Name $Name -Backend $Backend
+            Lock-Sandbox -Descriptor $d -Backend $Backend
+            return @{ Backend = $Backend; Desc = $d }
+        }
+    }
+
+    It 'a clean seal has automatic checkpoints off and no checkpoint, and certifies' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-clean'
+        (& $sb.Backend.GetAutomaticCheckpoints @{ VMName = 'sbx-cp-clean' }) | Should -BeFalse
+        (& $sb.Backend.GetCheckpoint @{ VMName = 'sbx-cp-clean' }).Count | Should -Be 0
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+
+    It 'REFUSES automatic checkpoints left ON at Tiers 0, 1 and 2 (SimulateAutomaticCheckpointsStuckOn)' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend -SimulateAutomaticCheckpointsStuckOn) -Tier $t -Name "sbx-cp-auto$t"
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage '*because automatic checkpoints are enabled*' -Because "automatic checkpoints must be refused at Tier $t"
+        }
+    }
+
+    It 'REFUSES automatic checkpoints turned back ON after the seal' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 0 -Name 'sbx-cp-reon'
+        & $sb.Backend.SetAutomaticCheckpoints @{ VMName = 'sbx-cp-reon'; Enabled = $true }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*because automatic checkpoints are enabled*'
+    }
+
+    It 'REFUSES an existing checkpoint at Tiers 0, 1 and 2 (SimulateCheckpointPresent), counting it' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend -SimulateCheckpointPresent) -Tier $t -Name "sbx-cp-has$t"
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage '*because 1 checkpoint(s) exist*' -Because "a checkpoint must be refused at Tier $t"
+        }
+    }
+
+    It 'REFUSES checkpoints taken after the seal, counting each one' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-two'
+        Checkpoint-Sandbox -Name 'sbx-cp-two' -SnapshotName 'a' -Backend $sb.Backend
+        Checkpoint-Sandbox -Name 'sbx-cp-two' -SnapshotName 'b' -Backend $sb.Backend
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*because 2 checkpoint(s) exist*'
+    }
+
+    It 'REFUSES (fail closed) when the automatic-checkpoint read throws' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-autothrow'
+        $sb.Backend.GetAutomaticCheckpoints = { param($P) throw 'INJECTED: Get-VM failed' }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not read its automatic-checkpoint setting (INJECTED: Get-VM failed)*'
+    }
+
+    It 'REFUSES (fail closed) when the automatic-checkpoint read is not a boolean: <Label>' -ForEach @(
+        @{ Value = $null;   Label = 'null' },
+        @{ Value = 'False'; Label = 'the string False' },
+        @{ Value = 0;       Label = 'the integer 0' }
+    ) {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-autobad'
+        $v = $Value
+        $sb.Backend.GetAutomaticCheckpoints = { param($P) return $v }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*host returned no boolean automatic-checkpoint setting*'
+    }
+
+    It 'REFUSES (fail closed) when the checkpoint listing throws' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-listthrow'
+        $sb.Backend.GetCheckpoint = { param($P) throw 'INJECTED: Get-VMSnapshot failed' }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not list its checkpoints (INJECTED: Get-VMSnapshot failed)*'
+    }
+
+    It 'REFUSES (fail closed) when the checkpoint listing returns no collection' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-listnull'
+        $sb.Backend.GetCheckpoint = { param($P) return $null }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not list its checkpoints (the read returned no collection)*'
+    }
+}

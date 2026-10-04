@@ -57,6 +57,9 @@
           must sit on an isolated Internal vSwitch that is not the Default Switch.
         * ANY tier: no GPU partition adapter and no device assigned by Discrete Device Assignment
           (GetGpuPartitionAdapters / GetAssignableDevices; a read that fails refuses).
+        * ANY tier: no path on COM2 (GetComPort Number=2; Voidseal wires only COM1).
+        * ANY tier: automatic checkpoints off and no checkpoint present (GetAutomaticCheckpoints /
+          GetCheckpoint); a restore would roll the VM back past the seal. Unreadable refuses.
         * ANY tier: no import DVD attached; no transfer/import medium recorded on the descriptor
           still attached.
         * a secret-SHAPED attached disk path (Test-IsSecretPath) is REFUSED at any tier.
@@ -85,6 +88,8 @@
         *-VMIntegrationService cmdlet.
       * GetGpuPartitionAdapters @{ VMName } and GetAssignableDevices @{ VMName }: host-truth reads of
         passthrough devices, so the gate can refuse any without reaching for a raw Get-VM* cmdlet.
+      * GetAutomaticCheckpoints @{ VMName }: host-truth read of the automatic-checkpoint setting (added
+        2026-10-03 with the checkpoint refusal; GetCheckpoint already existed).
 
     LINUX-GUEST SEAL MODEL (the channels split into TWO classes):
       * GuestServices = the ONE REAL autonomous host<->guest data channel (Copy-VMFile / 'Guest
@@ -582,6 +587,10 @@ function Lock-Sandbox {
         still-Phase-6-live layer.
       * NO passthrough device at any tier: GetGpuPartitionAdapters and GetAssignableDevices must both
         report none (a read that throws or returns no collection is a refusal).
+      * NO path on COM2 at any tier (GetComPort Number=2). Voidseal wires only COM1; a read that throws
+        refuses.
+      * automatic checkpoints OFF and NO checkpoint present at any tier (GetAutomaticCheckpoints,
+        GetCheckpoint). A throw, a non-[bool] setting or a listing that is not a collection refuses.
       * no import DVD/ISO attached (a live read-only-but-present host<->guest medium).
       * no transfer/import VHD recorded on the descriptor still attached.
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.
@@ -796,6 +805,46 @@ function Assert-Sealed {
         throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because its COM2 port is connected to " +
                "'$com2Path'. Voidseal wires only COM1 (the serial management channel); a path on COM2 is a " +
                "second host<->guest byte stream added outside the tool. Fail closed.")
+    }
+
+    # --- NO automatic checkpoints and NO existing checkpoint (any tier, host-verified) ---
+    # A checkpoint holds a copy of the VM from before (or during) the seal; restoring it undoes the seal
+    # without the gate ever seeing it, and automatic checkpoints also pin a differencing .avhdx per disk
+    # (RC7). New-SandboxVM turns automatic checkpoints off and nothing in the engine takes a checkpoint, so
+    # either one here was changed outside the tool. Both reads fail closed: a throw, a non-[bool] setting
+    # and a listing that is not a collection all refuse.
+    $autoCheckpoints = $null
+    try {
+        $autoCheckpoints = & $Backend.GetAutomaticCheckpoints @{ VMName = $vmName }
+    }
+    catch {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not read its " +
+               "automatic-checkpoint setting ($($_.Exception.Message)). Fail closed.")
+    }
+    if ($autoCheckpoints -isnot [bool]) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host returned no boolean " +
+               "automatic-checkpoint setting. Fail closed.")
+    }
+    if ($autoCheckpoints) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because automatic checkpoints are enabled. " +
+               "They pin a differencing disk and capture pre-run state that a restore would bring back; " +
+               "New-SandboxVM turns them off, so this was changed outside the tool. Fail closed.")
+    }
+    $checkpoints = $null
+    try {
+        $checkpoints = & $Backend.GetCheckpoint @{ VMName = $vmName }
+    }
+    catch {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not list its " +
+               "checkpoints ($($_.Exception.Message)). Fail closed.")
+    }
+    if ($null -eq $checkpoints) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not list its " +
+               "checkpoints (the read returned no collection). Fail closed.")
+    }
+    if ($checkpoints.Count -ne 0) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because $($checkpoints.Count) checkpoint(s) " +
+               "exist. A restore would roll the VM back past the seal, and the engine never takes one. Fail closed.")
     }
 
     # --- NO import DVD/ISO attached (any tier) ----------------------------

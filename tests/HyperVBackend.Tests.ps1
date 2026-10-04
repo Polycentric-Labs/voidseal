@@ -77,7 +77,7 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             # VM lifecycle
             'NewVM', 'GetVM', 'StartVM', 'StopVM', 'RemoveVM'
             # hardware
-            'SetProcessor', 'SetMemory', 'SetFirmware', 'SetAutomaticCheckpoints', 'SetComPort', 'GetComPort'
+            'SetProcessor', 'SetMemory', 'SetFirmware', 'SetAutomaticCheckpoints', 'GetAutomaticCheckpoints', 'SetComPort', 'GetComPort'
             # guest command delivery (the Runner serial seam)
             'InvokeGuestCommand'
             # host channels (the seal surface)
@@ -188,7 +188,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
         # from the manifest's first identifying key. TestAvailable is arg-less (excluded).
         $primaryKey = @{
             NewVM = 'Name'; GetVM = 'Name'; StartVM = 'Name'; StopVM = 'Name'; RemoveVM = 'Name'
-            SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
+            SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; GetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
             InvokeGuestCommand = 'VMName'
             SetHostChannel = 'VMName'; GetHostChannels = 'VMName'
             NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; WriteVhdxFileBytes = 'Path'; ReadVhdxFileBytes = 'Path'; ReadVhdxRawRegion = 'Path'; GetVhdxImageHash = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'; GetVolumeFreeSpace = 'Path'
@@ -452,6 +452,36 @@ Describe 'Fake backend — SetAutomaticCheckpoints (RC7)' {
     It 'both backends expose SetAutomaticCheckpoints as a scriptblock (interface parity)' {
         (New-RealHyperVBackend)['SetAutomaticCheckpoints'] | Should -BeOfType [scriptblock]
         (New-FakeHyperVBackend)['SetAutomaticCheckpoints'] | Should -BeOfType [scriptblock]
+    }
+
+    It 'GetAutomaticCheckpoints reads the recorded flag back as a [bool] (the seal gate''s host read)' {
+        $v = & $script:B.GetAutomaticCheckpoints @{ VMName = 'vm1' }
+        $v | Should -BeOfType [bool]
+        $v | Should -BeTrue -Because 'a fresh VM carries the Hyper-V default'
+        & $script:B.SetAutomaticCheckpoints @{ VMName = 'vm1'; Enabled = $false }
+        (& $script:B.GetAutomaticCheckpoints @{ VMName = 'vm1' }) | Should -BeFalse
+        @($script:ExpectedMethods['GetAutomaticCheckpoints']) | Should -Be @('VMName')
+    }
+
+    It 'SimulateAutomaticCheckpointsStuckOn: the disable does not take, so the read stays $true' {
+        $b = New-FakeHyperVBackend -SimulateAutomaticCheckpointsStuckOn
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $b.SetAutomaticCheckpoints @{ VMName = 'vm1'; Enabled = $false }
+        (& $b.GetAutomaticCheckpoints @{ VMName = 'vm1' }) | Should -BeTrue
+    }
+
+    It 'SimulateCheckpointPresent: every new VM lists one checkpoint, and it can be restored' {
+        $b = New-FakeHyperVBackend -SimulateCheckpointPresent
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        $cps = & $b.GetCheckpoint @{ VMName = 'vm1' }
+        $cps.Count   | Should -Be 1
+        $cps[0].Name | Should -Be 'external-checkpoint'
+        { & $b.RestoreCheckpoint @{ VMName = 'vm1'; SnapshotName = 'external-checkpoint' } } | Should -Not -Throw
+        (& $script:B.GetCheckpoint @{ VMName = 'vm1' }).Count | Should -Be 0 -Because 'without the switch a new VM has no checkpoint'
+    }
+
+    It 'GetAutomaticCheckpoints on a missing VM throws naming the VM' {
+        { & $script:B.GetAutomaticCheckpoints @{ VMName = 'ghost' } } | Should -Throw -ExpectedMessage '*ghost*'
     }
 }
 
@@ -1986,6 +2016,29 @@ Describe 'Seal-device methods: the REAL bodies, executed out of process against 
         # SilentlyContinue this came back $null with no error, which the COM2 refusal would read as clean.
         $script:SealDevCap.Com2_Fail.err  | Should -Match 'simulated Get-VMComPort failure'
         $script:SealDevCap.Com2_Fail.read | Should -Be 'vm1#2'
+    }
+
+    It 'GetAutomaticCheckpoints returns the real [bool] off Get-VM, $false and $true alike' {
+        $script:SealDevCap.AutoCp_Off.err    | Should -BeNullOrEmpty
+        $script:SealDevCap.AutoCp_Off.isBool | Should -BeTrue
+        $script:SealDevCap.AutoCp_Off.value  | Should -BeFalse
+        $script:SealDevCap.AutoCp_On.value   | Should -BeTrue
+    }
+
+    It 'GetAutomaticCheckpoints THROWS on a missing property, a non-boolean value, zero or two VMs, and a failed Get-VM' {
+        $script:SealDevCap.AutoCp_NoProp.err | Should -BeLike '*reported no boolean AutomaticCheckpointsEnabled*'
+        $script:SealDevCap.AutoCp_String.err | Should -BeLike '*reported no boolean AutomaticCheckpointsEnabled*' -Because 'the string False is truthy and must never be coerced'
+        $script:SealDevCap.AutoCp_NoVM.err   | Should -BeLike '*expected exactly one VM*found 0*'
+        $script:SealDevCap.AutoCp_TwoVMs.err | Should -BeLike '*expected exactly one VM*found 2*'
+        $script:SealDevCap.AutoCp_Fail.err   | Should -Match 'simulated Get-VM failure' -Because 'a non-terminating Get-VM error must surface (-ErrorAction Stop)'
+    }
+
+    It 'GetCheckpoint returns an ARRAY for 0 and 1 checkpoints, and THROWS when Get-VMSnapshot fails' {
+        $script:SealDevCap.CpList_None.isArray | Should -BeTrue
+        $script:SealDevCap.CpList_None.count   | Should -Be 0
+        $script:SealDevCap.CpList_One.isArray  | Should -BeTrue -Because 'a single checkpoint must not unroll to a bare object'
+        $script:SealDevCap.CpList_One.count    | Should -Be 1
+        $script:SealDevCap.CpList_Fail.err     | Should -Match 'simulated Get-VMSnapshot failure' -Because 'an unreadable checkpoint list must not read as empty'
     }
 
     It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal)' {
