@@ -504,3 +504,149 @@ Describe 'Assert-Sealed and recorded data disks' {
         { Assert-Sealed -Descriptor $s.Desc -Backend $s.Backend } | Should -Throw -ExpectedMessage '*secret*'
     }
 }
+
+Describe 'Guest runners mount each data disk read-only and fail closed' {
+
+    BeforeAll {
+        $two = @(
+            @{ Name = 'corpus'; Path = 'D:\vs\corpus.vhdx'; ImageHash = ('a' * 64) },
+            @{ Name = 'wheels'; Path = 'D:\vs\wheels.vhdx'; ImageHash = ('b' * 64) }
+        )
+        $script:SeedProfiles = @{
+            exfat  = @{ WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/job.py --out /mnt/out/result.html'; DataDisks = $two }
+            outbox = @{ WorkloadMode = 'Disk'; OutboxOutput = $true; Entrypoint = 'python3 /mnt/in/job.py --out /run/staging/result.html'; DataDisks = $two }
+        }
+
+        # The runner script embedded in the user-data (the write_files content block), dedented.
+        function script:Get-RunnerScript {
+            param([string] $UserData)
+            $lines = $UserData -split "`n"
+            $start = [array]::IndexOf($lines, '  - path: /usr/local/sbin/vmdep-workload')
+            $start | Should -BeGreaterOrEqual 0
+            $body = [System.Collections.Generic.List[string]]::new()
+            for ($i = $start + 3; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - path: ') { break }
+                $body.Add(($lines[$i] -replace '^      ', ''))
+            }
+            return ($body -join "`n")
+        }
+
+        # Each mount command that targets a data disk label (comment lines skipped).
+        function script:Get-DataMountCommand {
+            param([string] $Script)
+            foreach ($line in ($Script -split "`n")) {
+                if ($line.TrimStart().StartsWith('#')) { continue }
+                foreach ($seg in ($line -split '\|\||&&|;')) {
+                    if ($seg -match '^\s*mount\s.*\bLABEL=VSD') { $seg.Trim() }
+                }
+            }
+        }
+
+        # A POSIX sh for `-n` syntax checks: Debian's /bin/sh is dash. On Windows, use Git for Windows'
+        # dash (never the WSL bash launcher that PATH may offer).
+        $script:PosixSh = $null
+        if ($IsWindows) {
+            # git.exe lives in <GitRoot>\cmd, \bin or \mingw64\bin depending on how PATH was set up.
+            foreach ($git in @(Get-Command git -CommandType Application -All -ErrorAction SilentlyContinue)) {
+                $dir = Split-Path -Parent $git.Source
+                for ($up = 0; $up -lt 3 -and -not $script:PosixSh -and $dir; $up++) {
+                    $dir = Split-Path -Parent $dir
+                    foreach ($c in 'usr\bin\dash.exe', 'usr\bin\sh.exe') {
+                        $cand = Join-Path $dir $c
+                        if (Test-Path -LiteralPath $cand) { $script:PosixSh = $cand; break }
+                    }
+                }
+                if ($script:PosixSh) { break }
+            }
+        }
+        else {
+            $sh = Get-Command dash, sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sh) { $script:PosixSh = $sh.Source }
+        }
+    }
+
+    It '<Kind> runner: one read-only mount block per declared disk, by its VSD label' -ForEach @(
+        @{ Kind = 'exfat' }, @{ Kind = 'outbox' }
+    ) {
+        $runner = Get-RunnerScript -UserData (New-CidataUserData -Profile $script:SeedProfiles[$Kind])
+        $runner | Should -Match 'mkdir -p /mnt/data/corpus'
+        $runner | Should -Match 'LABEL=VSDCORPUS /mnt/data/corpus'
+        $runner | Should -Match 'LABEL=VSDWHEELS /mnt/data/wheels'
+        $runner | Should -Not -Match '__DATA_DISK_MOUNTS__'
+        $mounts = @(Get-DataMountCommand -Script $runner)
+        $mounts.Count | Should -Be 4 -Because 'two disks, each with a uid/gid arm and a plain fallback arm'
+        foreach ($m in $mounts) {
+            $opt = [regex]::Match($m, '\s-o\s+(\S+)')
+            $opt.Success | Should -BeTrue -Because "'$m' passes no option list, so it would mount read-write"
+            $opts = $opt.Groups[1].Value -split ','
+            $opts | Should -Contain 'ro'
+            $opts | Should -Not -Contain 'rw'
+        }
+    }
+
+    It '<Kind> runner: a disk that does not mount, or is not read-only, powers off before the entrypoint' -ForEach @(
+        @{ Kind = 'exfat'; Marker = "printf '%s' 71" }, @{ Kind = 'outbox'; Marker = 'ABORT data-disk-not-mounted name=corpus label=VSDCORPUS' }
+    ) {
+        $runner = Get-RunnerScript -UserData (New-CidataUserData -Profile $script:SeedProfiles[$Kind])
+        $runner | Should -Match ([regex]::Escape("if ! mountpoint -q /mnt/data/corpus; then"))
+        $runner | Should -Match ([regex]::Escape('findmnt -no OPTIONS /mnt/data/corpus'))
+        $guard = ($runner -split "`n" | Where-Object { $_ -match 'mountpoint -q /mnt/data/wheels' } | Select-Object -First 1)
+        $guard | Should -Match 'poweroff; exit 0'
+        $runner.IndexOf('mountpoint -q /mnt/data/wheels') | Should -BeLessThan $runner.IndexOf("/bin/sh -c '") -Because 'disks are mounted and checked before the workload runs'
+        $runner | Should -Match ([regex]::Escape($Marker))
+    }
+
+    It '<Kind> runner: the script still parses as POSIX sh (dash -n) with data disks' -ForEach @(
+        @{ Kind = 'exfat' }, @{ Kind = 'outbox' }
+    ) {
+        if (-not $script:PosixSh) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $runner = Get-RunnerScript -UserData (New-CidataUserData -Profile $script:SeedProfiles[$Kind])
+        $f = Join-Path $TestDrive "runner-$Kind.sh"
+        [System.IO.File]::WriteAllText($f, $runner, [System.Text.UTF8Encoding]::new($false))
+        $out = & $script:PosixSh -n $f 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because "sh -n reported: $out"
+    }
+
+    It 'with no data disks the runners carry no data-disk mount and still parse' {
+        foreach ($k in 'exfat', 'outbox') {
+            $p = @{} + $script:SeedProfiles[$k]
+            $p.Remove('DataDisks')
+            $runner = Get-RunnerScript -UserData (New-CidataUserData -Profile $p)
+            @(Get-DataMountCommand -Script $runner).Count | Should -Be 0
+            $runner | Should -Not -Match 'mkdir -p /mnt/data'
+            $runner | Should -Not -Match '__DATA_DISK_MOUNTS__'
+            if ($script:PosixSh) {
+                $f = Join-Path $TestDrive "runner-none-$k.sh"
+                [System.IO.File]::WriteAllText($f, $runner, [System.Text.UTF8Encoding]::new($false))
+                $null = & $script:PosixSh -n $f 2>&1
+                $LASTEXITCODE | Should -Be 0
+            }
+        }
+    }
+
+    It 'refuses an unsafe name before it can reach the seed' {
+        $p = @{} + $script:SeedProfiles['outbox']
+        $p['DataDisks'] = @(@{ Name = 'x;reboot'; Path = 'D:\vs\x.vhdx'; ImageHash = ('a' * 64) })
+        { New-CidataUserData -Profile $p } | Should -Throw -ExpectedMessage '*name*'
+    }
+
+    It 'the builder and Serial seeds refuse data disks instead of ignoring them' {
+        $dd = @(@{ Name = 'corpus'; Path = 'D:\vs\corpus.vhdx'; ImageHash = ('a' * 64) })
+        { New-CidataUserData -Profile @{ WorkloadMode = 'Disk'; EgressMode = 'SquidSniProxy'; Entrypoint = 'python3 /mnt/in/f.py'; EgressAllowlist = @('pypi.org'); DataDisks = $dd } } |
+            Should -Throw -ExpectedMessage '*builder*'
+        { New-CidataUserData -Profile @{ WorkloadMode = 'Serial'; Entrypoint = 'bash run.sh'; DataDisks = $dd } } |
+            Should -Throw -ExpectedMessage '*Serial*'
+    }
+
+    It 'Invoke-Voidseal writes the mount lines into the CIDATA seed it attaches' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $p = Join-Path $script:DataRoot 'seedcheck.vhdx'
+        & $b.NewVHD @{ Path = $p; SizeBytes = 1GB; Dynamic = $true }
+        $h = [string](& $b.GetVhdxImageHash @{ Path = $p })
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = @(@{ Name = 'corpus'; Path = $p; ImageHash = $h }) } `
+            -Name 'sbx-dd-seed' -ArtifactRoot (Join-Path $TestDrive 'art-seed') -Destination (Join-Path $TestDrive 'dest-seed') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+        $ud = (@($b.FakeCallLog | Where-Object { $_.Op -eq 'WriteVhdxFile' -and $_.Path -eq $report.Descriptor.SeedDiskPath -and $_.InnerPath -eq 'user-data' }) | Select-Object -First 1).Content
+        $ud | Should -Match 'LABEL=VSDCORPUS /mnt/data/corpus'
+    }
+}

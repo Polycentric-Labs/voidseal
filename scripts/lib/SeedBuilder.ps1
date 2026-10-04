@@ -139,6 +139,9 @@ write_files:
       # No INPUT -> the entrypoint (which lives on /mnt/in) can't run; record a determinate non-zero
       # sentinel so the host classifies Failed with a definite code, flush, power off.
       if ! mountpoint -q /mnt/in; then printf '%s' 70 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
+      # Declared DATA DISKS: each mounts read-only by LABEL=VSD<NAME> at /mnt/data/<name>; a disk that
+      # does not mount, or mounts writable, records rc 71 and powers off (no run on missing inputs).
+      __DATA_DISK_MOUNTS__
       # Run the workload ONCE. Prefer the unprivileged 'sandbox' user, but ONLY when OUTPUT is
       # sandbox-OWNED (the uid/gid mount won) AND the user exists — otherwise a non-root run could not
       # write to a root-owned plain-mounted /mnt/out. Fall back to root in every other case (v1: the VM
@@ -278,6 +281,10 @@ write_files:
       # outbox read fails closed on a missing/empty raw region — same DENY-on-absence contract).
       if ! mountpoint -q /mnt/in; then diag "ABORT input-not-mounted (LABEL=INPUT did not mount at /mnt/in - exfat module missing on this kernel? label mismatch?)"; poweroff; exit 0; fi
       diag "input_mounted=yes input_files=$(ls -1 /mnt/in 2>/dev/null | wc -l)"
+      # Declared DATA DISKS: each mounts read-only by LABEL=VSD<NAME> at /mnt/data/<name>. A data disk is
+      # exFAT on a GPT partition, so the raw-OUTPUT search below skips it (it has partitions). A disk
+      # that does not mount, or mounts writable, is a structural ABORT: no outbox, power off.
+      __DATA_DISK_MOUNTS__
       chown -R "$SBX_UID:$SBX_GID" /run/staging 2>/dev/null
       # --- Identify the raw OUTPUT block device POSITIVELY (no filesystem/label to mount by) ---
       # The OUTPUT disk is the ONLY attached whole-disk that is RAW: host-created with NO partition
@@ -775,6 +782,49 @@ function ConvertTo-LfText {
 
 <#
 .SYNOPSIS
+    The runner lines that mount each declared data disk read-only, or fail closed.
+.DESCRIPTION
+    One block per disk: mkdir /mnt/data/<name>, mount LABEL=VSD<NAME> with ro plus the sandbox
+    uid/gid, fall back to a plain ro mount (never rw, on any arm), then refuse unless the disk is
+    mounted AND its live mount options include ro. On refusal the runner powers off without running
+    the entrypoint: the outbox runner first prints a structural [voidseal-diag] ABORT marker (name and
+    label only, never content); the exFAT runner writes rc 71 to OUTPUT instead (it has no diag()).
+    Names are validated against ConvertTo-DataDiskList's pattern here as well, because these lines
+    are shell text. Lines are joined with LF and indented to the runner's six-space block.
+.PARAMETER DataDisks
+    The profile's DataDisks value (raw or normalized).
+.PARAMETER Diag
+    $true for a runner that defines diag() (the outbox runner).
+#>
+function New-DataDiskMountLines {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()] $DataDisks, [bool] $Diag)
+
+    $list = @(ConvertTo-DataDiskList -Value $DataDisks -Context 'New-CidataUserData')
+    if ($list.Count -eq 0) { return '# (no data disks declared for this run)' }
+    $ind = '      '
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($dd in $list) {
+        $name  = [string]$dd['Name']
+        $label = Get-DataDiskLabel -Name $name     # re-validates the name before it becomes shell text
+        $mnt   = "/mnt/data/$name"
+        $fail  = if ($Diag) {
+            { param($why) "diag `"ABORT $why name=$name label=$label`"; poweroff; exit 0" }
+        } else {
+            { param($why) "printf '%s' 71 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0" }
+        }
+        $lines.Add("mkdir -p $mnt")
+        $lines.Add("mount -o ro,uid=`$SBX_UID,gid=`$SBX_GID LABEL=$label $mnt 2>/dev/null || mount -o ro LABEL=$label $mnt 2>/dev/null")
+        $lines.Add("if ! mountpoint -q $mnt; then $(& $fail 'data-disk-not-mounted'); fi")
+        $lines.Add("case `",`$(findmnt -no OPTIONS $mnt 2>/dev/null),`" in *,ro,*) ;; *) umount $mnt 2>/dev/null; $(& $fail 'data-disk-not-read-only');; esac")
+        if ($Diag) { $lines.Add("diag `"data_disk_mounted name=$name ro=yes files=`$(find $mnt -type f 2>/dev/null | wc -l)`"") }
+    }
+    return ($lines -join ("`n" + $ind))
+}
+
+<#
+.SYNOPSIS
     Build the cloud-init `user-data` string for a profile (Disk-mode runner or Serial baseline).
 .PARAMETER Profile
     The resolved profile (hashtable). `WorkloadMode='Disk'` selects the disk-mode runner (and the
@@ -798,6 +848,9 @@ function New-CidataUserData {
 
     if ($mode -eq 'Disk' -and $egressMode -eq 'SquidSniProxy') {
         # Builder path: network-enabled disk-mode seed with a transparent Squid SNI domain-ACL proxy.
+        if (@(ConvertTo-DataDiskList -Value (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Context 'New-CidataUserData').Count -gt 0) {
+            throw "New-CidataUserData: the builder runner does not mount data disks; a builder profile must not declare DataDisks (fail-closed)."
+        }
         $entrypoint = [string](Get-SeedProfileField -Profile $Profile -Name 'Entrypoint' -Default '')
         # FAIL-CLOSED: same sh -c guard as the offline runner (single quote / newline / blank are refused).
         if ([string]::IsNullOrWhiteSpace($entrypoint)) {
@@ -873,11 +926,19 @@ function New-CidataUserData {
                 }
                 $screenArgs = "--mode $mode"
             }
-            $ud = $script:CidataOutboxDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__PRODUCER_SCREEN_ARGS__', $screenArgs)
+            $mounts = New-DataDiskMountLines -DataDisks (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Diag $true
+            $ud = $script:CidataOutboxDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__PRODUCER_SCREEN_ARGS__', $screenArgs).Replace('__DATA_DISK_MOUNTS__', $mounts)
             return (ConvertTo-LfText -Text $ud)
         }
-        $ud = $script:CidataDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint)
+        $mounts = New-DataDiskMountLines -DataDisks (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Diag $false
+        $ud = $script:CidataDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__DATA_DISK_MOUNTS__', $mounts)
         return (ConvertTo-LfText -Text $ud)
+    }
+
+    # Only the two Disk-mode runners mount data disks; a Serial seed would leave them attached and
+    # unmounted, so refuse rather than emit a seed that silently ignores them.
+    if (@(ConvertTo-DataDiskList -Value (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Context 'New-CidataUserData').Count -gt 0) {
+        throw "New-CidataUserData: data disks are mounted only by the Disk-mode runners; a Serial-mode profile must not declare DataDisks (fail-closed)."
     }
 
     # EG-2 (ralph in-guest egress, Option A): a Serial-mode profile that declares EgressMode=
