@@ -300,6 +300,56 @@ Describe 'HostEgress: Lock-Sandbox installs, records and rolls back' {
     }
 }
 
+Describe 'HostEgress: leftover rules from a crashed run stop the install before anything is created' {
+
+    It 'refuses, naming the rules and the cleanup command, and creates no address, rule or ACL' {
+        $b = New-FakeHyperVBackend
+        $d = script:New-HPVM -Backend $b -Name 'sbx-hp-stale'
+        & $b.NewHostFirewallRule @{ Name = 'Voidseal-egress-sbx-hp-stale-block-udp'; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'vEthernet (sbx-hp-stale-int)' }
+        $err = $null
+        try { Lock-Sandbox -Descriptor $d -Backend $b } catch { $err = $_.Exception.Message }
+        $err | Should -Match "^Install-SandboxEgressNetwork: refusing 'sbx-hp-stale' because 1 firewall rule\(s\) named 'Voidseal-egress-sbx-hp-stale-\*' already exist"
+        $err | Should -Match "Remove-NetFirewallRule -Name 'Voidseal-egress-sbx-hp-stale-block-udp' -PolicyStore ActiveStore"
+        $err | Should -Match 'Fail closed\.$'
+        @($b.FakeCallLog | Where-Object { $_.Op -in @('AddSwitchHostIPAddress', 'AddNetworkAdapterAcl') }).Count | Should -Be 0
+        @($b.FakeFirewallRules.Keys).Count | Should -Be 1 -Because 'only the leftover rule exists; none of the seven was created'
+        $d.EgressGatewayAddress | Should -BeNullOrEmpty
+        @($d.EgressFirewallRules).Count | Should -Be 0
+        @($d.EgressAcls).Count | Should -Be 0
+    }
+
+    It 'names every leftover rule, whatever its case' {
+        $b = New-FakeHyperVBackend
+        $d = script:New-HPVM -Backend $b -Name 'sbx-hp-stale2'
+        foreach ($n in @('Voidseal-egress-sbx-hp-stale2-allow-proxy', 'VOIDSEAL-EGRESS-SBX-HP-STALE2-BLOCK-ICMP4')) {
+            & $b.NewHostFirewallRule @{ Name = $n; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'vEthernet (sbx-hp-stale2-int)' }
+        }
+        { Lock-Sandbox -Descriptor $d -Backend $b } | Should -Throw "*2 firewall rule(s)*Voidseal-egress-sbx-hp-stale2-allow-proxy*VOIDSEAL-EGRESS-SBX-HP-STALE2-BLOCK-ICMP4*"
+    }
+
+    It 'a rule of another VM whose name merely starts with this VM''s prefix is not a clash' {
+        $b = New-FakeHyperVBackend
+        $d = script:New-HPVM -Backend $b -Name 'sbx-hp-st'
+        & $b.NewHostFirewallRule @{ Name = 'Voidseal-egress-sbx-hp-st-x-allow-proxy'; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'vEthernet (sbx-hp-st-int)' }
+        { Lock-Sandbox -Descriptor $d -Backend $b } | Should -Not -Throw
+        @($d.EgressFirewallRules).Count | Should -Be 7
+    }
+
+    It 'refuses, and creates nothing, when the existing rules cannot be read' {
+        $b = New-FakeHyperVBackend -SimulateEgressMethodError @('GetHostFirewallRuleNames')
+        $d = script:New-HPVM -Backend $b -Name 'sbx-hp-stale3'
+        { Lock-Sandbox -Descriptor $d -Backend $b } | Should -Throw "Install-SandboxEgressNetwork: refusing 'sbx-hp-stale3' because the existing firewall rules could not be read (*SimulateEgressMethodError*). Fail closed."
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'AddSwitchHostIPAddress' }).Count | Should -Be 0
+        @($b.FakeFirewallRules.Keys).Count | Should -Be 0
+    }
+
+    It 'a clean host installs as before' {
+        $b = New-FakeHyperVBackend
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-hp-clean'
+        @($d.EgressFirewallRules).Count | Should -Be 7
+    }
+}
+
 Describe 'HostEgress: Assert-Sealed refusals for a Tier-1 HostProxy VM (each message pinned)' {
 
     BeforeEach {

@@ -181,3 +181,10 @@ places where a check is an argument rather than a measurement.
   layer from a workload profile. The engine already read all three from the resolved profile, but the
   unknown-key refusal rejected them at load, so a profile could not set them. Out-of-range sizes and
   malformed hashes are refused at load. Documented in `tier-profiles/SCHEMA.md`.
+- Host egress firewall rules now live in the active store like the gateway address, so a crash cannot
+  leave rules behind that outlive the address they guard (`New-NetFirewallRule`, and the reads and
+  removals, use `-PolicyStore ActiveStore`). `Install-SandboxEgressNetwork` also refuses, before it
+  creates anything, when any of the seven `Voidseal-egress-<vm>-*` rules already exists, naming them and
+  the removal command. New backend read `GetHostFirewallRuleNames` (manifest, real, fake, parity). Not yet
+  run live: the first elevated run must confirm the cmdlet accepts the store
+  (`docs/phase-6-live-runbook.md` section 2).

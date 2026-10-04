@@ -58,14 +58,18 @@ the HostProxy backend methods in `scripts/lib/HyperVBackend.ps1`, and the HostPr
    sources, and an in-guest default-DROP (nftables, iptables fallback) that allows only TCP to the proxy
    port and is applied before networking on the guest's only boot.
 4. **Seal (Lock-Sandbox).** `New-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -PolicyStore
-   ActiveStore` for the gateway; seven `New-NetFirewallRule` rules in the group `Voidseal egress`, named
-   `Voidseal-egress-<vm>-*`, all inbound and scoped to that interface (one Allow for TCP from the guest to
+   ActiveStore` for the gateway; seven `New-NetFirewallRule -PolicyStore ActiveStore` rules in the group
+   `Voidseal egress`, named `Voidseal-egress-<vm>-*` (the active store for the rules too, so neither
+   outlives a reboot), all inbound and scoped to that interface (one Allow for TCP from the guest to
    gateway:13128; Blocks for every other TCP port, the proxy port from any other address, UDP, ICMPv4,
    ICMPv6, and every protocol to any local address but the gateway, IPv6 included; Windows lets a Block
    beat any Allow, so the Blocks are shaped around the allowed tuple); three
    `Add-VMNetworkAdapterExtendedAcl` entries (deny inbound and outbound at weight 1, allow stateful
-   outbound TCP from the guest to gateway:13128 at weight 100). Each is recorded the moment it exists;
-   a failure rolls back what was created.
+   outbound TCP from the guest to gateway:13128 at weight 100). Before it creates anything, the install
+   asks the host (`GetHostFirewallRuleNames`) whether any of the seven rule names already exists and
+   refuses if so, naming the rules and the `Remove-NetFirewallRule` command that clears them: a crashed
+   run can leave rules behind, and rollback only removes what this run recorded. Each object is recorded
+   the moment it exists; a failure rolls back what was created.
 5. **Gate (Assert-Sealed).** On top of the one-NIC-on-own-switch rule: the gateway address is on the
    interface with prefix 30, no other host address overlaps the /30, no NAT covers it, every recorded rule
    exists, is enabled and matches its record, the adapter carries exactly the recorded ACL entries, and
@@ -112,7 +116,10 @@ allowlist. Every item below is something the mock suite cannot prove.
    `PrefixLength 30`, `PolicyStore ActiveStore`, and `AddressState Preferred` (not Tentative or
    Duplicate). Note whether the APIPA `169.254.x.x` address is still there; the gate ignores it, but
    record it.
-7. `Get-NetFirewallRule -Group 'Voidseal egress'` lists seven rules, all `Enabled True`. For each, compare
+7. `Get-NetFirewallRule -Group 'Voidseal egress' -PolicyStore ActiveStore` lists seven rules, all
+   `Enabled True`. This is also the first live proof that `New-NetFirewallRule -PolicyStore ActiveStore` is
+   accepted and that the rules are visible and removable through the same store; if the cmdlet refuses the
+   store, the install fails and rolls back, and the store choice must change. For each, compare
    `Get-NetFirewallPortFilter`, `Get-NetFirewallAddressFilter` and `Get-NetFirewallInterfaceFilter` with
    the record: how an address range renders (`0.0.0.0-10.231.a.b`), whether the IPv6 range
    `::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff` was accepted, how `ICMPv4`/`ICMPv6`/`Any` render as
@@ -157,13 +164,18 @@ allowlist. Every item below is something the mock suite cannot prove.
 
 **After teardown**
 
-16. `Get-NetFirewallRule -Group 'Voidseal egress'` is empty, the gateway address is gone, the proxy pid is
+16. `Get-NetFirewallRule -Group 'Voidseal egress' -PolicyStore ActiveStore` is empty (or reports no
+    such group), the gateway address is gone, the proxy pid is
     gone, the switch is gone, and `TeardownStatus` starts with `OK`.
 17. Crash path: start a run, kill the PowerShell process mid-run, and confirm the proxy exits on its own
-    (parent watch). Then clean up by hand: `Get-NetFirewallRule -Group 'Voidseal egress' |
-    Remove-NetFirewallRule`, `Remove-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -IPAddress
-    <gateway>`, and the usual VM and switch removal. The address is in the active store only, so a host
-    reboot also clears it.
+    (parent watch). Then clean up by hand: `Get-NetFirewallRule -Group 'Voidseal egress' -PolicyStore
+    ActiveStore | Where-Object { $_.Name -like 'Voidseal-egress-<vm>-*' } | Remove-NetFirewallRule`,
+    `Remove-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -IPAddress <gateway>`, and the usual VM
+    and switch removal. The address and the rules are both in the active store, so a host reboot clears
+    them too. Until they are cleared, a new run of a VM with the same name refuses at the seal, before it
+    creates anything: first on the leftover gateway address if that is still there, then on the leftover
+    rules, with a message that names them and the removal command. Confirm that refusal, then clean up
+    and confirm the next run installs.
 
 The builder (`SquidSniProxy`) is unchanged by B': it still uses its in-guest Squid and has no host
 enforcement. Moving it to the host proxy is a follow-up (its Disk-mode runner would need the same proxy

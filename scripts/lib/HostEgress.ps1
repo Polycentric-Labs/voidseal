@@ -366,6 +366,34 @@ function Assert-EgressAddressFree {
     }
 }
 
+<#
+.SYNOPSIS
+    Throw when a firewall rule this VM's install would create already exists on the host.
+.DESCRIPTION
+    A crashed run can leave its rules behind. Install would then fail part way through, after the gateway
+    address was added, and rollback has no record of rules it did not create. So the install asks first
+    (GetHostFirewallRuleNames, by the plan's RulePrefix) and refuses before it creates anything. Only the
+    seven names the install would create count: another VM's rule whose name merely starts with this
+    prefix ('sbx-a' and 'sbx-a-b') is not a clash. A read that fails is a refusal too. The message names
+    the rules and the command that removes them.
+#>
+function Assert-EgressRulesAbsent {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Plan, [Parameter(Mandatory)] [hashtable] $Backend, [string] $Context = 'HostEgress')
+    $vm     = [string](Get-EgressPlanField $Plan 'VMName')
+    $prefix = [string](Get-EgressPlanField $Plan 'RulePrefix')
+    $expected = @(Get-EgressFirewallRuleSpec -Plan $Plan | ForEach-Object { [string]$_.Name })
+    $existing = $null
+    try { $existing = & $Backend.GetHostFirewallRuleNames @{ NamePrefix = $prefix } }
+    catch { throw "${Context}: refusing '$vm' because the existing firewall rules could not be read ($($_.Exception.Message)). Fail closed." }
+    $clash = @($existing | Where-Object { $null -ne $_ -and $expected -contains [string]$_ } | ForEach-Object { [string]$_ } | Sort-Object)
+    if ($clash.Count -eq 0) { return }
+    $quoted = ($clash | ForEach-Object { "'$_'" }) -join ','
+    throw ("${Context}: refusing '$vm' because $($clash.Count) firewall rule(s) named '${prefix}*' already exist on the host " +
+           "(a crashed run leaves them behind): $($clash -join ', '). Remove them with: " +
+           "Remove-NetFirewallRule -Name $quoted -PolicyStore ActiveStore. Fail closed.")
+}
+
 # --------------------------------------------------------------------------
 # install, proxy, teardown
 # --------------------------------------------------------------------------
@@ -394,6 +422,7 @@ function Install-SandboxEgressNetwork {
         throw "Install-SandboxEgressNetwork: '$vm' records switch '$sw' but its egress plan names '$(Get-EgressPlanField $plan 'SwitchName')'. Fail closed."
     }
     Assert-EgressAddressFree -Plan $plan -Backend $Backend -Context 'Install-SandboxEgressNetwork'
+    Assert-EgressRulesAbsent -Plan $plan -Backend $Backend -Context 'Install-SandboxEgressNetwork'
 
     Set-EgressDescriptorField -Descriptor $Descriptor -Name 'EgressFirewallRules' -Value @()
     Set-EgressDescriptorField -Descriptor $Descriptor -Name 'EgressAcls' -Value @()
