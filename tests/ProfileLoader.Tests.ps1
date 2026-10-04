@@ -541,6 +541,17 @@ Describe 'Mounts: declared, not wired (the docs must say so while no engine code
         @(script:Find-MountsKeyReference -Files $loader) | Should -Not -BeNullOrEmpty -Because 'the loader screens and merges Mounts, so a working scan must see it there'
     }
 
+    It 'the scan catches a reader written in any letter case (planted positive control)' {
+        # Profile hashtables ignore case, so $p['mounts'] and $p.MOUNTS read the same entry as
+        # $p['Mounts']. A case-sensitive match would let those readers evade the guard.
+        $planted = Join-Path $TestDrive 'planted-mounts-reader.ps1'
+        Set-Content -LiteralPath $planted -Encoding utf8 -Value @(
+            '$a = $p[''mounts'']'
+            '$b = $p.MOUNTS'
+        )
+        @(script:Find-MountsKeyReference -Files @(Get-Item -LiteralPath $planted)).Count | Should -Be 2
+    }
+
     It 'no engine script outside the loader reads the Mounts key' {
         $engine = @($script:MountsScanFiles | Where-Object Name -ne 'ProfileLoader.ps1')
         $engine.Count | Should -BeGreaterThan 5 -Because 'the scan must actually cover the engine'
@@ -737,19 +748,37 @@ Describe 'Packages: declared, not installed (the docs must say so while no engin
     # authoring guide used to say packages were "staged before the seal". These checks tie the docs
     # to the code in both directions: a new reader fails the first It, so the docs get revisited,
     # and while there is none, the docs must say the field installs nothing.
+    BeforeAll {
+        # Each place a script names the Packages key, as 'file:line'. Index reads ($p['Packages']),
+        # member reads ($p.Packages) and quoted names all parse to a string constant whose value is
+        # the bare key. Comments are not in the AST, and a here-string that merely mentions packages
+        # never equals the key. The match ignores case because profile hashtables do: $p['packages']
+        # reads the same entry, so a case-sensitive match would let such a reader evade the guard.
+        function script:Find-PackagesKeyReference {
+            param([System.IO.FileInfo[]] $Files)
+            foreach ($f in $Files) {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+                $ast.FindAll({ param($n)
+                    $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -eq 'Packages'
+                }, $true) | ForEach-Object { '{0}:{1}' -f $f.Name, $_.Extent.StartLineNumber }
+            }
+        }
+    }
+
+    It 'the scan catches a reader written in any letter case (planted positive control)' {
+        $planted = Join-Path $TestDrive 'planted-packages-reader.ps1'
+        Set-Content -LiteralPath $planted -Encoding utf8 -Value @(
+            '$a = $p[''packages'']'
+            '$b = $p.PACKAGES'
+        )
+        @(script:Find-PackagesKeyReference -Files @(Get-Item -LiteralPath $planted)).Count | Should -Be 2
+    }
+
     It 'no engine script outside the loader reads the Packages key' {
         $engineScripts = @(Get-ChildItem -Path (Join-Path $script:SkillRoot 'scripts') -Recurse -Filter '*.ps1' |
                            Where-Object { $_.Name -ne 'ProfileLoader.ps1' })
         $engineScripts.Count | Should -BeGreaterThan 5 -Because 'the scan must actually cover the engine'
-        $readers = foreach ($f in $engineScripts) {
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
-            # Index reads ($p['Packages']), member reads ($p.Packages) and quoted names all parse to a
-            # string constant whose value is exactly 'Packages'. Comments are not in the AST, and a
-            # here-string that merely mentions packages never equals the bare key.
-            $ast.FindAll({ param($n)
-                $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -ceq 'Packages'
-            }, $true) | ForEach-Object { '{0}:{1}' -f $f.Name, $_.Extent.StartLineNumber }
-        }
+        $readers = script:Find-PackagesKeyReference -Files $engineScripts
         @($readers) | Should -BeNullOrEmpty -Because 'Packages is unread today; a reader means the docs that call it declared-only must change with it'
     }
 
