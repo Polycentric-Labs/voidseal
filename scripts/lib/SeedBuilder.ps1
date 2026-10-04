@@ -450,9 +450,10 @@ write_files:
       # SERIAL DIAGNOSTICS (Phase-6 live-debug observability — the same discipline whose markers
       # pinned BOTH Tier-0 live root causes in the OutboxOutput runner). Phase 6 is the FIRST live
       # egress: a failed fetch must be attributable to squid-down vs REDIRECT-not-applied vs
-      # mount-failure vs the fetch itself. Invoke-BuilderVM's Status=Success is clean-POWEROFF-only
-      # (the exitcode read deferred to Phase 4 and never landed for the builder) and teardown deletes
-      # the OUTPUT disk, so this console narration is the ONLY live signal of fetch outcome.
+      # mount-failure vs the fetch itself. Invoke-BuilderVM reads result.exitcode and deps-manifest.json
+      # off the OUTPUT disk and reports Success only for an exit code of exactly 0 with the manifest
+      # present, else FetchFailed with the reason; teardown then deletes the OUTPUT disk, so this console
+      # narration is the second source and the only one that says WHERE the guest stopped.
       # STRUCTURAL ONLY: liveness, rc values, file COUNTS, manifest presence — NEVER fetched-artifact
       # bytes (contract-consistency with the shared outbox runner; serial stays a control-flow record,
       # not a payload mirror). Never alters control flow: runs under `set +e`, writes to /dev/console
@@ -525,9 +526,9 @@ write_files:
       if mount -o uid=$SBX_UID,gid=$SBX_GID LABEL=OUTPUT /mnt/out 2>/dev/null; then OUT_SANDBOX_OWNED=1; fi
       mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out 2>/dev/null
       # Both fail-closed branches below were SILENT `poweroff` guards — the exact silent-runner class
-      # that hid the Tier-0 root causes. Each now names its branch first. The no-INPUT branch writes
-      # the rc70 sentinel to OUTPUT, but the host never reads it (no host-mount by design), so serial
-      # is the only place that sentinel's meaning surfaces.
+      # that hid the Tier-0 root causes. Each now names its branch first. The no-OUTPUT branch writes
+      # nothing, so the host sees no exit-code file (FetchFailed); the no-INPUT branch writes the rc70
+      # sentinel, which the host reads as a non-zero exit code (FetchFailed). Serial names which branch.
       if ! mountpoint -q /mnt/out; then diag "ABORT output-not-mounted (LABEL=OUTPUT did not mount at /mnt/out - exfat module missing on this kernel? label mismatch?)"; poweroff; exit 0; fi
       diag "output_mounted=yes owner_sandbox=$OUT_SANDBOX_OWNED"
       if ! mountpoint -q /mnt/in; then diag "ABORT input-not-mounted (LABEL=INPUT did not mount at /mnt/in; rc70 sentinel written to OUTPUT)"; printf '%s' 70 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
@@ -543,7 +544,7 @@ write_files:
       rc=$?
       printf '%s' "$rc" > /mnt/out/result.exitcode
       # fetch_deps.py exits 2 on the FIRST failed fetcher; that rc reaches result.exitcode on the
-      # OUTPUT disk (which teardown deletes) and nowhere else — narrate it, plus the per-fetcher
+      # OUTPUT disk, which the host reads as the verdict. Narrate it too, plus the per-fetcher
       # artifact COUNTS (never names/bytes) and the manifest verdict. write_manifest runs only after
       # ALL fetchers succeed, so manifest_present=yes is the single yes/no of a fully-green fetch.
       diag "entrypoint_rc=$rc"
@@ -605,6 +606,24 @@ write_files:
       [Service]
       ExecStart=
       ExecStart=-/sbin/agetty --autologin sandbox --keep-baud 115200,38400,9600 ttyS0 $TERM
+  # SERIAL DIAGNOSTICS, the same discipline as the disk runners' [voidseal-diag] markers: a seed that
+  # misbehaves live must be attributable from the serial capture alone. STRUCTURAL ONLY: liveness, device
+  # and mount counts, yes/no presence of this seed's own artifacts, never file content or any name that
+  # came from the workload. Never alters control flow: `set +e`, writes to /dev/console, swallows errors.
+  - path: /usr/local/sbin/voidseal-serial-diag
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set +e
+      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
+      diag "serial-seed start"
+      diag "block_devices=$(lsblk -dn -o NAME 2>/dev/null | wc -l) device_mounts=$(grep -c '^/dev/' /proc/mounts 2>/dev/null) cidata_labeled=$(blkid -L CIDATA >/dev/null 2>&1 && echo yes || echo no)"
+      diag "sandbox_user=$(id -u sandbox >/dev/null 2>&1 && echo yes || echo no)"
+      diag "serial_getty_active=$(systemctl is-active serial-getty@ttyS0.service 2>/dev/null) autologin_dropin=$([ -f /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf ] && echo yes || echo no)"
+      diag "grub_ttyS0_lines=$(grep -c ttyS0 /boot/grub/grub.cfg 2>/dev/null) cmdline_ttyS0=$(grep -c 'console=ttyS0' /proc/cmdline 2>/dev/null)"
+      diag "bwrap_present=$(command -v bwrap >/dev/null 2>&1 && echo yes || echo no) ca_certificates=$(dpkg -s ca-certificates >/dev/null 2>&1 && echo yes || echo no)"
+      diag "failed_units=$(systemctl --failed --no-legend 2>/dev/null | wc -l)"
+      diag "serial-seed done"
 
 runcmd:
   - update-grub
@@ -613,6 +632,7 @@ runcmd:
   - systemctl restart serial-getty@ttyS0.service
   - [ apt-get, update ]
   - [ apt-get, install, -y, bubblewrap, ca-certificates ]
+  - [ /usr/local/sbin/voidseal-serial-diag ]
 
 # Tier keeps egress credential-FREE; no secrets are ever written here. A workload's own packages
 # are not installed here; nothing reads the profile's Packages field, so bake them into the image.
@@ -711,10 +731,15 @@ write_files:
       # in-depth only: a root guest can flush/disable this. FAIL-CLOSED: if this script errors
       # partway, the OUTPUT policy stays DROP -> no egress -> fails closed, not open.
       set +e
+      # Structural-only serial markers, the same helper shape and marker names as the builder runner:
+      # liveness, rc values, yes/no outcomes, never any content. Writes to /dev/console, swallows errors.
+      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
+      diag "egress-lockdown start"
       # Belt-and-braces (mirrors the builder runner): ensure Squid is up before the REDIRECT rules
       # point 80/443 at its ports. The unit's After=squid.service already orders this; the restart
       # guards a squid that failed its own start. `|| true` keeps the fail-closed DROP path intact.
       systemctl restart squid 2>/dev/null || true
+      diag "squid_active=$(systemctl is-active squid 2>/dev/null)"
       iptables -F OUTPUT 2>/dev/null
       iptables -P OUTPUT DROP
       iptables -A OUTPUT -o lo -j ACCEPT
@@ -726,7 +751,11 @@ write_files:
       # Transparent-proxy REDIRECT of outbound 80/443 through Squid (domain-ACL gatekeeps the fetch);
       # the owner-exclusion keeps Squid's OWN upstream egress from being re-redirected.
       iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
+      r80=$?
       iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
+      r443=$?
+      # An unapplied REDIRECT silently bypasses the domain-ACL for that protocol: show each rule's rc.
+      diag "egress_lockdown=v4-applied redirect80_rc=$r80 redirect443_rc=$r443"
       # IPv6 belt-and-braces: default-DROP OUTPUT over ip6tables too, guarded so a missing binary
       # cannot abort this `set +e` script. No IPv6 egress ACCEPT is opened for 53/80/443.
       if command -v ip6tables >/dev/null 2>&1; then
@@ -734,7 +763,30 @@ write_files:
         ip6tables -P OUTPUT DROP
         ip6tables -A OUTPUT -o lo -j ACCEPT
         ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        diag "ip6_lockdown=applied"
+      else
+        diag "ip6_lockdown=skipped (no ip6tables binary)"
       fi
+
+  # SERIAL DIAGNOSTICS for the seed itself (the lockdown script above narrates its own run): structural
+  # facts only, the same helper shape as the builder runner. Run once at the end of runcmd, while the
+  # lockdown is enabled but not yet applied, so it reads as "what the seed installed and enabled".
+  - path: /usr/local/sbin/voidseal-serial-diag
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set +e
+      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
+      diag "serial-seed start"
+      diag "block_devices=$(lsblk -dn -o NAME 2>/dev/null | wc -l) device_mounts=$(grep -c '^/dev/' /proc/mounts 2>/dev/null) cidata_labeled=$(blkid -L CIDATA >/dev/null 2>&1 && echo yes || echo no)"
+      diag "sandbox_user=$(id -u sandbox >/dev/null 2>&1 && echo yes || echo no)"
+      diag "serial_getty_active=$(systemctl is-active serial-getty@ttyS0.service 2>/dev/null) autologin_dropin=$([ -f /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf ] && echo yes || echo no)"
+      diag "grub_ttyS0_lines=$(grep -c ttyS0 /boot/grub/grub.cfg 2>/dev/null) cmdline_ttyS0=$(grep -c 'console=ttyS0' /proc/cmdline 2>/dev/null)"
+      diag "bwrap_present=$(command -v bwrap >/dev/null 2>&1 && echo yes || echo no) ca_certificates=$(dpkg -s ca-certificates >/dev/null 2>&1 && echo yes || echo no)"
+      diag "squid_present=$(command -v squid >/dev/null 2>&1 && echo yes || echo no) squid_active=$(systemctl is-active squid 2>/dev/null) egress_unit_enabled=$(systemctl is-enabled voidseal-egress.service 2>/dev/null)"
+      diag "ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) output_policy=$(iptables -S OUTPUT 2>/dev/null | sed -n 1p | cut -d ' ' -f 3)"
+      diag "failed_units=$(systemctl --failed --no-legend 2>/dev/null | wc -l)"
+      diag "serial-seed done"
 
   - path: /etc/systemd/system/voidseal-egress.service
     permissions: '0644'
@@ -763,6 +815,7 @@ runcmd:
   - [ apt-get, install, -y, bubblewrap, ca-certificates ]
   - systemctl enable squid.service
   - systemctl enable voidseal-egress.service
+  - [ /usr/local/sbin/voidseal-serial-diag ]
 
 # LIVE-ONLY (Phase 6): voidseal-egress.service is ENABLED here (applies on the NEXT boot / at the
 # sealed-run point) but deliberately NOT started inline in runcmd, so the default-DROP does not block

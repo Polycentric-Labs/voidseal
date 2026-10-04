@@ -138,6 +138,32 @@ properties are in play here — do not conflate them:
 See `profiles/builder.psd1`'s `DepsSpec` for the `RequirementsFile` / `Revision` keys in
 practice, and `guest/fetch_deps.py` for the enforcement.
 
+### 0.5 Builder result: the verdict and the deps disk
+
+`Invoke-BuilderVM` returns a hashtable. `Status` is `Success` only when the guest wrote `result.exitcode`
+with exactly `0` and `deps-manifest.json` is present on the OUTPUT disk; a missing, unparsable or
+non-zero exit code, or a missing manifest, is `FetchFailed` (the reason is in `Error`, the code in
+`ExitCode`), and a timeout or any other lifecycle error is `Failed`. A power-off alone no longer counts
+as success. Only a `Success` run emits a disk:
+
+| Field | Meaning |
+|---|---|
+| `DepsDiskPath` | the finished `deps-<Name>.vhdx`, moved out of the sandbox folder into `-DepsOutputDir` (default `<ArtifactRoot>\deps`); `-DepsDiskPath` names an exact file instead |
+| `DepsImageHash` | whole-image SHA-256 of that file, taken after the move (`WholeImageHash` is the same value, kept for older callers) |
+| `ExitCode` | the exit code the guest recorded, or `$null` when none was read |
+
+Feed the first two straight into the processor run:
+
+```powershell
+$built = Invoke-BuilderVM -Profile builder -DepsOutputDir 'D:\VoidsealDeps'
+Invoke-Voidseal -Tier 1 -Profile <processor-profile> `
+    -Workload @{ DepsDiskPath = $built.DepsDiskPath; DepsImageHash = $built.DepsImageHash } ...
+```
+
+The processor run copies the file into its own sandbox folder and attaches the copy (see the data-disk
+notes), so the builder's file is reusable. `-DepsOutputDir` must be an absolute local path outside the
+sandbox storage root, and the file must not exist yet; both are checked before the build starts.
+
 ---
 
 ## 1. Provision → run → teardown walkthrough

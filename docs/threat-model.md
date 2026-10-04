@@ -221,6 +221,25 @@ be a Voidseal defect.
   between its structure check and the copy is caught by the copy's hash; a change after the copy does
   not affect this run and shows up in `DataDiskChanged`.
 
+**Builder verdict and deps disk.** IN SCOPE (the Tier-1 builder, `scripts/lib/BuilderVM.ps1`).
+- **What the host reads from the builder guest.** After power-off and detach, `Read-BuilderVerdict` reads two
+  small files off the OUTPUT disk, `result.exitcode` and `deps-manifest.json`, through `ReadVhdxFile`, and
+  uses them only for the Success or `FetchFailed` verdict: Success needs the first to read exactly `0` and
+  the second to be non-empty. Anything else fails closed. The reason text never repeats file content.
+- **The exposure this adds.** `ReadVhdxFile` is a read-write `Mount-VHD` of a volume the guest wrote, so the
+  host's partition and filesystem drivers parse guest-controlled metadata. This is the one place the engine
+  does that; every other OUTPUT read is the user-space outbox read. The builder is the guest most likely to
+  be hostile (it installs dependency code from the network). The mount is short and only reads, and the
+  whole-image hash is taken after it, so the hash describes the bytes a later run copies. It is recorded as
+  an open design question: a verdict carried in a small Raw region read with `ReadVhdxRawRegion` would avoid
+  the mount, at the cost of a second Raw disk. `Read-BuilderVerdict` is the single place to change.
+- **What survives.** The finished disk is moved out of the sandbox folder (`MoveVhdxFile`, a plain file move)
+  into a destination `Resolve-BuilderDepsDestination` has checked: absolute and local, `.vhdx`, not already
+  present, and outside the sandbox storage root both lexically and after following links. Teardown deletes
+  only the descriptor's `CreatedDisks`, and the destination is neither on that list nor under the root. The
+  hash returned with it is the one a processor run verifies its working copy against (tamper evidence for
+  the hand-off, not upstream provenance; see `docs/operator-runbook.md` §0.4).
+
 **Hostile-output extraction / quarantine.**
 - **T0/T1 — not applicable in the adversarial sense.** `Extraction='HostReadResultDir'` is a **trusting**
   host read by design, because Tier 0/1 workloads are not presumed hostile at the output stage. (The

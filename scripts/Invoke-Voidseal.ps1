@@ -436,7 +436,8 @@ function Invoke-Voidseal {
     # NO BUILDER CARVE-OUT (deliberate, Step-1 finding): the builder (EgressMode='SquidSniProxy') has
     # its OWN, entirely separate orchestrator (Invoke-BuilderVM, BuilderVM.ps1) — it never calls
     # Invoke-Voidseal at all, and never calls Read-WorkloadResult; it hashes its OUTPUT disk whole-file
-    # via GetVhdxImageHash and never mounts it. Nothing in Invoke-Voidseal.ps1 or any test/caller ever
+    # via GetVhdxImageHash, and its one host read of that disk is its own verdict (Read-BuilderVerdict,
+    # two small files). Nothing in Invoke-Voidseal.ps1 or any test/caller ever
     # legitimately passes a builder-shaped profile to Invoke-Voidseal — the only place 'builder' is
     # referenced here is a PROCESSOR attaching a builder-PRODUCED, hash-VERIFIED deps disk (a different
     # concept). So a builder-shaped profile arriving at Invoke-Voidseal is ALWAYS a caller misroute

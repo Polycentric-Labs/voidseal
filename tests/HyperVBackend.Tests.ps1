@@ -244,7 +244,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             InvokeGuestCommand = 'VMName'
             SetHostChannel = 'VMName'; GetHostChannels = 'VMName'
             NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; WriteVhdxFileBytes = 'Path'; ReadVhdxFileBytes = 'Path'; ReadVhdxRawRegion = 'Path'; GetVhdxImageHash = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'; GetVolumeFreeSpace = 'Path'
-            CopyDirectoryToVhdx = 'Path'; CopyVhdxFile = 'Path'
+            CopyDirectoryToVhdx = 'Path'; CopyVhdxFile = 'Path'; MoveVhdxFile = 'Path'
             AddHardDiskDrive = 'VMName'; RemoveHardDiskDrive = 'VMName'; SetDvdDrive = 'VMName'; RemoveDvdDrive = 'VMName'; GetDvdDrives = 'VMName'
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'

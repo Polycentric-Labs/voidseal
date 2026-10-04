@@ -112,3 +112,26 @@ places where a check is an argument rather than a measurement.
   copy and changed flag. Both Disk-mode runners mount each disk read-only at `/mnt/data/<name>` and
   power off without running the workload if one is missing or writable. `Mounts` and `Packages` docs
   now point here. Mock-tested only; the real disk build, copy, attach and re-hash have not run live.
+- Builder verdict: `Invoke-BuilderVM` no longer reports Success for any clean power-off. After the
+  guest powers off and the OUTPUT disk is detached, it reads the guest's `result.exitcode` and
+  `deps-manifest.json` and reports Success only when the file reads exactly 0 and the manifest is
+  present. A missing, unparsable or non-zero exit code, or a missing manifest, is the new `FetchFailed`
+  status, with the reason in `Error` and the code in the new `ExitCode` field; nothing is emitted and
+  teardown deletes the disk. A timeout stays `Failed`. The serial `[voidseal-diag]` markers remain the
+  second source. The read is a host mount of the guest-written OUTPUT volume (`ReadVhdxFile`), the one
+  the builder flow makes; `docs/threat-model.md` records the exposure. Mock-tested only.
+- Fixed: the builder's `deps.vhdx` survives teardown. Teardown deletes everything the run created, and
+  the finished deps disk was one of those files, so only its hash outlived a run. After the verdict, the
+  disk is moved out of the sandbox folder through the new `MoveVhdxFile` backend method (manifest, real
+  and fake; the real body is a plain file move with no Hyper-V cmdlet, a rename on one volume and a
+  copy, rename and delete across volumes) into `-DepsOutputDir` (default `<ArtifactRoot>\deps`, as
+  `deps-<Name>.vhdx`), hashed there, and returned as `DepsDiskPath` and `DepsImageHash`, ready for
+  `-Workload.DepsDiskPath` and `-Workload.DepsImageHash` of a later run, which attaches a verified
+  working copy of it. `-DepsDiskPath` still names an exact file. A destination inside the storage root,
+  a relative or UNC path, a non-`.vhdx` name, or an existing file is refused before the build starts.
+  New `-ArtifactRoot` parameter; `WholeImageHash` stays in the result as an alias of `DepsImageHash`.
+- Serial seed diagnostics: the Serial baseline and Serial egress seeds now emit the same structural
+  `[voidseal-diag]` markers the outbox and builder runners do (device and mount counts, serial-getty
+  and package presence, Squid and IPv6 state, the lockdown's REDIRECT return codes), through the same
+  `diag()` helper, so a misbehaving ralph seed can be told apart from the serial capture alone. Counts
+  and yes/no facts only, never file content or workload names.

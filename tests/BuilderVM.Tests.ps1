@@ -6,8 +6,10 @@
 .DESCRIPTION
     Task 2.4: Tier-1 builder orchestration — provision->seed->run->detach->whole-image-hash->emit.
     No seal (the builder keeps its NIC + Squid egress for the whole run).
-    No host-mount (the integrity artifact is the whole-image hash, raw, no mount).
-    Success = clean power-off this phase; timeout = Failed, no deps artifact.
+    The integrity artifact is the whole-image hash (raw, no mount); the one host read of the OUTPUT disk is the
+    verdict (the exit-code file and the manifest), taken before the move and the hash.
+    Success = exit code exactly 0 + manifest present (E7); a bad verdict = FetchFailed; timeout = Failed.
+    The finished deps.vhdx is moved out of the sandbox folder and survives teardown (E7).
 
     TDD: written FIRST; drives scripts/lib/BuilderVM.ps1.
 #>
@@ -26,6 +28,9 @@ BeforeAll {
     # SensitivityGate.ps1 — all the engine libs BuilderVM.ps1 reuses). Then dot-source BuilderVM.ps1.
     . $script:OrchPath
     . $script:BVMPath
+
+    # What a green builder guest leaves on its OUTPUT disk: the exit-code file (0) and the deps manifest.
+    $script:BuilderOk = @{ 'result.exitcode' = '0'; 'deps-manifest.json' = '{"files":[]}' }
 }
 
 # ===========================================================================
@@ -35,7 +40,7 @@ Describe 'Invoke-BuilderVM — Tier-1 builder orchestration (Phase 2.4)' {
 
     It 'a clean builder run emits a deps.vhdx + the whole-image hash (== SHA256 of the deps bytes) and Status=Success' {
         $blob = [byte[]](1..64)
-        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob $blob
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld1' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps.vhdx')
         $r.Status | Should -Be 'Success'
         $r.DepsDiskPath | Should -Not -BeNullOrEmpty
@@ -45,7 +50,7 @@ Describe 'Invoke-BuilderVM — Tier-1 builder orchestration (Phase 2.4)' {
     }
 
     It 'the OUTPUT (deps) disk is DETACHED before the host hash (no read of a locked/attached disk)' {
-        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob ([byte[]](1..8))
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld2' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'd2.vhdx')
         $r.Status | Should -Be 'Success'   # GetVhdxImageHash THROWS if still attached -> Success proves detach-before-hash
         $ops = @($fake.FakeCallLog | Where-Object { $_.Op -in @('RemoveHardDiskDrive','GetVhdxImageHash') } | ForEach-Object { $_.Op })
@@ -80,7 +85,7 @@ Describe 'Invoke-BuilderVM — teardown removes the VM (no orphan), on success a
 
     It 'the VM is removed after a successful builder run (no orphan)' {
         $blob = [byte[]](1..16)
-        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob $blob
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-teardown' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-td.vhdx')
         $r.Status | Should -Be 'Success'
         (& $fake.GetVM @{ Name = 'bld-teardown' }) | Should -BeNullOrEmpty -Because 'the builder VM is removed at teardown'
@@ -103,7 +108,7 @@ Describe 'Invoke-BuilderVM — no seal (builder keeps NIC for the fetch)' {
 
     It 'the builder run does NOT call Lock-Sandbox (no NIC removal, no host-channel zeroing)' {
         $blob = [byte[]](1..8)
-        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob $blob
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-noseal' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-ns.vhdx')
         $r.Status | Should -Be 'Success'
         # A sealed NoAdapter VM has its network adapter removed. The builder is a Tier-1 non-processor
@@ -121,7 +126,7 @@ Describe 'Invoke-BuilderVM — no seal (builder keeps NIC for the fetch)' {
 
     It 'the builder run does NOT record a SealVerdict (SealVerdict is not a builder output)' {
         $blob = [byte[]](1..8)
-        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob $blob
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-nosealt' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-nst.vhdx')
         # The Invoke-BuilderVM result hashtable has no SealVerdict key (a builder output, not a seal output).
         $r.ContainsKey('SealVerdict') | Should -BeFalse -Because 'SealVerdict is an Invoke-Voidseal concept; Invoke-BuilderVM does not produce a seal verdict'
@@ -141,7 +146,7 @@ Describe 'Invoke-BuilderVM — RC7: SetAutomaticCheckpoints called before StartV
         # DepsImageRegion (the base layer) and the hash matches the blob. So a non-empty/correct
         # hash here is the proof that AutomaticCheckpoints were OFF before StartVM.
         $blob = [byte[]](1..8)
-        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob $blob
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-rc7' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-rc7.vhdx')
         $r.Status | Should -Be 'Success'
         # Compute the expected hash of the blob.
@@ -322,7 +327,7 @@ Describe 'Invoke-BuilderVM - honors -StorageRoot (E2)' {
 
     BeforeAll {
         function script:New-DiskPathRecorder {
-            $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob ([byte[]](1..8))
             $made = [System.Collections.Generic.List[string]]::new()
             $origVhd = $b.NewVHD; $origOut = $b.NewOutputVhdx
             $b.NewVHD        = { param($P) $made.Add([string]$P.Path); & $origVhd $P }.GetNewClosure()
@@ -375,23 +380,449 @@ Describe 'Invoke-BuilderVM - the deadline comes from -WorkloadTimeoutSeconds, th
     BeforeEach { Mock Wait-WorkloadComplete { @{ State = 'Off'; TimedOut = $false } } }
 
     It 'uses the profile key when the parameter is not given' {
-        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob ([byte[]](1..8))
         $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout 3600) -Name 'bld-to-prof' -Backend $b `
             -DepsDiskPath (Join-Path $TestDrive 'to-prof.vhdx')
         Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 3600 }
     }
 
     It 'an explicit parameter beats the profile key' {
-        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob ([byte[]](1..8))
         $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout 3600) -Name 'bld-to-exp' -Backend $b `
             -WorkloadTimeoutSeconds 0 -DepsDiskPath (Join-Path $TestDrive 'to-exp.vhdx')
         Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 0 }
     }
 
     It 'falls back to 600 when neither is given' {
-        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob ([byte[]](1..8))
         $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout $null) -Name 'bld-to-def' -Backend $b `
             -DepsDiskPath (Join-Path $TestDrive 'to-def.vhdx')
         Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+    }
+}
+
+# ===========================================================================
+#  Verdict: Success needs the guest's exit-code file to read exactly 0 and the manifest present (E7)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - the verdict comes from the exit-code file and the manifest, not from a clean power-off (E7)' {
+
+    BeforeAll {
+        # One builder run on a fake whose guest leaves exactly $Output on the OUTPUT disk, then powers off.
+        function script:Invoke-VerdictRun {
+            param([string] $Name, [hashtable] $Output)
+            $fakeArgs = @{ SimulateSelfPowerOff = $true; SimulateDepsImageBlob = [byte[]](1..16) }
+            if ($null -ne $Output) { $fakeArgs.SimulateWorkloadOutput = $Output }
+            $b = New-FakeHyperVBackend @fakeArgs
+            $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name $Name -Backend $b `
+                -DepsDiskPath (Join-Path $TestDrive "$Name.vhdx") -WarningAction SilentlyContinue
+            return @{ Result = $r; Backend = $b; Name = $Name }
+        }
+        # A failed verdict must emit nothing and must not have moved or hashed the disk.
+        function script:Assert-NoArtifact {
+            param($Run)
+            $Run.Result.Status          | Should -Be 'FetchFailed'
+            $Run.Result.DepsDiskPath    | Should -BeNullOrEmpty
+            $Run.Result.DepsImageHash   | Should -BeNullOrEmpty
+            $Run.Result.WholeImageHash  | Should -BeNullOrEmpty
+            @($Run.Backend.FakeCallLog | Where-Object { $_.Op -in @('MoveVhdxFile', 'GetVhdxImageHash') }).Count | Should -Be 0
+            (& $Run.Backend.GetVM @{ Name = $Run.Name }) | Should -BeNullOrEmpty -Because 'teardown still removes the VM'
+        }
+    }
+
+    It 'exit code 0 with the manifest present is Success and reports ExitCode 0' {
+        $run = script:Invoke-VerdictRun -Name 'bld-v-ok' -Output $script:BuilderOk
+        $run.Result.Status   | Should -Be 'Success'
+        $run.Result.ExitCode | Should -Be 0
+        $run.Result.Error    | Should -BeNullOrEmpty
+        @($run.Result.States) | Should -Contain 'VERDICT'
+    }
+
+    It 'surrounding whitespace on the exit code is ignored (the runner writes no newline, an editor might)' {
+        $run = script:Invoke-VerdictRun -Name 'bld-v-ws' -Output @{ 'result.exitcode' = " 0`n"; 'deps-manifest.json' = '{"files":[]}' }
+        $run.Result.Status | Should -Be 'Success'
+    }
+
+    It 'a missing exit-code file is FetchFailed, even though the guest powered off cleanly' {
+        $run = script:Invoke-VerdictRun -Name 'bld-v-none' -Output $null
+        script:Assert-NoArtifact $run
+        $run.Result.ExitCode | Should -BeNullOrEmpty
+        $run.Result.Error    | Should -Match 'no exit-code file'
+    }
+
+    It 'a non-zero exit code is FetchFailed and is reported' {
+        $run = script:Invoke-VerdictRun -Name 'bld-v-rc2' -Output @{ 'result.exitcode' = '2'; 'deps-manifest.json' = '{"files":[]}' }
+        script:Assert-NoArtifact $run
+        $run.Result.ExitCode | Should -Be 2
+        $run.Result.Error    | Should -Match 'exit code 2'
+    }
+
+    It 'the rc70 sentinel of the no-INPUT branch is a non-zero exit code, so FetchFailed' {
+        $run = script:Invoke-VerdictRun -Name 'bld-v-rc70' -Output @{ 'result.exitcode' = '70' }
+        script:Assert-NoArtifact $run
+        $run.Result.ExitCode | Should -Be 70
+    }
+
+    It 'content that is not a plain exit code is FetchFailed, and the reason does not repeat the content' -ForEach @(
+        @{ Content = 'not-a-number' }, @{ Content = '00' }, @{ Content = '0x0' }, @{ Content = '+0' }, @{ Content = '-1' },
+        @{ Content = '0 1' }, @{ Content = '1.0' }, @{ Content = '' }, @{ Content = '   ' }, @{ Content = '99999999999' }
+    ) {
+        $name = 'bld-v-junk{0}' -f ([guid]::NewGuid().ToString('N').Substring(0, 6))
+        $run = script:Invoke-VerdictRun -Name $name -Output @{ 'result.exitcode' = $Content; 'deps-manifest.json' = '{"files":[]}' }
+        script:Assert-NoArtifact $run
+        $run.Result.Error | Should -Match 'not a plain exit code'
+        if ($Content.Trim().Length -gt 3) { $run.Result.Error | Should -Not -BeLike "*$($Content.Trim())*" }
+    }
+
+    It 'exit code 0 but no manifest (or a blank one) is FetchFailed' -ForEach @(
+        @{ Case = 'absent'; Output = @{ 'result.exitcode' = '0' } },
+        @{ Case = 'blank';  Output = @{ 'result.exitcode' = '0'; 'deps-manifest.json' = "  `n" } }
+    ) {
+        $name = "bld-v-nm-$Case"
+        $run = script:Invoke-VerdictRun -Name $name -Output $Output
+        script:Assert-NoArtifact $run
+        $run.Result.ExitCode | Should -Be 0
+        $run.Result.Error    | Should -Match 'deps-manifest.json'
+    }
+
+    It 'a failed fetch deletes the OUTPUT disk with the rest of the sandbox (nothing durable is left)' {
+        $run = script:Invoke-VerdictRun -Name 'bld-v-clean' -Output @{ 'result.exitcode' = '2' }
+        $out = @($run.Backend.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' } | ForEach-Object { $_.Path } | Select-Object -Unique)
+        $out.Count | Should -Be 1
+        (& $run.Backend.GetVHDInfo @{ Path = $out[0] }) | Should -BeNullOrEmpty
+        (Test-Path -LiteralPath (Join-Path $TestDrive 'bld-v-clean.vhdx')) | Should -BeFalse
+    }
+
+    It 'a timeout stays Status=Failed (a lifecycle failure), not FetchFailed' {
+        $b = New-FakeHyperVBackend -SimulateNeverOff
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-v-to' -Backend $b -WorkloadTimeoutSeconds 0 `
+            -DepsDiskPath (Join-Path $TestDrive 'bld-v-to.vhdx') -WarningAction SilentlyContinue
+        $r.Status | Should -Be 'Failed'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' }).Count | Should -Be 0 -Because 'a hung guest''s disk is never read'
+    }
+
+    It 'the verdict is read after the detach and before the move and the hash' {
+        $run = script:Invoke-VerdictRun -Name 'bld-v-order' -Output $script:BuilderOk
+        $ops = @($run.Backend.FakeCallLog | Where-Object { $_.Op -in @('RemoveHardDiskDrive', 'ReadVhdxFile', 'MoveVhdxFile', 'GetVhdxImageHash') } | ForEach-Object { $_.Op })
+        foreach ($op in 'RemoveHardDiskDrive', 'ReadVhdxFile', 'MoveVhdxFile', 'GetVhdxImageHash') { $ops | Should -Contain $op }
+        $ops.IndexOf('RemoveHardDiskDrive') | Should -BeLessThan $ops.IndexOf('ReadVhdxFile')
+        $ops.IndexOf('ReadVhdxFile')        | Should -BeLessThan $ops.IndexOf('MoveVhdxFile')
+        $ops.IndexOf('MoveVhdxFile')        | Should -BeLessThan $ops.IndexOf('GetVhdxImageHash')
+    }
+}
+
+Describe 'Read-BuilderVerdict (the host read of the guest verdict, in isolation)' {
+
+    BeforeAll {
+        function script:New-VerdictDisk {
+            param([hashtable] $Files)
+            $b = New-FakeHyperVBackend
+            & $b.NewVHD @{ Path = 'C:\v\out.vhdx'; SizeBytes = 64MB; Dynamic = $true }
+            foreach ($k in @($Files.Keys)) { & $b.WriteVhdxFile @{ Path = 'C:\v\out.vhdx'; InnerPath = $k; Content = [string]$Files[$k] } }
+            return $b
+        }
+    }
+
+    It 'is Ok only for exactly 0 plus a non-empty manifest' {
+        $b = script:New-VerdictDisk @{ 'result.exitcode' = '0'; 'deps-manifest.json' = '{}' }
+        $v = Read-BuilderVerdict -OutputDiskPath 'C:\v\out.vhdx' -Backend $b
+        $v.Ok | Should -BeTrue
+        $v.ExitCode | Should -Be 0
+        $v.ManifestPresent | Should -BeTrue
+        $v.Reason | Should -BeNullOrEmpty
+    }
+
+    It 'does not look for the manifest once the exit code is already a failure' {
+        $b = script:New-VerdictDisk @{ 'result.exitcode' = '3'; 'deps-manifest.json' = '{}' }
+        $v = Read-BuilderVerdict -OutputDiskPath 'C:\v\out.vhdx' -Backend $b
+        $v.Ok | Should -BeFalse
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.InnerPath -eq 'deps-manifest.json' }).Count | Should -Be 0
+    }
+
+    It 'a read failure propagates (fail-closed: the run becomes Failed, never a guessed Success)' {
+        $b = New-FakeHyperVBackend
+        { Read-BuilderVerdict -OutputDiskPath 'C:\v\missing.vhdx' -Backend $b } | Should -Throw -ExpectedMessage '*does not exist*'
+    }
+}
+
+# ===========================================================================
+#  deps.vhdx survives teardown (E7)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - deps.vhdx is moved out of the sandbox folder and survives teardown (E7)' {
+
+    BeforeEach { $script:SavedRoot2 = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot2 }
+
+    BeforeAll {
+        function script:New-GreenBuilderBackend { New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob ([byte[]](1..32)) }
+    }
+
+    It 'the file lands in -DepsOutputDir, is hashed THERE, and is still present after teardown' {
+        $b = script:New-GreenBuilderBackend
+        $dir = Join-Path $TestDrive 'out-keep'
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-keep' -Backend $b -DepsOutputDir $dir
+        $r.Status | Should -Be 'Success'
+        $r.DepsDiskPath | Should -Be (Join-Path $dir 'deps-bld-keep.vhdx')
+        (& $b.GetVHDInfo @{ Path = $r.DepsDiskPath }) | Should -Not -BeNullOrEmpty -Because 'teardown must not delete the moved deps disk'
+        $r.DepsImageHash | Should -Be ([string](& $b.GetVhdxImageHash @{ Path = $r.DepsDiskPath }))
+        $r.WholeImageHash | Should -Be $r.DepsImageHash
+        $hashed = @($b.FakeCallLog | Where-Object { $_.Op -eq 'GetVhdxImageHash' })
+        $hashed[0].Path | Should -Be $r.DepsDiskPath -Because 'the hash describes the moved file, which is what a consumer copies'
+        @($r.States) | Should -Contain 'MOVED'
+        @($r.States) | Should -Contain 'DESTROYED'
+    }
+
+    It 'the old OUTPUT path is gone (a move, not a copy) and no teardown delete ever names the new path' {
+        $b = script:New-GreenBuilderBackend
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-mv' -Backend $b -DepsOutputDir (Join-Path $TestDrive 'out-mv')
+        $mv = @($b.FakeCallLog | Where-Object { $_.Op -eq 'MoveVhdxFile' })
+        $mv.Count | Should -Be 1
+        $mv[0].Destination | Should -Be $r.DepsDiskPath
+        (& $b.GetVHDInfo @{ Path = $mv[0].Path }) | Should -BeNullOrEmpty
+        $deleted = @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveVHD' } | ForEach-Object { $_.Path })
+        $deleted | Should -Not -Contain $r.DepsDiskPath
+        # The run's own disks (system, INPUT, seed) are gone; only the deps disk remains of its VHDs.
+        (& $b.GetVHDInfo @{ Path = $mv[0].Path }) | Should -BeNullOrEmpty
+    }
+
+    It 'the default destination is the deps folder under the artifact root (the per-run temp artifact dir when -ArtifactRoot is not given)' {
+        $b = script:New-GreenBuilderBackend
+        $art = Join-Path $TestDrive 'art-root'
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-art' -Backend $b -ArtifactRoot $art
+        $r.DepsDiskPath | Should -Be (Join-Path (Join-Path $art 'deps') 'deps-bld-art.vhdx')
+
+        $b2 = script:New-GreenBuilderBackend
+        $r2 = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-art2' -Backend $b2
+        $r2.DepsDiskPath | Should -Be (Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\artifacts\bld-art2\deps\deps-bld-art2.vhdx')
+    }
+
+    It '-DepsDiskPath names the exact file' {
+        $b = script:New-GreenBuilderBackend
+        $dest = Join-Path $TestDrive 'exact\my-deps.vhdx'
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-exact' -Backend $b -DepsDiskPath $dest
+        $r.DepsDiskPath | Should -Be $dest
+        (& $b.GetVHDInfo @{ Path = $dest }) | Should -Not -BeNullOrEmpty
+    }
+
+    It 'refuses a destination inside the storage root, lexically or through a junction, before anything is created' {
+        $root = Join-Path $TestDrive 'sandboxes-e7'
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $link = Join-Path $TestDrive 'link-e7'
+        New-Item -ItemType Junction -Path $link -Target $root | Out-Null
+        foreach ($dest in @((Join-Path $root 'keep\deps.vhdx'), (Join-Path $link 'keep\deps.vhdx'), (Join-Path $root 'deps.vhdx'))) {
+            $b = New-FakeHyperVBackend
+            { Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-inside' -StorageRoot $root -Backend $b -DepsDiskPath $dest } |
+                Should -Throw -ExpectedMessage '*inside the sandbox storage root*'
+            @($b.FakeCallLog).Count | Should -Be 0 -Because 'the refusal comes before any backend call'
+        }
+    }
+
+    It 'a sibling folder that only shares the storage root prefix is allowed' {
+        $root = Join-Path $TestDrive 'sandboxes-e7b'
+        $b = script:New-GreenBuilderBackend
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-sib' -StorageRoot $root -Backend $b `
+            -DepsOutputDir ($root + '-deps')
+        $r.Status | Should -Be 'Success'
+    }
+
+    It 'refuses bad destinations before anything is created' -ForEach @(
+        @{ Why = 'a relative directory';  Splat = @{ DepsOutputDir = 'relative\deps' };            Msg = '*absolute local path*' }
+        @{ Why = 'a UNC directory';       Splat = @{ DepsOutputDir = '\\server\share\deps' };      Msg = '*absolute local path*' }
+        @{ Why = 'a relative file';       Splat = @{ DepsDiskPath = 'deps.vhdx' };                 Msg = '*absolute local path*' }
+        @{ Why = 'a non-vhdx file';       Splat = @{ DepsDiskPath = 'C:\keep\deps.img' };          Msg = '*must end in*vhdx*' }
+        @{ Why = 'both parameters';       Splat = @{ DepsDiskPath = 'C:\keep\a.vhdx'; DepsOutputDir = 'C:\keep' }; Msg = '*alternatives*' }
+    ) {
+        $b = New-FakeHyperVBackend
+        { Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-bad-dest' -Backend $b @Splat } |
+            Should -Throw -ExpectedMessage $Msg
+        @($b.FakeCallLog).Count | Should -Be 0
+    }
+
+    It 'refuses a destination that already exists, before the build, and leaves the old file alone' {
+        $dir = Join-Path $TestDrive 'out-exists'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $old = Join-Path $dir 'deps-bld-exists.vhdx'
+        Set-Content -LiteralPath $old -Value 'previous build'
+        $b = New-FakeHyperVBackend
+        { Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-exists' -Backend $b -DepsOutputDir $dir } |
+            Should -Throw -ExpectedMessage '*already exists*'
+        @($b.FakeCallLog).Count | Should -Be 0
+        (Get-Content -LiteralPath $old -Raw).Trim() | Should -Be 'previous build'
+    }
+
+    It 'a hash that cannot be taken after the move fails the run and emits no artifact' {
+        $b = script:New-GreenBuilderBackend
+        $realHash = $b.GetVhdxImageHash
+        $b.GetVhdxImageHash = { param($P) throw 'simulated hash failure' }.GetNewClosure()
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-nohash' -Backend $b `
+            -DepsOutputDir (Join-Path $TestDrive 'out-nohash') -WarningAction SilentlyContinue
+        $r.Status | Should -Be 'Failed'
+        $r.DepsDiskPath | Should -BeNullOrEmpty
+        $r.DepsImageHash | Should -BeNullOrEmpty
+        $r.Error | Should -Match 'NOT verified'
+    }
+}
+
+Describe 'A builder run feeds a later consumer run straight from its result (E7)' {
+
+    BeforeAll {
+        # A Disk-mode processor profile (Network=None, ScreenConfig): the kind of run that attaches a DEPS disk.
+        $tierDir = Join-Path $script:SkillRoot 'tier-profiles'
+        $fx = @{} + (Import-TierProfile -Path (Join-Path $tierDir 'tier0.psd1'))
+        $fx['Name']         = 'e7-consumer'
+        $fx['WorkloadMode'] = 'Disk'
+        $fx['FileSystem']   = 'exFAT'
+        $fx['Entrypoint']   = 'python3 /mnt/in/summarize.py --out /run/staging/result.html'
+        $fx['Network']      = 'None'; $fx['EgressMode'] = 'None'; $fx['EgressAllowlist'] = @()
+        $fx['ScreenConfig'] = @{ mode = 'aggressive' }
+        $fx['Inputs']       = @{}
+        foreach ($helper in @('run_disk_workload.py', 'outbox.py', 'screener.py')) {
+            $fx['Inputs'][$helper] = Get-Content -LiteralPath (Join-Path $script:SkillRoot "guest/$helper") -Raw
+        }
+        $script:E7Consumer = $fx
+    }
+
+    It 'the processor attaches a verified working copy of the builder output, never the builder file itself' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob ([byte[]](1..48))
+        $attached = [System.Collections.Generic.List[string]]::new()
+        $realAdd = $b.AddHardDiskDrive
+        $b.AddHardDiskDrive = { param($P) $attached.Add([string]$P.Path); & $realAdd $P }.GetNewClosure()
+
+        $built = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-e7' -Backend $b `
+            -DepsOutputDir (Join-Path $TestDrive 'out-e7')
+        $built.Status | Should -Be 'Success'
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:E7Consumer `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $built.DepsDiskPath; DepsImageHash = $built.DepsImageHash } `
+            -Name 'sbx-e7' -ArtifactRoot (Join-Path $TestDrive 'art-e7') -Destination (Join-Path $TestDrive 'dest-e7') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath (Join-Path $TestDrive 'ledger-e7.json') -WarningAction SilentlyContinue
+
+        @($report.States) | Should -Contain 'SEALED'
+        $copy = Join-Path (Get-SandboxStorageRoot -Name 'sbx-e7') 'sbx-e7-deps.vhdx'
+        $report.Descriptor.DepsSourcePath | Should -Be $built.DepsDiskPath
+        $report.Descriptor.DepsDiskPath   | Should -Be $copy
+        $report.Descriptor.DepsImageHash  | Should -Be $built.DepsImageHash
+        $attached | Should -Contain $copy
+        $attached | Should -Not -Contain $built.DepsDiskPath
+        (& $b.GetVHDInfo @{ Path = $copy }) | Should -BeNullOrEmpty -Because 'the consumer''s teardown deletes its working copy'
+        (& $b.GetVHDInfo @{ Path = $built.DepsDiskPath }) | Should -Not -BeNullOrEmpty -Because 'the builder output stays for the next run'
+    }
+
+    It 'a wrong hash from the caller is still refused (the hand-off check is unchanged)' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateWorkloadOutput $script:BuilderOk -SimulateDepsImageBlob ([byte[]](1..48))
+        $built = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-e7b' -Backend $b `
+            -DepsOutputDir (Join-Path $TestDrive 'out-e7b')
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:E7Consumer `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $built.DepsDiskPath; DepsImageHash = ('0' * 64) } `
+            -Name 'sbx-e7b' -ArtifactRoot (Join-Path $TestDrive 'art-e7b') -Destination (Join-Path $TestDrive 'dest-e7b') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath (Join-Path $TestDrive 'ledger-e7b.json') -WarningAction SilentlyContinue
+        @($report.States) | Should -Not -Contain 'SEALED'
+        $report.Error | Should -Match '(?i)hash'
+    }
+}
+
+# ===========================================================================
+#  The MoveVhdxFile backend method (E7)
+# ===========================================================================
+Describe 'MoveVhdxFile backend method' {
+
+    It 'is in the manifest with Path and Destination, and both factories implement it' {
+        (Get-HyperVBackendMethodManifest)['MoveVhdxFile'] | Should -Be @('Path', 'Destination')
+        (New-FakeHyperVBackend).MoveVhdxFile | Should -BeOfType [scriptblock]
+        (New-RealHyperVBackend).MoveVhdxFile | Should -BeOfType [scriptblock]
+    }
+
+    It 'fake: re-keys the record, so the old path is gone and the image bytes, label and hash travel with it' {
+        $b = New-FakeHyperVBackend
+        & $b.NewOutputVhdx @{ Path = 'C:\sb\out.vhdx'; Label = 'OUTPUT'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+        $before = [string](& $b.GetVhdxImageHash @{ Path = 'C:\sb\out.vhdx' })
+        & $b.MoveVhdxFile @{ Path = 'C:\sb\out.vhdx'; Destination = 'C:\keep\deps.vhdx' }
+        (& $b.GetVHDInfo @{ Path = 'C:\sb\out.vhdx' }) | Should -BeNullOrEmpty
+        $info = & $b.GetVHDInfo @{ Path = 'C:\keep\deps.vhdx' }
+        $info.Path | Should -Be 'C:\keep\deps.vhdx'
+        $info.Label | Should -Be 'OUTPUT'
+        [string](& $b.GetVhdxImageHash @{ Path = 'C:\keep\deps.vhdx' }) | Should -Be $before
+    }
+
+    It 'fake: refuses a missing source, an existing destination and a source attached to a running VM' {
+        $b = New-FakeHyperVBackend
+        { & $b.MoveVhdxFile @{ Path = 'C:\nope.vhdx'; Destination = 'C:\keep\x.vhdx' } } | Should -Throw -ExpectedMessage '*does not exist*'
+        & $b.NewVHD @{ Path = 'C:\a.vhdx'; SizeBytes = 64MB; Dynamic = $true }
+        & $b.NewVHD @{ Path = 'C:\b.vhdx'; SizeBytes = 64MB; Dynamic = $true }
+        { & $b.MoveVhdxFile @{ Path = 'C:\a.vhdx'; Destination = 'C:\b.vhdx' } } | Should -Throw -ExpectedMessage '*already exists*'
+        & $b.NewVM @{ Name = 'vm-mv' }
+        & $b.AddHardDiskDrive @{ VMName = 'vm-mv'; Path = 'C:\a.vhdx' }
+        & $b.StartVM @{ Name = 'vm-mv' }
+        { & $b.MoveVhdxFile @{ Path = 'C:\a.vhdx'; Destination = 'C:\keep\y.vhdx' } } | Should -Throw -ExpectedMessage '*locked*'
+        (& $b.GetVHDInfo @{ Path = 'C:\a.vhdx' }) | Should -Not -BeNullOrEmpty -Because 'a refused move leaves the source alone'
+    }
+
+    Context 'real body, in-process on temp files (it runs no Hyper-V cmdlet)' {
+        BeforeAll {
+            $script:RealMv = New-RealHyperVBackend
+            $script:MvDir = Join-Path $TestDrive 'realmove'
+            New-Item -ItemType Directory -Path $script:MvDir -Force | Out-Null
+            $script:MvBytes = [byte[]](0..255 + 0..255)
+            $script:NewSrc = {
+                param([string] $Leaf)
+                $p = Join-Path $script:MvDir $Leaf
+                [System.IO.File]::WriteAllBytes($p, $script:MvBytes)
+                (Get-Item -LiteralPath $p).IsReadOnly = $true
+                return $p
+            }
+        }
+
+        It 'moves byte for byte into a new folder, clears ReadOnly, and leaves nothing behind' {
+            $src = & $script:NewSrc 'a.vhdx'
+            $dst = Join-Path $script:MvDir 'newdir\moved.vhdx'
+            & $script:RealMv.MoveVhdxFile @{ Path = $src; Destination = $dst }
+            [System.IO.File]::ReadAllBytes($dst) | Should -Be $script:MvBytes
+            (Get-Item -LiteralPath $dst).IsReadOnly | Should -BeFalse
+            Test-Path -LiteralPath $src | Should -BeFalse
+            @(Get-ChildItem -LiteralPath (Split-Path -Parent $dst) -Filter '*.partial-*').Count | Should -Be 0
+        }
+
+        It 'refuses an existing destination and a missing source, touching neither' {
+            $src = & $script:NewSrc 'b.vhdx'
+            $dst = Join-Path $script:MvDir 'taken.vhdx'
+            Set-Content -LiteralPath $dst -Value 'keep me'
+            { & $script:RealMv.MoveVhdxFile @{ Path = $src; Destination = $dst } } | Should -Throw -ExpectedMessage '*already exists*'
+            (Get-Content -LiteralPath $dst -Raw).Trim() | Should -Be 'keep me'
+            Test-Path -LiteralPath $src | Should -BeTrue
+            { & $script:RealMv.MoveVhdxFile @{ Path = (Join-Path $script:MvDir 'nope.vhdx'); Destination = (Join-Path $script:MvDir 'n2.vhdx') } } |
+                Should -Throw -ExpectedMessage '*does not exist*'
+        }
+
+        It 'leaves the source in place and nothing at the destination when the source is held open exclusively' {
+            $src = & $script:NewSrc 'c.vhdx'
+            $dst = Join-Path $script:MvDir 'c-moved.vhdx'
+            $fs = [System.IO.File]::Open($src, 'Open', 'Read', 'None')
+            try {
+                { & $script:RealMv.MoveVhdxFile @{ Path = $src; Destination = $dst } } | Should -Throw
+            }
+            finally { $fs.Dispose() }
+            Test-Path -LiteralPath $dst | Should -BeFalse
+            Test-Path -LiteralPath $src | Should -BeTrue
+        }
+
+        It 'the cross-volume branch copies, renames into place and deletes the source (a SUBST drive, skipped when none is free)' {
+            if (-not $IsWindows) { Set-ItResult -Skipped -Because 'SUBST is Windows only'; return }
+            $used = @((Get-PSDrive -PSProvider FileSystem).Name)
+            $letter = @('Z','Y','X','W','V','U','T') | Where-Object { $_ -notin $used } | Select-Object -First 1
+            if (-not $letter) { Set-ItResult -Skipped -Because 'no free drive letter for SUBST'; return }
+            $target = Join-Path $TestDrive 'substroot'
+            New-Item -ItemType Directory -Path $target -Force | Out-Null
+            & subst "${letter}:" $target 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'subst could not create a drive'; return }
+            try {
+                $src = & $script:NewSrc 'x.vhdx'
+                $dst = "${letter}:\deps\moved.vhdx"
+                & $script:RealMv.MoveVhdxFile @{ Path = $src; Destination = $dst }
+                [System.IO.File]::ReadAllBytes($dst) | Should -Be $script:MvBytes
+                (Get-Item -LiteralPath $dst).IsReadOnly | Should -BeFalse
+                Test-Path -LiteralPath $src | Should -BeFalse
+                @(Get-ChildItem -LiteralPath "${letter}:\deps" -Filter '*.partial-*').Count | Should -Be 0
+            }
+            finally { & subst "${letter}:" /D 2>&1 | Out-Null }
+        }
     }
 }
