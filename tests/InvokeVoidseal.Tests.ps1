@@ -411,6 +411,23 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         $report.RunResult | Should -Not -BeNullOrEmpty
     }
 
+    It 'Disk mode with -StorageRoot places the system, INPUT, OUTPUT and seed disks beside each other under it (E2)' {
+        $root = 'D:\vs-orch-disk'
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
+            -Workload @{ WorkloadMode = 'Disk' } -StorageRoot $root `
+            -Name 'sbx-disk-root' -ArtifactRoot $script:Art -Destination $script:Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:DiskB
+        $report.States | Should -Contain 'SEALED'
+        $expectedDir = Join-Path $root 'sbx-disk-root'
+        $d = $report.Descriptor
+        foreach ($p in @($d.DiskPath, $d.InputDiskPath, $d.OutputDiskPath)) {
+            $p | Should -Not -BeNullOrEmpty
+            $p | Should -BeLike "$expectedDir*"
+        }
+        # The CIDATA seed disk exists only when the fixture carries an entrypoint; when it does, it sits there too.
+        if ($d.SeedDiskPath) { $d.SeedDiskPath | Should -BeLike "$expectedDir*" }
+    }
+
     It 'Disk mode attaches BOTH data disks before the seal, folds them into CreatedDisks, and DETACHES them before the host read (proven via the call log)' {
         # The data disks are recorded on the descriptor and attached pre-seal; after the run they are
         # detached (RemoveHardDiskDrive) BEFORE the host reads the OUTPUT volume (ReadVhdxRawRegion, the
@@ -2148,5 +2165,155 @@ Describe 'Invoke-Voidseal: the NIC policy reaches the seal gate (processors at T
         $gateRead.Count          | Should -Be 1
         $gateRead[0].Adapters    | Should -Be 1 -Because 'one adapter: real New-VM creates it and the provisioner connects it'
         $gateRead[0].Switches[0] | Should -Be 'sbx-nic-t1-int'
+    }
+}
+
+# ===========================================================================
+#  -HostMemoryMarginBytes reaches the provisioner's free-RAM gate (E1)
+# ===========================================================================
+Describe 'Invoke-Voidseal - passes -HostMemoryMarginBytes to the provisioner (E1)' {
+
+    It 'a margin the host cannot meet aborts before PROVISIONED with the free-memory message' {
+        $b = New-FakeHyperVBackend
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-ov-margin' `
+            -Workload @{ Entrypoint = 'true' } -HostMemoryMarginBytes 100GB `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-ov-margin') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -Match '(?i)free memory'
+        @($report.States) | Should -Not -Contain 'PROVISIONED'
+        (& $b.GetVM @{ Name = 'sbx-ov-margin' }) | Should -BeNullOrEmpty
+    }
+
+    It 'with the parameter omitted the provisioner''s own 2GB default applies' {
+        $b = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes (4GB + 2GB - 1)
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-ov-default' `
+            -Workload @{ Entrypoint = 'true' } -ArtifactRoot (Join-Path $script:TmpRoot 'art-ov-default') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -Match '(?i)free memory'
+        $report.Error | Should -Match ([regex]::Escape([string]2GB))
+    }
+}
+
+# ===========================================================================
+#  -StorageRoot / VOIDSEAL_STORAGE_ROOT place every disk of a run (E2)
+# ===========================================================================
+Describe 'Invoke-Voidseal - the storage root covers the system, seed and data disks (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    It 'a Serial run with -StorageRoot puts the system disk and the CIDATA seed disk under it' {
+        $b = New-FakeHyperVBackend
+        $root = 'D:\vs-orch'
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-root' `
+            -Workload @{ Entrypoint = 'true' } -StorageRoot $root `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-root') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -BeNullOrEmpty
+        $expectedDir = Join-Path $root 'sbx-orch-root'
+        $report.Descriptor.DiskPath     | Should -BeLike "$expectedDir*"
+        $report.Descriptor.SeedDiskPath | Should -BeLike "$expectedDir*"
+    }
+
+    It 'VOIDSEAL_STORAGE_ROOT is honored when -StorageRoot is omitted, and the parameter wins when both are given' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-orch-env'
+        $b1 = New-FakeHyperVBackend
+        $r1 = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-env' -Workload @{ Entrypoint = 'true' } `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-env') -Backend $b1 -WarningAction SilentlyContinue
+        $r1.Descriptor.DiskPath | Should -BeLike (Join-Path 'D:\vs-orch-env' 'sbx-orch-env*')
+
+        $b2 = New-FakeHyperVBackend
+        $r2 = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-both' -Workload @{ Entrypoint = 'true' } `
+            -StorageRoot 'D:\vs-orch-param' -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-both') -Backend $b2 -WarningAction SilentlyContinue
+        $r2.Descriptor.DiskPath | Should -BeLike (Join-Path 'D:\vs-orch-param' 'sbx-orch-both*')
+    }
+
+    It 'a relative -StorageRoot is a caller error: it throws before INIT and creates nothing' {
+        $b = New-FakeHyperVBackend
+        { Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-bad' -Workload @{ Entrypoint = 'true' } `
+            -StorageRoot 'relative\dir' -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-bad') -Backend $b } |
+            Should -Throw -ExpectedMessage '*absolute local path*'
+        (& $b.GetVM @{ Name = 'sbx-orch-bad' }) | Should -BeNullOrEmpty
+    }
+}
+
+# ===========================================================================
+#  WorkloadTimeoutSeconds: explicit parameter > profile key > 600 (E3)
+# ===========================================================================
+Describe 'Invoke-Voidseal - the workload deadline comes from -WorkloadTimeoutSeconds, then the profile, then 600 (E3)' {
+
+    BeforeAll {
+        # A Disk-mode (outbox) Tier-0 profile, like the fixture above, with room to add the timeout key.
+        function script:New-TimeoutDiskProfile {
+            param($Timeout)
+            $p = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+            $p = @{} + $p
+            $p['Name'] = 'timeout-test'; $p['WorkloadMode'] = 'Disk'; $p['Inputs'] = (script:New-OutboxHelperInputs)
+            $p['FileSystem'] = 'exFAT'; $p['OutboxOutput'] = $true
+            if ($null -ne $Timeout) { $p['WorkloadTimeoutSeconds'] = $Timeout }
+            return $p
+        }
+    }
+
+    BeforeEach {
+        # The wait is mocked so the test can read the deadline it was handed without sleeping. A guest that
+        # is already Off is the same observable outcome as the fake's self-power-off.
+        Mock Wait-WorkloadComplete { @{ State = 'Off'; TimedOut = $false } }
+        Mock Start-SandboxWorkload { @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $null; TimedOut = $false } }
+    }
+
+    Context 'Disk mode (Wait-WorkloadComplete)' {
+        It 'uses the profile key when -WorkloadTimeoutSeconds is not given' {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+            $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout 7200) -Name 'sbx-to-prof' `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-prof') -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 7200 }
+        }
+
+        It 'an explicit -WorkloadTimeoutSeconds beats the profile key, including an explicit 0' {
+            foreach ($explicit in @(120, 0)) {
+                $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+                $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout 7200) -Name "sbx-to-exp$explicit" `
+                    -WorkloadTimeoutSeconds $explicit -ArtifactRoot (Join-Path $script:TmpRoot "art-to-exp$explicit") `
+                    -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+                Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq $explicit }
+            }
+        }
+
+        It 'falls back to 600 when neither is given' {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+            $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout $null) -Name 'sbx-to-def' `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-def') -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+        }
+    }
+
+    Context 'Serial mode (Start-SandboxWorkload)' {
+        It 'passes the profile key as the serial command deadline when the parameter is not given' {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = 1800
+            $b = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-ser' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser') -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 1800 }
+        }
+
+        It 'an explicit parameter wins, and 600 applies when nothing is set' {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = 1800
+            $b = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-ser2' -Workload @{ Entrypoint = 'true' } `
+                -WorkloadTimeoutSeconds 90 -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser2') -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 90 }
+
+            $b2 = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-to-ser3' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser3') -Backend $b2 -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+        }
+    }
+
+    It 'an out-of-range profile key is a load error (the loader bounds are 60..86400)' {
+        foreach ($bad in @(30, 86401)) {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = $bad
+            { Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-bad' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-bad') -Backend (New-FakeHyperVBackend) } |
+                Should -Throw -ExpectedMessage '*WorkloadTimeoutSeconds*'
+        }
     }
 }

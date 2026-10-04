@@ -78,6 +78,8 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             'NewVM', 'GetVM', 'StartVM', 'StopVM', 'RemoveVM'
             # hardware
             'SetProcessor', 'SetMemory', 'SetFirmware', 'SetAutomaticCheckpoints', 'SetComPort', 'GetComPort'
+            # host resource read (the free-RAM gate)
+            'GetHostMemory'
             # guest command delivery (the Runner serial seam)
             'InvokeGuestCommand'
             # host channels (the seal surface)
@@ -96,13 +98,14 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
         }
     }
 
-    It 'documents a non-empty arg-key list for every method that takes args (only TestAvailable is arg-less)' {
+    It 'documents a non-empty arg-key list for every method that takes args (only TestAvailable and GetHostMemory are arg-less)' {
         # Arg-key drift guard: if a method silently grew/lost args, this catches the
-        # manifest going stale. TestAvailable is the sole documented arg-less method (@()).
+        # manifest going stale. TestAvailable (the capability probe) and GetHostMemory (a whole-host
+        # read) are the documented arg-less methods (@()).
         foreach ($name in $script:ExpectedMethods.Keys) {
             $argKeys = @($script:ExpectedMethods[$name])
-            if ($name -eq 'TestAvailable') {
-                $argKeys.Count | Should -Be 0 -Because 'TestAvailable is the capability probe and takes no named args'
+            if ($name -in @('TestAvailable', 'GetHostMemory')) {
+                $argKeys.Count | Should -Be 0 -Because "$name takes no named args"
             }
             else {
                 $argKeys.Count | Should -BeGreaterThan 0 -Because "$name is documented as taking named args; an empty list means the manifest drifted"
@@ -199,10 +202,11 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             Checkpoint = 'VMName'; RestoreCheckpoint = 'VMName'; GetCheckpoint = 'VMName'; RemoveCheckpoint = 'VMName'
         }
 
-        # Sanity: the map covers exactly the non-TestAvailable manifest methods (so a NEW
-        # method added to the manifest forces this map — and thus the contract — to update).
+        # Sanity: the map covers exactly the arg-taking manifest methods (so a NEW
+        # method added to the manifest forces this map, and thus the contract, to update).
+        # TestAvailable and GetHostMemory are arg-less, so they have no primary key to drop.
         $covered  = @($primaryKey.Keys | Sort-Object)
-        $expected = @($script:ExpectedMethods.Keys | Where-Object { $_ -ne 'TestAvailable' } | Sort-Object)
+        $expected = @($script:ExpectedMethods.Keys | Where-Object { $_ -notin @('TestAvailable', 'GetHostMemory') } | Sort-Object)
         ($covered -join ',') | Should -Be ($expected -join ',') -Because 'every arg-taking manifest method must be in the primary-key drift map'
 
         foreach ($name in $primaryKey.Keys) {
@@ -350,6 +354,38 @@ Describe 'Fake backend — hardware (processor / memory / firmware / COM port)' 
         $vm = & $script:B.GetVM @{ Name = 'vm1' }
         $vm.ProcessorCount | Should -Be 4
         $vm.ExposeVirtualizationExtensions | Should -BeTrue
+    }
+
+    It 'a fresh VM carries Hyper-V''s own processor defaults (Maximum 100, RelativeWeight 100)' {
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.ProcessorMaximum        | Should -Be 100
+        $vm.ProcessorRelativeWeight | Should -Be 100
+    }
+
+    It 'SetProcessor records Maximum and RelativeWeight when supplied' {
+        & $script:B.SetProcessor @{ VMName = 'vm1'; Count = 2; Maximum = 50; RelativeWeight = 250 }
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.ProcessorMaximum        | Should -Be 50
+        $vm.ProcessorRelativeWeight | Should -Be 250
+        $vm.ProcessorCount          | Should -Be 2
+    }
+
+    It 'SetProcessor without Maximum/RelativeWeight leaves the recorded values untouched' {
+        & $script:B.SetProcessor @{ VMName = 'vm1'; Maximum = 40; RelativeWeight = 300 }
+        & $script:B.SetProcessor @{ VMName = 'vm1'; Count = 3 }
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.ProcessorMaximum        | Should -Be 40
+        $vm.ProcessorRelativeWeight | Should -Be 300
+        $vm.ProcessorCount          | Should -Be 3
+    }
+
+    It 'SetProcessor rejects what the real Set-VMProcessor rejects (Maximum outside 0..100, RelativeWeight outside 1..10000)' {
+        { & $script:B.SetProcessor @{ VMName = 'vm1'; Maximum = 101 } }          | Should -Throw -ExpectedMessage '*Maximum*'
+        { & $script:B.SetProcessor @{ VMName = 'vm1'; Maximum = -1 } }           | Should -Throw -ExpectedMessage '*Maximum*'
+        { & $script:B.SetProcessor @{ VMName = 'vm1'; RelativeWeight = 0 } }     | Should -Throw -ExpectedMessage '*RelativeWeight*'
+        { & $script:B.SetProcessor @{ VMName = 'vm1'; RelativeWeight = 10001 } } | Should -Throw -ExpectedMessage '*RelativeWeight*'
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.ProcessorMaximum | Should -Be 100 -Because 'a rejected call must not half-apply'
     }
 
     It 'SetMemory records startup/dynamic settings' {
@@ -2664,5 +2700,96 @@ Describe 'Resolve-QemuImg (I5 version-floor + SHA-256 pin)' {
         Mock Get-FileSha256     { 'should-not-be-called' }
         Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
         Should -Invoke Get-FileSha256 -Times 0
+    }
+}
+
+# ===========================================================================
+#  GetHostMemory: the host free-RAM read behind the engine's pre-boot gate
+# ===========================================================================
+Describe 'Fake backend - GetHostMemory' {
+
+    It 'returns FreeBytes and TotalBytes as [long] byte counts, with a default that clears every shipped guest size' {
+        $b = New-FakeHyperVBackend
+        $m = & $b.GetHostMemory @{}
+        $m.FreeBytes  | Should -BeOfType [long]
+        $m.TotalBytes | Should -BeOfType [long]
+        $m.FreeBytes  | Should -BeGreaterThan 32GB
+        $m.TotalBytes | Should -BeGreaterOrEqual $m.FreeBytes
+    }
+
+    It 'is configurable through -SimulateHostFreeMemoryBytes / -SimulateHostTotalMemoryBytes' {
+        $b = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes 3GB -SimulateHostTotalMemoryBytes 16GB
+        $m = & $b.GetHostMemory @{}
+        $m.FreeBytes  | Should -Be 3GB
+        $m.TotalBytes | Should -Be 16GB
+    }
+
+    It 'throws under -SimulateHostMemoryReadError (the unreadable-host case the gate must fail closed on)' {
+        $b = New-FakeHyperVBackend -SimulateHostMemoryReadError
+        { & $b.GetHostMemory @{} } | Should -Throw -ExpectedMessage '*GetHostMemory*'
+    }
+}
+
+# ===========================================================================
+#  REAL backend: processor caps + the CIM host-memory read (out-of-process capture)
+# ===========================================================================
+#  The real bodies cannot run here (no elevation, no live Hyper-V). Like the SetProcessor pass-through
+#  above, they are driven out-of-process with recording shadow stubs: Set-VMProcessor records which
+#  parameters arrived, and Get-CimInstance returns the shape the real class has (UInt64 properties in
+#  KiB), so a missing unit conversion or a wrong class name shows up here and not on first live use.
+Describe 'Real backend - SetProcessor caps and GetHostMemory (out-of-process capture)' {
+
+    BeforeAll {
+        $harness = Join-Path $PSScriptRoot 'fixtures/Invoke-RealBackendCapture.ps1'
+        $pwsh = (Get-Process -Id $PID).Path
+        if ([string]::IsNullOrWhiteSpace($pwsh)) { $pwsh = 'pwsh' }
+        $raw = & $pwsh -NoProfile -File $harness -LibPath $script:LibPath 2>&1
+        $rawText = ($raw | Out-String).Trim()
+        $jsonLine = ($rawText -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        $jsonLine | Should -Not -BeNullOrEmpty -Because "the harness must emit JSON; got: $rawText"
+        $script:Cap2 = $jsonLine | ConvertFrom-Json
+    }
+
+    It 'SetProcessor passes -Maximum and -RelativeWeight through when supplied' {
+        $script:Cap2.SetProcessor_Caps.err | Should -BeNullOrEmpty
+        $cap = $script:Cap2.SetProcessor_Caps.cap
+        $cap.MaximumGiven        | Should -BeTrue
+        $cap.Maximum             | Should -Be 60
+        $cap.RelativeWeightGiven | Should -BeTrue
+        $cap.RelativeWeight      | Should -Be 500
+        $cap.CountGiven          | Should -BeTrue
+        $cap.Count               | Should -Be 2
+    }
+
+    It 'SetProcessor OMITS -Maximum and -RelativeWeight when they are not supplied (Hyper-V defaults stay)' {
+        $cap = $script:Cap2.SetProcessor.cap
+        $cap.MaximumGiven        | Should -BeFalse
+        $cap.RelativeWeightGiven | Should -BeFalse
+    }
+
+    It 'SetProcessor passes only the one cap that was supplied' {
+        $cap = $script:Cap2.SetProcessor_MaxOnly.cap
+        $cap.MaximumGiven        | Should -BeTrue
+        $cap.RelativeWeightGiven | Should -BeFalse
+    }
+
+    It 'GetHostMemory reads Win32_OperatingSystem and converts KiB to bytes (x1024)' {
+        $script:Cap2.GetHostMemory.err | Should -BeNullOrEmpty
+        $script:Cap2.GetHostMemory.cap.ClassName | Should -Be 'Win32_OperatingSystem'
+        $script:Cap2.GetHostMemory.result.FreeBytes  | Should -Be (8388608 * 1024)  -Because 'FreePhysicalMemory is reported in KiB'
+        $script:Cap2.GetHostMemory.result.TotalBytes | Should -Be (16777216 * 1024) -Because 'TotalVisibleMemorySize is reported in KiB'
+    }
+
+    It 'GetHostMemory does not truncate a figure above the Int32 range (the CIM properties are UInt64)' {
+        $script:Cap2.GetHostMemory_Big.err | Should -BeNullOrEmpty
+        $script:Cap2.GetHostMemory_Big.result.FreeBytes | Should -Be ([long]4294967296 * 1024)
+    }
+
+    It 'GetHostMemory throws (fail closed) when the CIM read returns nothing' {
+        $script:Cap2.GetHostMemory_Null.err | Should -Match 'HyperVBackend\.GetHostMemory'
+    }
+
+    It 'GetHostMemory throws when the CIM instance carries no usable memory figures' {
+        $script:Cap2.GetHostMemory_Empty.err | Should -Match 'HyperVBackend\.GetHostMemory'
     }
 }

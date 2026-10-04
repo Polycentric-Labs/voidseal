@@ -296,3 +296,102 @@ Describe 'Resolve-PythonExe — robust host python resolution (fold-in #1)' {
         Resolve-PythonExe | Should -Be $script:RealPython
     }
 }
+
+# ===========================================================================
+#  -HostMemoryMarginBytes reaches the provisioner's free-RAM gate (E1)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - passes -HostMemoryMarginBytes to the provisioner (E1)' {
+
+    It 'a margin the host cannot meet fails the run before anything is created' {
+        $b = New-FakeHyperVBackend
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-margin' `
+            -HostMemoryMarginBytes 100GB -Backend $b -WarningAction SilentlyContinue
+        $r.Status | Should -Be 'Failed'
+        $r.Error  | Should -Match '(?i)free memory'
+        (& $b.GetVM @{ Name = 'bld-margin' }) | Should -BeNullOrEmpty
+    }
+}
+
+# ===========================================================================
+#  -StorageRoot covers the builder's disks (E2)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - honors -StorageRoot (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    BeforeAll {
+        function script:New-DiskPathRecorder {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+            $made = [System.Collections.Generic.List[string]]::new()
+            $origVhd = $b.NewVHD; $origOut = $b.NewOutputVhdx
+            $b.NewVHD        = { param($P) $made.Add([string]$P.Path); & $origVhd $P }.GetNewClosure()
+            $b.NewOutputVhdx = { param($P) $made.Add([string]$P.Path); & $origOut $P }.GetNewClosure()
+            $b['Made'] = $made
+            return $b
+        }
+    }
+
+    It 'creates every disk (system, input, output, seed) under the per-VM folder below -StorageRoot' {
+        $b = script:New-DiskPathRecorder
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root' -StorageRoot 'D:\vs-bld' `
+            -Backend $b -DepsDiskPath (Join-Path $TestDrive 'deps-root.vhdx')
+        $r.Status | Should -Be 'Success'
+        $dir = Join-Path 'D:\vs-bld' 'bld-root'
+        $b.Made.Count | Should -BeGreaterThan 3
+        foreach ($p in $b.Made) { $p | Should -BeLike "$dir*" }
+    }
+
+    It 'honors VOIDSEAL_STORAGE_ROOT when the parameter is omitted' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-bld-env'
+        $b = script:New-DiskPathRecorder
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root-env' `
+            -Backend $b -DepsDiskPath (Join-Path $TestDrive 'deps-root-env.vhdx')
+        $r.Status | Should -Be 'Success'
+        foreach ($p in $b.Made) { $p | Should -BeLike (Join-Path 'D:\vs-bld-env' 'bld-root-env*') }
+    }
+
+    It 'a relative -StorageRoot is refused before anything is created' {
+        $b = New-FakeHyperVBackend
+        { Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root-bad' -StorageRoot 'relative\dir' -Backend $b } |
+            Should -Throw -ExpectedMessage '*absolute local path*'
+        (& $b.GetVM @{ Name = 'bld-root-bad' }) | Should -BeNullOrEmpty
+    }
+}
+
+# ===========================================================================
+#  WorkloadTimeoutSeconds: explicit parameter > profile key > 600 (E3)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - the deadline comes from -WorkloadTimeoutSeconds, then the profile, then 600 (E3)' {
+
+    BeforeAll {
+        function script:New-BuilderProfileWithTimeout {
+            param($Timeout)
+            $p = @{} + (Import-WorkloadProfile -Path "$script:SkillRoot/profiles/builder.psd1" -TierProfileDir "$script:SkillRoot/tier-profiles")
+            if ($null -ne $Timeout) { $p['WorkloadTimeoutSeconds'] = $Timeout }
+            return $p
+        }
+    }
+    BeforeEach { Mock Wait-WorkloadComplete { @{ State = 'Off'; TimedOut = $false } } }
+
+    It 'uses the profile key when the parameter is not given' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout 3600) -Name 'bld-to-prof' -Backend $b `
+            -DepsDiskPath (Join-Path $TestDrive 'to-prof.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 3600 }
+    }
+
+    It 'an explicit parameter beats the profile key' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout 3600) -Name 'bld-to-exp' -Backend $b `
+            -WorkloadTimeoutSeconds 0 -DepsDiskPath (Join-Path $TestDrive 'to-exp.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 0 }
+    }
+
+    It 'falls back to 600 when neither is given' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout $null) -Name 'bld-to-def' -Backend $b `
+            -DepsDiskPath (Join-Path $TestDrive 'to-def.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+    }
+}

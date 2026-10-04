@@ -842,6 +842,194 @@ Describe 'Get-SealNicPolicy: the single NIC-posture predicate (Provisioner, Lock
 }
 
 # ===========================================================================
+#  New-SandboxVM: CPU caps and workload-driven sizing (E1)
+# ===========================================================================
+Describe 'New-SandboxVM - applies the CPU caps only when the profile sets them (E1)' {
+
+    BeforeAll {
+        # Wrap SetProcessor so a test can read exactly which arg keys the provisioner passed. The key set
+        # matters: the real Set-VMProcessor must receive -Maximum / -RelativeWeight ONLY when supplied.
+        function script:New-ProcRecordingBackend {
+            $b = New-FakeHyperVBackend
+            $calls = [System.Collections.Generic.List[object]]::new()
+            $orig = $b.SetProcessor
+            $b.SetProcessor = { param($P) $calls.Add($P.Clone()); & $orig $P }.GetNewClosure()
+            $b['ProcCalls'] = $calls
+            return $b
+        }
+    }
+
+    It 'passes NO Maximum / RelativeWeight when the profile carries neither (Hyper-V defaults stay)' {
+        $b = script:New-ProcRecordingBackend
+        $null = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-nocap' -Backend $b
+        $b.ProcCalls.Count | Should -Be 1
+        $b.ProcCalls[0].ContainsKey('Maximum')        | Should -BeFalse
+        $b.ProcCalls[0].ContainsKey('RelativeWeight') | Should -BeFalse
+        $vm = & $b.GetVM @{ Name = 'sbx-nocap' }
+        $vm.ProcessorMaximum        | Should -Be 100
+        $vm.ProcessorRelativeWeight | Should -Be 100
+    }
+
+    It 'passes both caps through to SetProcessor and the VM record reads them back' {
+        $b = script:New-ProcRecordingBackend
+        $p = $script:Tier1.Clone(); $p['CpuMaximumPercent'] = 50; $p['CpuRelativeWeight'] = 250
+        $null = New-SandboxVM -Profile $p -Name 'sbx-cap2' -Backend $b
+        $b.ProcCalls[0].Maximum        | Should -Be 50
+        $b.ProcCalls[0].RelativeWeight | Should -Be 250
+        $b.ProcCalls[0].Count          | Should -Be 4 -Because 'the cap rides the same call as the processor count'
+        $vm = & $b.GetVM @{ Name = 'sbx-cap2' }
+        $vm.ProcessorMaximum        | Should -Be 50
+        $vm.ProcessorRelativeWeight | Should -Be 250
+    }
+
+    It 'passes only the cap that is set' {
+        $b = script:New-ProcRecordingBackend
+        $p = $script:Tier1.Clone(); $p['CpuMaximumPercent'] = 30
+        $null = New-SandboxVM -Profile $p -Name 'sbx-cap1' -Backend $b
+        $b.ProcCalls[0].Maximum | Should -Be 30
+        $b.ProcCalls[0].ContainsKey('RelativeWeight') | Should -BeFalse
+        $vm = & $b.GetVM @{ Name = 'sbx-cap1' }
+        $vm.ProcessorRelativeWeight | Should -Be 100
+    }
+
+    It 'a cap the backend rejects (bypassing the loader) rolls the provision back: no VM, no disk' {
+        $b = New-FakeHyperVBackend
+        $p = $script:Tier1.Clone(); $p['CpuMaximumPercent'] = 150
+        { New-SandboxVM -Profile $p -Name 'sbx-badcap' -Backend $b } | Should -Throw -ExpectedMessage '*Maximum*'
+        (& $b.GetVM @{ Name = 'sbx-badcap' }) | Should -BeNullOrEmpty
+        (& $b.GetVHDInfo @{ Path = (Join-Path (Get-SandboxStorageRoot -Name 'sbx-badcap') 'sbx-badcap-system.vhdx') }) | Should -BeNullOrEmpty
+    }
+
+    It 'a workload profile''s Memory and Cpu size the guest (not the tier''s)' {
+        $wl = @"
+@{
+    BaseTier   = 1
+    Name       = 'sized-wl'
+    Entrypoint = 'true'
+    Memory     = '8GB'
+    Cpu        = 6
+    CpuMaximumPercent = 75
+}
+"@
+        $wlPath = Join-Path $TestDrive 'sized-wl.psd1'
+        Set-Content -LiteralPath $wlPath -Value $wl -Encoding UTF8
+        $merged = Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir
+        $b = New-FakeHyperVBackend
+        $desc = New-SandboxVM -Profile $merged -Name 'sbx-sized' -Backend $b
+        $vm = & $b.GetVM @{ Name = 'sbx-sized' }
+        $vm.MemoryStartupBytes | Should -Be 8GB
+        $vm.ProcessorCount     | Should -Be 6
+        $vm.ProcessorMaximum   | Should -Be 75
+        $desc.MemoryStartupBytes | Should -Be 8GB
+        $desc.ProcessorCount     | Should -Be 6
+    }
+}
+
+# ===========================================================================
+#  New-SandboxVM: the host free-RAM gate (E1)
+# ===========================================================================
+Describe 'New-SandboxVM - refuses to provision when the host lacks free RAM (E1)' {
+
+    # Tier 1 asks for 4GB; the default margin is 2GB, so the gate needs 6GB free.
+    It 'passes when free memory equals guest memory plus the default 2GB margin exactly' {
+        $b = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes 6GB
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ram-edge' -Backend $b
+        $desc | Should -Not -BeNullOrEmpty
+        (& $b.GetVM @{ Name = 'sbx-ram-edge' }) | Should -Not -BeNullOrEmpty
+    }
+
+    It 'refuses one byte short, names BOTH numbers, and creates nothing' {
+        $free = 6GB - 1
+        $b = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes $free
+        $msg = $null
+        try { $null = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ram-short' -Backend $b } catch { $msg = $_.Exception.Message }
+        $msg | Should -Not -BeNullOrEmpty
+        $msg | Should -Match ([regex]::Escape([string]$free)) -Because 'the message must name the free figure'
+        $msg | Should -Match ([regex]::Escape([string](4GB + 2GB))) -Because 'the message must name the required figure (guest memory + margin)'
+        $msg | Should -Match ([regex]::Escape([string]4GB))
+        $msg | Should -Match ([regex]::Escape([string]2GB))
+        $msg | Should -Match '(?i)free memory'
+        (& $b.GetVM @{ Name = 'sbx-ram-short' }) | Should -BeNullOrEmpty -Because 'the gate runs before anything is created'
+        (& $b.GetVHDInfo @{ Path = (Join-Path (Get-SandboxStorageRoot -Name 'sbx-ram-short') 'sbx-ram-short-system.vhdx') }) | Should -BeNullOrEmpty
+        (& $b.GetSwitch @{ Name = 'sbx-ram-short-int' }) | Should -BeNullOrEmpty
+    }
+
+    It 'honors -HostMemoryMarginBytes (0 lets free == guest pass; a huge margin refuses a roomy host)' {
+        $b0 = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes 4GB
+        { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ram-m0' -Backend $b0 -HostMemoryMarginBytes 0 } | Should -Not -Throw
+
+        $bBig = New-FakeHyperVBackend   # 64GB free by default
+        { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ram-mbig' -Backend $bBig -HostMemoryMarginBytes 62GB } |
+            Should -Throw -ExpectedMessage '*free memory*'
+        (& $bBig.GetVM @{ Name = 'sbx-ram-mbig' }) | Should -BeNullOrEmpty
+    }
+
+    It 'gates on the PROFILE''S guest memory, not a fixed figure (an 8GB workload needs 10GB free)' {
+        $p = $script:Tier1.Clone(); $p['Memory'] = '8GB'
+        $b = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes 9GB
+        { New-SandboxVM -Profile $p -Name 'sbx-ram-8' -Backend $b } | Should -Throw -ExpectedMessage '*free memory*'
+        $b2 = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes 10GB
+        { New-SandboxVM -Profile $p -Name 'sbx-ram-8b' -Backend $b2 } | Should -Not -Throw
+    }
+
+    It 'FAILS CLOSED when the host-memory read throws, and says so' {
+        $b = New-FakeHyperVBackend -SimulateHostMemoryReadError
+        $msg = $null
+        try { $null = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ram-throw' -Backend $b } catch { $msg = $_.Exception.Message }
+        $msg | Should -Match '(?i)host memory'
+        $msg | Should -Match 'SimulateHostMemoryReadError' -Because 'the underlying cause rides along'
+        (& $b.GetVM @{ Name = 'sbx-ram-throw' }) | Should -BeNullOrEmpty
+    }
+
+    It 'FAILS CLOSED on a null, empty or malformed host-memory result' {
+        $shapes = @(
+            @{ Label = 'null';           Value = $null },
+            @{ Label = 'no FreeBytes';   Value = @{ TotalBytes = 64GB } },
+            @{ Label = 'null FreeBytes'; Value = @{ FreeBytes = $null; TotalBytes = 64GB } },
+            @{ Label = 'non-numeric';    Value = @{ FreeBytes = 'plenty'; TotalBytes = 64GB } },
+            @{ Label = 'negative';       Value = @{ FreeBytes = -1; TotalBytes = 64GB } }
+        )
+        foreach ($s in $shapes) {
+            $b = New-FakeHyperVBackend
+            $val = $s.Value
+            $b.GetHostMemory = { $val }.GetNewClosure()
+            $vmName = 'sbx-ram-' + ([guid]::NewGuid().ToString('N').Substring(0, 6))
+            { New-SandboxVM -Profile $script:Tier1 -Name $vmName -Backend $b } |
+                Should -Throw -ExpectedMessage '*host memory*' -Because "a '$($s.Label)' read must refuse, never pass"
+            (& $b.GetVM @{ Name = $vmName }) | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'the gate runs after the availability and duplicate-name checks, so those messages are unchanged' {
+        $bUnavail = New-FakeHyperVBackend -SimulateUnavailable -SimulateHostFreeMemoryBytes 1GB
+        { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ram-un' -Backend $bUnavail } | Should -Throw -ExpectedMessage '*Hyper-V unavailable*'
+
+        $b = New-FakeHyperVBackend
+        $null = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ram-dup' -Backend $b
+        { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-ram-dup' -Backend $b } | Should -Throw -ExpectedMessage '*already exists*'
+    }
+}
+
+# ===========================================================================
+#  The loader's memory grammar and the Provisioner's agree (E1)
+# ===========================================================================
+Describe 'ConvertTo-ProfileMemoryBytes (loader) and ConvertTo-Bytes (Provisioner) parse the same grammar' {
+
+    It 'return the same byte count for every accepted form' {
+        foreach ($v in @('512MB', '4GB', '4 GB', '1.5GB', '2gb', '64GB', '1024', '4096B', '2TB', 4GB, 536870912)) {
+            (ConvertTo-ProfileMemoryBytes -Value $v) | Should -Be (ConvertTo-Bytes $v) -Because "'$v' must mean the same thing to the loader and the provisioner"
+        }
+    }
+
+    It 'the loader helper returns $null (not a number) for what the provisioner throws on' {
+        foreach ($v in @('lots', '', '  ', '4 Gigs', '-1GB')) {
+            (ConvertTo-ProfileMemoryBytes -Value $v) | Should -BeNullOrEmpty
+            { ConvertTo-Bytes $v } | Should -Throw
+        }
+    }
+}
+
+# ===========================================================================
 #  New-SandboxVM: records Network; builds a switch only for an IsolatedInternalSwitch VM
 # ===========================================================================
 Describe 'New-SandboxVM: records Network and builds a switch only for an IsolatedInternalSwitch VM' {
@@ -886,5 +1074,127 @@ Describe 'New-SandboxVM: records Network and builds a switch only for an Isolate
         $d = New-SandboxVM -Profile $t0 -Name 'sbx-net0' -Backend $b
         $d.SwitchName | Should -BeNullOrEmpty
         (& $b.GetSwitch @{ Name = 'sbx-net0-int' }) | Should -BeNullOrEmpty
+    }
+}
+
+# ===========================================================================
+#  Storage root: -StorageRoot > VOIDSEAL_STORAGE_ROOT > the ProgramData default (E2)
+# ===========================================================================
+Describe 'Get-SandboxStorageRoot - precedence and validation (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    It 'defaults to the ProgramData sandboxes folder with nothing set (behavior unchanged)' {
+        $want = Join-Path (Join-Path $env:ProgramData 'Voidseal\sandboxes') 'vm-a'
+        Get-SandboxStorageRoot -Name 'vm-a' | Should -Be $want
+    }
+
+    It 'uses VOIDSEAL_STORAGE_ROOT when it is set' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
+        Get-SandboxStorageRoot -Name 'vm-a' | Should -Be (Join-Path 'D:\vs-env' 'vm-a')
+    }
+
+    It 'an explicit -StorageRoot beats the environment variable' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot 'E:\vs-param' | Should -Be (Join-Path 'E:\vs-param' 'vm-a')
+    }
+
+    It 'ignores a blank environment variable and a blank -StorageRoot (treated as unset)' {
+        $env:VOIDSEAL_STORAGE_ROOT = '   '
+        $want = Join-Path (Join-Path $env:ProgramData 'Voidseal\sandboxes') 'vm-a'
+        Get-SandboxStorageRoot -Name 'vm-a' | Should -Be $want
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot '' | Should -Be $want
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot ' ' | Should -Be (Join-Path 'D:\vs-env' 'vm-a') -Because 'a blank parameter falls through to the next source'
+    }
+
+    It 'tolerates a trailing separator and forward slashes' {
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot 'D:\vms\' | Should -Be (Join-Path 'D:\vms\' 'vm-a')
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot 'D:/vms'  | Should -Be (Join-Path 'D:/vms' 'vm-a')
+    }
+
+    It 'REFUSES a relative path, a drive-relative path and a rooted path with no drive, naming the source' {
+        foreach ($bad in @('sandboxes', '.\sandboxes', '..\sandboxes', 'C:sandboxes', '\sandboxes')) {
+            { Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot $bad } |
+                Should -Throw -ExpectedMessage '*absolute local path*' -Because "'$bad' is not an absolute local path"
+        }
+        $env:VOIDSEAL_STORAGE_ROOT = 'relative\dir'
+        { Get-SandboxStorageRoot -Name 'vm-a' } | Should -Throw -ExpectedMessage '*VOIDSEAL_STORAGE_ROOT*'
+    }
+
+    It 'REFUSES UNC, extended and device paths (the root must be local)' {
+        foreach ($bad in @('\\fileserver\share\vs', '//fileserver/share/vs', '\\?\C:\vs', '\\.\C:\vs', '\\?\UNC\fileserver\share\vs')) {
+            { Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot $bad } |
+                Should -Throw -ExpectedMessage '*absolute local path*' -Because "'$bad' is a UNC/extended/device path"
+        }
+    }
+}
+
+Describe 'New-SandboxVM - honors the storage root (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    BeforeAll {
+        # Record where the VM and its disks are asked to live.
+        function script:New-PathRecordingBackend {
+            $b = New-FakeHyperVBackend
+            $paths = [ordered]@{ NewVMPath = $null; Vhds = [System.Collections.Generic.List[string]]::new() }
+            $origNewVM  = $b.NewVM
+            $origNewVHD = $b.NewVHD
+            $b.NewVM  = { param($P) $paths.NewVMPath = [string]$P.Path; & $origNewVM $P }.GetNewClosure()
+            $b.NewVHD = { param($P) $paths.Vhds.Add([string]$P.Path); & $origNewVHD $P }.GetNewClosure()
+            $b['Paths'] = $paths
+            return $b
+        }
+    }
+
+    It 'places the VM folder and the system disk under -StorageRoot' {
+        $b = script:New-PathRecordingBackend
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root1' -StorageRoot 'D:\vs-root' -Backend $b
+        $b.Paths.NewVMPath | Should -Be (Join-Path 'D:\vs-root' 'sbx-root1')
+        $desc.DiskPath     | Should -Be (Join-Path (Join-Path 'D:\vs-root' 'sbx-root1') 'sbx-root1-system.vhdx')
+        $b.Paths.Vhds[0]   | Should -Be $desc.DiskPath
+        @($desc.CreatedDisks) | Should -Contain $desc.DiskPath
+    }
+
+    It 'falls back to VOIDSEAL_STORAGE_ROOT, and an explicit parameter still wins over it' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
+        $b = script:New-PathRecordingBackend
+        $d1 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root2' -Backend $b
+        $d1.DiskPath | Should -Be (Join-Path (Join-Path 'D:\vs-env' 'sbx-root2') 'sbx-root2-system.vhdx')
+        $d2 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root3' -StorageRoot 'E:\vs-param' -Backend $b
+        $d2.DiskPath | Should -Be (Join-Path (Join-Path 'E:\vs-param' 'sbx-root3') 'sbx-root3-system.vhdx')
+    }
+
+    It 'keeps the old default when neither is set' {
+        $b = New-FakeHyperVBackend
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root4' -Backend $b
+        $desc.DiskPath | Should -Be (Join-Path (Get-SandboxStorageRoot -Name 'sbx-root4') 'sbx-root4-system.vhdx')
+        $desc.DiskPath | Should -Match ([regex]::Escape((Join-Path $env:ProgramData 'Voidseal\sandboxes')))
+    }
+
+    It 'refuses a relative or UNC root before any backend call: no VM, no disk' {
+        foreach ($bad in @('relative\dir', '\\fileserver\share\vs')) {
+            $b = New-FakeHyperVBackend
+            { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root5' -StorageRoot $bad -Backend $b } |
+                Should -Throw -ExpectedMessage '*absolute local path*'
+            (& $b.GetVM @{ Name = 'sbx-root5' }) | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'teardown deletes only the disks the descriptor recorded, even if the environment root changed since' {
+        $b = New-FakeHyperVBackend
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root6' -StorageRoot 'D:\vs-a' -Backend $b
+
+        # An unrelated VHD that sits where a recomputed root WOULD point.
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-b'
+        $bystander = Join-Path (Join-Path 'D:\vs-b' 'sbx-root6') 'sbx-root6-system.vhdx'
+        & $b.NewVHD @{ Path = $bystander; SizeBytes = 1GB; Dynamic = $true }
+
+        Remove-Sandbox -Name 'sbx-root6' -DeleteDisks -Descriptor $desc -Backend $b
+        (& $b.GetVHDInfo @{ Path = $desc.DiskPath }) | Should -BeNullOrEmpty -Because 'the recorded disk is deleted'
+        (& $b.GetVHDInfo @{ Path = $bystander })     | Should -Not -BeNullOrEmpty -Because 'teardown must never recompute the root and reach for a different path'
     }
 }

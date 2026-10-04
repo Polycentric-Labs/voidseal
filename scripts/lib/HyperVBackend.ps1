@@ -103,7 +103,10 @@ function Get-HyperVBackendMethodManifest {
         RemoveVM             = @('Name', 'Force')                   # does NOT delete VHDX (caller's step)
 
         # ---- hardware ----
-        SetProcessor         = @('VMName', 'Count', 'ExposeVirtualizationExtensions')
+        # Maximum / RelativeWeight are the optional CPU caps (E1): Set-VMProcessor -Maximum (percent of the
+        # virtual processor, 0..100) and -RelativeWeight (scheduling weight vs other VMs, 1..10000). Each is
+        # passed through only when supplied, so a call without them leaves Hyper-V's defaults (100 / 100).
+        SetProcessor         = @('VMName', 'Count', 'ExposeVirtualizationExtensions', 'Maximum', 'RelativeWeight')
         SetMemory            = @('VMName', 'StartupBytes', 'DynamicMemoryEnabled', 'MinimumBytes', 'MaximumBytes')
         SetFirmware          = @('VMName', 'EnableSecureBoot', 'SecureBootTemplate', 'BootOrder')
         # RC7 (2026-06-25 live): disable Hyper-V's automatic checkpoints. Hyper-V defaults
@@ -124,6 +127,16 @@ function Get-HyperVBackendMethodManifest {
         # parity/drift tests). REAL = Get-VMComPort -VMName <vm> -Number <n>; FAKE = reads the
         # com-port state SetComPort records.
         GetComPort           = @('VMName', 'Number')               # -> @{ Number; Path } or $null
+
+        # Host physical-memory read behind the provisioner's pre-boot free-RAM gate (E1). Returns
+        # @{ FreeBytes; TotalBytes } as [long] BYTES. REAL = Get-CimInstance Win32_OperatingSystem, whose
+        # FreePhysicalMemory and TotalVisibleMemorySize are UInt64 values in KiB (the real body multiplies
+        # by 1024; a test that assumed bytes would be off by a factor of 1024). FAKE = configurable figures,
+        # with a default that clears every shipped guest size, plus a switch that makes the read throw.
+        # A read that throws or yields nothing is a REFUSAL for the gate, never a pass. Arg-less, like
+        # TestAvailable. Added per the GetVolumeFreeSpace addendum precedent (manifest + both factories +
+        # parity/drift tests).
+        GetHostMemory        = @()                                  # -> @{ FreeBytes; TotalBytes } ([long] bytes)
 
         # ---- guest command delivery (RUNNER serial seam) ----
         # Deliver a command to a Linux guest over the COM1 named-pipe serial console and read back
@@ -839,10 +852,15 @@ function New-RealHyperVBackend {
         $vm  = & $AssertArg $P 'VMName' 'SetProcessor'
         $cnt = & $GetArg $P 'Count'
         $ext = & $GetArg $P 'ExposeVirtualizationExtensions'
+        $max = & $GetArg $P 'Maximum'
+        $wgt = & $GetArg $P 'RelativeWeight'
         & $InvokeOp {
             $p = @{ VMName = $vm; ErrorAction = 'Stop' }
             if ($null -ne $cnt) { $p.Count = $cnt }
             if ($null -ne $ext) { $p.ExposeVirtualizationExtensions = [bool]$ext }
+            # E1 caps: passed ONLY when supplied, so an uncapped run leaves Hyper-V's defaults untouched.
+            if ($null -ne $max) { $p.Maximum = [uint64]$max }
+            if ($null -ne $wgt) { $p.RelativeWeight = [int]$wgt }
             Set-VMProcessor @p
         }
     }.GetNewClosure()
@@ -1497,6 +1515,29 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
+    # E1: host physical memory for the pre-boot free-RAM gate. Win32_OperatingSystem reports
+    # FreePhysicalMemory and TotalVisibleMemorySize as UInt64 KiB, so both are multiplied by 1024 here
+    # and the method returns BYTES. A missing instance or missing/zero figures THROW: the caller treats
+    # an unreadable host as a refusal, so this method must never hand back a plausible-looking zero.
+    $b.GetHostMemory = {
+        param([System.Collections.IDictionary] $P)
+        & $InvokeOp {
+            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+            $freeKiB  = $null
+            $totalKiB = $null
+            if ($null -ne $os) {
+                $freeProp  = $os.PSObject.Properties['FreePhysicalMemory']
+                $totalProp = $os.PSObject.Properties['TotalVisibleMemorySize']
+                if ($null -ne $freeProp)  { $freeKiB  = $freeProp.Value }
+                if ($null -ne $totalProp) { $totalKiB = $totalProp.Value }
+            }
+            if ($null -eq $freeKiB -or $null -eq $totalKiB -or [uint64]$totalKiB -eq 0) {
+                throw 'HyperVBackend.GetHostMemory: Win32_OperatingSystem returned no usable FreePhysicalMemory / TotalVisibleMemorySize.'
+            }
+            @{ FreeBytes = ([long][uint64]$freeKiB * 1024); TotalBytes = ([long][uint64]$totalKiB * 1024) }
+        }
+    }.GetNewClosure()
+
     $b.AddHardDiskDrive = {
         param([System.Collections.IDictionary] $P)
         $vm   = & $AssertArg $P 'VMName' 'AddHardDiskDrive'
@@ -1812,6 +1853,14 @@ $script:SbCopyFakeVM = {
     and RE-THROWS (fail-closed — a partial-write disk-full must abort the run, never swallow-and-
     continue with a missing OUTPUT disk). A GUEST filling the OUTPUT disk during its own run is a
     separate, live-only/run-time concern this seam does NOT model (see Workload.ps1).
+.PARAMETER SimulateHostFreeMemoryBytes
+    The FreeBytes GetHostMemory reports (default 64GB, enough for every shipped guest plus the gate's
+    margin). Lower it to drive the provisioner's free-RAM refusal deterministically.
+.PARAMETER SimulateHostTotalMemoryBytes
+    The TotalBytes GetHostMemory reports (default 128GB).
+.PARAMETER SimulateHostMemoryReadError
+    Make GetHostMemory THROW, modelling an unreadable host (a failed CIM query). The provisioner's gate
+    must refuse in that case rather than assume there is enough memory.
 .PARAMETER SimulateCreateEnospc
     Make NewOutputVhdx THROW a System.IO.IOException carrying the Win32 ERROR_DISK_FULL HResult on its
     FIRST call (the INPUT disk create in New-WorkloadDisks) — modelling a HOST-side disk-full CREATING a
@@ -1840,12 +1889,20 @@ function New-FakeHyperVBackend {
         [switch] $SimulateDetachError,
         [switch] $SimulateWriteEnospc,
         [switch] $SimulateCreateEnospc,
-        [long] $SimulateFreeSpaceBytes = 500GB
+        [long] $SimulateFreeSpaceBytes = 500GB,
+        [long] $SimulateHostFreeMemoryBytes = 64GB,
+        [long] $SimulateHostTotalMemoryBytes = 128GB,
+        [switch] $SimulateHostMemoryReadError
     )
 
     # Hoist shared helpers into factory-locals so the method closures capture them
     # (see the helpers' header note — closures can't reach script-scoped functions).
     $freeSpaceBytes = $SimulateFreeSpaceBytes
+    # Captured by the GetHostMemory closure (E1 free-RAM gate): the figures it reports, and whether the
+    # read throws. The 64GB / 128GB defaults clear every shipped guest size plus the gate's margin.
+    $hostFreeMemoryBytes  = $SimulateHostFreeMemoryBytes
+    $hostTotalMemoryBytes = $SimulateHostTotalMemoryBytes
+    $hostMemoryReadThrows = $SimulateHostMemoryReadError.IsPresent
     $GetArg       = $script:SbGetArg
     $AssertArg    = $script:SbAssertArg
     $CopyVM       = $script:SbCopyFakeVM
@@ -1953,6 +2010,9 @@ function New-FakeHyperVBackend {
             DynamicMemoryEnabled           = $false
             ProcessorCount                 = 1
             ExposeVirtualizationExtensions = $false
+            # Hyper-V's own defaults for the E1 CPU caps: Maximum 100 (percent), RelativeWeight 100.
+            ProcessorMaximum               = 100
+            ProcessorRelativeWeight        = 100
             SecureBootEnabled              = $false
             SecureBootTemplate             = $null
             # RC7: seed Hyper-V's REAL default (automatic checkpoints ON) so SetAutomaticCheckpoints's
@@ -2100,9 +2160,23 @@ function New-FakeHyperVBackend {
     $b.SetProcessor = {
         param([System.Collections.IDictionary] $P)
         $vm = & $requireVM (& $GetArg $P 'VMName') 'SetProcessor'
+        # E1 caps. Validate BEFORE recording anything, with the ranges the real Set-VMProcessor enforces
+        # (Maximum 0..100, RelativeWeight 1..10000), so a value the real cmdlet would reject cannot pass
+        # in the mock suite and fail on a live host (the fake != real class of bug), and a rejected call
+        # leaves the record untouched.
+        $max = & $GetArg $P 'Maximum'
+        $wgt = & $GetArg $P 'RelativeWeight'
+        if ($null -ne $max -and ([long]$max -lt 0 -or [long]$max -gt 100)) {
+            throw "HyperVBackend(fake).SetProcessor: Maximum '$max' is outside 0..100 (the real Set-VMProcessor rejects it)."
+        }
+        if ($null -ne $wgt -and ([long]$wgt -lt 1 -or [long]$wgt -gt 10000)) {
+            throw "HyperVBackend(fake).SetProcessor: RelativeWeight '$wgt' is outside 1..10000 (the real Set-VMProcessor rejects it)."
+        }
         $cnt = & $GetArg $P 'Count'; if ($null -ne $cnt) { $vm.ProcessorCount = $cnt }
         $ext = & $GetArg $P 'ExposeVirtualizationExtensions'
         if ($null -ne $ext) { $vm.ExposeVirtualizationExtensions = [bool]$ext }
+        if ($null -ne $max) { $vm.ProcessorMaximum = [int]$max }
+        if ($null -ne $wgt) { $vm.ProcessorRelativeWeight = [int]$wgt }
     }.GetNewClosure()
 
     $b.SetMemory = {
@@ -2567,6 +2641,17 @@ function New-FakeHyperVBackend {
         # preflight's refusal path deterministically.
         $null = & $AssertArg $P 'Path' 'GetVolumeFreeSpace'
         [long]$freeSpaceBytes
+    }.GetNewClosure()
+
+    # E1: the fake's host-memory read. Reports the configured figures in BYTES (the real method converts
+    # from the CIM class's KiB), or throws under -SimulateHostMemoryReadError so a test can prove the
+    # free-RAM gate fails closed on an unreadable host.
+    $b.GetHostMemory = {
+        param([System.Collections.IDictionary] $P)
+        if ($hostMemoryReadThrows) {
+            throw 'HyperVBackend(fake).GetHostMemory: simulated host-memory read failure (SimulateHostMemoryReadError).'
+        }
+        @{ FreeBytes = [long]$hostFreeMemoryBytes; TotalBytes = [long]$hostTotalMemoryBytes }
     }.GetNewClosure()
 
     $b.AddHardDiskDrive = {

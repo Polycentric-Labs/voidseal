@@ -32,7 +32,7 @@ onto the tier profile** and **re-validates the merged result against every loade
 weakened egress mode — see §2.3).
 
 **Which layer owns which field, precisely:** of all the tier-profile fields, a workload profile
-can influence exactly **two**, and only additively/restrictively:
+can influence a short, fixed list. Two of them touch isolation, and only additively/restrictively:
 
 - `EgressAllowlist` — your workload's `ExtraAllowlist` **unions** onto the tier's
   `EgressAllowlist` (deduped, case-insensitive). You can only *add* hosts, never remove one the
@@ -42,8 +42,13 @@ can influence exactly **two**, and only additively/restrictively:
   never weaken it). Any other workload-level `EgressMode` is refused at load time (see
   `profiles/builder.psd1` for the one shipped profile that uses this).
 
-Every other tier-profile field (`Substrate`, `Network`, `Credentials`, `GuestImage`, `Memory`,
-`Cpu`, `HostChannels`, `Extraction`, `Lifecycle`, `Controls`, …) is **immutable from the workload
+The rest are resource choices, not isolation ones. A workload may set `Memory`, `Cpu`,
+`CpuMaximumPercent` and `CpuRelativeWeight` (and its own run deadline, `WorkloadTimeoutSeconds`, §2.2); each replaces the tier's value (a key the workload
+omits keeps the tier's), and the bounds in §2.1 apply to the merged result, so a workload cannot
+ask for a guest the loader would refuse on a tier.
+
+Every other tier-profile field (`Substrate`, `Network`, `Credentials`, `GuestImage`,
+`HostChannels`, `Extraction`, `Lifecycle`, `Controls`, …) is **immutable from the workload
 layer** — `Import-WorkloadProfile` simply never copies a workload key of that name onto the
 merged result. If your task needs a different isolation contract, that's a **different
 `BaseTier`**, not a workload-level override.
@@ -69,7 +74,9 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `Credentials` | yes | `'None'` \| `'ScopedOnDemand'` | credential posture | `Tier ≥ 2` ⇒ must be `'None'` (invariant 2); **not** overridable from a workload profile at all |
 | `GuestImage` | yes | string | base image id | if it matches the Linux regex (`debian\|ubuntu\|alpine\|fedora\|remnux\|linux`) *and* a `ManagementChannel` is declared, that channel must be `'Com1Serial'` (invariant 5 — PowerShell Direct is Windows-guest-only) |
 | `SecureBootTemplate` | no | `'MicrosoftWindows'` \| `'MicrosoftUEFICertificateAuthority'` \| `'OpenSourceShieldedVM'` | the `Set-VMFirmware -SecureBootTemplate` value | validated only when present/non-blank — an invalid value fails closed at load instead of surfacing as a live `Set-VMFirmware` reject |
-| `Memory` / `Cpu` | yes | string / int | hardware sizing | presence only, no enum |
+| `Memory` / `Cpu` | yes | string / int | hardware sizing. A workload profile may override both (§2.2) | `Memory` parses as a size (`'4GB'`, `'512MB'`, or a byte count) and sits in `512MB`..`64GB`; `Cpu` is an integer in `1`..`32`. Out-of-range, unparseable, string and fractional values are refused at load |
+| `CpuMaximumPercent` | no | int | cap on the share of each virtual processor the guest may use (`Set-VMProcessor -Maximum`) | integer in `1`..`100`; absent means no cap (Hyper-V's default of 100) |
+| `CpuRelativeWeight` | no | int | scheduling weight against the other VMs on the host (`Set-VMProcessor -RelativeWeight`) | integer in `1`..`10000`; absent means Hyper-V's default of 100 |
 | `NestedVirt` | no | bool | expose virtualization extensions to the guest | none |
 | `ManagementChannel` | no | `'Com1Serial'` \| `'PSDirect'` | how the host drives the guest | if present, must be a valid enum member; combines with `GuestImage` for invariant 5 |
 | `HostChannels` | yes | hashtable | clipboard/shares/guest-services/enhanced-session toggles | must be a hashtable; see `Substrate` row for the HyperV-Gen2 all-`$false` rule |
@@ -85,6 +92,9 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `BaseTier` | **yes** | int selecting which `tier-profiles/tier<N>.psd1` to inherit | must resolve to an existing tier file |
 | `Name` | **yes** | the profile id | convention: matches the filename (minus `.psd1`) |
 | `Entrypoint` | **yes** | the command the Runner delivers | **Serial mode** (the default): delivered over the COM1 serial seam to the sealed guest. **Disk mode**: substituted for `__ENTRYPOINT__` in the runner the engine writes into the seed. For an `OutboxOutput` or processor profile (the only Disk shapes `Invoke-Voidseal` accepts) it reads `/mnt/in` and writes its result into `/run/staging/` (`result.html` unless you pass `ResultInnerName`), which the in-guest producer packs into the outbox; `/mnt/out` is never mounted there, and a seed whose `Entrypoint` names it is refused |
+| `Memory` / `Cpu` | no | size this workload's guest; replaces the tier's `Memory` / `Cpu` | same format and bounds as §2.1 (`512MB`..`64GB`, `1`..`32`), checked on the merged profile. Before the VM is created the provisioner also checks the host: free RAM must cover `Memory` plus a margin (default 2GB, `-HostMemoryMarginBytes`), or the run is refused |
+| `CpuMaximumPercent` / `CpuRelativeWeight` | no | the optional CPU caps from §2.1, set for this workload; the workload value wins over a tier value | integers in `1`..`100` and `1`..`10000`; each reaches `Set-VMProcessor` only when set, so an unset cap leaves Hyper-V's default alone |
+| `WorkloadTimeoutSeconds` | no (default 600) | the overall deadline for the run: past it the guest is force-stopped and the run reports `Failed`. Use it for a workload that legitimately runs longer than ten minutes (or one you want cut off sooner) | integer in `60`..`86400`, checked at load. `Invoke-Voidseal -WorkloadTimeoutSeconds` beats it, but only when you pass that parameter explicitly (an explicit value, including `0` in a test, always wins); with neither, the engine uses 600 |
 | `Packages` | no | **declared but not installed**: a record of the guest packages the workload expects. The loader merges it, but no engine code reads it, so nothing installs these packages | array of strings; put the packages themselves in the golden image (a Disk-mode guest runs offline and cannot install anything) |
 | `Mounts` | no | **declared but not wired**: host→guest bind mounts that nothing attaches. The loader screens the field and merges it onto the tier, but no provisioner, runner or backend method reads it (the backend has no 9p, virtiofs or SMB method), so it moves no file in or out in either workload mode. §4 Step 4 lists the channels that do carry data | every **source** key is refused if secret-shaped (invariant 1, see §2.3). The screen runs on every profile even though nothing consumes the field at runtime, a deliberate regression guard (see `firefox.psd1`) |
 | `ExtraAllowlist` | no | FQDNs unioned onto the tier's `EgressAllowlist` | deduped case-insensitively; each entry still passes the tier's hostname-charset check |
@@ -147,10 +157,10 @@ takes effect:
 | State | What happens | Fields in play |
 |---|---|---|
 | `INIT` | your workload profile loads, merges onto its `BaseTier`, and is re-validated against every invariant above | all of §2.1/§2.2 |
-| `PROVISIONED` | `New-SandboxVM` creates the substrate | `Substrate`, `Memory`, `Cpu`, `GuestImage`, `SecureBootTemplate`, `Network` |
+| `PROVISIONED` | `New-SandboxVM` first checks the host has the free RAM for `Memory` (plus the margin), then creates the substrate and applies any CPU caps | `Substrate`, `Memory`, `Cpu`, `CpuMaximumPercent`, `CpuRelativeWeight`, `GuestImage`, `SecureBootTemplate`, `Network` |
 | `STAGED` | `Import-SandboxAsset` attaches any `StageAssets` as a read-only ISO (ejected again at `SEALED`, before the guest boots), and `New-WorkloadSeedDisk` builds the cloud-init seed on a `CIDATA` data disk for any run that will boot (Disk mode also builds its INPUT/OUTPUT disks here) | `StageAssets`; the seed comes from the resolved profile |
 | `SEALED` | `Lock-Sandbox` ejects import media (any `StageAssets` ISO; the seed disk stays attached) and disconnects host↔guest channels, then `Assert-Sealed` runs as a **hard gate**: if it throws, the deploy aborts *here*, the workload never runs, and the VM is torn down | `HostChannels`, `Network` |
-| `RUNNING` | your `Entrypoint` runs in the sealed guest. **Serial mode**: `Start-SandboxWorkload` boots the guest and sends the command over the COM1 seam, and the command's stdout and stderr come back the same way into the host-side run capture (there are no data disks, and `Mounts` is not wired); **Disk mode**: the guest boots straight into the seed-injected runner, mounts `INPUT` read-only / `OUTPUT` read-write, runs your `Entrypoint`, writes the result + an exit-code sentinel, and self-powers-off | `Entrypoint` (Serial) or `WorkloadMode`/`Inputs`/`FileSystem`/`InputLabel`/`OutputLabel` (Disk) |
+| `RUNNING` | your `Entrypoint` runs in the sealed guest, bounded by the effective deadline (`-WorkloadTimeoutSeconds` if passed, else `WorkloadTimeoutSeconds`, else 600 s). **Serial mode**: `Start-SandboxWorkload` boots the guest and sends the command over the COM1 seam, and the command's stdout and stderr come back the same way into the host-side run capture (there are no data disks, and `Mounts` is not wired); **Disk mode**: the guest boots straight into the seed-injected runner, mounts `INPUT` read-only / `OUTPUT` read-write, runs your `Entrypoint`, writes the result + an exit-code sentinel, and self-powers-off | `Entrypoint` (Serial) or `WorkloadMode`/`Inputs`/`FileSystem`/`InputLabel`/`OutputLabel` (Disk); `WorkloadTimeoutSeconds` for either |
 | `CAPTURED` | the run result + host-side capture artifact are recorded | `Capture` |
 | `EXTRACTED` | `Export-SandboxArtifact` reads the result out, **one-way OUT** — `HostReadResultDir` (Tier 0/1) just reads what your workload wrote; `ColdVHDX-Quarantine-CDR` (Tier ≥ 2) routes to the quarantine sink (throws — not implemented in v1) | `Extraction` |
 | `DESTROYED` | `Remove-Sandbox` tears down per the teardown model — **always runs**, in a `finally`, so a mid-flow failure never leaves an orphaned VM/disk/switch | `Lifecycle` |

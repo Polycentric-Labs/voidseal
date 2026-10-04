@@ -69,6 +69,11 @@ from the host side:
 - **Pre-seal gate**: `Assert-Sealed` refuses to certify a VM that must have no NIC (Tier 0,
   Tier ≥ 2, any processor) while the host reports one, refuses any passthrough device at every
   tier, and refuses a secret-shaped or unrecorded attached volume.
+- **Guest sizing bounds and the free-RAM gate**: the loader bounds `Memory` (`512MB` to `64GB`)
+  and `Cpu` (1 to 32) for every tier and workload, and `New-SandboxVM` refuses, before it creates
+  anything, to start a guest whose memory plus a margin (default 2GB) does not fit in the host's
+  free RAM. An unreadable host is refused too. This is a resource guard for the host, not a
+  containment boundary.
 
 ---
 
