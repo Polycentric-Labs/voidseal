@@ -92,3 +92,161 @@ function Assert-DiskImageVerified {
     }
     return $actual
 }
+
+<#
+.SYNOPSIS
+    Resolve the run's effective DataDisks declaration: a -Workload value replaces the profile's.
+.DESCRIPTION
+    The workload value wins whenever the key is PRESENT, even as an empty array, so a caller can
+    run a profile that declares data disks without any. Returns the validated, normalized list
+    (ConvertTo-DataDiskList) as an array; empty when nothing is declared.
+#>
+function Resolve-DataDiskDeclaration {
+    [CmdletBinding()]
+    param([AllowNull()] $Workload, [Parameter(Mandatory)] [hashtable] $Profile, [string] $Context = 'Invoke-Voidseal')
+
+    $decl = $null
+    $source = 'profile'
+    $present = $false
+    if ($Workload -is [System.Collections.IDictionary]) { $present = $Workload.Contains('DataDisks') }
+    elseif ($null -ne $Workload) { $present = $null -ne $Workload.PSObject.Properties['DataDisks'] }
+    if ($present) {
+        $decl = if ($Workload -is [System.Collections.IDictionary]) { $Workload['DataDisks'] } else { $Workload.DataDisks }
+        $source = '-Workload'
+    }
+    elseif ($Profile.ContainsKey('DataDisks')) {
+        $decl = $Profile['DataDisks']
+    }
+    # Unrolled; callers wrap the call in @() (an empty declaration yields no output at all).
+    ConvertTo-DataDiskList -Value $decl -Context "$Context DataDisks ($source)"
+}
+
+<#
+.SYNOPSIS
+    Resolve a host path through any junctions and symbolic links on it (best effort, existing parts only).
+.DESCRIPTION
+    Walks the path one segment at a time; when an existing segment is a junction or symbolic link,
+    substitutes its target and starts again (at most 32 substitutions, then fails closed). Segments
+    that do not exist are kept as written. Returns the canonical result without a trailing separator.
+    Used so that a data disk path cannot reach the sandbox storage root, the DEPS disk or the golden
+    parent through a link that only a lexical compare would miss.
+#>
+function Resolve-HostFinalPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $full = [System.IO.Path]::GetFullPath($Path)
+    for ($hop = 0; $hop -lt 32; $hop++) {
+        $root  = [System.IO.Path]::GetPathRoot($full)
+        $parts = @($full.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
+        $cur = $root
+        $swapped = $false
+        for ($i = 0; $i -lt $parts.Count; $i++) {
+            $cur = [System.IO.Path]::Combine($cur, $parts[$i])
+            $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item) { break }
+            $linkType = [string]$item.LinkType
+            if ($linkType -eq 'Junction' -or $linkType -eq 'SymbolicLink') {
+                $target = [string](@($item.Target)[0])
+                if ([string]::IsNullOrWhiteSpace($target)) { break }
+                if ($target.StartsWith('\\?\') -or $target.StartsWith('\??\')) { $target = $target.Substring(4) }
+                if (-not [System.IO.Path]::IsPathRooted($target)) {
+                    $target = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($cur), $target)
+                }
+                $rest = if ($i + 1 -lt $parts.Count) { $parts[($i + 1)..($parts.Count - 1)] -join '\' } else { '' }
+                $next = if ($rest) { [System.IO.Path]::Combine($target, $rest) } else { $target }
+                $full = [System.IO.Path]::GetFullPath($next)
+                $swapped = $true
+                break
+            }
+        }
+        if (-not $swapped) { return $full.TrimEnd('\', '/') }
+    }
+    throw "Resolve-HostFinalPath: '$Path' passes through more than 32 links; refusing to resolve it. Failing closed."
+}
+
+# True when $Candidate equals $Root or lies under it (both canonical, case-insensitive).
+function Test-PathUnderRoot {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [string] $Candidate, [Parameter(Mandatory)] [string] $Root)
+    $c = $Candidate.TrimEnd('\', '/')
+    $r = $Root.TrimEnd('\', '/')
+    if ($c.Equals($r, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return $c.StartsWith($r + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+<#
+.SYNOPSIS
+    Refuse any data disk path that could alias a disk the run owns or depends on (fail-closed).
+.DESCRIPTION
+    A data disk is attached read-write at the Hyper-V level (Hyper-V cannot attach a VHDX
+    read-only), so its path must never name something the guest must not be able to write:
+      * anything under the sandbox storage root (every run's system, INPUT, OUTPUT and CIDATA disks
+        live there; the run's own disks are created there later, so they are covered too);
+      * the DEPS disk;
+      * the golden parent of the differencing system disk (-ParentDiskPath).
+    Both the lexical canonical path and the link-resolved path (Resolve-HostFinalPath) are compared,
+    for the data disk and for each protected location. A data disk file with more than one hard link
+    is refused too: a second name could be any of the above, and the host cannot cheaply tell which.
+.PARAMETER DataDisks
+    The normalized list from ConvertTo-DataDiskList.
+.PARAMETER StorageRoot
+    The sandbox storage root (the parent of every per-VM folder).
+.PARAMETER DepsDiskPath
+    The run's DEPS disk path, if any.
+.PARAMETER ParentDiskPath
+    The run's golden parent disk, if any.
+#>
+function Assert-DataDiskPathsIsolated {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $DataDisks,
+        [Parameter(Mandatory)] [string] $StorageRoot,
+        [AllowNull()] [AllowEmptyString()] [string] $DepsDiskPath,
+        [AllowNull()] [AllowEmptyString()] [string] $ParentDiskPath
+    )
+
+    $forms = {
+        param([string] $p)
+        $lex = [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/')
+        $fin = Resolve-HostFinalPath -Path $p
+        return @(@($lex, $fin) | Select-Object -Unique)
+    }
+    $rootForms = @(& $forms $StorageRoot)
+    $protected = [System.Collections.Generic.List[object]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($DepsDiskPath)) {
+        $protected.Add(@{ What = 'the DEPS disk'; Forms = @(& $forms $DepsDiskPath) })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ParentDiskPath)) {
+        $protected.Add(@{ What = 'the golden parent disk (-ParentDiskPath)'; Forms = @(& $forms $ParentDiskPath) })
+    }
+
+    foreach ($dd in $DataDisks) {
+        $name = [string]$dd['Name']
+        $path = [string]$dd['Path']
+        foreach ($f in @(& $forms $path)) {
+            foreach ($r in $rootForms) {
+                if (Test-PathUnderRoot -Candidate $f -Root $r) {
+                    throw ("Invoke-Voidseal: data disk '$name' ('$path') resolves under the sandbox storage root ('$r'), " +
+                           "where run disks live. A data disk must live outside it. Failing closed.")
+                }
+            }
+            foreach ($pr in $protected) {
+                foreach ($pf in $pr.Forms) {
+                    if ($f.Equals([string]$pf, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        throw ("Invoke-Voidseal: data disk '$name' ('$path') is $($pr.What) ('$pf'). A data disk must " +
+                               "never alias a disk the run already uses. Failing closed.")
+                    }
+                }
+            }
+        }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and [string]$item.LinkType -eq 'HardLink') {
+            throw ("Invoke-Voidseal: data disk '$name' ('$path') has more than one hard link, so another name for the " +
+                   "same file could be a run disk, the DEPS disk or the golden parent. Copy it to a file of its own. " +
+                   "Failing closed.")
+        }
+    }
+}

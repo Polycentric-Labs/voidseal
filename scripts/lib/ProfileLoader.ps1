@@ -319,6 +319,113 @@ function Assert-NoSecretMounts {
 }
 
 # --------------------------------------------------------------------------
+# DataDisks: pre-built, hash-verified, read-only-mounted data disks (SINGLE SOURCE OF TRUTH)
+# --------------------------------------------------------------------------
+# A data disk is a VHDX the operator builds on the host (scripts/New-VoidsealDataDisk.ps1) and
+# declares as @{ Name = 'corpus'; Path = 'D:\vs\corpus.vhdx'; ImageHash = '<64 hex>' }. The Name is
+# the only declared value that reaches the guest: it becomes the mount directory /mnt/data/<name>
+# and, upper-cased behind the 'VSD' prefix, the volume label the guest mounts by. The seed is shell
+# text, so the name charset is deliberately tiny (lowercase letters and digits) and the label stays
+# within exFAT's limit (3 + 8 = 11 characters). Paths and hashes stay on the host.
+$script:DataDiskNamePattern = '^[a-z0-9]{1,8}$'
+$script:DataDiskMaxCount    = 8
+$script:DataDiskLabelPrefix = 'VSD'
+$script:DataDiskKeys        = @('Name', 'Path', 'ImageHash')
+
+<#
+.SYNOPSIS
+    The volume label a data disk carries and the guest mounts by: 'VSD' + the upper-cased name.
+#>
+function Get-DataDiskLabel {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [string] $Name)
+    if ($Name -cnotmatch $script:DataDiskNamePattern) {
+        throw "Get-DataDiskLabel: data disk name '$Name' does not match $script:DataDiskNamePattern."
+    }
+    return ($script:DataDiskLabelPrefix + $Name.ToUpperInvariant())
+}
+
+<#
+.SYNOPSIS
+    Validate a DataDisks declaration and return it normalized (fail-closed, path strings only).
+.DESCRIPTION
+    Accepts $null (no data disks), one hashtable, or an array of hashtables. Each entry must carry
+    exactly Name, Path and ImageHash:
+      * Name      matches ^[a-z0-9]{1,8}$ (case-sensitive) and is unique.
+      * Path      a local, fully qualified drive-letter path ending in .vhdx; no UNC or device
+                  namespace (\\server\..., \\?\, \\.\), no alternate data stream, not secret-shaped
+                  (invariant 1's matcher), unique after canonicalization.
+      * ImageHash exactly 64 hex characters (any case; normalized to lowercase).
+    At most 8 entries. Returns an array of [ordered] @{ Name; Path (canonical); ImageHash (lowercase) }.
+    Pure: inspects strings only, never touches the file system.
+#>
+function ConvertTo-DataDiskList {
+    [CmdletBinding()]
+    param([AllowNull()] $Value, [string] $Context = 'profile')
+
+    $out = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Value) { return }
+    $entries = @($Value)   # one hashtable or an array of them; @() keeps a single entry an array
+    if ($entries.Count -gt $script:DataDiskMaxCount) {
+        throw "DataDisks: '$Context' declares $($entries.Count) data disks; at most $script:DataDiskMaxCount are allowed. Failing closed."
+    }
+    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $paths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($e in $entries) {
+        if (-not ($e -is [System.Collections.IDictionary])) {
+            throw "DataDisks: '$Context' has an entry that is not a hashtable (expected @{ Name; Path; ImageHash }). Failing closed."
+        }
+        foreach ($k in @($e.Keys)) {
+            if ($script:DataDiskKeys -notcontains [string]$k) {
+                throw "DataDisks: '$Context' entry has unknown key '$k' (allowed: $($script:DataDiskKeys -join ', ')). Failing closed."
+            }
+        }
+        $name = if ($e.Contains('Name')) { [string]$e['Name'] } else { '' }
+        if ($name -cnotmatch $script:DataDiskNamePattern) {
+            throw ("DataDisks: '$Context' data disk name '$name' is invalid: it must match $script:DataDiskNamePattern " +
+                   "(1 to 8 lowercase letters or digits; it becomes a guest mount directory and volume label). Failing closed.")
+        }
+        if (-not $names.Add($name)) {
+            throw "DataDisks: '$Context' declares the data disk name '$name' more than once. Names must be unique. Failing closed."
+        }
+
+        $path = if ($e.Contains('Path')) { [string]$e['Path'] } else { '' }
+        $why = $null
+        if ([string]::IsNullOrWhiteSpace($path))                   { $why = 'it is blank' }
+        elseif ($path -match '[\x00-\x1f]')                         { $why = 'it contains a control character' }
+        elseif ($path -notmatch '^[A-Za-z]:\\')                     { $why = 'it is not a local, fully qualified drive-letter path (UNC, device and relative paths are refused)' }
+        elseif ($path.IndexOf(':', 2) -ge 0)                        { $why = 'it names an alternate data stream' }
+        elseif ($path -notmatch '(?i)\.vhdx$')                      { $why = 'it does not end in .vhdx' }
+        if ($null -ne $why) {
+            throw "DataDisks: '$Context' data disk '$name' Path '$path' is refused: $why. Failing closed."
+        }
+        $canon = [System.IO.Path]::GetFullPath($path)
+        if ($canon -notmatch '(?i)\.vhdx$') {
+            throw "DataDisks: '$Context' data disk '$name' Path '$path' does not resolve to a .vhdx file ('$canon'). Failing closed."
+        }
+        if (Test-IsSecretPath -Path $canon) {
+            throw ("Invariant 1 (secret-file refusal): '$Context' data disk '$name' Path '$canon' is secret-shaped. " +
+                   "A secret-shaped path must never be attached to a sandbox. Failing closed.")
+        }
+        if (-not $paths.Add($canon)) {
+            throw "DataDisks: '$Context' declares the data disk path '$canon' more than once. Failing closed."
+        }
+
+        $hash = if ($e.Contains('ImageHash')) { ([string]$e['ImageHash']).Trim() } else { '' }
+        if ($hash -notmatch '^[0-9A-Fa-f]{64}$') {
+            $shown = if ([string]::IsNullOrWhiteSpace($hash)) { 'missing' } else { "'$hash' is not 64 hex characters" }
+            throw ("DataDisks: '$Context' data disk '$name' ImageHash is $shown. Every data disk MUST carry the " +
+                   "whole-image SHA-256 printed by New-VoidsealDataDisk.ps1; an unverified disk is never attached. Failing closed.")
+        }
+        $out.Add([ordered]@{ Name = $name; Path = $canon; ImageHash = $hash.ToLowerInvariant() })
+    }
+    # Unrolled on purpose: every caller wraps the call in @(). The entries are dictionaries, which
+    # the pipeline never enumerates, so a single entry still arrives whole.
+    return $out.ToArray()
+}
+
+# --------------------------------------------------------------------------
 # Shared validation (applied to a tier profile AND to a merged workload)
 # --------------------------------------------------------------------------
 
@@ -423,6 +530,11 @@ function Assert-TierProfileValid {
     }
     if ($Profile.ContainsKey('StageAssets')) {
         Assert-NoSecretMounts -Mounts $Profile['StageAssets'] -Context $Context -Field 'StageAssets'
+    }
+    # DataDisks: shape, names, path rules (secret-shaped paths included) and hash format. The
+    # host-context checks (storage-root aliasing, Disk mode only) run in Invoke-Voidseal's preflight.
+    if ($Profile.ContainsKey('DataDisks')) {
+        $null = ConvertTo-DataDiskList -Value $Profile['DataDisks'] -Context $Context
     }
 
     # --- invariant 2: Tier >= 2 starvation -------------------------------
@@ -711,9 +823,12 @@ function Import-WorkloadProfile {
     # OutboxOutput (C1.4) is the transport-only counterpart: a non-processor Disk-mode workload
     # (firefox) that still wants the Raw-OUTPUT / user-space-outbox-read path (Workload.ps1's
     # Raw-OUTPUT predicate + Invoke-Voidseal.ps1's post-detach outbox read) without a ScreenConfig.
+    # DataDisks declares pre-built, hash-verified data disks (validated above in Assert-TierProfileValid;
+    # a -Workload.DataDisks value replaces this one entirely at run time).
     foreach ($layerKey in @('Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
                             'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
-                            'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput')) {
+                            'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput',
+                            'DataDisks')) {
         if ($raw.ContainsKey($layerKey)) {
             $merged[$layerKey] = $raw[$layerKey]
         }

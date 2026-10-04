@@ -518,6 +518,34 @@ function Invoke-Voidseal {
         }
     }
 
+    # --- DATA DISKS preflight: declaration, mode and path isolation, BEFORE anything is provisioned ---
+    # Pre-built, hash-verified data disks (DataDisks.ps1). A -Workload.DataDisks value replaces the
+    # profile's entirely. ConvertTo-DataDiskList (ProfileLoader.ps1) refuses a bad name, a duplicate,
+    # more than 8 disks, a non-local or non-.vhdx or secret-shaped path, and an ImageHash that is not
+    # 64 hex characters. Here we add the checks that need run context: Disk mode only (the Serial
+    # runner never mounts them), and no path that could alias the storage root, the DEPS disk or the
+    # golden parent. These are caller errors, so they THROW before any VM exists; the per-disk
+    # GetVHDInfo and hash checks run later, all of them before the first data disk is attached.
+    $dataDisks = @(Resolve-DataDiskDeclaration -Workload $Workload -Profile $resolved)
+    if ($dataDisks.Count -gt 0) {
+        if ($workloadMode -ne 'Disk') {
+            throw ("Invoke-Voidseal: REFUSING '$Name': it declares $($dataDisks.Count) data disk(s) but runs in " +
+                   "'$workloadMode' mode. Data disks are mounted only by the Disk-mode runners; a Serial-mode guest " +
+                   "would get a writable disk nothing mounts read-only. Fail closed.")
+        }
+        $preDepsPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
+        if ([string]::IsNullOrWhiteSpace($preDepsPath) -and $resolved.ContainsKey('DepsDiskPath')) { $preDepsPath = [string]$resolved['DepsDiskPath'] }
+        $storageBase = Split-Path -Parent (Get-SandboxStorageRoot -Name $Name)
+        Assert-DataDiskPathsIsolated -DataDisks $dataDisks -StorageRoot $storageBase `
+            -DepsDiskPath $preDepsPath -ParentDiskPath $ParentDiskPath
+        # The seed builder reads the names from here to emit one read-only mount per disk.
+        $resolved['DataDisks'] = $dataDisks
+    }
+    elseif ($resolved.ContainsKey('DataDisks')) {
+        # Overridden to none (or declared empty): make sure no stale declaration reaches the seed.
+        $resolved.Remove('DataDisks')
+    }
+
     # --- the report, built up as we traverse ----------------------------
     $states     = [System.Collections.Generic.List[string]]::new()
     $report = [pscustomobject]@{
