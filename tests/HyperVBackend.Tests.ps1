@@ -250,7 +250,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
             GetGpuPartitionAdapters = 'VMName'; GetAssignableDevices = 'VMName'
             AddSwitchHostIPAddress = 'SwitchName'; RemoveSwitchHostIPAddress = 'SwitchName'
-            NewHostFirewallRule = 'Name'; GetHostFirewallRule = 'Name'; RemoveHostFirewallRule = 'Name'
+            NewHostFirewallRule = 'Name'; GetHostFirewallRule = 'Name'; RemoveHostFirewallRule = 'Name'; GetHostFirewallRuleNames = 'NamePrefix'
             AddNetworkAdapterAcl = 'VMName'; GetNetworkAdapterAcls = 'VMName'; RemoveNetworkAdapterAcl = 'VMName'
             StartEgressProxy = 'PythonExe'; StopEgressProxy = 'ProcessId'
             Checkpoint = 'VMName'; RestoreCheckpoint = 'VMName'; GetCheckpoint = 'VMName'; RemoveCheckpoint = 'VMName'

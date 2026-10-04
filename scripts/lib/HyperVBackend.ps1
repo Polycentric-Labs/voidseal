@@ -344,6 +344,7 @@ function Get-HyperVBackendMethodManifest {
         RemoveSwitchHostIPAddress = @('SwitchName', 'IPAddress')   # idempotent
         NewHostFirewallRule     = @('Name', 'Direction', 'Action', 'Protocol', 'LocalAddress', 'LocalPort', 'RemoteAddress', 'InterfaceAlias')
         GetHostFirewallRule     = @('Name')                        # -> normalized rule record, or $null when no rule has that Name
+        GetHostFirewallRuleNames = @('NamePrefix')                 # -> string[] of rule names (group 'Voidseal egress') starting with the prefix
         RemoveHostFirewallRule  = @('Name')                        # idempotent
         AddNetworkAdapterAcl    = @('VMName', 'Action', 'Direction', 'Weight', 'Protocol', 'LocalIPAddress', 'RemoteIPAddress', 'RemotePort', 'Stateful')
         GetNetworkAdapterAcls   = @('VMName')                      # -> @() of normalized extended-ACL records
@@ -2041,6 +2042,9 @@ function New-RealHyperVBackend {
             if ($local[0]  -ne 'Any') { $p.LocalAddress  = [string[]]$local }
             if ($remote[0] -ne 'Any') { $p.RemoteAddress = [string[]]$remote }
             if ($ports[0]  -ne 'Any') { $p.LocalPort     = [string[]]$ports }
+            # The ACTIVE store, like the gateway address: neither survives a reboot, so a crashed run cannot
+            # leave a rule behind that outlives the address it guards.
+            $p.PolicyStore = 'ActiveStore'
             $null = New-NetFirewallRule @p
         }
     }.GetNewClosure()
@@ -2052,7 +2056,7 @@ function New-RealHyperVBackend {
         $name = & $AssertArg $P 'Name' 'GetHostFirewallRule'
         & $InvokeOp {
             $found = $null
-            try { $found = Get-NetFirewallRule -Name $name -ErrorAction Stop }
+            try { $found = Get-NetFirewallRule -Name $name -PolicyStore ActiveStore -ErrorAction Stop }
             catch {
                 if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) { return $null }
                 throw
@@ -2084,13 +2088,33 @@ function New-RealHyperVBackend {
         $name = & $AssertArg $P 'Name' 'RemoveHostFirewallRule'
         & $InvokeOp {
             $found = $null
-            try { $found = Get-NetFirewallRule -Name $name -ErrorAction Stop }
+            try { $found = Get-NetFirewallRule -Name $name -PolicyStore ActiveStore -ErrorAction Stop }
             catch {
                 if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) { return }
                 throw
             }
-            if (@($found).Count -gt 0) { Remove-NetFirewallRule -Name $name -ErrorAction Stop }
+            if (@($found).Count -gt 0) { Remove-NetFirewallRule -Name $name -PolicyStore ActiveStore -ErrorAction Stop }
         }
+    }.GetNewClosure()
+
+    # The names of the rules in the group 'Voidseal egress' that start with the prefix, from the ACTIVE
+    # store (which also shows any rule a persistent store holds). A group with no rules is an empty array;
+    # any other failure THROWS, so the install turns an unreadable firewall into a refusal.
+    $b.GetHostFirewallRuleNames = {
+        param([System.Collections.IDictionary] $P)
+        $prefix = & $AssertArg $P 'NamePrefix' 'GetHostFirewallRuleNames'
+        return ,@(& $InvokeOp {
+            $found = @()
+            try { $found = @(Get-NetFirewallRule -Group 'Voidseal egress' -PolicyStore ActiveStore -ErrorAction Stop) }
+            catch {
+                if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) { return }
+                throw
+            }
+            foreach ($r in $found) {
+                $n = [string]$r.Name
+                if ($n.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { $n }
+            }
+        })
     }.GetNewClosure()
 
     $b.AddNetworkAdapterAcl = {
@@ -2443,7 +2467,7 @@ $script:SbCopyFakeVM = {
     NAT networks GetNetNats reports, each @{ Name; InternalIPInterfaceAddressPrefix }. Default: none.
 .PARAMETER SimulateEgressMethodError
     Names of host egress methods (GetHostIPAddresses, AddSwitchHostIPAddress, NewHostFirewallRule,
-    GetHostFirewallRule, AddNetworkAdapterAcl, GetNetworkAdapterAcls, GetNetNats, StartEgressProxy,
+    GetHostFirewallRule, GetHostFirewallRuleNames, AddNetworkAdapterAcl, GetNetworkAdapterAcls, GetNetNats, StartEgressProxy,
     StopEgressProxy and the Remove* methods) that THROW when called, modeling the host cmdlet failing,
     so a test can drive each fail-closed and rollback path. Default: none.
 #>
@@ -3678,6 +3702,13 @@ function New-FakeHyperVBackend {
             LocalPort = [string[]]@($r.LocalPort); LocalAddress = [string[]]@($r.LocalAddress)
             RemoteAddress = [string[]]@($r.RemoteAddress); InterfaceAlias = [string[]]@($r.InterfaceAlias)
         }
+    }.GetNewClosure()
+
+    $b.GetHostFirewallRuleNames = {
+        param([System.Collections.IDictionary] $P)
+        $prefix = [string](& $AssertArg $P 'NamePrefix' 'GetHostFirewallRuleNames')
+        & $egressFail 'GetHostFirewallRuleNames'
+        return ,[string[]]@($state.FirewallRules.Keys | Where-Object { ([string]$_).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) } | Sort-Object)
     }.GetNewClosure()
 
     $b.RemoveHostFirewallRule = {

@@ -1299,3 +1299,67 @@ Describe 'ResultInnerName is a layered workload key' {
         { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } | Should -Throw -ExpectedMessage '*ResultInnerName*'
     }
 }
+
+Describe 'InputDiskSizeBytes, OutputDiskSizeBytes and DepsImageHash are schema keys' {
+
+    It 'layers a workload InputDiskSizeBytes and OutputDiskSizeBytes onto the merged profile' {
+        $wl = @{ BaseTier = 0; Name = 'sized'; Entrypoint = 'true'; InputDiskSizeBytes = 128MB; OutputDiskSizeBytes = 2GB }
+        $p = script:New-Psd1File -Data $wl -Name 'sized.psd1'
+        $m = Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir
+        [long]$m.InputDiskSizeBytes  | Should -Be 128MB
+        [long]$m.OutputDiskSizeBytes | Should -Be 2GB
+    }
+
+    It 'accepts the 64MB and 2TB bounds themselves' {
+        foreach ($v in @(64MB, 2TB)) {
+            $wl = @{ BaseTier = 0; Name = 'edge'; Entrypoint = 'true'; InputDiskSizeBytes = $v; OutputDiskSizeBytes = $v }
+            $p = script:New-Psd1File -Data $wl -Name ("edge-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+            { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } | Should -Not -Throw -Because "$v bytes is inside 64MB..2TB"
+        }
+    }
+
+    It 'refuses a disk size outside 64MB..2TB or that is not an integer, naming the key' {
+        foreach ($key in @('InputDiskSizeBytes', 'OutputDiskSizeBytes')) {
+            foreach ($bad in @(0, -1, (64MB - 1), (2TB + 1), 1.5, '1GB', $true)) {
+                $wl = @{ BaseTier = 0; Name = 'badsize'; Entrypoint = 'true' }
+                $wl[$key] = $bad
+                $p = script:New-Psd1File -Data $wl -Name ("badsize-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+                { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } |
+                    Should -Throw -ExpectedMessage "*field '$key' must be an integer in 64MB..2TB*" -Because "'$bad' is not an integer in 64MB..2TB"
+            }
+        }
+    }
+
+    It 'a bare tier file with a disk size key is accepted by the resolved-key list and bounds-checked' {
+        $t = script:Get-ValidTier1Hashtable
+        $t['InputDiskSizeBytes'] = 1GB
+        { Assert-KnownProfileKeys -Profile $t -Kind Resolved -Context 'fixture' } | Should -Not -Throw
+        { Assert-TierProfileValid -Profile $t -Context 'fixture' } | Should -Not -Throw
+        $t['InputDiskSizeBytes'] = 1KB
+        { Assert-TierProfileValid -Profile $t -Context 'fixture' } | Should -Throw -ExpectedMessage "*field 'InputDiskSizeBytes' must be an integer*"
+    }
+
+    It 'layers a workload DepsImageHash and accepts 64 hex characters in either case' {
+        foreach ($h in @(('ab' * 32), ('AB' * 32), ('0123456789abcdefABCDEF' + ('0' * 42)))) {
+            $wl = @{ BaseTier = 0; Name = 'hashed'; Entrypoint = 'true'; DepsImageHash = $h }
+            $p = script:New-Psd1File -Data $wl -Name ("hashed-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+            (Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir).DepsImageHash | Should -Be $h
+        }
+    }
+
+    It 'refuses a DepsImageHash that is not exactly 64 hex characters' {
+        foreach ($bad in @('', 'abc', ('a' * 63), ('a' * 65), ('g' * 64), ('a' * 63 + ' '), ("`n" + ('a' * 64)), (('a' * 64) + "`n"), 7, $true)) {
+            $wl = @{ BaseTier = 0; Name = 'badhash'; Entrypoint = 'true'; DepsImageHash = $bad }
+            $p = script:New-Psd1File -Data $wl -Name ("badhash-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+            { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } |
+                Should -Throw -ExpectedMessage "*field 'DepsImageHash' must be exactly 64 hex characters*" -Because "'$bad' is not 64 hex characters"
+        }
+    }
+
+    It 'the new keys are on the layered list, so the unknown-key refusal accepts them' {
+        foreach ($k in @('InputDiskSizeBytes', 'OutputDiskSizeBytes', 'DepsImageHash')) {
+            $script:WorkloadLayeredKeys | Should -Contain $k
+            @((Get-ProfileSchemaKeys).Resolved) | Should -Contain $k
+        }
+    }
+}

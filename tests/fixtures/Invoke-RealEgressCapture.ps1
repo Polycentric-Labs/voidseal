@@ -80,16 +80,27 @@ function New-NetFirewallRule {
     [CmdletBinding()]
     param([string] $Name, [string] $DisplayName, [string] $Group, [string] $Direction, [string] $Action, [string] $Protocol,
           [string[]] $LocalAddress, [string[]] $RemoteAddress, [string[]] $LocalPort, [string[]] $InterfaceAlias,
-          [string] $Profile, [string] $Enabled)
+          [string] $Profile, [string] $Enabled, [string] $PolicyStore)
     $rec = [ordered]@{}
     foreach ($k in $PSBoundParameters.Keys) { $rec[$k] = $PSBoundParameters[$k] }
     $script:cap['NewRule_' + $Name] = $rec
     [pscustomobject]@{ Name = $Name }
 }
+$script:stubGroupEmpty = $false
 function Get-NetFirewallRule {
     [CmdletBinding()]
-    param([string[]] $Name)
+    param([string[]] $Name, [string] $Group, [string] $PolicyStore)
+    $script:cap['GetRule_PolicyStore'] = $PolicyStore
     if ($script:stubRuleReadFail) { Write-StubError $PSCmdlet 'stub: firewall service unreadable' 'ReadError' $Name; return }
+    if ($PSBoundParameters.ContainsKey('Group')) {
+        $script:cap['GetRule_Group'] = $Group
+        if ($script:stubGroupEmpty) {
+            Write-StubError $PSCmdlet "No MSFT_NetFirewallRule objects found with property 'Group' equal to '$Group'." 'ObjectNotFound' $Group
+            return
+        }
+        foreach ($k in @($script:stubRules.Keys)) { foreach ($r in @($script:stubRules[$k])) { $r.Rule } }
+        return
+    }
     $n = @($Name)[0]
     if (-not $script:stubRules.ContainsKey($n)) {
         Write-StubError $PSCmdlet "No MSFT_NetFirewallRule objects found with property 'Name' equal to '$n'." 'ObjectNotFound' $n
@@ -102,8 +113,9 @@ function Get-NetFirewallAddressFilter   { [CmdletBinding()] param($AssociatedNet
 function Get-NetFirewallInterfaceFilter { [CmdletBinding()] param($AssociatedNetFirewallRule) $script:stubRules[$AssociatedNetFirewallRule.Name].Iface }
 function Remove-NetFirewallRule {
     [CmdletBinding()]
-    param([string[]] $Name)
+    param([string[]] $Name, [string] $PolicyStore)
     $script:cap['RemoveRule'] = @($Name) -join ','
+    $script:cap['RemoveRule_PolicyStore'] = $PolicyStore
 }
 
 $script:stubAcls = @()
@@ -209,7 +221,7 @@ $script:stubRules['Voidseal-sbx-block-tcp'] = @{
 $c = Invoke-Capture { & $b.GetHostFirewallRule @{ Name = 'Voidseal-sbx-allow-proxy' } }
 $out.GetRule_DisabledAllow = [ordered]@{ err = $c.err; rule = $c.result; enabledType = if ($c.result) { $c.result.Enabled.GetType().Name } else { $null } }
 $c = Invoke-Capture { & $b.GetHostFirewallRule @{ Name = 'Voidseal-sbx-block-tcp' } }
-$out.GetRule_Block = [ordered]@{ err = $c.err; rule = $c.result }
+$out.GetRule_Block = [ordered]@{ err = $c.err; rule = $c.result; store = $c.cap['GetRule_PolicyStore'] }
 $c = Invoke-Capture { & $b.GetHostFirewallRule @{ Name = 'Voidseal-sbx-missing' } }
 $out.GetRule_Missing = [ordered]@{ err = $c.err; isNull = ($null -eq $c.result) }
 $script:stubRuleReadFail = $true
@@ -219,9 +231,31 @@ $c = Invoke-Capture { & $b.RemoveHostFirewallRule @{ Name = 'Voidseal-sbx-allow-
 $out.RemoveRule_Fail = [ordered]@{ err = $c.err; removed = $c.cap['RemoveRule'] }
 $script:stubRuleReadFail = $false
 $c = Invoke-Capture { & $b.RemoveHostFirewallRule @{ Name = 'Voidseal-sbx-allow-proxy' } }
-$out.RemoveRule_Present = [ordered]@{ err = $c.err; removed = $c.cap['RemoveRule'] }
+$out.RemoveRule_Present = [ordered]@{ err = $c.err; removed = $c.cap['RemoveRule']; store = $c.cap['RemoveRule_PolicyStore']; readStore = $c.cap['GetRule_PolicyStore'] }
 $c = Invoke-Capture { & $b.RemoveHostFirewallRule @{ Name = 'Voidseal-sbx-missing' } }
 $out.RemoveRule_Missing = [ordered]@{ err = $c.err; removed = $c.cap['RemoveRule'] }
+
+# ---- listing rule names by prefix (the pre-install check) ---------------------------------------------
+$script:stubRules['Voidseal-sbx2-allow-proxy'] = @{
+    Rule    = [pscustomobject]@{ Name = 'Voidseal-sbx2-allow-proxy'; Enabled = [StubEnabled]::True; Direction = [StubDirection]::Inbound; Action = [StubFwAction]::Allow }
+    Port    = [pscustomobject]@{ Protocol = 'TCP'; LocalPort = '13128' }
+    Address = [pscustomobject]@{ LocalAddress = '10.231.0.5'; RemoteAddress = '10.231.0.6' }
+    Iface   = [pscustomobject]@{ InterfaceAlias = 'vEthernet (sbx2-int)' }
+}
+$c = Invoke-Capture { & $b.GetHostFirewallRuleNames @{ NamePrefix = 'Voidseal-sbx-' } }
+$out.ListRules = [ordered]@{ err = $c.err; names = @($c.result); isArray = ($c.result -is [array]); group = $c.cap['GetRule_Group']; store = $c.cap['GetRule_PolicyStore'] }
+$c = Invoke-Capture { & $b.GetHostFirewallRuleNames @{ NamePrefix = 'voidseal-SBX-' } }
+$out.ListRules_Case = [ordered]@{ err = $c.err; count = @($c.result).Count }
+$c = Invoke-Capture { & $b.GetHostFirewallRuleNames @{ NamePrefix = 'Voidseal-nothing-' } }
+$out.ListRules_None = [ordered]@{ err = $c.err; count = @($c.result).Count; isArray = ($c.result -is [array]) }
+$script:stubGroupEmpty = $true
+$c = Invoke-Capture { & $b.GetHostFirewallRuleNames @{ NamePrefix = 'Voidseal-sbx-' } }
+$out.ListRules_NoGroup = [ordered]@{ err = $c.err; count = @($c.result).Count; isArray = ($c.result -is [array]) }
+$script:stubGroupEmpty = $false
+$script:stubRuleReadFail = $true
+$c = Invoke-Capture { & $b.GetHostFirewallRuleNames @{ NamePrefix = 'Voidseal-sbx-' } }
+$out.ListRules_Fail = [ordered]@{ err = $c.err }
+$script:stubRuleReadFail = $false
 
 # ---- port ACLs -----------------------------------------------------------------------------------------
 $c = Invoke-Capture { & $b.AddNetworkAdapterAcl @{ VMName = 'sbx'; Action = 'Allow'; Direction = 'Outbound'; Weight = 100; Protocol = 'TCP'

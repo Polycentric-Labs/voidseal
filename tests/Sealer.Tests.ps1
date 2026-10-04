@@ -305,7 +305,7 @@ Describe 'Lock-Sandbox — a Tier-1 net-restricted seal keeps the NIC but still 
         Import-SandboxAsset -Descriptor $script:Desc -Source $script:IsoSrc -As Iso -Backend $script:B
     }
 
-    It 'KEEPS the NIC for a Tier-1 net-restricted VM (egress enforcement is a separate, not-yet-implemented in-guest concern — not the seal''s job)' {
+    It 'KEEPS the NIC for a Tier-1 net-restricted VM (egress itself is restricted by the host-side HostProxy control, not by removing the NIC)' {
         Lock-Sandbox -Descriptor $script:Desc -Backend $script:B
         (& $script:B.GetNetworkAdapter @{ VMName = 'sbx-seal1' }).Count |
             Should -Be 1 -Because 'Tier-1 is net-restricted, not no-net; Lock-Sandbox does not strip the NIC at Tier 1'

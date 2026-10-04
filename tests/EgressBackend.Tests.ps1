@@ -33,6 +33,7 @@ Describe 'Host egress backend methods: the manifest' {
         $m['NewHostFirewallRule']       | Should -Be @('Name', 'Direction', 'Action', 'Protocol', 'LocalAddress', 'LocalPort', 'RemoteAddress', 'InterfaceAlias')
         $m['GetHostFirewallRule']       | Should -Be @('Name')
         $m['RemoveHostFirewallRule']    | Should -Be @('Name')
+        $m['GetHostFirewallRuleNames']  | Should -Be @('NamePrefix')
         $m['AddNetworkAdapterAcl']      | Should -Be @('VMName', 'Action', 'Direction', 'Weight', 'Protocol', 'LocalIPAddress', 'RemoteIPAddress', 'RemotePort', 'Stateful')
         $m['GetNetworkAdapterAcls']     | Should -Be @('VMName')
         $m['RemoveNetworkAdapterAcl']   | Should -Be @('VMName', 'Action', 'Direction', 'Weight')
@@ -107,6 +108,25 @@ Describe 'Host egress backend methods: the fake' {
         $r = & $script:B.GetHostFirewallRule @{ Name = 'r1' }
         $r.Action = 'Allow'
         (& $script:B.GetHostFirewallRule @{ Name = 'r1' }).Action | Should -Be 'Block'
+    }
+
+    It 'GetHostFirewallRuleNames lists the rule names that start with the prefix (any case) as an array' {
+        New-EgressFakeVM -Backend $script:B
+        foreach ($n in @('Voidseal-egress-vm1-allow-proxy', 'Voidseal-egress-vm1-block-udp', 'Voidseal-egress-vm12-allow-proxy', 'Other-rule')) {
+            & $script:B.NewHostFirewallRule @{ Name = $n; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'vEthernet (vm1-int)' }
+        }
+        $names = & $script:B.GetHostFirewallRuleNames @{ NamePrefix = 'voidseal-EGRESS-vm1-' }
+        $names -is [array] | Should -BeTrue
+        @($names | Sort-Object) | Should -Be @('Voidseal-egress-vm1-allow-proxy', 'Voidseal-egress-vm1-block-udp')
+        $none = & $script:B.GetHostFirewallRuleNames @{ NamePrefix = 'Voidseal-egress-nobody-' }
+        $none -is [array] | Should -BeTrue
+        $none.Count | Should -Be 0
+    }
+
+    It 'GetHostFirewallRuleNames requires NamePrefix and honors SimulateEgressMethodError' {
+        { & $script:B.GetHostFirewallRuleNames @{} } | Should -Throw
+        $b = New-FakeHyperVBackend -SimulateEgressMethodError @('GetHostFirewallRuleNames')
+        { & $b.GetHostFirewallRuleNames @{ NamePrefix = 'x' } } | Should -Throw '*SimulateEgressMethodError*'
     }
 
     It 'GetHostFirewallRule returns null for a missing rule and RemoveHostFirewallRule is idempotent' {
@@ -234,6 +254,32 @@ Describe 'Host egress backend methods: the REAL bodies, executed out of process 
         @($c.InterfaceAlias) | Should -Be @('vEthernet (sbx-int)')
         $c.Profile | Should -Be 'Any'
         $c.Enabled | Should -Be 'True'
+    }
+
+    It 'creates, reads and removes firewall rules in the ACTIVE store, like the gateway address, so a crash cannot leave them past a reboot' {
+        $script:Cap.NewRule_Allow.call.PolicyStore | Should -Be 'ActiveStore'
+        $script:Cap.GetRule_Block.store            | Should -Be 'ActiveStore'
+        $script:Cap.RemoveRule_Present.readStore   | Should -Be 'ActiveStore'
+        $script:Cap.RemoveRule_Present.store       | Should -Be 'ActiveStore'
+    }
+
+    It 'GetHostFirewallRuleNames lists the voidseal group in the active store, filtered by prefix, as an array' {
+        $l = $script:Cap.ListRules
+        $l.err | Should -BeNullOrEmpty
+        $l.isArray | Should -BeTrue
+        @($l.names | Sort-Object) | Should -Be @('Voidseal-sbx-allow-proxy', 'Voidseal-sbx-block-tcp') -Because 'Voidseal-sbx2-* shares the text but not the prefix'
+        $l.group | Should -Be 'Voidseal egress'
+        $l.store | Should -Be 'ActiveStore'
+        $script:Cap.ListRules_Case.count | Should -Be 2 -Because 'rule names compare without regard to case'
+        $script:Cap.ListRules_None.count | Should -Be 0
+        $script:Cap.ListRules_None.isArray | Should -BeTrue
+    }
+
+    It 'GetHostFirewallRuleNames reads a group with no rules as an empty array, and THROWS when the firewall cannot be read' {
+        $script:Cap.ListRules_NoGroup.err | Should -BeNullOrEmpty
+        $script:Cap.ListRules_NoGroup.count | Should -Be 0
+        $script:Cap.ListRules_NoGroup.isArray | Should -BeTrue
+        $script:Cap.ListRules_Fail.err | Should -Match 'firewall service unreadable'
     }
 
     It 'NewHostFirewallRule leaves an Any filter off the call instead of passing the word Any' {

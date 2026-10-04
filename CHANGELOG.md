@@ -185,3 +185,23 @@ places where a check is an argument rather than a measurement.
   settings, and an in-guest default-DROP that allows only the proxy port. `InGuestSquid` still works for
   a tier that sets it; the builder keeps `SquidSniProxy`. Mock-green only: the first elevated run follows
   `docs/phase-6-live-runbook.md` section 2, which this replaces (no host Squid, no NAT).
+- Profile schema: `InputDiskSizeBytes` and `OutputDiskSizeBytes` (data-disk sizes, integers from 64MB to
+  2TB, default 1GB each) and `DepsImageHash` (64 hex characters, either case) are now schema keys that
+  layer from a workload profile. The engine already read all three from the resolved profile, but the
+  unknown-key refusal rejected them at load, so a profile could not set them. Out-of-range sizes and
+  malformed hashes are refused at load. Documented in `tier-profiles/SCHEMA.md`.
+- Host egress firewall rules now live in the active store like the gateway address, so a crash cannot
+  leave rules behind that outlive the address they guard (`New-NetFirewallRule`, and the reads and
+  removals, use `-PolicyStore ActiveStore`). `Install-SandboxEgressNetwork` also refuses, before it
+  creates anything, when any of the seven `Voidseal-egress-<vm>-*` rules already exists, naming them and
+  the removal command. New backend read `GetHostFirewallRuleNames` (manifest, real, fake, parity). Not yet
+  run live: the first elevated run must confirm the cmdlet accepts the store
+  (`docs/phase-6-live-runbook.md` section 2).
+- A Disk-mode workload on a VM that keeps its NIC under `EgressMode='HostProxy'` is now refused by an
+  `Invoke-Voidseal` preflight, before anything is created. Previously only the seed builder refused it,
+  after the system, INPUT and OUTPUT disks had been created and copied; that check stays as a backstop.
+- The seal gate now compares each host firewall rule with its record as parsed address and port sets
+  (single addresses, ranges, prefixes, IPv6 in any form, any list order, split or merged ranges), not as
+  text, since how Windows renders them was unproven. An address or port the parser cannot read exactly
+  (for example `LocalSubnet`, a scope id, or `RPC`) refuses the seal, naming the rule. Added to the
+  Phase-6 live checks: readback equals record for all seven rules.

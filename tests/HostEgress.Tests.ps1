@@ -300,6 +300,200 @@ Describe 'HostEgress: Lock-Sandbox installs, records and rolls back' {
     }
 }
 
+Describe 'HostEgress: leftover rules from a crashed run stop the install before anything is created' {
+
+    It 'refuses, naming the rules and the cleanup command, and creates no address, rule or ACL' {
+        $b = New-FakeHyperVBackend
+        $d = script:New-HPVM -Backend $b -Name 'sbx-hp-stale'
+        & $b.NewHostFirewallRule @{ Name = 'Voidseal-egress-sbx-hp-stale-block-udp'; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'vEthernet (sbx-hp-stale-int)' }
+        $err = $null
+        try { Lock-Sandbox -Descriptor $d -Backend $b } catch { $err = $_.Exception.Message }
+        $err | Should -Match "^Install-SandboxEgressNetwork: refusing 'sbx-hp-stale' because 1 firewall rule\(s\) named 'Voidseal-egress-sbx-hp-stale-\*' already exist"
+        $err | Should -Match "Remove-NetFirewallRule -Name 'Voidseal-egress-sbx-hp-stale-block-udp' -PolicyStore ActiveStore"
+        $err | Should -Match 'Fail closed\.$'
+        @($b.FakeCallLog | Where-Object { $_.Op -in @('AddSwitchHostIPAddress', 'AddNetworkAdapterAcl') }).Count | Should -Be 0
+        @($b.FakeFirewallRules.Keys).Count | Should -Be 1 -Because 'only the leftover rule exists; none of the seven was created'
+        $d.EgressGatewayAddress | Should -BeNullOrEmpty
+        @($d.EgressFirewallRules).Count | Should -Be 0
+        @($d.EgressAcls).Count | Should -Be 0
+    }
+
+    It 'names every leftover rule, whatever its case' {
+        $b = New-FakeHyperVBackend
+        $d = script:New-HPVM -Backend $b -Name 'sbx-hp-stale2'
+        foreach ($n in @('Voidseal-egress-sbx-hp-stale2-allow-proxy', 'VOIDSEAL-EGRESS-SBX-HP-STALE2-BLOCK-ICMP4')) {
+            & $b.NewHostFirewallRule @{ Name = $n; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'vEthernet (sbx-hp-stale2-int)' }
+        }
+        { Lock-Sandbox -Descriptor $d -Backend $b } | Should -Throw "*2 firewall rule(s)*Voidseal-egress-sbx-hp-stale2-allow-proxy*VOIDSEAL-EGRESS-SBX-HP-STALE2-BLOCK-ICMP4*"
+    }
+
+    It 'a rule of another VM whose name merely starts with this VM''s prefix is not a clash' {
+        $b = New-FakeHyperVBackend
+        $d = script:New-HPVM -Backend $b -Name 'sbx-hp-st'
+        & $b.NewHostFirewallRule @{ Name = 'Voidseal-egress-sbx-hp-st-x-allow-proxy'; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'vEthernet (sbx-hp-st-int)' }
+        { Lock-Sandbox -Descriptor $d -Backend $b } | Should -Not -Throw
+        @($d.EgressFirewallRules).Count | Should -Be 7
+    }
+
+    It 'refuses, and creates nothing, when the existing rules cannot be read' {
+        $b = New-FakeHyperVBackend -SimulateEgressMethodError @('GetHostFirewallRuleNames')
+        $d = script:New-HPVM -Backend $b -Name 'sbx-hp-stale3'
+        { Lock-Sandbox -Descriptor $d -Backend $b } | Should -Throw "Install-SandboxEgressNetwork: refusing 'sbx-hp-stale3' because the existing firewall rules could not be read (*SimulateEgressMethodError*). Fail closed."
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'AddSwitchHostIPAddress' }).Count | Should -Be 0
+        @($b.FakeFirewallRules.Keys).Count | Should -Be 0
+    }
+
+    It 'a clean host installs as before' {
+        $b = New-FakeHyperVBackend
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-hp-clean'
+        @($d.EgressFirewallRules).Count | Should -Be 7
+    }
+}
+
+Describe 'HostEgress: the firewall readback compares address and port sets, not text' {
+
+    Context 'ConvertTo-EgressAddressKey' {
+
+        It 'reads a single address, a one-address range, a /32 and a full mask as the same set' {
+            $keys = @('10.231.0.1', '10.231.0.1-10.231.0.1', '10.231.0.1/32', '10.231.0.1/255.255.255.255', ' 10.231.0.1 ') | ForEach-Object { ConvertTo-EgressAddressKey -Value @($_) }
+            @($keys | Select-Object -Unique).Count | Should -Be 1
+        }
+
+        It 'reads CIDR and mask forms as the range they cover, and masks host bits off' {
+            $range = ConvertTo-EgressAddressKey -Value @('10.231.0.0-10.231.0.3')
+            ConvertTo-EgressAddressKey -Value @('10.231.0.0/30')            | Should -Be $range
+            ConvertTo-EgressAddressKey -Value @('10.231.0.1/30')            | Should -Be $range
+            ConvertTo-EgressAddressKey -Value @('10.231.0.0/255.255.255.252') | Should -Be $range
+            ConvertTo-EgressAddressKey -Value @('10.231.0.0/31')            | Should -Not -Be $range
+        }
+
+        It 'ignores order, repeats and how a set is split: overlapping and adjacent ranges merge' {
+            $a = ConvertTo-EgressAddressKey -Value @('0.0.0.0-10.231.0.0', '10.231.0.2-255.255.255.255')
+            ConvertTo-EgressAddressKey -Value @('10.231.0.2-255.255.255.255', '0.0.0.0-10.231.0.0') | Should -Be $a
+            ConvertTo-EgressAddressKey -Value @('0.0.0.0-10.231.0.0', '10.231.0.2-255.255.255.255', '10.231.0.2-10.231.0.9') | Should -Be $a
+            ConvertTo-EgressAddressKey -Value @('0.0.0.0-10.231.0.0,10.231.0.2-255.255.255.255') | Should -Be $a -Because 'a renderer may join a list with commas'
+            (ConvertTo-EgressAddressKey -Value @('1.1.1.1-1.1.1.5')) | Should -Be (ConvertTo-EgressAddressKey -Value @('1.1.1.1-1.1.1.3', '1.1.1.4-1.1.1.5'))
+            (ConvertTo-EgressAddressKey -Value @('1.1.1.1-1.1.1.3', '1.1.1.5-1.1.1.6')) | Should -Not -Be (ConvertTo-EgressAddressKey -Value @('1.1.1.1-1.1.1.6')) -Because 'a gap is a gap'
+        }
+
+        It 'reads IPv6 in compressed, expanded, upper-case, CIDR and range forms as the same set' {
+            $full = ConvertTo-EgressAddressKey -Value @('::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')
+            ConvertTo-EgressAddressKey -Value @('0:0:0:0:0:0:0:0-FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF') | Should -Be $full
+            ConvertTo-EgressAddressKey -Value @('::/0') | Should -Be $full
+            $one = ConvertTo-EgressAddressKey -Value @('::1')
+            ConvertTo-EgressAddressKey -Value @('0:0:0:0:0:0:0:1') | Should -Be $one
+            ConvertTo-EgressAddressKey -Value @('0000:0000:0000:0000:0000:0000:0000:0001/128') | Should -Be $one
+            ConvertTo-EgressAddressKey -Value @('FE80::A') | Should -Be (ConvertTo-EgressAddressKey -Value @('fe80:0:0:0:0:0:0:a'))
+            ConvertTo-EgressAddressKey -Value @('2001:db8::/32') | Should -Be (ConvertTo-EgressAddressKey -Value @('2001:db8::-2001:db8:ffff:ffff:ffff:ffff:ffff:ffff'))
+        }
+
+        It 'a mixed IPv4 and IPv6 list is the same set in any order and rendering, and not the IPv4 half alone' {
+            $v4 = @('0.0.0.0-10.231.0.0', '10.231.0.2-255.255.255.255')
+            $v6 = '::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+            $mixed = ConvertTo-EgressAddressKey -Value (@($v4) + @($v6))
+            ConvertTo-EgressAddressKey -Value (@($v6) + @($v4[1], $v4[0])) | Should -Be $mixed
+            ConvertTo-EgressAddressKey -Value @('::/0', '10.231.0.2-255.255.255.255', '0.0.0.0-10.231.0.0') | Should -Be $mixed
+            ConvertTo-EgressAddressKey -Value $v4 | Should -Not -Be $mixed
+        }
+
+        It 'an IPv4 address and an IPv6 address with the same number are different sets' {
+            ConvertTo-EgressAddressKey -Value @('0.0.0.1') | Should -Not -Be (ConvertTo-EgressAddressKey -Value @('::1'))
+            ConvertTo-EgressAddressKey -Value @('1.2.3.4') | Should -Not -Be (ConvertTo-EgressAddressKey -Value @('::ffff:1.2.3.4'))
+        }
+
+        It 'reads nothing, a blank, Any, ANY and * as the single set "any", which is not a list of every address' {
+            $any = ConvertTo-EgressAddressKey -Value @('Any')
+            foreach ($v in @($null, @(), @(''), @('ANY'), @('*'), @(' any '))) { ConvertTo-EgressAddressKey -Value $v | Should -Be $any }
+            ConvertTo-EgressAddressKey -Value @('0.0.0.0-255.255.255.255') | Should -Not -Be $any
+        }
+
+        It 'refuses to read anything it cannot parse exactly (fail closed)' {
+            foreach ($bad in @('LocalSubnet', 'DNS', 'abc', '10.231.0.999', '10.1', '1', '010.0.0.1', '10.231.0.1-', '-10.231.0.1', '10.231.0.5-10.231.0.1',
+                               '1.2.3.4/33', '1.2.3.4/-1', '1.2.3.4/255.0.255.0', '::1/129', 'fe80::1%12', '1.2.3.4-::1', '10.231.0.1-10.231.0.2-10.231.0.3', 'Any,10.231.0.1')) {
+                { ConvertTo-EgressAddressKey -Value @($bad) } | Should -Throw -Because "'$bad' is not an address, range or prefix the gate can compare"
+            }
+        }
+    }
+
+    Context 'ConvertTo-EgressPortKey' {
+
+        It 'ignores order and split, merges adjacent ranges, and reads a single port as a one-port range' {
+            $a = ConvertTo-EgressPortKey -Value @('1-13127', '13129-65535')
+            ConvertTo-EgressPortKey -Value @('13129-65535', '1-13127') | Should -Be $a
+            ConvertTo-EgressPortKey -Value @('1-5000', '5001-13127', '13129-65535') | Should -Be $a
+            ConvertTo-EgressPortKey -Value @('13128') | Should -Be (ConvertTo-EgressPortKey -Value @('13128-13128'))
+            ConvertTo-EgressPortKey -Value @('1-13128', '13129-65535') | Should -Not -Be $a
+        }
+
+        It 'reads nothing and Any as "any", and refuses a keyword or an out-of-range value' {
+            foreach ($v in @($null, @(), @('Any'), @('*'))) { ConvertTo-EgressPortKey -Value $v | Should -Be (ConvertTo-EgressPortKey -Value @('Any')) }
+            foreach ($bad in @('RPC', 'RPC-EPMap', '70000', '-1', '5-1', '80-', 'abc', '1.5', 'Any,80')) {
+                { ConvertTo-EgressPortKey -Value @($bad) } | Should -Throw -Because "'$bad' is not a port or port range the gate can compare"
+            }
+        }
+    }
+
+    Context 'the seal gate, against host renderings of the recorded rules' {
+
+        BeforeEach {
+            $script:B = New-FakeHyperVBackend
+            $script:D = script:New-SealedHPVM -Backend $script:B -Name 'sbx-g'
+            $script:Head = "Assert-Sealed: REFUSING to certify Tier-1 HostProxy VM 'sbx-g' SEALED because"
+        }
+
+        It 'certifies when the host renders addresses as /32 and ranges, in another order' {
+            $r0 = $script:D.EgressFirewallRules[0]
+            $script:B.FakeFirewallRules[$r0.Name].LocalAddress  = [string[]]@("$($script:D.Egress.GatewayIP)/32")
+            $script:B.FakeFirewallRules[$r0.Name].RemoteAddress = [string[]]@("$($script:D.Egress.GuestIP)-$($script:D.Egress.GuestIP)")
+            Assert-Sealed -Descriptor $script:D -Backend $script:B | Should -BeTrue
+        }
+
+        It 'certifies when the host renders the mixed IPv4 and IPv6 local list reversed, with the IPv6 range as ::/0' {
+            $r6 = @($script:D.EgressFirewallRules | Where-Object { $_.Name -like '*block-other-local' })[0]
+            $before = @($script:B.FakeFirewallRules[$r6.Name].LocalAddress)
+            $before.Count | Should -Be 3 -Because 'two IPv4 ranges around the gateway and one IPv6 range'
+            $script:B.FakeFirewallRules[$r6.Name].LocalAddress = [string[]]@('::/0', $before[1], $before[0])
+            Assert-Sealed -Descriptor $script:D -Backend $script:B | Should -BeTrue
+            $script:B.FakeFirewallRules[$r6.Name].LocalAddress = [string[]]@('0:0:0:0:0:0:0:0-FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF', $before[0], $before[1])
+            Assert-Sealed -Descriptor $script:D -Backend $script:B | Should -BeTrue
+        }
+
+        It 'certifies when the host splits or reorders the port ranges' {
+            $r1 = @($script:D.EgressFirewallRules | Where-Object { $_.Name -like '*block-tcp-ports' })[0]
+            $port = [int]$script:D.Egress.ProxyPort
+            $script:B.FakeFirewallRules[$r1.Name].LocalPort = [string[]]@("$($port + 1)-65535", "1-$($port - 1)")
+            Assert-Sealed -Descriptor $script:D -Backend $script:B | Should -BeTrue
+            $script:B.FakeFirewallRules[$r1.Name].LocalPort = [string[]]@("1-100", "101-$($port - 1)", "$($port + 1)-65535")
+            Assert-Sealed -Descriptor $script:D -Backend $script:B | Should -BeTrue
+        }
+
+        It 'refuses when the host list lost its IPv6 range, or an address moved by one' {
+            $r6 = @($script:D.EgressFirewallRules | Where-Object { $_.Name -like '*block-other-local' })[0]
+            $before = @($script:B.FakeFirewallRules[$r6.Name].LocalAddress)
+            $script:B.FakeFirewallRules[$r6.Name].LocalAddress = [string[]]@($before[0], $before[1])
+            { Assert-Sealed -Descriptor $script:D -Backend $script:B } | Should -Throw "$($script:Head) host firewall rule '$($r6.Name)' differs from its record (direction, action, protocol, addresses, ports or interface). Fail closed."
+            $script:B.FakeFirewallRules[$r6.Name].LocalAddress = $before
+            $r0 = $script:D.EgressFirewallRules[0]
+            $script:B.FakeFirewallRules[$r0.Name].RemoteAddress = [string[]]@('10.231.9.9')
+            { Assert-Sealed -Descriptor $script:D -Backend $script:B } | Should -Throw "*host firewall rule '$($r0.Name)' differs from its record*"
+        }
+
+        It 'refuses, naming the rule, when the host reports an address or port it cannot interpret' {
+            $r0 = $script:D.EgressFirewallRules[0]
+            $script:B.FakeFirewallRules[$r0.Name].LocalAddress = [string[]]@('LocalSubnet')
+            { Assert-Sealed -Descriptor $script:D -Backend $script:B } | Should -Throw "$($script:Head) host firewall rule '$($r0.Name)' reports an address or port the gate cannot interpret (*). Fail closed."
+            $script:B.FakeFirewallRules[$r0.Name].LocalAddress = [string[]]@($script:D.Egress.GatewayIP)
+            $script:B.FakeFirewallRules[$r0.Name].LocalPort = [string[]]@('RPC')
+            { Assert-Sealed -Descriptor $script:D -Backend $script:B } | Should -Throw "*host firewall rule '$($r0.Name)' reports an address or port the gate cannot interpret*"
+        }
+
+        It 'refuses a recorded rule whose own record cannot be interpreted' {
+            $script:D.EgressFirewallRules[0].LocalAddress = [string[]]@('LocalSubnet')
+            { Assert-Sealed -Descriptor $script:D -Backend $script:B } | Should -Throw "*cannot interpret*"
+        }
+    }
+}
+
 Describe 'HostEgress: Assert-Sealed refusals for a Tier-1 HostProxy VM (each message pinned)' {
 
     BeforeEach {

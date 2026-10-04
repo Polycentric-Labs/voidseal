@@ -58,14 +58,18 @@ the HostProxy backend methods in `scripts/lib/HyperVBackend.ps1`, and the HostPr
    sources, and an in-guest default-DROP (nftables, iptables fallback) that allows only TCP to the proxy
    port and is applied before networking on the guest's only boot.
 4. **Seal (Lock-Sandbox).** `New-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -PolicyStore
-   ActiveStore` for the gateway; seven `New-NetFirewallRule` rules in the group `Voidseal egress`, named
-   `Voidseal-egress-<vm>-*`, all inbound and scoped to that interface (one Allow for TCP from the guest to
+   ActiveStore` for the gateway; seven `New-NetFirewallRule -PolicyStore ActiveStore` rules in the group
+   `Voidseal egress`, named `Voidseal-egress-<vm>-*` (the active store for the rules too, so neither
+   outlives a reboot), all inbound and scoped to that interface (one Allow for TCP from the guest to
    gateway:13128; Blocks for every other TCP port, the proxy port from any other address, UDP, ICMPv4,
    ICMPv6, and every protocol to any local address but the gateway, IPv6 included; Windows lets a Block
    beat any Allow, so the Blocks are shaped around the allowed tuple); three
    `Add-VMNetworkAdapterExtendedAcl` entries (deny inbound and outbound at weight 1, allow stateful
-   outbound TCP from the guest to gateway:13128 at weight 100). Each is recorded the moment it exists;
-   a failure rolls back what was created.
+   outbound TCP from the guest to gateway:13128 at weight 100). Before it creates anything, the install
+   asks the host (`GetHostFirewallRuleNames`) whether any of the seven rule names already exists and
+   refuses if so, naming the rules and the `Remove-NetFirewallRule` command that clears them: a crashed
+   run can leave rules behind, and rollback only removes what this run recorded. Each object is recorded
+   the moment it exists; a failure rolls back what was created.
 5. **Gate (Assert-Sealed).** On top of the one-NIC-on-own-switch rule: the gateway address is on the
    interface with prefix 30, no other host address overlaps the /30, no NAT covers it, every recorded rule
    exists, is enabled and matches its record, the adapter carries exactly the recorded ACL entries, and
@@ -112,13 +116,27 @@ allowlist. Every item below is something the mock suite cannot prove.
    `PrefixLength 30`, `PolicyStore ActiveStore`, and `AddressState Preferred` (not Tentative or
    Duplicate). Note whether the APIPA `169.254.x.x` address is still there; the gate ignores it, but
    record it.
-7. `Get-NetFirewallRule -Group 'Voidseal egress'` lists seven rules, all `Enabled True`. For each, compare
+7. `Get-NetFirewallRule -Group 'Voidseal egress' -PolicyStore ActiveStore` lists seven rules, all
+   `Enabled True`. This is also the first live proof that `New-NetFirewallRule -PolicyStore ActiveStore` is
+   accepted and that the rules are visible and removable through the same store; if the cmdlet refuses the
+   store, the install fails and rolls back, and the store choice must change. For each, compare
    `Get-NetFirewallPortFilter`, `Get-NetFirewallAddressFilter` and `Get-NetFirewallInterfaceFilter` with
    the record: how an address range renders (`0.0.0.0-10.231.a.b`), whether the IPv6 range
    `::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff` was accepted, how `ICMPv4`/`ICMPv6`/`Any` render as
    `Protocol`, and whether `InterfaceAlias` reads back as the alias. This is the most likely fake versus
-   real gap: if `Assert-Sealed` refuses with "differs from its record", capture these outputs, because
-   the normalization in the real `GetHostFirewallRule` must change, not the gate.
+   real gap: if `Assert-Sealed` refuses with "differs from its record" or "cannot interpret", capture
+   these outputs, because the normalization in the real `GetHostFirewallRule`, or the address and port
+   parsing in `HostEgress.ps1` (`ConvertTo-EgressAddressKey`, `ConvertTo-EgressPortKey`), must change, not
+   the gate's strictness.
+7a. **Readback equals record for all seven rules.** The gate compares each host rule with its record as
+   parsed address and port sets (a single address, an `a-b` range, a prefix, IPv6 in any form and any list
+   order read as the same set), not as text. Confirm that `Assert-Sealed` certifies, so all seven rules
+   (`allow-proxy`, `block-tcp-ports`, `block-proxy-others`, `block-udp`, `block-icmp4`, `block-icmp6`,
+   `block-other-local`) read back equal to their records, and write down how Windows rendered each
+   `LocalAddress`, `RemoteAddress` and `LocalPort`, especially the mixed IPv4 and IPv6 `LocalAddress` of
+   `block-other-local`. A refusal that says "cannot interpret" means Windows used a form the parser does
+   not know (a keyword such as `LocalSubnet`, or an IPv6 scope id); capture it and extend the parser
+   rather than loosening the comparison.
 8. `Get-VMNetworkAdapterExtendedAcl -VMName <vm>` lists three entries. Record how an unset field renders
    (empty, `ANY`, `*`), whether `Protocol` reads `TCP` or `6`, and `Stateful`.
 9. `Assert-Sealed` returns `$true`.
@@ -135,6 +153,25 @@ allowlist. Every item below is something the mock suite cannot prove.
     `egress_mode=hostproxy guest_addr=1 default_routes=0 nameservers=0 proxy_env=1`, and
     `proxy_reachable=yes`. `guest_addr=1` also proves the NIC is `eth0`; if it is 0, the network-config
     key must change.
+11a. First boot with four integration services off. `Lock-Sandbox` turns off Time Synchronization,
+    Key-Value Pair Exchange, Backup and Heartbeat, and `Assert-Sealed` refuses a VM with any of them on.
+    Neither the mock suite nor any earlier live run has booted a guest that way. Check both effects:
+    - **cloud-init NoCloud still completes without KVP.** In the guest, `cloud-init status --long` reads
+      `done` and `cloud-id` reads `nocloud` (the CIDATA data disk is the datasource). The journal shows no
+      wait on the Azure datasource, which uses Hyper-V KVP: `journalctl -b | grep -i -E
+      'azure|kvp|hyperv'`. Note how long first boot took. If it hangs or picks another datasource, pin
+      `datasource_list: [ NoCloud ]` in a drop-in under `/etc/cloud/cloud.cfg.d/` of the golden image and
+      rebuild it; do not turn KVP back on (the gate would refuse the VM).
+    - **The guest clock is sane enough for TLS.** HostProxy tunnels CONNECT to port 443 only, so no NTP
+      leaves the guest, and with Time Synchronization off the clock comes from the RTC the VM starts with.
+      Compare `date -u` in the guest with `(Get-Date).ToUniversalTime()` on the host (within a few
+      seconds), expect `timedatectl` to say `System clock synchronized: no` and `RTC in local TZ: no`, and
+      confirm item 12's first `curl` to an allowlisted name verifies its certificate. If the offset equals
+      the host's UTC offset, the RTC is being read as local time: fix it in the golden image
+      (`timedatectl set-local-rtc 0`, `/etc/adjtime` saying UTC). Record any drift over a long run and
+      bound such runs with `-WorkloadTimeoutSeconds`. Do not re-enable Time Synchronization or open UDP
+      123 to fix it: the seal verifies the first and the firewall rules block the second, so either would
+      be a deliberate design change to record, not a workaround.
 12. From the guest (a test entrypoint, run as the sandbox user):
     - `curl -sS -o /dev/null -w '%{http_code}' https://<an allowlisted name>/` succeeds through the proxy.
     - `curl https://<a name not on the list>/` fails with the proxy's 403; the log shows
@@ -157,13 +194,18 @@ allowlist. Every item below is something the mock suite cannot prove.
 
 **After teardown**
 
-16. `Get-NetFirewallRule -Group 'Voidseal egress'` is empty, the gateway address is gone, the proxy pid is
+16. `Get-NetFirewallRule -Group 'Voidseal egress' -PolicyStore ActiveStore` is empty (or reports no
+    such group), the gateway address is gone, the proxy pid is
     gone, the switch is gone, and `TeardownStatus` starts with `OK`.
 17. Crash path: start a run, kill the PowerShell process mid-run, and confirm the proxy exits on its own
-    (parent watch). Then clean up by hand: `Get-NetFirewallRule -Group 'Voidseal egress' |
-    Remove-NetFirewallRule`, `Remove-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -IPAddress
-    <gateway>`, and the usual VM and switch removal. The address is in the active store only, so a host
-    reboot also clears it.
+    (parent watch). Then clean up by hand: `Get-NetFirewallRule -Group 'Voidseal egress' -PolicyStore
+    ActiveStore | Where-Object { $_.Name -like 'Voidseal-egress-<vm>-*' } | Remove-NetFirewallRule`,
+    `Remove-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -IPAddress <gateway>`, and the usual VM
+    and switch removal. The address and the rules are both in the active store, so a host reboot clears
+    them too. Until they are cleared, a new run of a VM with the same name refuses at the seal, before it
+    creates anything: first on the leftover gateway address if that is still there, then on the leftover
+    rules, with a message that names them and the removal command. Confirm that refusal, then clean up
+    and confirm the next run installs.
 
 The builder (`SquidSniProxy`) is unchanged by B': it still uses its in-guest Squid and has no host
 enforcement. Moving it to the host proxy is a follow-up (its Disk-mode runner would need the same proxy

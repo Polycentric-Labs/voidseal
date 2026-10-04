@@ -1485,6 +1485,29 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $hostMountOps.Count | Should -Be 0 -Because 'a processor must NEVER host-mount (ReadVhdxFile) its Raw OUTPUT disk (D4-B, P0 risk)'
     }
 
+    It 'a profile DepsImageHash is the expected hash when -Workload supplies none, and a wrong one still refuses' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+        $good = @{} + $script:Proc
+        $good['DepsImageHash'] = $depsHash.ToUpperInvariant()
+        $report = Invoke-Voidseal -Tier 0 -Profile $good -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Name 'sbx-proc-profhash' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger
+        @($report.States) | Should -Contain 'SEALED' -Because 'the profile hash matches the disk, in either case'
+        $report.Descriptor.DepsImageHash | Should -Be $depsHash
+
+        $b2 = New-FakeHyperVBackend -SimulateSelfPowerOff
+        & $b2.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $wrong = @{} + $script:Proc
+        $wrong['DepsImageHash'] = ('0' * 64)
+        $report2 = Invoke-Voidseal -Tier 0 -Profile $wrong -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk } `
+            -Name 'sbx-proc-profhash2' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b2 -RateLedgerPath $script:ProcLedger
+        @($report2.States) | Should -Not -Contain 'SEALED'
+        $report2.Error | Should -Match '(?i)integrity'
+    }
+
     It 'GC invariant (D3-D): the verified deps.vhdx is NOT in CreatedDisks -> teardown LEAVES it (builder-owned, reusable)' {
         $b = New-FakeHyperVBackend -SimulateSelfPowerOff
         & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
@@ -2481,6 +2504,47 @@ Describe 'Get-OutboxWorkloadExitCode' {
 # ===========================================================================
 #  Profile key strictness + ResultInnerName layering (hashtable -Profile path)
 # ===========================================================================
+Describe 'Invoke-Voidseal: a Disk-mode workload under HostProxy is refused before anything is provisioned' {
+
+    BeforeAll {
+        $t1 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier1.psd1')
+        $p  = @{} + $t1
+        $p['Name']         = 'hp-disk'
+        $p['WorkloadMode'] = 'Disk'
+        $p['Inputs']       = script:New-OutboxHelperInputs
+        $p['FileSystem']   = 'exFAT'
+        $p['OutboxOutput'] = $true
+        $p['Entrypoint']   = 'python3 /mnt/in/work.py --out /run/staging/result.html'
+        $script:HpDiskProfile = $p
+    }
+
+    It 'the fixture really is a networked Tier-1 HostProxy Disk profile' {
+        $script:HpDiskProfile['EgressMode'] | Should -Be 'HostProxy'
+        (Get-SealNicPolicy -Tier ([int]$script:HpDiskProfile['Tier']) -Network ([string]$script:HpDiskProfile['Network'])) | Should -Be 'IsolatedInternalSwitch'
+    }
+
+    It 'refuses up front, naming HostProxy and Disk mode, and creates no VM, switch or disk' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $made = [System.Collections.Generic.List[string]]::new()
+        foreach ($m in @('NewVHD', 'NewOutputVhdx', 'CopyVhdxFile', 'NewSwitch', 'NewVM')) {
+            $orig = $b[$m]; $name = $m
+            $b[$m] = { param([System.Collections.IDictionary] $P) $made.Add($name); & $orig $P }.GetNewClosure()
+        }
+        { Invoke-Voidseal -Tier 1 -Profile $script:HpDiskProfile -Name 'sbx-hp-disk' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage "*Disk-mode workload*EgressMode='HostProxy'*"
+        (& $b.GetVM @{ Name = 'sbx-hp-disk' }) | Should -BeNullOrEmpty
+        (& $b.GetSwitch @{ Name = 'sbx-hp-disk-int' }) | Should -BeNullOrEmpty
+        @($b.FakeCallLog | Where-Object { $_.Op -in @('StartVM', 'AddSwitchHostIPAddress', 'NewHostFirewallRule', 'WriteVhdxFile', 'WriteVhdxFileBytes') }).Count | Should -Be 0
+        $made.Count | Should -Be 0 -Because 'nothing (no VM, switch, disk or copy) was created before the refusal'
+    }
+
+    It 'a Disk-mode Tier-0 outbox profile (no NIC) is not affected' {
+        $t0 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $t0['EgressMode'] | Should -Not -Be 'InGuestSquid'
+        (Get-SealNicPolicy -Tier ([int]$t0['Tier']) -Network ([string]$t0['Network'])) | Should -Be 'NoAdapter'
+    }
+}
+
 Describe 'Invoke-Voidseal: unknown profile keys and ResultInnerName layering' {
 
     BeforeAll {
@@ -2548,6 +2612,35 @@ Describe 'Invoke-Voidseal: unknown profile keys and ResultInnerName layering' {
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b    # ... and the run overrides it
         $report.Error | Should -BeNullOrEmpty
         [System.IO.Path]::GetFileName(@($report.ExtractedArtifact)[0]) | Should -Be 'report.html'
+    }
+
+    It 'a profile InputDiskSizeBytes and OutputDiskSizeBytes size the data disks the run creates' {
+        $p = @{} + $script:RinProfile
+        $p['InputDiskSizeBytes']  = 128MB
+        $p['OutputDiskSizeBytes'] = 256MB
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:RinBlob
+        # Teardown deletes the data disks, so record what NewOutputVhdx was asked for, by volume label.
+        $created = @{}
+        $real = $b.NewOutputVhdx
+        $b.NewOutputVhdx = { param([System.Collections.IDictionary] $P) $created[[string]$P['Label']] = [long]$P['SizeBytes']; & $real $P }.GetNewClosure()
+        $dest = Join-Path $script:TmpRoot ("dest-rin-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $p -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'report.html' } `
+            -Name 'sbx-rin-sizes' -ArtifactRoot (Join-Path $script:TmpRoot 'art-rin3') -Destination $dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        $report.Error | Should -BeNullOrEmpty
+        $created['INPUT']  | Should -Be 128MB
+        $created['OUTPUT'] | Should -Be 256MB
+    }
+
+    It 'refuses an out-of-range disk size in a hashtable -Profile before anything is provisioned' {
+        foreach ($key in @('InputDiskSizeBytes', 'OutputDiskSizeBytes')) {
+            $bad = @{} + $script:RinProfile
+            $bad[$key] = 1MB
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+            { Invoke-Voidseal -Tier 0 -Profile $bad -Name 'sbx-rin-badsize' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+                Should -Throw -ExpectedMessage "*$key*"
+            (& $b.GetVM @{ Name = 'sbx-rin-badsize' }) | Should -BeNullOrEmpty
+        }
     }
 
     It 'refuses a -Workload ResultInnerName that is not a plain file name' {

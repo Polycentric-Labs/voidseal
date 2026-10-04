@@ -366,6 +366,34 @@ function Assert-EgressAddressFree {
     }
 }
 
+<#
+.SYNOPSIS
+    Throw when a firewall rule this VM's install would create already exists on the host.
+.DESCRIPTION
+    A crashed run can leave its rules behind. Install would then fail part way through, after the gateway
+    address was added, and rollback has no record of rules it did not create. So the install asks first
+    (GetHostFirewallRuleNames, by the plan's RulePrefix) and refuses before it creates anything. Only the
+    seven names the install would create count: another VM's rule whose name merely starts with this
+    prefix ('sbx-a' and 'sbx-a-b') is not a clash. A read that fails is a refusal too. The message names
+    the rules and the command that removes them.
+#>
+function Assert-EgressRulesAbsent {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Plan, [Parameter(Mandatory)] [hashtable] $Backend, [string] $Context = 'HostEgress')
+    $vm     = [string](Get-EgressPlanField $Plan 'VMName')
+    $prefix = [string](Get-EgressPlanField $Plan 'RulePrefix')
+    $expected = @(Get-EgressFirewallRuleSpec -Plan $Plan | ForEach-Object { [string]$_.Name })
+    $existing = $null
+    try { $existing = & $Backend.GetHostFirewallRuleNames @{ NamePrefix = $prefix } }
+    catch { throw "${Context}: refusing '$vm' because the existing firewall rules could not be read ($($_.Exception.Message)). Fail closed." }
+    $clash = @($existing | Where-Object { $null -ne $_ -and $expected -contains [string]$_ } | ForEach-Object { [string]$_ } | Sort-Object)
+    if ($clash.Count -eq 0) { return }
+    $quoted = ($clash | ForEach-Object { "'$_'" }) -join ','
+    throw ("${Context}: refusing '$vm' because $($clash.Count) firewall rule(s) named '${prefix}*' already exist on the host " +
+           "(a crashed run leaves them behind): $($clash -join ', '). Remove them with: " +
+           "Remove-NetFirewallRule -Name $quoted -PolicyStore ActiveStore. Fail closed.")
+}
+
 # --------------------------------------------------------------------------
 # install, proxy, teardown
 # --------------------------------------------------------------------------
@@ -394,6 +422,7 @@ function Install-SandboxEgressNetwork {
         throw "Install-SandboxEgressNetwork: '$vm' records switch '$sw' but its egress plan names '$(Get-EgressPlanField $plan 'SwitchName')'. Fail closed."
     }
     Assert-EgressAddressFree -Plan $plan -Backend $Backend -Context 'Install-SandboxEgressNetwork'
+    Assert-EgressRulesAbsent -Plan $plan -Backend $Backend -Context 'Install-SandboxEgressNetwork'
 
     Set-EgressDescriptorField -Descriptor $Descriptor -Name 'EgressFirewallRules' -Value @()
     Set-EgressDescriptorField -Descriptor $Descriptor -Name 'EgressAcls' -Value @()
@@ -558,6 +587,171 @@ function ConvertTo-EgressCompareKey {
     return ((@($items) | Sort-Object) -join ',')
 }
 
+# The firewall readback cannot compare address and port lists as text: how Windows renders a single
+# address, a range, a prefix, an IPv6 address or the order of a list is not something the mock can show.
+# These functions parse each entry to a numeric range, merge the ranges and return one canonical key, so
+# two renderings of the same set compare equal and two different sets do not. Anything they cannot
+# parse exactly (a keyword such as LocalSubnet or RPC, a malformed address, a reversed range, an IPv6
+# scope id) THROWS, and the gate turns that into a refusal: an entry that cannot be read is never
+# assumed to be the recorded one.
+
+<#
+.SYNOPSIS
+    Parse one IPv4 or IPv6 address to @{ Family; Bits; Value } with Value a BigInteger. Throws if not exact.
+.DESCRIPTION
+    IPv4 must be a strict dotted quad (no short forms, no leading zeros). IPv6 may be compressed, expanded,
+    in any case, or carry an embedded IPv4 tail; a scope id ('%12') or any other text is refused.
+#>
+function ConvertTo-EgressIpNumber {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Text)
+    $t = $Text.Trim()
+    $ipv4 = '^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$'
+    $family = $null; $bytes = $null
+    if ($t -match $ipv4) {
+        $family = 'v4'; $bytes = [System.Net.IPAddress]::Parse($t).GetAddressBytes()
+    }
+    elseif ($t.Contains(':') -and $t -notmatch '[%/\s]') {
+        $ip = $null
+        if ([System.Net.IPAddress]::TryParse($t, [ref]$ip) -and $ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            $family = 'v6'; $bytes = $ip.GetAddressBytes()
+        }
+    }
+    if ($null -eq $family) { throw "HostEgress: '$t' is not an IPv4 or IPv6 address the gate can read." }
+    $value = [System.Numerics.BigInteger]::Zero
+    foreach ($byte in $bytes) { $value = ($value * 256) + [int]$byte }
+    return @{ Family = $family; Bits = ($bytes.Length * 8); Value = $value }
+}
+
+<#
+.SYNOPSIS
+    Parse one address entry (address, a-b range, a/len prefix, a/mask) to @{ Family; First; Last }.
+#>
+function ConvertTo-EgressAddressRange {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Item)
+    if ($Item.Contains('/')) {
+        $parts = $Item.Split('/')
+        if ($parts.Count -ne 2) { throw "HostEgress: '$Item' is not an address prefix the gate can read." }
+        $base = ConvertTo-EgressIpNumber -Text $parts[0]
+        $lenText = $parts[1].Trim()
+        $len = -1
+        if ($lenText -match '^\d{1,3}$') { $len = [int]$lenText }
+        elseif ($base.Family -eq 'v4' -and $lenText -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            $mask = (ConvertTo-EgressIpNumber -Text $lenText).Value
+            $ones = [System.Numerics.BigInteger]::Pow(2, 32) - 1
+            for ($l = 0; $l -le 32; $l++) {
+                if ($mask -eq ($ones - ([System.Numerics.BigInteger]::Pow(2, 32 - $l) - 1))) { $len = $l; break }
+            }
+        }
+        if ($len -lt 0 -or $len -gt $base.Bits) { throw "HostEgress: '$Item' has a prefix length or mask the gate can not read." }
+        $size  = [System.Numerics.BigInteger]::Pow(2, $base.Bits - $len)
+        $first = [System.Numerics.BigInteger]::Divide($base.Value, $size) * $size
+        return @{ Family = $base.Family; First = $first; Last = ($first + $size - 1) }
+    }
+    if ($Item.Contains('-')) {
+        $parts = $Item.Split('-')
+        if ($parts.Count -ne 2) { throw "HostEgress: '$Item' is not an address range the gate can read." }
+        $a = ConvertTo-EgressIpNumber -Text $parts[0]
+        $b = ConvertTo-EgressIpNumber -Text $parts[1]
+        if ($a.Family -ne $b.Family) { throw "HostEgress: '$Item' mixes IPv4 and IPv6." }
+        if ($a.Value -gt $b.Value)   { throw "HostEgress: '$Item' is a reversed range." }
+        return @{ Family = $a.Family; First = $a.Value; Last = $b.Value }
+    }
+    $one = ConvertTo-EgressIpNumber -Text $Item
+    return @{ Family = $one.Family; First = $one.Value; Last = $one.Value }
+}
+
+# Sort ranges by First and merge any that overlap or touch. Input: @{ First; Last } records (BigInteger).
+function Merge-EgressRanges {
+    param([object[]] $Ranges)
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in @($Ranges)) { $list.Add($r) }
+    $list.Sort([System.Comparison[object]]{ param($x, $y) [System.Numerics.BigInteger]::Compare($x.First, $y.First) })
+    $merged = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $list) {
+        if ($merged.Count -gt 0 -and $r.First -le ($merged[$merged.Count - 1].Last + 1)) {
+            if ($r.Last -gt $merged[$merged.Count - 1].Last) { $merged[$merged.Count - 1].Last = $r.Last }
+        }
+        else { $merged.Add(@{ First = $r.First; Last = $r.Last }) }
+    }
+    return ,$merged.ToArray()
+}
+
+# Split a list value into trimmed non-blank entries; a renderer may join entries with commas.
+function Get-EgressListItems {
+    param($Value)
+    $items = [System.Collections.Generic.List[string]]::new()
+    foreach ($v in @($Value)) {
+        if ($null -eq $v) { continue }
+        foreach ($piece in ([string]$v).Split(',')) { $t = $piece.Trim(); if ($t -ne '') { $items.Add($t) } }
+    }
+    return ,$items.ToArray()
+}
+
+<#
+.SYNOPSIS
+    One canonical key for a firewall address list: 'any', or the merged IPv4 and IPv6 ranges it covers.
+.DESCRIPTION
+    Nothing, a blank, 'Any', 'ANY' and '*' are the one set 'any' (which is NOT the same key as a list that
+    happens to cover every address). Single addresses, a-b ranges, a/len prefixes, a/mask prefixes and
+    IPv6 in any form are read to numeric ranges; order, repeats and how the set is split do not matter.
+    Throws on anything it cannot read exactly.
+#>
+function ConvertTo-EgressAddressKey {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()] $Value)
+    $items = Get-EgressListItems -Value $Value
+    if ($items.Count -eq 0) { return 'any' }
+    $anyCount = @($items | Where-Object { $_ -ieq 'any' -or $_ -eq '*' }).Count
+    if ($anyCount -gt 0) {
+        if ($items.Count -eq 1) { return 'any' }
+        throw "HostEgress: an address list mixes 'Any' with other entries ($($items -join ', '))."
+    }
+    $byFamily = @{ v4 = [System.Collections.Generic.List[object]]::new(); v6 = [System.Collections.Generic.List[object]]::new() }
+    foreach ($item in $items) {
+        $r = ConvertTo-EgressAddressRange -Item $item
+        $byFamily[$r.Family].Add(@{ First = $r.First; Last = $r.Last })
+    }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($fam in @('v4', 'v6')) {
+        if ($byFamily[$fam].Count -eq 0) { continue }
+        $merged = Merge-EgressRanges -Ranges $byFamily[$fam].ToArray()
+        $parts.Add("$fam=" + ((@($merged) | ForEach-Object { '{0}-{1}' -f $_.First, $_.Last }) -join ','))
+    }
+    return ($parts -join ';')
+}
+
+<#
+.SYNOPSIS
+    One canonical key for a firewall port list: 'any', or the merged port ranges it covers (0 to 65535).
+.DESCRIPTION
+    A port keyword such as RPC, a value outside 0..65535 and a reversed range throw.
+#>
+function ConvertTo-EgressPortKey {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()] $Value)
+    $items = Get-EgressListItems -Value $Value
+    if ($items.Count -eq 0) { return 'any' }
+    $anyCount = @($items | Where-Object { $_ -ieq 'any' -or $_ -eq '*' }).Count
+    if ($anyCount -gt 0) {
+        if ($items.Count -eq 1) { return 'any' }
+        throw "HostEgress: a port list mixes 'Any' with other entries ($($items -join ', '))."
+    }
+    $ranges = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $items) {
+        if ($item -notmatch '^(\d{1,5})(?:-(\d{1,5}))?$') { throw "HostEgress: '$item' is not a port or port range the gate can read." }
+        $lo = [System.Numerics.BigInteger]::Parse($Matches[1])
+        $hi = if ($Matches[2]) { [System.Numerics.BigInteger]::Parse($Matches[2]) } else { $lo }
+        if ($lo -gt 65535 -or $hi -gt 65535 -or $lo -gt $hi) { throw "HostEgress: '$item' is outside 0..65535 or reversed." }
+        $ranges.Add(@{ First = $lo; Last = $hi })
+    }
+    $merged = Merge-EgressRanges -Ranges $ranges.ToArray()
+    return 'p=' + ((@($merged) | ForEach-Object { '{0}-{1}' -f $_.First, $_.Last }) -join ',')
+}
+
 <#
 .SYNOPSIS
     Seal-gate checks for a HostProxy VM. Throws a named refusal; returns nothing when all hold.
@@ -567,7 +761,9 @@ function ConvertTo-EgressCompareKey {
        bug cannot certify weaker enforcement);
     2. the gateway address is on "vEthernet (<switch>)" with the plan's prefix, no other host address
        overlaps the subnet, and no NAT network covers it (Get-EgressAddressConflict);
-    3. every recorded firewall rule exists, is enabled and matches its record field for field;
+    3. every recorded firewall rule exists, is enabled and matches its record field for field (addresses
+       and ports as parsed sets, so another rendering of the same set passes; an entry the parser cannot
+       read exactly is a refusal);
     4. the VM's adapter carries exactly the recorded ACL entries, no more and no fewer.
     Every read that throws or returns no collection is a refusal.
 #>
@@ -594,11 +790,17 @@ function Assert-SandboxEgressSealed {
     # 1. the records are the full required set
     $wantRules = @(Get-EgressFirewallRuleSpec -Plan $plan)
     $gotRules  = @(Get-EgressDescriptorField -Descriptor $Descriptor -Name 'EgressFirewallRules' -Default @())
+    # Addresses and ports compare as parsed sets (ConvertTo-EgressAddressKey / ConvertTo-EgressPortKey), not
+    # as text; an entry that cannot be parsed throws, and each caller turns that into a named refusal.
     $ruleKey = { param($r) ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f (Get-EgressPlanField $r 'Name'), (Get-EgressPlanField $r 'Direction'), (Get-EgressPlanField $r 'Action'),
-                 (Get-EgressPlanField $r 'Protocol'), (ConvertTo-EgressCompareKey (Get-EgressPlanField $r 'LocalAddress')), (ConvertTo-EgressCompareKey (Get-EgressPlanField $r 'LocalPort')),
-                 (ConvertTo-EgressCompareKey (Get-EgressPlanField $r 'RemoteAddress')), (ConvertTo-EgressCompareKey (Get-EgressPlanField $r 'InterfaceAlias'))).ToLowerInvariant() }
-    $wantKeys = @($wantRules | ForEach-Object { & $ruleKey $_ } | Sort-Object)
-    $gotKeys  = @($gotRules  | ForEach-Object { & $ruleKey $_ } | Sort-Object)
+                 (Get-EgressPlanField $r 'Protocol'), (ConvertTo-EgressAddressKey (Get-EgressPlanField $r 'LocalAddress')), (ConvertTo-EgressPortKey (Get-EgressPlanField $r 'LocalPort')),
+                 (ConvertTo-EgressAddressKey (Get-EgressPlanField $r 'RemoteAddress')), (ConvertTo-EgressCompareKey (Get-EgressPlanField $r 'InterfaceAlias'))).ToLowerInvariant() }
+    $wantKeys = $null; $gotKeys = $null
+    try {
+        $wantKeys = @($wantRules | ForEach-Object { & $ruleKey $_ } | Sort-Object)
+        $gotKeys  = @($gotRules  | ForEach-Object { & $ruleKey $_ } | Sort-Object)
+    }
+    catch { throw "$head a recorded host firewall rule has an address or port the gate cannot interpret ($($_.Exception.Message)). Fail closed." }
     if (($wantKeys -join "`n") -ne ($gotKeys -join "`n")) {
         throw "$head the descriptor records $($gotRules.Count) host firewall rule(s) that are not the $($wantRules.Count) its egress plan requires. Fail closed."
     }
@@ -638,7 +840,10 @@ function Assert-SandboxEgressSealed {
         catch { throw "$head host firewall rule '$name' could not be read ($($_.Exception.Message)). Fail closed." }
         if ($null -eq $host_) { throw "$head host firewall rule '$name' is missing. Fail closed." }
         if (-not [bool](Get-EgressPlanField $host_ 'Enabled')) { throw "$head host firewall rule '$name' is disabled. Fail closed." }
-        if ((& $ruleKey $host_) -ne (& $ruleKey $rule)) {
+        $hostKey = $null
+        try { $hostKey = & $ruleKey $host_ }
+        catch { throw "$head host firewall rule '$name' reports an address or port the gate cannot interpret ($($_.Exception.Message)). Fail closed." }
+        if ($hostKey -ne (& $ruleKey $rule)) {
             throw "$head host firewall rule '$name' differs from its record (direction, action, protocol, addresses, ports or interface). Fail closed."
         }
     }
