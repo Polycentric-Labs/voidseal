@@ -68,7 +68,11 @@ from the host side:
 - **Secret-file refusal** — no secret-shaped mount source, any tier.
 - **Pre-seal gate**: `Assert-Sealed` refuses to certify a VM that must have no NIC (Tier 0,
   Tier ≥ 2, any processor) while the host reports one, refuses any passthrough device at every
-  tier, and refuses a secret-shaped or unrecorded attached volume.
+  tier, and refuses a secret-shaped or unrecorded attached volume. At every tier it also refuses a
+  host channel left on (the four original ones plus the Time Synchronization, Key-Value Pair
+  Exchange, Backup and Heartbeat integration services; Shutdown stays on, and the reference TSC
+  page still gives the guest host-paced time), a pipe path on COM2, automatic checkpoints, and any
+  existing checkpoint.
 - **Guest sizing bounds and the free-RAM gate**: the loader bounds `Memory` (`512MB` to `64GB`)
   and `Cpu` (1 to 32) for every tier and workload, and `New-SandboxVM` refuses, before it creates
   anything, to start a guest whose memory plus a margin (default 2GB) does not fit in the host's

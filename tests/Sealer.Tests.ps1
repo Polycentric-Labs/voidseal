@@ -584,7 +584,7 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         & $b.NewSwitch @{ Name = 'ext-sw'; SwitchType = 'External'; NetAdapterName = 'Ethernet' }
         & $b.ConnectNetworkAdapter @{ VMName = 'sbx-i4-external'; SwitchName = 'ext-sw' }
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Internal*' -Because 'an External switch bypasses the host-controlled egress chokepoint; the seal must refuse'
+            Should -Throw -ExpectedMessage "*its NIC is on switch 'ext-sw' (SwitchType=External), not an isolated Internal vSwitch*" -Because 'an External switch bypasses the host-controlled egress chokepoint; the seal must refuse'
     }
 
     It 'Tier-1: REFUSES when the NIC is on an unresolvable switch name (no matching VMSwitch on host)' {
@@ -599,7 +599,7 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         $vm = & $b.GetVM @{ Name = 'sbx-i4-unresolvable' }
         $vm.NetworkAdapters.Add(@{ SwitchName = 'orphan-switch-zz9'; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Internal*' -Because 'a NIC on a switch name with no resolvable host VMSwitch object cannot be verified isolated; fail closed'
+            Should -Throw -ExpectedMessage "*its NIC is on switch 'orphan-switch-zz9' (SwitchType=(switch not found on host))*" -Because 'a NIC on a switch name with no resolvable host VMSwitch object cannot be verified isolated; fail closed'
     }
 
     It 'Tier-1: REFUSES when the NIC is on the built-in "Default Switch" (type-Internal but ICS/internet)' {
@@ -616,7 +616,7 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         $vm = & $b.GetVM @{ Name = 'sbx-i4-defaultswitch' }
         $vm.NetworkAdapters.Add(@{ SwitchName = 'Default Switch'; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Default Switch*' `
+            Should -Throw -ExpectedMessage "*its NIC is on the built-in 'Default Switch'*" `
                 -Because 'the Default Switch is ICS/internet egress the host does not control; a Tier-1 seal must refuse it by name even though it reports type-Internal'
     }
 
@@ -628,7 +628,49 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         $vm = & $b.GetVM @{ Name = 'sbx-i4-noswitch' }
         $vm.NetworkAdapters.Add(@{ SwitchName = ''; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Internal*' -Because 'a NIC not attached to any resolvable vSwitch cannot be verified isolated; fail closed'
+            Should -Throw -ExpectedMessage '*a network adapter is not on any vSwitch (no SwitchName)*' -Because 'a NIC not attached to any resolvable vSwitch cannot be verified isolated; fail closed'
+    }
+
+    It 'Tier-1: REFUSES a NIC re-pointed at ANOTHER Internal switch (type-Internal, not Default, but not this VM''s own)' {
+        # The gap the review found: any Internal switch not named "Default Switch" used to certify, e.g.
+        # another sandbox's switch or one the host has NAT'ed. The gate now binds the NIC to the switch the
+        # Provisioner recorded on the descriptor.
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-repoint'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        $d.SwitchName | Should -Be 'sbx-i4-repoint-int' -Because 'precondition: the Provisioner records its own switch'
+        & $b.NewSwitch @{ Name = 'sbx-other-int'; SwitchType = 'Internal' }
+        & $b.ConnectNetworkAdapter @{ VMName = 'sbx-i4-repoint'; SwitchName = 'sbx-other-int' }
+        @(& $b.GetNetworkAdapter @{ VMName = 'sbx-i4-repoint' }).Count | Should -Be 1 -Because 'precondition: still one NIC, only re-pointed'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*its NIC is on switch 'sbx-other-int', not this VM's own recorded switch 'sbx-i4-repoint-int'*"
+    }
+
+    It 'Tier-1: REFUSES a second NIC, even when both sit on the VM''s own switch' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-twonics'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        (& $b.GetVM @{ Name = 'sbx-i4-twonics' }).NetworkAdapters.Add(@{ SwitchName = 'sbx-i4-twonics-int'; Name = 'Network Adapter 2' })
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*because 2 network adapters are attached; a Tier-1 VM must have exactly one*"
+    }
+
+    It 'Tier-1: REFUSES zero NICs too (the seal must find the one adapter the Provisioner connected)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-nonic'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-nonic' }
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*because 0 network adapters are attached; a Tier-1 VM must have exactly one*"
+    }
+
+    It 'Tier-1: REFUSES a descriptor that records no SwitchName (nothing to bind the NIC to)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-noswname'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        $d.SwitchName = $null
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*because the descriptor records no SwitchName, so its NIC cannot be bound to the VM's own switch*"
     }
 
     It 'Tier>=2/processor (no-NIC) regression: the switch-isolation check does not fire when there is no NIC' {
@@ -1160,6 +1202,27 @@ Describe 'Lock-Sandbox + Assert-Sealed: the NIC policy is enforced at every tier
             Should -Throw -ExpectedMessage '*no Network posture*'
     }
 
+    It 'Assert-Sealed REFUSES (fail closed) when the adapter read returns no collection: <Label>' -ForEach @(
+        @{ Tier = 0; Label = 'Tier 0, NoAdapter branch' },
+        @{ Tier = 1; Label = 'Tier 1, isolated-switch branch' }
+    ) {
+        $p = if ($Tier -eq 0) { $script:T0 } else { $script:Tier1 }
+        $sb = & $script:NewTestSandbox -Profile $p -Name "sbx-np-nullnic$Tier"
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue -Because 'precondition: the seal certifies with a working read'
+        $sb.Backend.GetNetworkAdapter = { param($P) return $null }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*REFUSING to certify 'sbx-np-nullnic$Tier' SEALED because the host could not report its network adapters (the read returned no collection)*"
+    }
+
+    It 'Assert-Sealed REFUSES a Tier-1 descriptor whose Network label the policy does not recognize' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-np-badlabel'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $sb.Desc.Network = 'Internal'
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*REFUSING to certify 'sbx-np-badlabel' SEALED because its network-adapter policy cannot be determined*Tier-1 Network label 'Internal' is not recognized*"
+    }
+
     It 'Lock-Sandbox removes the NIC whenever the policy is not exactly IsolatedInternalSwitch (allow-list polarity): <Label>' -ForEach @(
         @{ Policy = 'HostProxyAdapter'; Label = 'an unknown name' },
         @{ Policy = $null;              Label = 'null' }
@@ -1384,5 +1447,277 @@ Describe 'Assert-Sealed: refuses any passthrough device (GPU partition adapter o
         $sb.Backend.GetGpuPartitionAdapters = { param($P) return $null }.GetNewClosure()
         { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
             Should -Throw -ExpectedMessage '*could not report*'
+    }
+}
+
+# ===========================================================================
+#  Seal coverage (design E6): integration services
+# ===========================================================================
+#  Time Synchronization, Key-Value Pair Exchange, Backup (VSS) and Heartbeat are live VMBus channels the
+#  engine never uses. Lock-Sandbox turns them off and Assert-Sealed host-verifies they read off, failing
+#  closed when one cannot be read. Shutdown is left on: the engine's StopVM calls (no TurnOff) ask the
+#  guest to shut down through it. A service "left on" is modeled with -SimulateChannelStuckOn, a disable
+#  that silently does not take, so the gate is shown to read host truth rather than trust the seal.
+Describe 'Seal coverage: the four integration services are disabled by the seal and host-verified off' {
+
+    BeforeAll {
+        $script:IsChannels = @('TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat')
+        # Provision (on the given backend) and seal at Tier 0, 1 or 2; returns @{ Backend; Desc }.
+        $script:NewSealedOn = {
+            param([hashtable] $Backend, [int] $Tier, [string] $Name)
+            $p = $script:Tier1
+            if ($Tier -eq 0) {
+                $p = $script:Tier1.Clone()
+                $p['Tier']        = 0
+                $p['Description'] = 'TEST FIXTURE: Tier 0 for the seal-coverage gate.'
+            }
+            elseif ($Tier -eq 2) { $p = $script:Tier2 }
+            $d = New-SandboxVM -Profile $p -Name $Name -Backend $Backend
+            Lock-Sandbox -Descriptor $d -Backend $Backend
+            return @{ Backend = $Backend; Desc = $d }
+        }
+    }
+
+    It 'the Sealer seals exactly the backend''s channel set, which includes the four services and not Shutdown' {
+        ($script:SealHostChannels -join ',') | Should -Be ($script:HostChannelNames -join ',')
+        foreach ($c in $script:IsChannels) { $script:SealHostChannels | Should -Contain $c }
+        $script:SealHostChannels | Should -Not -Contain 'Shutdown'
+    }
+
+    It 'Lock-Sandbox turns each of the four services OFF at Tiers 0, 1 and 2, and the gate certifies' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedOn -Backend (New-FakeHyperVBackend) -Tier $t -Name "sbx-is-clean$t"
+            $ch = & $sb.Backend.GetHostChannels @{ VMName = "sbx-is-clean$t" }
+            foreach ($c in $script:IsChannels) { $ch[$c] | Should -BeFalse -Because "Lock-Sandbox must disable $c at Tier $t" }
+            Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+        }
+    }
+
+    It 'REFUSES a VM whose <Channel> service is still ON after the seal (named refusal)' -ForEach @(
+        @{ Channel = 'TimeSync' }, @{ Channel = 'KeyValueExchange' }, @{ Channel = 'Backup' }, @{ Channel = 'Heartbeat' }
+    ) {
+        $sb = & $script:NewSealedOn -Backend (New-FakeHyperVBackend -SimulateChannelStuckOn $Channel) -Tier 1 -Name "sbx-is-on-$Channel"
+        (& $sb.Backend.GetHostChannels @{ VMName = "sbx-is-on-$Channel" })[$Channel] |
+            Should -BeTrue -Because 'precondition: the stuck service survived the seal'
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*host channel '$Channel' is still ON*" -Because "a live $Channel service must be refused by name"
+    }
+
+    It 'REFUSES (fail closed) when the host reports no state for <Channel>' -ForEach @(
+        @{ Channel = 'TimeSync' }, @{ Channel = 'KeyValueExchange' }, @{ Channel = 'Backup' }, @{ Channel = 'Heartbeat' }
+    ) {
+        $sb = & $script:NewSealedOn -Backend (New-FakeHyperVBackend) -Tier 1 -Name "sbx-is-unread-$Channel"
+        $real = $sb.Backend.GetHostChannels
+        $drop = $Channel
+        $sb.Backend.GetHostChannels = { param($P) $h = & $real $P; $h.Remove($drop); return $h }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*could not read host-channel '$Channel' state*"
+    }
+
+    It 'REFUSES (fail closed) when the host-channel read throws, at Tier 0' {
+        $sb = & $script:NewSealedOn -Backend (New-FakeHyperVBackend) -Tier 0 -Name 'sbx-is-throw'
+        $sb.Backend.GetHostChannels = { param($P) throw 'INJECTED: integration-service enumeration failed' }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*INJECTED: integration-service enumeration failed*'
+    }
+}
+
+# ===========================================================================
+#  Seal coverage (design E6): COM2
+# ===========================================================================
+#  Voidseal wires only COM1 (the serial management channel). A named pipe on COM2 is a second byte stream
+#  between guest and host that the tool never created, so the gate refuses it at every tier, serial-managed
+#  or not. The COM1 logic is unchanged. A COM2 read that throws refuses too.
+Describe 'Seal coverage: Assert-Sealed refuses a VM whose COM2 has a path' {
+
+    BeforeAll {
+        $script:NewSealedCom = {
+            param([hashtable] $Backend, [int] $Tier, [string] $Name)
+            $p = $script:Tier1
+            if ($Tier -eq 0) {
+                $p = $script:Tier1.Clone()
+                $p['Tier']        = 0
+                $p['Description'] = 'TEST FIXTURE: Tier 0 for the COM2 gate.'
+            }
+            elseif ($Tier -eq 2) { $p = $script:Tier2 }
+            $d = New-SandboxVM -Profile $p -Name $Name -Backend $Backend
+            Lock-Sandbox -Descriptor $d -Backend $Backend
+            return @{ Backend = $Backend; Desc = $d }
+        }
+    }
+
+    It 'a clean seal leaves COM2 without a path and certifies (the default fake models an empty COM2)' {
+        $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-com2-clean'
+        (& $sb.Backend.GetComPort @{ VMName = 'sbx-com2-clean'; Number = 2 }) | Should -BeNullOrEmpty
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+
+    It 'REFUSES a COM2 path at Tiers 0, 1 and 2 (SimulateCom2Path), naming the pipe' {
+        foreach ($t in 0, 1, 2) {
+            $pipe = "\\.\pipe\sbx-com2-$t-extra"
+            $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend -SimulateCom2Path $pipe) -Tier $t -Name "sbx-com2-$t"
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage "*COM2 port is connected to '$pipe'*" -Because "a COM2 pipe must be refused at Tier $t"
+        }
+    }
+
+    It 'REFUSES a COM2 path wired after the seal, on a descriptor that is not serial-managed' {
+        $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-com2-late'
+        Set-DescriptorField -Descriptor $sb.Desc -Name 'ManagementChannel' -Value $null
+        Set-DescriptorField -Descriptor $sb.Desc -Name 'ComPipePath' -Value $null
+        & $sb.Backend.SetComPort @{ VMName = 'sbx-com2-late'; Number = 2; Path = '\\.\pipe\late-com2' }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*COM2 port is connected to '\\.\pipe\late-com2'*" -Because 'the COM2 rule does not depend on the COM1 serial-management test'
+    }
+
+    It 'REFUSES (fail closed) when the COM2 read throws, and still reads COM1 through the same method' {
+        $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-com2-throw'
+        $real = $sb.Backend.GetComPort
+        $sb.Backend.GetComPort = {
+            param($P)
+            if ([int]$P['Number'] -eq 2) { throw 'INJECTED: COM2 query failed' }
+            return (& $real $P)
+        }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not read its COM2 port (INJECTED: COM2 query failed)*'
+    }
+
+    It 'COM1 logic is unchanged: a serial-managed VM with COM1 attached and COM2 empty still certifies' {
+        $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend) -Tier 0 -Name 'sbx-com2-com1ok'
+        (& $sb.Backend.GetComPort @{ VMName = 'sbx-com2-com1ok'; Number = 1 }) | Should -Not -BeNullOrEmpty -Because 'precondition: COM1 is wired'
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+}
+
+# ===========================================================================
+#  Seal coverage (design E6): checkpoints
+# ===========================================================================
+#  A checkpoint holds a copy of the VM's state from before the seal, and restoring it would undo the seal
+#  without the gate ever seeing it. Automatic checkpoints also pin a differencing .avhdx per disk (RC7). The
+#  Provisioner turns automatic checkpoints off and never takes a checkpoint, so the gate refuses either at
+#  every tier and fails closed when it cannot read the setting or list the checkpoints.
+Describe 'Seal coverage: Assert-Sealed refuses automatic checkpoints and any existing checkpoint' {
+
+    BeforeAll {
+        $script:NewSealedCp = {
+            param([hashtable] $Backend, [int] $Tier, [string] $Name)
+            $p = $script:Tier1
+            if ($Tier -eq 0) {
+                $p = $script:Tier1.Clone()
+                $p['Tier']        = 0
+                $p['Description'] = 'TEST FIXTURE: Tier 0 for the checkpoint gate.'
+            }
+            elseif ($Tier -eq 2) { $p = $script:Tier2 }
+            $d = New-SandboxVM -Profile $p -Name $Name -Backend $Backend
+            Lock-Sandbox -Descriptor $d -Backend $Backend
+            return @{ Backend = $Backend; Desc = $d }
+        }
+    }
+
+    It 'a clean seal has automatic checkpoints off and no checkpoint, and certifies' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-clean'
+        (& $sb.Backend.GetAutomaticCheckpoints @{ VMName = 'sbx-cp-clean' }) | Should -BeFalse
+        (& $sb.Backend.GetCheckpoint @{ VMName = 'sbx-cp-clean' }).Count | Should -Be 0
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+
+    It 'REFUSES automatic checkpoints left ON at Tiers 0, 1 and 2 (SimulateAutomaticCheckpointsStuckOn)' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend -SimulateAutomaticCheckpointsStuckOn) -Tier $t -Name "sbx-cp-auto$t"
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage '*because automatic checkpoints are enabled*' -Because "automatic checkpoints must be refused at Tier $t"
+        }
+    }
+
+    It 'REFUSES automatic checkpoints turned back ON after the seal' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 0 -Name 'sbx-cp-reon'
+        & $sb.Backend.SetAutomaticCheckpoints @{ VMName = 'sbx-cp-reon'; Enabled = $true }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*because automatic checkpoints are enabled*'
+    }
+
+    It 'REFUSES an existing checkpoint at Tiers 0, 1 and 2 (SimulateCheckpointPresent), counting it' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend -SimulateCheckpointPresent) -Tier $t -Name "sbx-cp-has$t"
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage '*because 1 checkpoint(s) exist*' -Because "a checkpoint must be refused at Tier $t"
+        }
+    }
+
+    It 'REFUSES checkpoints taken after the seal, counting each one' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-two'
+        Checkpoint-Sandbox -Name 'sbx-cp-two' -SnapshotName 'a' -Backend $sb.Backend
+        Checkpoint-Sandbox -Name 'sbx-cp-two' -SnapshotName 'b' -Backend $sb.Backend
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*because 2 checkpoint(s) exist*'
+    }
+
+    It 'REFUSES (fail closed) when the automatic-checkpoint read throws' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-autothrow'
+        $sb.Backend.GetAutomaticCheckpoints = { param($P) throw 'INJECTED: Get-VM failed' }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not read its automatic-checkpoint setting (INJECTED: Get-VM failed)*'
+    }
+
+    It 'REFUSES (fail closed) when the automatic-checkpoint read is not a boolean: <Label>' -ForEach @(
+        @{ Value = $null;   Label = 'null' },
+        @{ Value = 'False'; Label = 'the string False' },
+        @{ Value = 0;       Label = 'the integer 0' }
+    ) {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-autobad'
+        $v = $Value
+        $sb.Backend.GetAutomaticCheckpoints = { param($P) return $v }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*host returned no boolean automatic-checkpoint setting*'
+    }
+
+    It 'REFUSES (fail closed) when the checkpoint listing throws' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-listthrow'
+        $sb.Backend.GetCheckpoint = { param($P) throw 'INJECTED: Get-VMSnapshot failed' }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not list its checkpoints (INJECTED: Get-VMSnapshot failed)*'
+    }
+
+    It 'REFUSES (fail closed) when the checkpoint listing returns no collection' {
+        $sb = & $script:NewSealedCp -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-cp-listnull'
+        $sb.Backend.GetCheckpoint = { param($P) return $null }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not list its checkpoints (the read returned no collection)*'
+    }
+}
+
+# ===========================================================================
+#  The NIC policy predicate travels with the Sealer
+# ===========================================================================
+#  Lock-Sandbox and Assert-Sealed call Get-SealNicPolicy. It used to live in Provisioner.ps1, so a session
+#  that dot-sourced Sealer.ps1 alone could not seal. It now lives in SealPolicy.ps1, which both the Sealer
+#  and the Provisioner dot-source, and each file is checked here in a fresh runspace.
+Describe 'Get-SealNicPolicy loads with Sealer.ps1 and with Provisioner.ps1, each dot-sourced alone' {
+
+    It 'a fresh runspace that dot-sources only <File> can call Get-SealNicPolicy' -ForEach @(
+        @{ File = 'Sealer.ps1' }, @{ File = 'Provisioner.ps1' }
+    ) {
+        $path = Join-Path $script:SkillRoot "scripts/lib/$File"
+        $ps = [powershell]::Create()
+        try {
+            $null = $ps.AddScript({
+                param($p)
+                . $p
+                Get-SealNicPolicy -Tier 1 -Network 'Internal+Allowlist'
+            }).AddArgument($path)
+            $out = $ps.Invoke()
+            @($ps.Streams.Error).Count | Should -Be 0 -Because "dot-sourcing $File alone must not error: $(@($ps.Streams.Error) -join '; ')"
+            @($out)[0] | Should -Be 'IsolatedInternalSwitch'
+        }
+        finally { $ps.Dispose() }
+    }
+
+    It 'the predicate is defined in exactly one file, SealPolicy.ps1' {
+        $defs = @(Get-ChildItem -LiteralPath (Join-Path $script:SkillRoot 'scripts/lib') -Filter '*.ps1' | Where-Object {
+            $t = $null; $e = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$t, [ref]$e)
+            @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-SealNicPolicy' }, $true)).Count -gt 0
+        } | ForEach-Object { $_.Name })
+        $defs | Should -Be @('SealPolicy.ps1')
     }
 }

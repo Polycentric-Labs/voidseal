@@ -56,6 +56,55 @@ BeforeAll {
                       $n.Left.Extent.Text -eq ('$b.' + $Method)
         }, $true) | Select-Object -First 1
     }
+
+    # AST pin helpers: each returns the matching NODES under an AST, so a pin built on one is satisfied
+    # only by real code, never by a comment or a string that names the call. 'AST pin helpers' below
+    # proves each one rejects a commented-out or quoted call.
+    #   PinFindCommand     <ast> <command> [<param>]  CommandAst invoking <command>, with -<param> when given
+    #   PinFindPipedInto   <ast> <command>            CommandAst for <command> fed by an upstream pipeline element
+    #   PinFindCountGuard  <ast>                      BinaryExpressionAst `<x>.Count -gt 0`
+    #   PinFindCommaReturn <ast>                      ReturnStatementAst returning `,@(...)`
+    $script:PinFindCommand = {
+        param($Ast, [string] $Command, [string] $Param)
+        @($Ast.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq $Command
+        }, $true) | Where-Object {
+            [string]::IsNullOrEmpty($Param) -or @($_.CommandElements | Where-Object {
+                $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq $Param }).Count -gt 0
+        })
+    }
+    $script:PinFindPipedInto = {
+        param($Ast, [string] $Command)
+        @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] }, $true) | ForEach-Object {
+            $els = @($_.PipelineElements)
+            for ($i = 1; $i -lt $els.Count; $i++) {
+                if ($els[$i] -is [System.Management.Automation.Language.CommandAst] -and $els[$i].GetCommandName() -eq $Command) { $els[$i] }
+            }
+        })
+    }
+    $script:PinFindCountGuard = {
+        param($Ast)
+        @($Ast.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                      $n.Operator -eq [System.Management.Automation.Language.TokenKind]::Igt -and
+                      $n.Left -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                      $n.Left.Member.Extent.Text -eq 'Count' -and
+                      $n.Right -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+                      $n.Right.Value -eq 0
+        }, $true))
+    }
+    $script:PinFindCommaReturn = {
+        param($Ast)
+        @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and $null -ne $n.Pipeline }, $true) |
+            Where-Object {
+                # `,@(...)` parses as a one-element ArrayLiteralAst wrapping an ArrayExpressionAst.
+                $null -ne $_.Pipeline.Find({
+                    param($m) $m -is [System.Management.Automation.Language.ArrayLiteralAst] -and
+                              @($m.Elements).Count -eq 1 -and
+                              $m.Elements[0] -is [System.Management.Automation.Language.ArrayExpressionAst]
+                }, $true)
+            })
+    }
 }
 
 # ===========================================================================
@@ -77,7 +126,7 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             # VM lifecycle
             'NewVM', 'GetVM', 'StartVM', 'StopVM', 'RemoveVM'
             # hardware
-            'SetProcessor', 'SetMemory', 'SetFirmware', 'SetAutomaticCheckpoints', 'SetComPort', 'GetComPort'
+            'SetProcessor', 'SetMemory', 'SetFirmware', 'SetAutomaticCheckpoints', 'GetAutomaticCheckpoints', 'SetComPort', 'GetComPort'
             # host resource read (the free-RAM gate)
             'GetHostMemory'
             # guest command delivery (the Runner serial seam)
@@ -191,7 +240,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
         # from the manifest's first identifying key. TestAvailable is arg-less (excluded).
         $primaryKey = @{
             NewVM = 'Name'; GetVM = 'Name'; StartVM = 'Name'; StopVM = 'Name'; RemoveVM = 'Name'
-            SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
+            SetProcessor = 'VMName'; SetMemory = 'VMName'; SetFirmware = 'VMName'; SetAutomaticCheckpoints = 'VMName'; GetAutomaticCheckpoints = 'VMName'; SetComPort = 'VMName'; GetComPort = 'VMName'
             InvokeGuestCommand = 'VMName'
             SetHostChannel = 'VMName'; GetHostChannels = 'VMName'
             NewVHD = 'Path'; NewOutputVhdx = 'Path'; WriteVhdxFile = 'Path'; ReadVhdxFile = 'Path'; WriteVhdxFileBytes = 'Path'; ReadVhdxFileBytes = 'Path'; ReadVhdxRawRegion = 'Path'; GetVhdxImageHash = 'Path'; GetVHDInfo = 'Path'; RemoveVHD = 'Path'; GetVolumeFreeSpace = 'Path'
@@ -490,6 +539,36 @@ Describe 'Fake backend — SetAutomaticCheckpoints (RC7)' {
         (New-RealHyperVBackend)['SetAutomaticCheckpoints'] | Should -BeOfType [scriptblock]
         (New-FakeHyperVBackend)['SetAutomaticCheckpoints'] | Should -BeOfType [scriptblock]
     }
+
+    It 'GetAutomaticCheckpoints reads the recorded flag back as a [bool] (the seal gate''s host read)' {
+        $v = & $script:B.GetAutomaticCheckpoints @{ VMName = 'vm1' }
+        $v | Should -BeOfType [bool]
+        $v | Should -BeTrue -Because 'a fresh VM carries the Hyper-V default'
+        & $script:B.SetAutomaticCheckpoints @{ VMName = 'vm1'; Enabled = $false }
+        (& $script:B.GetAutomaticCheckpoints @{ VMName = 'vm1' }) | Should -BeFalse
+        @($script:ExpectedMethods['GetAutomaticCheckpoints']) | Should -Be @('VMName')
+    }
+
+    It 'SimulateAutomaticCheckpointsStuckOn: the disable does not take, so the read stays $true' {
+        $b = New-FakeHyperVBackend -SimulateAutomaticCheckpointsStuckOn
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $b.SetAutomaticCheckpoints @{ VMName = 'vm1'; Enabled = $false }
+        (& $b.GetAutomaticCheckpoints @{ VMName = 'vm1' }) | Should -BeTrue
+    }
+
+    It 'SimulateCheckpointPresent: every new VM lists one checkpoint, and it can be restored' {
+        $b = New-FakeHyperVBackend -SimulateCheckpointPresent
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        $cps = & $b.GetCheckpoint @{ VMName = 'vm1' }
+        $cps.Count   | Should -Be 1
+        $cps[0].Name | Should -Be 'external-checkpoint'
+        { & $b.RestoreCheckpoint @{ VMName = 'vm1'; SnapshotName = 'external-checkpoint' } } | Should -Not -Throw
+        (& $script:B.GetCheckpoint @{ VMName = 'vm1' }).Count | Should -Be 0 -Because 'without the switch a new VM has no checkpoint'
+    }
+
+    It 'GetAutomaticCheckpoints on a missing VM throws naming the VM' {
+        { & $script:B.GetAutomaticCheckpoints @{ VMName = 'ghost' } } | Should -Throw -ExpectedMessage '*ghost*'
+    }
 }
 
 # ===========================================================================
@@ -550,17 +629,53 @@ Describe 'Fake backend — host channels (the seal surface)' {
     }
 
     It 'a freshly-created VM reports ALL host channels ON (the unsealed default)' {
-        # Hyper-V enables Guest Services / Enhanced Session by default; a new VM is NOT sealed.
+        # Hyper-V enables Enhanced Session and the Time Synchronization, Key-Value Pair Exchange, Backup
+        # and Heartbeat integration services by default; a new VM is NOT sealed.
         $ch = & $script:B.GetHostChannels @{ VMName = 'vm1' }
-        $ch.Clipboard       | Should -BeTrue
-        $ch.Shares          | Should -BeTrue
-        $ch.GuestServices   | Should -BeTrue
-        $ch.EnhancedSession | Should -BeTrue
+        foreach ($name in 'Clipboard', 'Shares', 'GuestServices', 'EnhancedSession', 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') {
+            $ch[$name] | Should -BeTrue -Because "$name starts ON on a fresh VM, so the seal's disable is observable"
+        }
     }
 
-    It 'GetHostChannels returns exactly the four canonical channel keys' {
+    It 'GetHostChannels returns exactly the eight canonical channel keys' {
         $ch = & $script:B.GetHostChannels @{ VMName = 'vm1' }
-        @($ch.Keys | Sort-Object) -join ',' | Should -Be 'Clipboard,EnhancedSession,GuestServices,Shares'
+        @($ch.Keys | Sort-Object) -join ',' |
+            Should -Be 'Backup,Clipboard,EnhancedSession,GuestServices,Heartbeat,KeyValueExchange,Shares,TimeSync'
+    }
+
+    It 'the canonical channel list adds the four integration services and leaves Shutdown out' {
+        # Shutdown stays enabled on purpose: the engine stops VMs with StopVM without TurnOff, which asks
+        # the guest to shut down through that service (docs/threat-model.md).
+        $script:HostChannelNames -join ',' |
+            Should -Be 'Clipboard,Shares,GuestServices,EnhancedSession,TimeSync,KeyValueExchange,Backup,Heartbeat'
+        $script:HostChannelNames | Should -Not -Contain 'Shutdown'
+    }
+
+    It 'SetHostChannel turns each integration service OFF independently' {
+        foreach ($name in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') {
+            $b = New-FakeHyperVBackend
+            & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+            & $b.SetHostChannel @{ VMName = 'vm1'; Channel = $name; Enabled = $false }
+            $ch = & $b.GetHostChannels @{ VMName = 'vm1' }
+            $ch[$name] | Should -BeFalse -Because "$name was turned off"
+            @($ch.Keys | Where-Object { $_ -ne $name -and -not $ch[$_] }).Count |
+                Should -Be 0 -Because "turning $name off must not touch another channel"
+        }
+    }
+
+    It 'SimulateChannelStuckOn: the disable of a stuck channel does not take; the others still turn off' {
+        $b = New-FakeHyperVBackend -SimulateChannelStuckOn 'KeyValueExchange'
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $b.SetHostChannel @{ VMName = 'vm1'; Channel = 'KeyValueExchange'; Enabled = $false }
+        & $b.SetHostChannel @{ VMName = 'vm1'; Channel = 'TimeSync'; Enabled = $false }
+        $ch = & $b.GetHostChannels @{ VMName = 'vm1' }
+        $ch.KeyValueExchange | Should -BeTrue  -Because 'a stuck channel stays ON after its disable'
+        $ch.TimeSync         | Should -BeFalse -Because 'a channel that is not stuck still turns off'
+    }
+
+    It 'SimulateChannelStuckOn rejects a channel name the backend does not know' {
+        { New-FakeHyperVBackend -SimulateChannelStuckOn 'Shutdown' } |
+            Should -Throw -ExpectedMessage "*SimulateChannelStuckOn names unknown channel 'Shutdown'*"
     }
 
     It 'SetHostChannel turns a single channel OFF (others untouched)' {
@@ -821,6 +936,79 @@ Describe 'Real backend — Linux-guest host-channel seal model (invalid-enum SET
         $script:ChCap.GetGsiThrows.err | Should -Not -BeNullOrEmpty -Because 'an unreadable GuestServices channel must propagate so the gate fails closed'
         $script:ChCap.GetGsiThrows.ch  | Should -BeNullOrEmpty -Because 'no channel hashtable should be returned when the real channel read throws'
     }
+
+    # ---- integration services (design E6): REAL reads by stable component GUID ------------------
+    # The harness stubs return services with GERMAN display names, so these pass only if the real body
+    # matches on the Id's trailing component GUID. Shutdown and Guest Service Interface are in the stub
+    # set too, so a match that grabbed the wrong service would read the wrong value.
+    It 'GetHostChannels reads the four integration services from the host (all ON) and returns all eight keys' {
+        $c = $script:ChCap.IsGetAllOn
+        $c.err  | Should -BeNullOrEmpty
+        $c.keys | Should -Be 'Backup,Clipboard,EnhancedSession,GuestServices,Heartbeat,KeyValueExchange,Shares,TimeSync'
+        foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeTrue -Because "$k is enabled on the host" }
+    }
+
+    It 'GetHostChannels reads them OFF when the host reports them disabled (a real read, not a constant)' {
+        $c = $script:ChCap.IsGetAllOff
+        $c.err | Should -BeNullOrEmpty
+        foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeFalse -Because "$k is disabled on the host" }
+    }
+
+    It 'GetHostChannels maps each value to its own service (mixed states, localized names)' {
+        $c = $script:ChCap.IsGetMixed
+        $c.err              | Should -BeNullOrEmpty
+        $c.KeyValueExchange | Should -BeTrue  -Because 'only Key-Value Pair Exchange is enabled in this scenario'
+        $c.TimeSync         | Should -BeFalse
+        $c.Backup           | Should -BeFalse
+        $c.Heartbeat        | Should -BeFalse
+    }
+
+    It 'GetHostChannels THROWS when an integration service is missing from the host enumeration (fail closed)' {
+        $script:ChCap.IsGetMissingKvp.err  | Should -BeLike "*could not identify the 'KeyValueExchange' integration service*0 matching*"
+        $script:ChCap.IsGetMissingKvp.keys | Should -BeNullOrEmpty
+    }
+
+    It 'GetHostChannels THROWS when two services carry the same component id (ambiguous, fail closed)' {
+        $script:ChCap.IsGetDuplicate.err | Should -BeLike "*could not identify the 'Heartbeat' integration service*2 matching*"
+    }
+
+    It 'GetHostChannels THROWS when a service reports a non-boolean Enabled (no truthiness coercion)' {
+        $script:ChCap.IsGetNonBool.err | Should -BeLike "*'Backup' integration service*no boolean Enabled state*"
+    }
+
+    It 'GetHostChannels THROWS when the integration-service enumeration itself fails' {
+        $script:ChCap.IsGetEnumThrows.err  | Should -BeLike '*simulated Get-VMIntegrationService enumeration failure*'
+        $script:ChCap.IsGetEnumThrows.keys | Should -BeNullOrEmpty
+    }
+
+    It 'SetHostChannel disables each integration service by piping the ID-matched object, never by -Name' {
+        $expect = @{
+            IsSetTimeSyncOff  = '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
+            IsSetKvpOff       = '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
+            IsSetBackupOff    = '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
+            IsSetHeartbeatOff = '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'
+        }
+        foreach ($key in $expect.Keys) {
+            $c = $script:ChCap.$key
+            $c.err | Should -BeNullOrEmpty -Because $key
+            @($c.disabledIds) | Should -Be @("Microsoft:00000000-0000-0000-0000-000000000ABC\$($expect[$key])") -Because "$key must disable exactly its own service"
+            @($c.enabledIds).Count | Should -Be 0
+            $c.anyNameGiven | Should -BeFalse -Because 'display names are localized; the set must not pass -Name'
+            $c.gsiByName    | Should -BeFalse -Because 'the integration-service set must not reach the GuestServices by-name path'
+        }
+    }
+
+    It 'SetHostChannel ENABLE pipes the matched object to Enable-VMIntegrationService (symmetric)' {
+        $c = $script:ChCap.IsSetHeartbeatOn
+        $c.err | Should -BeNullOrEmpty
+        @($c.enabledIds) | Should -Be @('Microsoft:00000000-0000-0000-0000-000000000ABC\84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47')
+        @($c.disabledIds).Count | Should -Be 0
+    }
+
+    It 'SetHostChannel THROWS when the service to disable cannot be found (no silent no-op)' {
+        $script:ChCap.IsSetMissing.err | Should -BeLike "*could not identify the 'TimeSync' integration service*0 matching*"
+        @($script:ChCap.IsSetMissing.disabledIds).Count | Should -Be 0
+    }
 }
 
 # ===========================================================================
@@ -869,6 +1057,66 @@ Describe 'Real backend — never binds the nonexistent EnhancedSessionTransportT
         $libText = Get-Content -LiteralPath $script:LibPath -Raw
         $libText | Should -Not -Match "EnhancedSessionTransportType\s+'None'" -Because 'the disable path must use Disable-VMConsoleSupport, never an EnhancedSessionTransportType None'
         $libText | Should -Not -Match "EnhancedSessionTransportType\s+\`$transport" -Because 'the computed-transport indirection (which produced None) must be removed'
+    }
+}
+
+# ===========================================================================
+#  Integration services in the seal: matched by component GUID, never by localized name
+# ===========================================================================
+Describe 'Integration-service seal: matched by stable component GUID, never by localized name (AST-pinned real)' {
+
+    It 'the component GUID table names exactly the four sealed services with their Hyper-V component ids' {
+        $script:IntegrationServiceIds.Keys -join ',' | Should -Be 'TimeSync,KeyValueExchange,Backup,Heartbeat'
+        $script:IntegrationServiceIds.TimeSync         | Should -Be '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
+        $script:IntegrationServiceIds.KeyValueExchange | Should -Be '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
+        $script:IntegrationServiceIds.Backup           | Should -Be '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
+        $script:IntegrationServiceIds.Heartbeat        | Should -Be '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'
+        @($script:IntegrationServiceIds.Values) | Should -Not -Contain '9F8233AC-BE49-4C79-8EE3-E7E1985B2077' -Because 'Shutdown (9F8233AC) stays enabled and must never be in the sealed set'
+    }
+
+    It 'neither real SetHostChannel nor real GetHostChannels passes an English integration-service name to a cmdlet' {
+        $english = @('Time Synchronization', 'Key-Value Pair Exchange', 'Backup (volume shadow copy)', 'Heartbeat', 'Shutdown')
+        foreach ($method in 'SetHostChannel', 'GetHostChannels') {
+            $assign = & $script:GetRealBackendAssign $method
+            $assign | Should -Not -BeNullOrEmpty
+            $cmds = $assign.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+            $byName = @($cmds | Where-Object {
+                $els = $_.CommandElements
+                $hit = $false
+                for ($i = 0; $i -lt $els.Count - 1; $i++) {
+                    if ($els[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                        $els[$i].ParameterName -eq 'Name' -and
+                        $english -contains $els[$i + 1].Extent.Text.Trim("'", '"')) { $hit = $true }
+                }
+                $hit
+            })
+            $byName.Count | Should -Be 0 -Because "$method must find the integration services by component GUID; display names are localized"
+        }
+    }
+
+    It 'real GetHostChannels enumerates the services with Get-VMIntegrationService and no -Name (a host read, not a constant)' {
+        $assign = & $script:GetRealBackendAssign 'GetHostChannels'
+        $enum = @($assign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                      $n.GetCommandName() -eq 'Get-VMIntegrationService' -and
+                      -not ($n.CommandElements | Where-Object {
+                          $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Name' })
+        }, $true))
+        $enum.Count | Should -BeGreaterThan 0 -Because 'the four integration services must be read from the host by enumerating the VM''s services'
+    }
+
+    It 'the GUID matcher returns the single match, and throws on zero matches, two matches, or an object with no Id' {
+        $guid = '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'
+        $one  = [pscustomobject]@{ Id = "Microsoft:X\$guid"; Enabled = $true }
+        (& $script:SbFindIntegrationService @($one) 'Heartbeat' $guid 'vm1').Id | Should -Be $one.Id
+        (& $script:SbFindIntegrationService @([pscustomobject]@{ Id = "microsoft:x\$($guid.ToLowerInvariant())" }) 'Heartbeat' $guid 'vm1') |
+            Should -Not -BeNullOrEmpty -Because 'the GUID compare is case-insensitive'
+        { & $script:SbFindIntegrationService @() 'Heartbeat' $guid 'vm1' } |
+            Should -Throw -ExpectedMessage "*'Heartbeat' integration service*0 matching*"
+        { & $script:SbFindIntegrationService @($one, $one) 'Heartbeat' $guid 'vm1' } |
+            Should -Throw -ExpectedMessage "*'Heartbeat' integration service*2 matching*"
+        { & $script:SbFindIntegrationService @([pscustomobject]@{ Name = 'Heartbeat'; Enabled = $true }) 'Heartbeat' $guid 'vm1' } |
+            Should -Throw -ExpectedMessage '*0 matching*' -Because 'an object without an Id is never matched by its Name'
     }
 }
 
@@ -1001,6 +1249,27 @@ Describe 'GetComPort — real⇄fake shape parity (host-truth COM1 read; AST-pin
         $body = $script:RealComAssign.Right.Extent.Text
         $body | Should -Match '(?s)IsNullOrWhiteSpace' -Because 'an empty COM-port path is not a live channel; the real read must return $null for it (parity with the fake)'
         $body | Should -Match '(?s)return\s+\$null' -Because 'the real GetComPort must return $null for an absent/empty port'
+    }
+
+    It 'the REAL GetComPort reads with -ErrorAction Stop, never SilentlyContinue (an unreadable port must throw)' {
+        $call = @($script:RealComAssign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-VMComPort'
+        }, $true))
+        $call.Count | Should -Be 1
+        $call[0].Extent.Text | Should -Match '-ErrorAction\s+Stop'
+        $call[0].Extent.Text | Should -Not -Match 'SilentlyContinue' -Because 'a swallowed failure would make the COM2 refusal fail open'
+    }
+
+    It 'the FAKE models an empty COM2 by default and a wired one with -SimulateCom2Path' {
+        $b = New-FakeHyperVBackend
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        (& $b.GetComPort @{ VMName = 'vm1'; Number = 2 }) | Should -BeNullOrEmpty
+        $w = New-FakeHyperVBackend -SimulateCom2Path '\\.\pipe\extra'
+        & $w.NewVM @{ Name = 'vm1'; Generation = 2 }
+        $port = & $w.GetComPort @{ VMName = 'vm1'; Number = 2 }
+        $port.Number | Should -Be 2
+        $port.Path   | Should -Be '\\.\pipe\extra'
+        (& $w.GetComPort @{ VMName = 'vm1'; Number = 1 }) | Should -BeNullOrEmpty -Because 'the switch seeds COM2 only'
     }
 
     It 'the REAL GetComPort lives ONLY in the backend (no raw Get-VMComPort CALL leaks into the Sealer)' {
@@ -1652,21 +1921,68 @@ Describe 'RemoveNetworkAdapter: the REAL method uses only documented parameter s
         $script:RealRemoveNicAssign = & $script:GetRealBackendAssign 'RemoveNetworkAdapter'
     }
 
-    It 'enumerates the adapters with Get-VMNetworkAdapter (the harness below proves the removal only receives what was enumerated)' {
+    # These pins walk AST nodes (CommandAst, PipelineAst, BinaryExpressionAst), not the method's source
+    # text. A text regex also matched a comment, so deleting the call but leaving a comment that named it
+    # still passed; the 'pin helpers' Describe below proves each helper rejects exactly that.
+    It 'enumerates the adapters with Get-VMNetworkAdapter -VMName (the harness below proves the removal only receives what was enumerated)' {
         $script:RealRemoveNicAssign | Should -Not -BeNullOrEmpty -Because 'the real factory must define RemoveNetworkAdapter'
-        $script:RealRemoveNicAssign.Right.Extent.Text |
-            Should -Match 'Get-VMNetworkAdapter\s+-VMName' -Because 'the adapters to remove are read from host truth first'
+        @(& $script:PinFindCommand $script:RealRemoveNicAssign 'Get-VMNetworkAdapter' 'VMName').Count |
+            Should -BeGreaterThan 0 -Because 'the adapters to remove are read from host truth first'
     }
 
     It 'removes by piping the adapter objects, never with Remove-VMNetworkAdapter -VMName' {
-        $body = $script:RealRemoveNicAssign.Right.Extent.Text
-        $body | Should -Match '\|\s*Remove-VMNetworkAdapter' -Because 'piping adapter objects uses the documented ResourceObject parameter set'
-        $body | Should -Not -Match 'Remove-VMNetworkAdapter\s+-VMName' -Because 'omitting -Name in the VMName set relies on undocumented remove-everything behavior'
+        @(& $script:PinFindPipedInto $script:RealRemoveNicAssign 'Remove-VMNetworkAdapter').Count |
+            Should -BeGreaterThan 0 -Because 'piping adapter objects uses the documented ResourceObject parameter set'
+        @(& $script:PinFindCommand $script:RealRemoveNicAssign 'Remove-VMNetworkAdapter' 'VMName').Count |
+            Should -Be 0 -Because 'omitting -Name in the VMName set relies on undocumented remove-everything behavior'
     }
 
     It 'guards the removal on a non-zero adapter count (idempotent, like the fake)' {
-        $script:RealRemoveNicAssign.Right.Extent.Text |
-            Should -Match '\.Count\s+-gt\s+0' -Because 'a VM with no adapters must be a no-op, as the fake already is'
+        @(& $script:PinFindCountGuard $script:RealRemoveNicAssign).Count |
+            Should -BeGreaterThan 0 -Because 'a VM with no adapters must be a no-op, as the fake already is'
+    }
+}
+
+# ===========================================================================
+#  The AST pin helpers fail when the pinned code is gone
+# ===========================================================================
+#  Each helper is run against a synthetic scriptblock where the call survives only in a comment or a string
+#  (it must find nothing) and against one where the call is real (it must find it). This is the evidence
+#  that a pin built on the helper fails when the pinned call is removed.
+Describe 'AST pin helpers: comments and strings do not satisfy a pin' {
+
+    It 'PinFindCommand: a commented-out or quoted call is not a call; a real one is' {
+        $gone = { # Get-VMGpuPartitionAdapter -VMName $vm
+                  $note = 'Get-VMGpuPartitionAdapter -VMName $vm'
+                  return ,@() }.Ast
+        $here = { return ,@(Get-VMGpuPartitionAdapter -VMName $vm -ErrorAction Stop) }.Ast
+        @(& $script:PinFindCommand $gone 'Get-VMGpuPartitionAdapter' 'VMName').Count | Should -Be 0
+        @(& $script:PinFindCommand $here 'Get-VMGpuPartitionAdapter' 'VMName').Count | Should -Be 1
+        @(& $script:PinFindCommand $here 'Get-VMGpuPartitionAdapter' 'Name').Count   | Should -Be 0 -Because 'the parameter filter is exact'
+    }
+
+    It 'PinFindPipedInto: only a real pipeline into the command counts' {
+        $gone = { # $nics | Remove-VMNetworkAdapter
+                  Remove-VMNetworkAdapter -VMName $vm }.Ast
+        $here = { $nics | Remove-VMNetworkAdapter -ErrorAction Stop }.Ast
+        @(& $script:PinFindPipedInto $gone 'Remove-VMNetworkAdapter').Count | Should -Be 0
+        @(& $script:PinFindPipedInto $here 'Remove-VMNetworkAdapter').Count | Should -Be 1
+    }
+
+    It 'PinFindCountGuard: only a real `.Count -gt 0` comparison counts' {
+        $gone = { # if ($nics.Count -gt 0) { }
+                  if ($nics) { } }.Ast
+        $here = { if ($nics.Count -gt 0) { } }.Ast
+        @(& $script:PinFindCountGuard $gone).Count | Should -Be 0
+        @(& $script:PinFindCountGuard $here).Count | Should -Be 1
+    }
+
+    It 'PinFindCommaReturn: only a real `return ,@(...)` counts' {
+        $gone = { # return ,@(Get-Thing)
+                  return @(Get-Thing) }.Ast
+        $here = { return ,@(Get-Thing) }.Ast
+        @(& $script:PinFindCommaReturn $gone).Count | Should -Be 0
+        @(& $script:PinFindCommaReturn $here).Count | Should -Be 1
     }
 }
 
@@ -1679,16 +1995,6 @@ Describe 'RemoveNetworkAdapter: the REAL method uses only documented parameter s
 #  pinned via the AST; the fake carries the behavioral checks.
 Describe 'Passthrough-device reads: GetGpuPartitionAdapters + GetAssignableDevices (real/fake parity; AST-pinned real)' {
 
-    BeforeAll {
-        # The text of `$b.<Method> = { ... }` inside the real factory, or $null when absent.
-        $script:RealPtBody = {
-            param([string] $Method)
-            $assign = & $script:GetRealBackendAssign $Method
-            if ($null -eq $assign) { return $null }
-            return $assign.Right.Extent.Text
-        }
-    }
-
     It 'the manifest documents both reads taking exactly VMName' {
         foreach ($m in 'GetGpuPartitionAdapters', 'GetAssignableDevices') {
             $script:ExpectedMethods.Keys | Should -Contain $m
@@ -1696,18 +2002,14 @@ Describe 'Passthrough-device reads: GetGpuPartitionAdapters + GetAssignableDevic
         }
     }
 
-    It 'the REAL GetGpuPartitionAdapters reads Get-VMGpuPartitionAdapter and returns a ,@(...) collection' {
-        $body = & $script:RealPtBody 'GetGpuPartitionAdapters'
-        $body | Should -Not -BeNullOrEmpty -Because 'the real factory must define GetGpuPartitionAdapters'
-        $body | Should -Match 'Get-VMGpuPartitionAdapter\s+-VMName'
-        $body | Should -Match 'return\s*,@\(' -Because 'a single adapter must keep .Count = 1 for an unwrapped caller'
-    }
-
-    It 'the REAL GetAssignableDevices reads Get-VMAssignableDevice and returns a ,@(...) collection' {
-        $body = & $script:RealPtBody 'GetAssignableDevices'
-        $body | Should -Not -BeNullOrEmpty -Because 'the real factory must define GetAssignableDevices'
-        $body | Should -Match 'Get-VMAssignableDevice\s+-VMName'
-        $body | Should -Match 'return\s*,@\(' -Because 'a single device must keep .Count = 1 for an unwrapped caller'
+    It 'the REAL <Method> calls <Cmdlet> -VMName and returns a ,@(...) collection (AST nodes, not text)' -ForEach @(
+        @{ Method = 'GetGpuPartitionAdapters'; Cmdlet = 'Get-VMGpuPartitionAdapter' },
+        @{ Method = 'GetAssignableDevices';    Cmdlet = 'Get-VMAssignableDevice' }
+    ) {
+        $assign = & $script:GetRealBackendAssign $Method
+        $assign | Should -Not -BeNullOrEmpty -Because "the real factory must define $Method"
+        @(& $script:PinFindCommand $assign $Cmdlet 'VMName').Count | Should -BeGreaterThan 0 -Because "the read must invoke $Cmdlet for the VM it was given"
+        @(& $script:PinFindCommaReturn $assign).Count | Should -BeGreaterThan 0 -Because 'a single item must keep .Count = 1 for an unwrapped caller'
     }
 
     It 'the FAKE reports none by default, as arrays (no caller @() wrap needed)' {
@@ -1816,6 +2118,46 @@ Describe 'Seal-device methods: the REAL bodies, executed out of process against 
             $c.isArray   | Should -BeTrue -Because "$($case.Key): a single device must not unroll to a bare object"
             $c.count     | Should -Be $case.N
         }
+    }
+
+    It 'GetComPort returns $null for an empty COM2 and the pipe record for a wired one, reading the port it was asked for' {
+        $script:SealDevCap.Com2_Empty.err    | Should -BeNullOrEmpty
+        $script:SealDevCap.Com2_Empty.read   | Should -Be 'vm1#2'
+        $script:SealDevCap.Com2_Empty.isNull | Should -BeTrue -Because 'an empty COM2 path is not a live channel'
+        $script:SealDevCap.Com2_Path.err     | Should -BeNullOrEmpty
+        $script:SealDevCap.Com2_Path.number  | Should -Be 2
+        $script:SealDevCap.Com2_Path.path    | Should -Be '\\.\pipe\extra'
+        $script:SealDevCap.Com1_Path.path    | Should -Be '\\.\pipe\vm1-com1' -Because 'the COM1 read is unchanged'
+    }
+
+    It 'GetComPort THROWS when Get-VMComPort fails (never reads an unreadable COM2 as "no path")' {
+        # The stub reports a non-terminating error like a real cmdlet. Under the old -ErrorAction
+        # SilentlyContinue this came back $null with no error, which the COM2 refusal would read as clean.
+        $script:SealDevCap.Com2_Fail.err  | Should -Match 'simulated Get-VMComPort failure'
+        $script:SealDevCap.Com2_Fail.read | Should -Be 'vm1#2'
+    }
+
+    It 'GetAutomaticCheckpoints returns the real [bool] off Get-VM, $false and $true alike' {
+        $script:SealDevCap.AutoCp_Off.err    | Should -BeNullOrEmpty
+        $script:SealDevCap.AutoCp_Off.isBool | Should -BeTrue
+        $script:SealDevCap.AutoCp_Off.value  | Should -BeFalse
+        $script:SealDevCap.AutoCp_On.value   | Should -BeTrue
+    }
+
+    It 'GetAutomaticCheckpoints THROWS on a missing property, a non-boolean value, zero or two VMs, and a failed Get-VM' {
+        $script:SealDevCap.AutoCp_NoProp.err | Should -BeLike '*reported no boolean AutomaticCheckpointsEnabled*'
+        $script:SealDevCap.AutoCp_String.err | Should -BeLike '*reported no boolean AutomaticCheckpointsEnabled*' -Because 'the string False is truthy and must never be coerced'
+        $script:SealDevCap.AutoCp_NoVM.err   | Should -BeLike '*expected exactly one VM*found 0*'
+        $script:SealDevCap.AutoCp_TwoVMs.err | Should -BeLike '*expected exactly one VM*found 2*'
+        $script:SealDevCap.AutoCp_Fail.err   | Should -Match 'simulated Get-VM failure' -Because 'a non-terminating Get-VM error must surface (-ErrorAction Stop)'
+    }
+
+    It 'GetCheckpoint returns an ARRAY for 0 and 1 checkpoints, and THROWS when Get-VMSnapshot fails' {
+        $script:SealDevCap.CpList_None.isArray | Should -BeTrue
+        $script:SealDevCap.CpList_None.count   | Should -Be 0
+        $script:SealDevCap.CpList_One.isArray  | Should -BeTrue -Because 'a single checkpoint must not unroll to a bare object'
+        $script:SealDevCap.CpList_One.count    | Should -Be 1
+        $script:SealDevCap.CpList_Fail.err     | Should -Match 'simulated Get-VMSnapshot failure' -Because 'an unreadable checkpoint list must not read as empty'
     }
 
     It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal)' {

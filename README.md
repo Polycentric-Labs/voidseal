@@ -80,8 +80,8 @@ an **integrated combination on a specific delivery surface**:
    escalates Tier 0 → 3 with one interface.
 2. **A host-side, fail-closed seal *verification* before run** — the host independently certifies the
    tier's isolation contract and *refuses to run otherwise*. The adapter-count certification covers
-   every VM except a Tier-1 non-processor; at Tier 1 the host instead certifies the NIC's vSwitch
-   is a purpose-built isolated Internal switch. Media, disk and host-channel checks run at every tier.
+   every VM except a Tier-1 non-processor; at Tier 1 the host instead certifies exactly one NIC, on
+   the VM's own purpose-built Internal switch. Media, disk and host-channel checks run at every tier.
    This is the part nobody else ships: runtime *enforcement* (gVisor/Kata) and agent *health checks*
    (Cuckoo/CAPE) are not the same as a pre-run, host-side proof that the box is starved.
 3. **A no-live-channel disk-passing model** — inputs/outputs ride attached data disks; the guest

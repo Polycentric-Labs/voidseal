@@ -17,7 +17,7 @@ Voidseal's security claim is narrow and specific: the **host-verified, fail-clos
 (`scripts/lib/Sealer.ps1`) — a host-side proof, taken independently of anything the guest reports about
 itself, that a VM has been starved of the capabilities its tier says it must not have (network adapters, passthrough devices,
 host↔guest channels, residual/secret disks, import media) **before** any untrusted workload is allowed to
-run, plus the tier isolation that gate verifies (no NIC at Tier 0, at Tier ≥ 2 and for every processor; an isolated Internal vSwitch at Tier 1).
+run, plus the tier isolation that gate verifies (no NIC at Tier 0, at Tier ≥ 2 and for every processor; exactly one NIC, on the VM's own recorded Internal switch, at Tier 1).
 
 What a workload **does once sealed and running** — whether its own logic is correct, whether it handles the
 data it's given safely, whether an agent loop it drives goes off the rails — is **not** something Voidseal
@@ -55,10 +55,14 @@ Legend: 🟢 **IN SCOPE** (a bug here is a Voidseal defect — see the gate name
 | Threat class | T0 | T1 | T2 | T3 |
 |---|---|---|---|---|
 | **VM-escape** (guest breaks the Hyper-V hypervisor boundary itself) | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Live NIC / egress route present at seal time** | 🟢 zero NICs required | 🟢 an isolated Internal vSwitch, Default Switch refused by name (zero NICs for a processor) | 🟢 zero NICs required | 🟢 zero NICs required |
+| **Live NIC / egress route present at seal time** | 🟢 zero NICs required | 🟢 exactly one NIC, on the VM's own recorded Internal switch (zero NICs for a processor) | 🟢 zero NICs required | 🟢 zero NICs required |
 | **Passthrough device present at seal time** (GPU partition adapter, device assigned by DDA) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Egress filtering** (which destinations are reachable through whatever route exists) | ➖ no route exists | 🟡 in-guest defense-in-depth only, GuestRoot-disableable | ➖ no route exists | ➖ no route exists |
 | **Host↔guest channel left ON** (clipboard / shares / guest-services / enhanced-session) | 🟢 | 🟢 | 🟢 | 🟢 |
+| **Integration service left ON** (Time Synchronization, Key-Value Pair Exchange, Backup, Heartbeat) | 🟢 | 🟢 | 🟢 | 🟢 |
+| **Host time reaching the guest** (reference TSC page, after Time Synchronization is off) | 🟡 | 🟡 | 🟡 | 🟡 |
+| **Second serial channel** (a pipe path on COM2) | 🟢 | 🟢 | 🟢 | 🟢 |
+| **Checkpoint present, or automatic checkpoints on** | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Residual / import / secret-shaped disk left attached** | 🟢 best-effort backstop | 🟢 best-effort backstop | 🟢 structural, authoritative | 🟢 structural, authoritative |
 | **Malicious/malformed profile bypassing load-time invariants** | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Pre-built data disk** substituted before attach, aliasing a run disk, or written by the guest | 🟢 a verified per-run working copy is attached; the guest can write only to that copy, which teardown deletes | 🟢 same | 🟢 same | 🟢 same |
@@ -74,7 +78,7 @@ bubblewrap draws for the Linux kernel primitives it wraps. Keeping the host patc
 itself is patched.
 
 **Live NIC / egress route present at seal time.**
-- **T0, T2, T3, and every processor: IN SCOPE.** `Get-SealNicPolicy` (`scripts/lib/Provisioner.ps1`)
+- **T0, T2, T3, and every processor: IN SCOPE.** `Get-SealNicPolicy` (`scripts/lib/SealPolicy.ps1`)
   returns `NoAdapter` for all of them, and the Provisioner, `Lock-Sandbox` and `Assert-Sealed` all ask it.
   The Provisioner builds no switch, `Lock-Sandbox` removes the one adapter real `New-VM` always creates,
   and `Assert-Sealed` requires the backend's `GetNetworkAdapter` call to return zero adapters, naming the
@@ -85,14 +89,16 @@ itself is patched.
   live NIC found at certify time throws and refuses to seal. (Before 2026-10-03 the processor branch
   read a descriptor field production never wrote, and Tier 0 had no adapter check at all.)
 - **T1 non-processor: IN SCOPE, narrower.** Tier 1 legitimately keeps a NIC (net-restricted, not
-  no-net). `Assert-Sealed`'s Tier-1 block requires that NIC's vSwitch to host-verify as
-  `SwitchType='Internal'`, and separately refuses the built-in "Default Switch" **by name** (that switch
-  is itself `SwitchType=Internal`, so the type check alone cannot distinguish it from a purpose-built
-  isolated switch). A Tier-1 VM certified on an External/Private switch, or on the Default Switch, is a
+  no-net), and only when its `Network` label is exactly `Internal+Allowlist`. `Assert-Sealed`'s Tier-1
+  block requires exactly one NIC, requires its vSwitch to host-verify as `SwitchType='Internal'`, refuses
+  the built-in "Default Switch" **by name** (that switch is itself `SwitchType=Internal`), and, since
+  2026-10-03, binds the NIC to the VM's **own** switch: its `SwitchName` must equal the `<vm>-int` switch
+  `New-SandboxVM` recorded on the descriptor. A Tier-1 VM certified with a second NIC, on an
+  External/Private switch, on the Default Switch, or on any Internal switch other than its own is a
   Voidseal defect. A Tier-1 processor is `NoAdapter` like the tiers above: it gets no switch and must
-  seal with zero adapters. **Known gap inside this control:** the by-name refusal matches only the
-  switch's English friendly name; the GUID-based refusal (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`) that
-  would also catch a localized non-English "Default Switch" name is Phase-6-live, not yet shipped
+  seal with zero adapters. The by-name Default-Switch refusal matches only the English friendly name,
+  but the binding now also refuses a localized Default Switch (it is not the recorded switch); the
+  GUID-based refusal (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`) stays a Phase-6-live defense in depth
   (`phase-6-live-runbook.md` §4).
 
 **Passthrough device present at seal time.** IN SCOPE, every tier. `Assert-Sealed` reads the backend's
@@ -120,6 +126,43 @@ check sits beside the NIC check. Only the count is read, and a read that fails r
 (clipboard/shares/guest-services/enhanced-session) back from the host via `GetHostChannels` and fails
 closed both if any channel is ON *and* if a channel's state cannot be read at all. A channel silently left
 enabled after `Lock-Sandbox` runs is a Voidseal defect at any tier.
+
+**Integration service left ON.** IN SCOPE, every tier, since 2026-10-03. Time Synchronization, Key-Value
+Pair Exchange, Backup (VSS) and Heartbeat are live VMBus channels the engine never uses. `Lock-Sandbox`
+turns each one off and `Assert-Sealed` reads each back from the host, refusing by name when one is on and
+failing closed when the host gives no state for it. Unlike clipboard, shares and enhanced-session, these
+are real reads, not constants: the real `GetHostChannels` enumerates the VM's services with
+`Get-VMIntegrationService` and checks each one's `Enabled`. Services are matched by the component GUID at
+the end of their `Id`, because display names are localized; a missing or duplicated match throws.
+- **Heartbeat goes off.** Nothing in `scripts/` reads heartbeat state. Boot readiness is a probe over the
+  COM1 serial console (`Wait-GuestBootReady`), and Disk-mode completion is the VM's power state
+  (`Wait-WorkloadComplete` polls `GetVM` until `Off`).
+- **Shutdown stays on.** The engine stops VMs in three places (`Remove-Sandbox`, `Wait-WorkloadComplete`
+  on a timeout, and the Serial-mode timeout in `Invoke-Voidseal`), each as `StopVM -Force` without
+  `TurnOff`. On real Hyper-V that is `Stop-VM -Force`, which asks the guest to shut down through the
+  Shutdown service. Shutdown only carries a host-to-guest request; the guest cannot send data over it.
+  Switching those calls to `TurnOff` would let the seal close Shutdown too; that is left as an open choice.
+- **Live status:** mock-proven. The component GUIDs and the piped `Enable/Disable-VMIntegrationService`
+  calls have not run on a live host. A wrong GUID fails closed: the seal refuses, it never certifies a
+  service it could not read.
+
+**Host time reaching the guest.** KNOWN LIMITATION, TRACKED. Turning off Time Synchronization stops the
+host pushing time samples over VMBus, but the Hyper-V reference TSC page (the paravirtual clock source a
+Linux guest reads through `hyperv_clocksource_tsc_page`) stays available and is paced by the host. The
+seal narrows the guest's view of host time; it does not remove it. No per-VM setting is known to close
+the page, so the gate has nothing to verify here.
+
+**Second serial channel.** IN SCOPE, every tier, since 2026-10-03. Voidseal wires only COM1, its serial
+management channel. `Assert-Sealed` reads COM2 through `GetComPort` and refuses any pipe path, whether or
+not the run is serial-managed; a read that throws refuses too. The COM1 liveness check is unchanged.
+
+**Checkpoint present, or automatic checkpoints on.** IN SCOPE, every tier, since 2026-10-03. A checkpoint
+holds the VM's state from before the seal, so restoring it would undo the seal without the gate seeing
+it, and automatic checkpoints also pin a differencing disk per drive (the RC7 trap). `New-SandboxVM` turns
+automatic checkpoints off and the engine never takes a checkpoint, so `Assert-Sealed` refuses either one.
+It reads the setting through `GetAutomaticCheckpoints` and the list through `GetCheckpoint`; a throw, a
+setting that is not a boolean, or a list that is not a collection refuses. (`Lifecycle='SnapshotRevert'`
+is declared in `tier1.psd1` but not wired; wiring it would have to work with this rule.)
 
 **Residual / import / secret-shaped disk left attached.** IN SCOPE, every tier, with a strength gradient
 the code itself draws:
@@ -213,6 +256,10 @@ blend them: something can be correctly scoped as IN SCOPE and still be unproven 
 - **Zero-adapter seal and passthrough refusal:** mock-proven only. The real `RemoveNetworkAdapter` (now
   part of every Tier-0 seal) and the two passthrough reads have not run on a live host; the next Tier-0
   `firefox` re-run is their first exercise. Until then, treat them as shape-correct, not live-proven.
+- **Integration-service, COM2 and checkpoint checks:** mock-proven only (2026-10-03). The real reads
+  (`Get-VMIntegrationService` matched by component GUID, `Get-VMComPort -Number 2`, `Get-VM`'s
+  `AutomaticCheckpointsEnabled`, `Get-VMSnapshot`) run here only against stub cmdlets. A live failure
+  refuses the seal.
 - **Tier-1 in-guest egress:** shape-asserted only. The mock suite proves the rendered Squid config text,
   the iptables rule text, and the ACL substitution are correct — it does not prove a real Squid/iptables
   process has ever actually spliced or dropped a real packet (`phase-6-live-runbook.md` §5).

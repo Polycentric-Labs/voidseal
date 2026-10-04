@@ -112,7 +112,7 @@ Describe 'Invoke-BuilderVM — no seal (builder keeps NIC for the fetch)' {
         # adapter unless the policy is IsolatedInternalSwitch, and the builder is a Tier-1 non-processor
         # (it keeps its NIC), so a zero count here ALONE does not prove Lock-Sandbox was never called: a
         # regression invoking Lock-Sandbox on this VM would still log zero RemoveNetworkAdapter entries.
-        # SetHostChannel is Lock-Sandbox's UNCONDITIONAL op (every tier, 4 channels) and is what pins the claim.
+        # SetHostChannel is Lock-Sandbox's UNCONDITIONAL op (every tier, every channel) and is what pins the claim.
         $removeNicCalls = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' })
         $removeNicCalls.Count | Should -Be 0 -Because 'a sealed NoAdapter VM would have its NIC removed; the builder is a Tier-1 non-processor that keeps its NIC, so this check alone does not discriminate Lock-Sandbox invocation'
         $setChannelCalls = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'SetHostChannel' })

@@ -99,6 +99,59 @@ function Get-VMAssignableDevice {
     foreach ($d in $script:stubDda) { $d }
 }
 
+# Get-VMComPort stub for GetComPort (the COM1 liveness read and the COM2 refusal). It reports a failure
+# the way a real cmdlet does, as a NON-terminating error, so -ErrorAction decides whether the caller sees
+# it: under SilentlyContinue the read would come back empty, which is exactly the fail-open the real body
+# must not have.
+$script:stubComPorts  = @{}
+$script:stubComFail   = $false
+$script:capComRead    = $null
+function Get-VMComPort {
+    [CmdletBinding()]
+    param([string[]] $VMName, [int] $Number)
+    $script:capComRead = "$(@($VMName) -join ',')#$Number"
+    if ($script:stubComFail) {
+        $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new('stub: simulated Get-VMComPort failure'),
+            'StubComPortFailure', [System.Management.Automation.ErrorCategory]::ReadError, $Number))
+        return
+    }
+    [pscustomobject]@{ Number = $Number; Path = [string]$script:stubComPorts[$Number] }
+}
+
+# Get-VM stub for GetAutomaticCheckpoints: returns $script:stubVMs (zero, one or two objects), or reports a
+# non-terminating error like a real cmdlet when $script:stubVMFail. The bare availability probe other
+# methods make (no -Name) returns nothing.
+$script:stubVMs    = @()
+$script:stubVMFail = $false
+function Get-VM {
+    [CmdletBinding()]
+    param([string[]] $Name)
+    if (-not $PSBoundParameters.ContainsKey('Name')) { return }
+    if ($script:stubVMFail) {
+        $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new('stub: simulated Get-VM failure'),
+            'StubGetVMFailure', [System.Management.Automation.ErrorCategory]::ReadError, $Name))
+        return
+    }
+    foreach ($v in $script:stubVMs) { $v }
+}
+
+# Get-VMSnapshot stub for GetCheckpoint (the checkpoint refusal).
+$script:stubSnaps    = @()
+$script:stubSnapFail = $false
+function Get-VMSnapshot {
+    [CmdletBinding()]
+    param([string[]] $VMName, [string] $Name)
+    if ($script:stubSnapFail) {
+        $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new('stub: simulated Get-VMSnapshot failure'),
+            'StubSnapshotFailure', [System.Management.Automation.ErrorCategory]::ReadError, $VMName))
+        return
+    }
+    foreach ($s in $script:stubSnaps) { $s }
+}
+
 . $LibPath
 $b = New-RealHyperVBackend
 
@@ -159,6 +212,44 @@ function Invoke-ReadScenario {
     }
 }
 
+# Run the real GetComPort for one port number with the given stub paths; report the record or the error.
+function Invoke-ComScenario {
+    param([int] $Number, [hashtable] $Paths = @{}, [switch] $Fail)
+    $script:stubComPorts = $Paths
+    $script:stubComFail  = $Fail.IsPresent
+    $script:capComRead   = $null
+    $err = $null; $r = $null
+    try { $r = & $b.GetComPort @{ VMName = 'vm1'; Number = $Number } } catch { $err = $_.Exception.Message }
+    $script:stubComFail = $false
+    return [ordered]@{
+        err     = $err
+        read    = $script:capComRead
+        isNull  = ($null -eq $r)
+        number  = if ($r -is [System.Collections.IDictionary]) { $r['Number'] } else { $null }
+        path    = if ($r -is [System.Collections.IDictionary]) { $r['Path'] } else { $null }
+    }
+}
+
+# Run the real GetAutomaticCheckpoints against the given stub VMs; report the value, its type, or the error.
+function Invoke-AutoCpScenario {
+    param([object[]] $VMs, [switch] $Fail)
+    $script:stubVMs = $VMs; $script:stubVMFail = $Fail.IsPresent
+    $err = $null; $r = $null
+    try { $r = & $b.GetAutomaticCheckpoints @{ VMName = 'vm1' } } catch { $err = $_.Exception.Message }
+    $script:stubVMFail = $false
+    return [ordered]@{ err = $err; value = $r; isBool = ($r -is [bool]) }
+}
+
+# Run the real GetCheckpoint against the given stub snapshots; report array shape and count, or the error.
+function Invoke-CpListScenario {
+    param([object[]] $Snaps, [switch] $Fail)
+    $script:stubSnaps = $Snaps; $script:stubSnapFail = $Fail.IsPresent
+    $err = $null; $r = $null
+    try { $r = & $b.GetCheckpoint @{ VMName = 'vm1' } } catch { $err = $_.Exception.Message }
+    $script:stubSnapFail = $false
+    return [ordered]@{ err = $err; isArray = ($r -is [array]); count = if ($r -is [array]) { $r.Count } else { -1 } }
+}
+
 $out = [ordered]@{
     Remove_None = Invoke-RemoveScenario -Adapters @()
     Remove_One  = Invoke-RemoveScenario -Adapters @((New-StubAdapter 'nic-0'))
@@ -171,6 +262,20 @@ $out = [ordered]@{
     Gpu_Throw = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @() -Throw
     Dda_None  = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @()
     Dda_One   = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @([pscustomobject]@{ LocationPath = 'PCIROOT(0)#PCI(0300)' })
+    Com2_Empty = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '' }
+    Com2_Path  = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '\\.\pipe\extra' }
+    Com2_Fail  = Invoke-ComScenario -Number 2 -Fail
+    Com1_Path  = Invoke-ComScenario -Number 1 -Paths @{ 1 = '\\.\pipe\vm1-com1' }
+    AutoCp_Off     = Invoke-AutoCpScenario -VMs @([pscustomobject]@{ Name = 'vm1'; AutomaticCheckpointsEnabled = $false })
+    AutoCp_On      = Invoke-AutoCpScenario -VMs @([pscustomobject]@{ Name = 'vm1'; AutomaticCheckpointsEnabled = $true })
+    AutoCp_NoProp  = Invoke-AutoCpScenario -VMs @([pscustomobject]@{ Name = 'vm1' })
+    AutoCp_String  = Invoke-AutoCpScenario -VMs @([pscustomobject]@{ Name = 'vm1'; AutomaticCheckpointsEnabled = 'False' })
+    AutoCp_NoVM    = Invoke-AutoCpScenario -VMs @()
+    AutoCp_TwoVMs  = Invoke-AutoCpScenario -VMs @([pscustomobject]@{ Name = 'vm1'; AutomaticCheckpointsEnabled = $false }, [pscustomobject]@{ Name = 'vm1'; AutomaticCheckpointsEnabled = $false })
+    AutoCp_Fail    = Invoke-AutoCpScenario -VMs @() -Fail
+    CpList_None    = Invoke-CpListScenario -Snaps @()
+    CpList_One     = Invoke-CpListScenario -Snaps @([pscustomobject]@{ Name = 'cp-0' })
+    CpList_Fail    = Invoke-CpListScenario -Snaps @() -Fail
 }
 
 $out | ConvertTo-Json -Depth 6 -Compress

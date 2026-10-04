@@ -33,9 +33,10 @@
       Lock-Sandbox handles VM-CONFIG isolation:
         1. detach every import-only medium (ISO DVD + transfer VHDs recorded on the descriptor),
         2. for a NoAdapter VM (Tier 0, Tier >= 2, any processor; see Get-SealNicPolicy in
-           Provisioner.ps1) `RemoveNetworkAdapter` (remove, not disconnect),
+           SealPolicy.ps1) `RemoveNetworkAdapter` (remove, not disconnect),
         3. turn OFF every host<->guest channel (clipboard / shares / guest-services /
-           enhanced-session) via the backend's SetHostChannel,
+           enhanced-session, plus the Time Synchronization, Key-Value Pair Exchange, Backup and
+           Heartbeat integration services) via the backend's SetHostChannel,
         4. mark the descriptor State='Sealed'.
       It does NOT power the VM on (the seal runs before first boot) and it does NOT itself filter
       egress: Tier-1 net-restriction relies on in-guest controls (Squid SNI proxy + allowlist) as
@@ -52,10 +53,14 @@
         * an unrecognized network-adapter policy (anything but NoAdapter or IsolatedInternalSwitch) is
           refused before either NIC check runs.
         * NoAdapter VMs (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): GetNetworkAdapter
-          MUST be empty (no NIC, no live egress route). A Tier-1 non-processor keeps one NIC, which
-          must sit on an isolated Internal vSwitch that is not the Default Switch.
+          MUST be empty (no NIC, no live egress route). A Tier-1 non-processor keeps exactly one NIC,
+          which must sit on the VM's own recorded Internal switch (descriptor SwitchName), not the
+          Default Switch and not any other switch. A $null adapter read refuses in both branches.
         * ANY tier: no GPU partition adapter and no device assigned by Discrete Device Assignment
           (GetGpuPartitionAdapters / GetAssignableDevices; a read that fails refuses).
+        * ANY tier: no path on COM2 (GetComPort Number=2; Voidseal wires only COM1).
+        * ANY tier: automatic checkpoints off and no checkpoint present (GetAutomaticCheckpoints /
+          GetCheckpoint); a restore would roll the VM back past the seal. Unreadable refuses.
         * ANY tier: no import DVD attached; no transfer/import medium recorded on the descriptor
           still attached.
         * a secret-SHAPED attached disk path (Test-IsSecretPath) is REFUSED at any tier.
@@ -69,7 +74,8 @@
           descriptor's recorded disk set — at Tier-1 it is a best-effort backstop layered on the
           name-shape (Test-IsSecretPath) + descriptor import/transfer-denylist checks above; the
           STRUCTURAL no-net guarantee remains the Tier>=2 rule.
-        * all four host channels MUST be off.
+        * every host channel MUST be off: the four original ones plus the Time Synchronization,
+          Key-Value Pair Exchange, Backup and Heartbeat integration services (Shutdown stays on).
         * POSITIVE COM1-liveness (serial-managed guests only): for a Com1Serial / ComPipePath-bearing
           descriptor, COM1 MUST still be attached after sealing — the seal must never collaterally
           sever the Runner's serial command channel (the only no-NIC management path for a Linux guest).
@@ -83,6 +89,8 @@
         *-VMIntegrationService cmdlet.
       * GetGpuPartitionAdapters @{ VMName } and GetAssignableDevices @{ VMName }: host-truth reads of
         passthrough devices, so the gate can refuse any without reaching for a raw Get-VM* cmdlet.
+      * GetAutomaticCheckpoints @{ VMName }: host-truth read of the automatic-checkpoint setting (added
+        2026-10-03 with the checkpoint refusal; GetCheckpoint already existed).
 
     LINUX-GUEST SEAL MODEL (the channels split into TWO classes):
       * GuestServices = the ONE REAL autonomous host<->guest data channel (Copy-VMFile / 'Guest
@@ -102,14 +110,31 @@
 
 Set-StrictMode -Version Latest
 
+# Get-SealNicPolicy, the NIC predicate Lock-Sandbox and Assert-Sealed share with the Provisioner.
+. (Join-Path $PSScriptRoot 'SealPolicy.ps1')
+
 # --------------------------------------------------------------------------
 # Shared constants
 # --------------------------------------------------------------------------
 
 # The host<->guest channels the seal turns OFF and the gate host-verifies. Mirrors
 # $script:HostChannelNames in HyperVBackend.ps1 and the tier-profile HostChannels keys
-# (SCHEMA.md). Re-declared here so this file is usable when dot-sourced standalone.
-$script:SealHostChannels = @('Clipboard', 'Shares', 'GuestServices', 'EnhancedSession')
+# (SCHEMA.md). Re-declared here so the set does not depend on HyperVBackend.ps1 being loaded first.
+# What this file needs from elsewhere: Get-SealNicPolicy comes from SealPolicy.ps1, which this file
+# dot-sources itself; Get-VMField (Provisioner.ps1) and Test-IsSecretPath (ProfileLoader.ps1) still come
+# from the load order in the header, and Assert-Sealed refuses when Test-IsSecretPath is missing.
+#
+# Since 2026-10-03 (design E6) the set also closes four Hyper-V integration services the engine never
+# uses: TimeSync (Time Synchronization), KeyValueExchange (Key-Value Pair Exchange), Backup (VSS) and
+# Heartbeat. Nothing in scripts/ reads heartbeat state: boot readiness is a COM1 probe and Disk-mode
+# completion is the VM's power state. Shutdown is NOT in the set, because Remove-Sandbox,
+# Wait-WorkloadComplete and Invoke-Voidseal stop VMs with StopVM -Force and no TurnOff, which asks the
+# guest to shut down through that service. Disabling Time Synchronization narrows the guest's view of host
+# time but does not remove it: the Hyper-V reference TSC page stays readable (docs/threat-model.md).
+$script:SealHostChannels = @(
+    'Clipboard', 'Shares', 'GuestServices', 'EnhancedSession',
+    'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat'
+)
 
 # --------------------------------------------------------------------------
 # Internal helpers
@@ -461,7 +486,8 @@ function Dismount-SandboxAsset {
       2. detach every transfer VHD recorded on the descriptor (scripted — NOT inherently one-way),
       3. for a NoAdapter VM (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): RemoveNetworkAdapter
          (remove, not disconnect; real New-VM always creates one adapter, so there is always one to remove),
-      4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session),
+      4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session /
+         time sync / key-value exchange / backup / heartbeat),
       5. set the descriptor State = 'Sealed'.
     It does NOT power the VM on, and does NOT itself filter egress: Tier-1 net-restriction today
     relies on in-guest controls (Squid SNI proxy + allowlist) as defense-in-depth, not this
@@ -531,7 +557,7 @@ function Lock-Sandbox {
     }
 
     # --- 3. remove every NIC unless the policy is exactly IsolatedInternalSwitch ---
-    # Get-SealNicPolicy (Provisioner.ps1) is the single predicate shared with the Provisioner and
+    # Get-SealNicPolicy (SealPolicy.ps1) is the single predicate shared with the Provisioner and
     # Assert-Sealed. Only a Tier-1 non-processor keeps its NIC: it is net-RESTRICTED, not no-net (egress
     # control today is in-guest defense-in-depth, not the seal; host-side enforcement is Phase-6-live).
     # Every other VM is NoAdapter, and real New-VM always creates one adapter, so the seal removes it
@@ -576,7 +602,8 @@ function Lock-Sandbox {
       * NoAdapter VMs (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): GetNetworkAdapter MUST
         be empty (no NIC = no live egress route). Only a Tier-1 non-processor keeps a NIC; the media
         and channel checks apply to every tier.
-      * IsolatedInternalSwitch (Tier 1, non-processor): every NIC MUST be on an isolated Internal vSwitch (I4). Its
+      * IsolatedInternalSwitch (Tier 1, non-processor): exactly ONE NIC, bound to the descriptor's recorded
+        SwitchName (the VM's own "<vm>-int" switch; a blank record refuses), on an Internal vSwitch (I4). Its
         SwitchType is host-verified via GetSwitch. An External, Private, or unresolvable switch
         bypasses the host-controlled egress chokepoint and is refused, fail-closed. The
         built-in Default Switch is itself SwitchType=Internal (ICS/internet-connected), so the
@@ -587,6 +614,10 @@ function Lock-Sandbox {
         still-Phase-6-live layer.
       * NO passthrough device at any tier: GetGpuPartitionAdapters and GetAssignableDevices must both
         report none (a read that throws or returns no collection is a refusal).
+      * NO path on COM2 at any tier (GetComPort Number=2). Voidseal wires only COM1; a read that throws
+        refuses.
+      * automatic checkpoints OFF and NO checkpoint present at any tier (GetAutomaticCheckpoints,
+        GetCheckpoint). A throw, a non-[bool] setting or a listing that is not a collection refuses.
       * no import DVD/ISO attached (a live read-only-but-present host<->guest medium).
       * no transfer/import VHD recorded on the descriptor still attached.
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.
@@ -602,7 +633,8 @@ function Lock-Sandbox {
         rule above does not run), but is only as complete as the descriptor's recorded disk set — so
         at Tier-1 it layers on the name-shape + import/transfer-denylist checks rather than replacing
         the structural rule. A RECORDED data disk is expected; an UNRECORDED attached disk is refused.
-      * every host channel (clipboard / shares / guest-services / enhanced-session) MUST be off.
+      * every host channel (clipboard / shares / guest-services / enhanced-session / time sync /
+        key-value exchange / backup / heartbeat) MUST be off; a channel the host cannot report refuses.
       * POSITIVE COM1-liveness (serial-managed guests only): COM1 MUST still be attached after sealing
         so the seal cannot have severed the Runner's serial command channel. Read from host truth via
         the backend's GetComPort. Skipped for a non-serial tier (no ComPipePath, not Com1Serial).
@@ -629,11 +661,15 @@ function Assert-Sealed {
         throw "Assert-Sealed: descriptor has no VM Name; cannot verify a seal."
     }
     $tier = [int](Get-DescriptorField -Descriptor $Descriptor -Name 'Tier' -Default 0)
-    # The NIC policy comes from ONE predicate, Get-SealNicPolicy (Provisioner.ps1), shared with the
+    # The NIC policy comes from ONE predicate, Get-SealNicPolicy (SealPolicy.ps1), shared with the
     # Provisioner and Lock-Sandbox and computed from the Tier plus the Network label New-SandboxVM
     # records on the descriptor. Until 2026-10-03 production never recorded Network, so the processor
     # branch below could fire only in tests that injected the field by hand.
     $network     = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'Network')
+    # "Processor" here means Network='None' alone, which only picks the wording of the NIC refusal below.
+    # ProfileLoader's Test-IsProcessorProfile also requires a ScreenConfig because it decides screener
+    # routing, and the descriptor does not carry ScreenConfig. The two can disagree on a no-network
+    # profile without a ScreenConfig, but the NIC policy is NoAdapter under both, so no outcome changes.
     $isProcessor = ($network.Trim() -eq 'None')
 
     # --- FAIL CLOSED: if the host can't be queried, do NOT certify --------
@@ -661,7 +697,15 @@ function Assert-Sealed {
         throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the descriptor records no " +
                "Network posture, so its network-adapter policy cannot be determined. Fail closed.")
     }
-    $nicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
+    # Since 2026-10-03 the predicate throws for a Tier-1 label it does not recognize; turn that into a
+    # named refusal so the operator sees the gate's verdict rather than a bare predicate error.
+    try {
+        $nicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
+    }
+    catch {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because its network-adapter policy cannot be " +
+               "determined ($($_.Exception.Message)). Fail closed.")
+    }
     # Get-SealNicPolicy returns exactly two values today. A third would skip BOTH NIC branches below
     # and fall through to certification, the same "no branch means no check" shape that let Tier 0
     # escape the adapter check before 2026-10-03. Refuse anything unrecognized: fail closed.
@@ -678,6 +722,12 @@ function Assert-Sealed {
     # other tier. Read the collection DIRECTLY (the backend preserves array semantics; never re-wrap).
     if ($nicPolicy -eq 'NoAdapter') {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
+        # A read that returns no collection at all is not "zero adapters" (same rule as the passthrough
+        # reads): under StrictMode $null.Count throws a bare property error, so refuse by name instead.
+        if ($null -eq $nics) {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not report its " +
+                   "network adapters (the read returned no collection). Fail closed.")
+        }
         if ($nics.Count -ne 0) {
             if ($isProcessor) {
                 throw ("Assert-Sealed: REFUSING to certify processor VM '$vmName' SEALED because " +
@@ -710,6 +760,28 @@ function Assert-Sealed {
     # only — the VM can reach only the host gateway of whatever (non-Default) Internal switch it's on.
     if ($nicPolicy -eq 'IsolatedInternalSwitch') {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
+        # Without this guard a $null read meant the foreach below ran zero times and the VM CERTIFIED:
+        # an unreadable adapter list passed as "nothing to check". Refuse it.
+        if ($null -eq $nics) {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not report its " +
+                   "network adapters (the read returned no collection). Fail closed.")
+        }
+        # Bind the NIC to the VM's OWN switch (review finding, 2026-10-03). The type and Default-Switch checks
+        # below accepted a NIC on ANY Internal switch not named "Default Switch", and any number of NICs, so
+        # a Tier-1 VM re-pointed at another sandbox's switch, or at one the host had NAT'ed, sealed green.
+        # New-SandboxVM records the switch it built ("<vm>-int") as the descriptor's SwitchName; the gate now
+        # requires exactly one NIC, on exactly that switch. The per-NIC checks still run first, so an
+        # External, unresolvable or Default switch keeps its own, more specific refusal.
+        $recordedSwitch = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'SwitchName')
+        if ([string]::IsNullOrWhiteSpace($recordedSwitch)) {
+            throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because the descriptor records no " +
+                   "SwitchName, so its NIC cannot be bound to the VM's own switch. Fail closed.")
+        }
+        if ($nics.Count -ne 1) {
+            throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because $($nics.Count) network " +
+                   "adapters are attached; a Tier-1 VM must have exactly one, on its own switch '$recordedSwitch'. " +
+                   "Fail closed.")
+        }
         foreach ($nic in $nics) {
             $switchName = [string]$nic.SwitchName
             if ([string]::IsNullOrWhiteSpace($switchName)) {
@@ -744,6 +816,11 @@ function Assert-Sealed {
                        "isolated Tier-1 Internal vSwitch. A Tier-1 VM MUST ride a purpose-built isolated Internal " +
                        "switch (host-controlled egress chokepoint). Fail closed.")
             }
+            if ($switchName -ne $recordedSwitch) {
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because its NIC is on switch " +
+                       "'$switchName', not this VM's own recorded switch '$recordedSwitch'. An Internal switch built " +
+                       "for another sandbox, or one the host routes or NATs, is not this VM's isolated switch. Fail closed.")
+            }
         }
     }
 
@@ -774,6 +851,72 @@ function Assert-Sealed {
                    "$($passthrough.Label)(s) are attached. Voidseal never assigns one, so it was added " +
                    "outside the tool; no passthrough device may reach a sealed sandbox at any tier. Fail closed.")
         }
+    }
+
+    # --- COM2 carries NO path (any tier, host-verified) -------------------
+    # Voidseal wires only COM1, the serial management channel checked further down. A named pipe on COM2
+    # is a second byte stream between guest and host that the tool never created, so it is refused at
+    # every tier, whether or not the run is serial-managed. The read goes through GetComPort like COM1's;
+    # a read that throws is a refusal, because an inability to check is never a pass.
+    $com2 = $null
+    try {
+        $com2 = & $Backend.GetComPort @{ VMName = $vmName; Number = 2 }
+    }
+    catch {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not read its COM2 " +
+               "port ($($_.Exception.Message)). Fail closed.")
+    }
+    if ($null -ne $com2) {
+        $com2Path = if ($com2 -is [System.Collections.IDictionary] -and $com2.Contains('Path')) { [string]$com2['Path'] } else { '' }
+        if ([string]::IsNullOrWhiteSpace($com2Path)) {
+            # GetComPort returns $null for an empty port, so a record without a readable path is a shape the
+            # gate does not understand. Refuse it rather than guess.
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host returned a COM2 record " +
+                   "with no readable path. Fail closed.")
+        }
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because its COM2 port is connected to " +
+               "'$com2Path'. Voidseal wires only COM1 (the serial management channel); a path on COM2 is a " +
+               "second host<->guest byte stream added outside the tool. Fail closed.")
+    }
+
+    # --- NO automatic checkpoints and NO existing checkpoint (any tier, host-verified) ---
+    # A checkpoint holds a copy of the VM from before (or during) the seal; restoring it undoes the seal
+    # without the gate ever seeing it, and automatic checkpoints also pin a differencing .avhdx per disk
+    # (RC7). New-SandboxVM turns automatic checkpoints off and nothing in the engine takes a checkpoint, so
+    # either one here was changed outside the tool. Both reads fail closed: a throw, a non-[bool] setting
+    # and a listing that is not a collection all refuse.
+    $autoCheckpoints = $null
+    try {
+        $autoCheckpoints = & $Backend.GetAutomaticCheckpoints @{ VMName = $vmName }
+    }
+    catch {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not read its " +
+               "automatic-checkpoint setting ($($_.Exception.Message)). Fail closed.")
+    }
+    if ($autoCheckpoints -isnot [bool]) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host returned no boolean " +
+               "automatic-checkpoint setting. Fail closed.")
+    }
+    if ($autoCheckpoints) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because automatic checkpoints are enabled. " +
+               "They pin a differencing disk and capture pre-run state that a restore would bring back; " +
+               "New-SandboxVM turns them off, so this was changed outside the tool. Fail closed.")
+    }
+    $checkpoints = $null
+    try {
+        $checkpoints = & $Backend.GetCheckpoint @{ VMName = $vmName }
+    }
+    catch {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not list its " +
+               "checkpoints ($($_.Exception.Message)). Fail closed.")
+    }
+    if ($null -eq $checkpoints) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not list its " +
+               "checkpoints (the read returned no collection). Fail closed.")
+    }
+    if ($checkpoints.Count -ne 0) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because $($checkpoints.Count) checkpoint(s) " +
+               "exist. A restore would roll the VM back past the seal, and the engine never takes one. Fail closed.")
     }
 
     # --- NO import DVD/ISO attached (any tier) ----------------------------
@@ -959,9 +1102,9 @@ function Assert-Sealed {
                    "'$channel' state from the host. Fail closed.")
         }
         if ($on) {
-            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED — host channel '$channel' is still ON. " +
-                   "All host<->guest channels (clipboard / shares / guest-services / enhanced-session) MUST be " +
-                   "off in a sealed sandbox. Fail closed.")
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because host channel '$channel' is still ON. " +
+                   "All host<->guest channels (clipboard / shares / guest-services / enhanced-session / " +
+                   "time sync / key-value exchange / backup / heartbeat) MUST be off in a sealed sandbox. Fail closed.")
         }
     }
 

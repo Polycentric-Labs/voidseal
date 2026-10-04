@@ -130,7 +130,7 @@ but nothing yet confines the child process.*
 
 | Assertion | Status |
 |---|---|
-| Single-NIC invariant | live-only addition (not yet asserted) |
+| Single-NIC invariant, bound to the VM's own switch | **SHIPPED, mock-green (2026-10-03)**: `Assert-Sealed`'s Tier-1 block requires exactly one NIC and that its `SwitchName` equals the descriptor's recorded `SwitchName` (`<vm>-int`); a re-pointed NIC, a second NIC, or a descriptor with no recorded switch is refused |
 | Zero adapters for every NoAdapter VM (Tier 0, Tier >= 2, any processor) | **SHIPPED, mock-green**: `Get-SealNicPolicy` plus `Lock-Sandbox` removal plus `Assert-Sealed`'s zero-adapter refusal; the first live exercise is the next Tier-0 run |
 | No passthrough device (GPU partition adapter, DDA-assigned device) | **SHIPPED, mock-green**: `Assert-Sealed` reads `GetGpuPartitionAdapters` and `GetAssignableDevices` at every tier |
 | NIC's switch `SwitchType == Internal` | **SHIPPED, mock-green** — `Assert-Sealed`'s `SwitchType -ne 'Internal'` refusal in `scripts/lib/Sealer.ps1`'s Tier-1 block — locate by predicate |
@@ -144,8 +144,10 @@ The by-name Default-Switch refusal is real, host-verified, seal-time code today 
 `docs/operator-runbook.md` for the full writeup of what it does and does not guarantee). It is a
 switch-**isolation** control, not egress **filtering** — §2 above is the filtering layer, and it remains
 entirely live-only. The GUID-by-Id hardening is the one remaining live addition to the switch-identity
-check itself; the rest of this table (single-NIC, no-uplink, gateway-IP pin, firewall-baseline diff) are
-net-new live-only assertions, none of which exist in the mock-green engine today.
+check itself (the switch binding above already refuses a NIC on a localized Default Switch, because that
+is not the VM's recorded switch, so the GUID check is now defense in depth). The rest of this table
+(no-uplink, gateway-IP pin, firewall-baseline diff) are net-new live-only assertions, none of which exist
+in the mock-green engine today.
 
 ---
 
