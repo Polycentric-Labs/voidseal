@@ -62,7 +62,7 @@ $script:HyperVUnavailablePrefix =
 # The canonical host<->guest channel names the SEAL controls (matches the tier-profile
 # HostChannels hashtable keys). SINGLE SOURCE OF TRUTH: SetHostChannel
 # validates against this set; GetHostChannels returns exactly these keys; the fake seeds
-# every VM with all of them = $true (the UNSEALED default — Hyper-V enables these by default,
+# every VM with all of them = $true (the UNSEALED default: Hyper-V enables these by default,
 # so the Sealer must explicitly turn them off and Assert-Sealed must host-verify they are).
 #
 # The last four are Hyper-V integration services added to the seal on 2026-10-03 (design E6):
