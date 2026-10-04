@@ -124,8 +124,19 @@ allowlist. Every item below is something the mock suite cannot prove.
    the record: how an address range renders (`0.0.0.0-10.231.a.b`), whether the IPv6 range
    `::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff` was accepted, how `ICMPv4`/`ICMPv6`/`Any` render as
    `Protocol`, and whether `InterfaceAlias` reads back as the alias. This is the most likely fake versus
-   real gap: if `Assert-Sealed` refuses with "differs from its record", capture these outputs, because
-   the normalization in the real `GetHostFirewallRule` must change, not the gate.
+   real gap: if `Assert-Sealed` refuses with "differs from its record" or "cannot interpret", capture
+   these outputs, because the normalization in the real `GetHostFirewallRule`, or the address and port
+   parsing in `HostEgress.ps1` (`ConvertTo-EgressAddressKey`, `ConvertTo-EgressPortKey`), must change, not
+   the gate's strictness.
+7a. **Readback equals record for all seven rules.** The gate compares each host rule with its record as
+   parsed address and port sets (a single address, an `a-b` range, a prefix, IPv6 in any form and any list
+   order read as the same set), not as text. Confirm that `Assert-Sealed` certifies, so all seven rules
+   (`allow-proxy`, `block-tcp-ports`, `block-proxy-others`, `block-udp`, `block-icmp4`, `block-icmp6`,
+   `block-other-local`) read back equal to their records, and write down how Windows rendered each
+   `LocalAddress`, `RemoteAddress` and `LocalPort`, especially the mixed IPv4 and IPv6 `LocalAddress` of
+   `block-other-local`. A refusal that says "cannot interpret" means Windows used a form the parser does
+   not know (a keyword such as `LocalSubnet`, or an IPv6 scope id); capture it and extend the parser
+   rather than loosening the comparison.
 8. `Get-VMNetworkAdapterExtendedAcl -VMName <vm>` lists three entries. Record how an unset field renders
    (empty, `ANY`, `*`), whether `Protocol` reads `TCP` or `6`, and `Stateful`.
 9. `Assert-Sealed` returns `$true`.

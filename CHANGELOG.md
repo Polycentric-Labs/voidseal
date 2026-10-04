@@ -191,3 +191,8 @@ places where a check is an argument rather than a measurement.
 - A Disk-mode workload on a VM that keeps its NIC under `EgressMode='HostProxy'` is now refused by an
   `Invoke-Voidseal` preflight, before anything is created. Previously only the seed builder refused it,
   after the system, INPUT and OUTPUT disks had been created and copied; that check stays as a backstop.
+- The seal gate now compares each host firewall rule with its record as parsed address and port sets
+  (single addresses, ranges, prefixes, IPv6 in any form, any list order, split or merged ranges), not as
+  text, since how Windows renders them was unproven. An address or port the parser cannot read exactly
+  (for example `LocalSubnet`, a scope id, or `RPC`) refuses the seal, naming the rule. Added to the
+  Phase-6 live checks: readback equals record for all seven rules.
