@@ -1160,6 +1160,19 @@ Describe 'Lock-Sandbox + Assert-Sealed: the NIC policy is enforced at every tier
             Should -Throw -ExpectedMessage '*no Network posture*'
     }
 
+    It 'Assert-Sealed REFUSES (fail closed) when the adapter read returns no collection: <Label>' -ForEach @(
+        @{ Tier = 0; Label = 'Tier 0, NoAdapter branch' },
+        @{ Tier = 1; Label = 'Tier 1, isolated-switch branch' }
+    ) {
+        $p = if ($Tier -eq 0) { $script:T0 } else { $script:Tier1 }
+        $sb = & $script:NewTestSandbox -Profile $p -Name "sbx-np-nullnic$Tier"
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue -Because 'precondition: the seal certifies with a working read'
+        $sb.Backend.GetNetworkAdapter = { param($P) return $null }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*REFUSING to certify 'sbx-np-nullnic$Tier' SEALED because the host could not report its network adapters (the read returned no collection)*"
+    }
+
     It 'Assert-Sealed REFUSES a Tier-1 descriptor whose Network label the policy does not recognize' {
         $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-np-badlabel'
         Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend

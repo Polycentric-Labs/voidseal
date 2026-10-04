@@ -701,6 +701,12 @@ function Assert-Sealed {
     # other tier. Read the collection DIRECTLY (the backend preserves array semantics; never re-wrap).
     if ($nicPolicy -eq 'NoAdapter') {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
+        # A read that returns no collection at all is not "zero adapters" (same rule as the passthrough
+        # reads): under StrictMode $null.Count throws a bare property error, so refuse by name instead.
+        if ($null -eq $nics) {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not report its " +
+                   "network adapters (the read returned no collection). Fail closed.")
+        }
         if ($nics.Count -ne 0) {
             if ($isProcessor) {
                 throw ("Assert-Sealed: REFUSING to certify processor VM '$vmName' SEALED because " +
@@ -733,6 +739,12 @@ function Assert-Sealed {
     # only — the VM can reach only the host gateway of whatever (non-Default) Internal switch it's on.
     if ($nicPolicy -eq 'IsolatedInternalSwitch') {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
+        # Without this guard a $null read meant the foreach below ran zero times and the VM CERTIFIED:
+        # an unreadable adapter list passed as "nothing to check". Refuse it.
+        if ($null -eq $nics) {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not report its " +
+                   "network adapters (the read returned no collection). Fail closed.")
+        }
         foreach ($nic in $nics) {
             $switchName = [string]$nic.SwitchName
             if ([string]::IsNullOrWhiteSpace($switchName)) {
