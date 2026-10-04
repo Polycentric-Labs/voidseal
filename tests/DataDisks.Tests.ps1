@@ -19,7 +19,11 @@ BeforeAll {
     $script:Fx = @{} + (Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1'))
     $script:Fx['Name']         = 'datadisk-test'
     $script:Fx['WorkloadMode'] = 'Disk'
+    # The outbox helper preflight requires both guest helpers on INPUT for a transport-only profile.
     $script:Fx['Inputs']       = @{}
+    foreach ($helper in @('run_disk_workload.py', 'outbox.py')) {
+        $script:Fx['Inputs'][$helper] = Get-Content -LiteralPath (Join-Path $script:SkillRoot "guest/$helper") -Raw
+    }
     $script:Fx['FileSystem']   = 'exFAT'
     $script:Fx['OutboxOutput'] = $true
     $script:Fx['Entrypoint']   = 'python3 /mnt/in/summarize.py --corpus /mnt/data/corpus --out /run/staging/result.html'

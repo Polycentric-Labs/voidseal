@@ -106,14 +106,15 @@ Describe 'Invoke-BuilderVM — no seal (builder keeps NIC for the fetch)' {
         $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob $blob
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-noseal' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-ns.vhdx')
         $r.Status | Should -Be 'Success'
-        # A sealed VM would have no network adapters; the builder KEEPS its NIC.
-        # The VM is torn down so we can't read it back — assert via CallLog. RemoveNetworkAdapter is
-        # gated behind Tier>=2 inside Lock-Sandbox (the builder is Tier-1), so a zero count here ALONE
-        # does not prove Lock-Sandbox was never called — a regression invoking Lock-Sandbox on this
-        # Tier-1 VM would still log zero RemoveNetworkAdapter entries. SetHostChannel is Lock-Sandbox's
-        # UNCONDITIONAL op (every tier, 4 channels) and is what actually pins the claim.
+        # A sealed NoAdapter VM has its network adapter removed. The builder is a Tier-1 non-processor
+        # that never seals and KEEPS its NIC.
+        # The VM is torn down so we can't read it back, so assert via CallLog. Lock-Sandbox removes the
+        # adapter unless the policy is IsolatedInternalSwitch, and the builder is a Tier-1 non-processor
+        # (it keeps its NIC), so a zero count here ALONE does not prove Lock-Sandbox was never called: a
+        # regression invoking Lock-Sandbox on this VM would still log zero RemoveNetworkAdapter entries.
+        # SetHostChannel is Lock-Sandbox's UNCONDITIONAL op (every tier, 4 channels) and is what pins the claim.
         $removeNicCalls = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' })
-        $removeNicCalls.Count | Should -Be 0 -Because 'a sealed Tier>=2 VM would have its NIC removed; the builder is Tier-1 so this check alone does not discriminate Lock-Sandbox invocation'
+        $removeNicCalls.Count | Should -Be 0 -Because 'a sealed NoAdapter VM would have its NIC removed; the builder is a Tier-1 non-processor that keeps its NIC, so this check alone does not discriminate Lock-Sandbox invocation'
         $setChannelCalls = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'SetHostChannel' })
         $setChannelCalls.Count | Should -Be 0 -Because 'SetHostChannel is Lock-Sandbox''s unconditional op across every tier — zero entries is what actually proves Lock-Sandbox was never called'
     }
@@ -238,6 +239,45 @@ Describe 'Resolve-PythonExe — robust host python resolution (fold-in #1)' {
         $err.Exception.Message | Should -BeLike "*$($script:AliasPython)*"
     }
 
+    It 'skips a .bat shim that sits ahead of a real .exe and returns the .exe' {
+        # Get-Command -CommandType Application matches any PATHEXT file; a shim runs through cmd.exe.
+        $lookup = New-FakeCommandLookup @{
+            python3 = @('C:\Tools\shims\python3.bat')
+            python  = @('C:\Tools\shims\python.cmd', $script:RealPython)
+        }
+        Resolve-PythonExe -CommandLookup $lookup | Should -Be $script:RealPython
+    }
+
+    It 'skips a shim in any extension case and prefers a later real python3.exe' {
+        $realPython3 = 'C:\Tools\Python\python3.exe'
+        $lookup = New-FakeCommandLookup @{
+            python3 = @('C:\Tools\shims\python3.BAT', $realPython3)
+            python  = @($script:RealPython)
+        }
+        Resolve-PythonExe -CommandLookup $lookup | Should -Be $realPython3
+    }
+
+    It 'fails closed when PATH offers only shims, naming each shim it skipped' {
+        $lookup = New-FakeCommandLookup @{
+            python3 = @('C:\Tools\shims\python3.bat')
+            python  = @('C:\Tools\shims\python.cmd')
+        }
+        $err = { Resolve-PythonExe -CommandLookup $lookup } | Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike "*'python3'*'python'*"
+        $err.Exception.Message | Should -BeLike '*C:\Tools\shims\python3.bat*' -Because 'the operator needs to see which shim was refused'
+        $err.Exception.Message | Should -BeLike '*C:\Tools\shims\python.cmd*'
+    }
+
+    It 'names both skipped aliases and skipped shims when PATH offers nothing else' {
+        $lookup = New-FakeCommandLookup @{
+            python3 = @($script:AliasPython3)
+            python  = @('C:\Tools\shims\python.bat')
+        }
+        $err = { Resolve-PythonExe -CommandLookup $lookup } | Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike "*$($script:AliasPython3)*"
+        $err.Exception.Message | Should -BeLike '*C:\Tools\shims\python.bat*'
+    }
+
     It 'by default asks Get-Command for every Application match, so a real python behind an alias is reachable' {
         # Without -All, Get-Command stops at the first match on PATH; when that match is an alias, a
         # real interpreter further down would never be seen.
@@ -254,5 +294,104 @@ Describe 'Resolve-PythonExe — robust host python resolution (fold-in #1)' {
             $Name -eq 'python' -and $All -and $CommandType -eq [System.Management.Automation.CommandTypes]::Application
         }
         Resolve-PythonExe | Should -Be $script:RealPython
+    }
+}
+
+# ===========================================================================
+#  -HostMemoryMarginBytes reaches the provisioner's free-RAM gate (E1)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - passes -HostMemoryMarginBytes to the provisioner (E1)' {
+
+    It 'a margin the host cannot meet fails the run before anything is created' {
+        $b = New-FakeHyperVBackend
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-margin' `
+            -HostMemoryMarginBytes 100GB -Backend $b -WarningAction SilentlyContinue
+        $r.Status | Should -Be 'Failed'
+        $r.Error  | Should -Match '(?i)free memory'
+        (& $b.GetVM @{ Name = 'bld-margin' }) | Should -BeNullOrEmpty
+    }
+}
+
+# ===========================================================================
+#  -StorageRoot covers the builder's disks (E2)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - honors -StorageRoot (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    BeforeAll {
+        function script:New-DiskPathRecorder {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+            $made = [System.Collections.Generic.List[string]]::new()
+            $origVhd = $b.NewVHD; $origOut = $b.NewOutputVhdx
+            $b.NewVHD        = { param($P) $made.Add([string]$P.Path); & $origVhd $P }.GetNewClosure()
+            $b.NewOutputVhdx = { param($P) $made.Add([string]$P.Path); & $origOut $P }.GetNewClosure()
+            $b['Made'] = $made
+            return $b
+        }
+    }
+
+    It 'creates every disk (system, input, output, seed) under the per-VM folder below -StorageRoot' {
+        $b = script:New-DiskPathRecorder
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root' -StorageRoot 'D:\vs-bld' `
+            -Backend $b -DepsDiskPath (Join-Path $TestDrive 'deps-root.vhdx')
+        $r.Status | Should -Be 'Success'
+        $dir = Join-Path 'D:\vs-bld' 'bld-root'
+        $b.Made.Count | Should -BeGreaterThan 3
+        foreach ($p in $b.Made) { $p | Should -BeLike "$dir*" }
+    }
+
+    It 'honors VOIDSEAL_STORAGE_ROOT when the parameter is omitted' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-bld-env'
+        $b = script:New-DiskPathRecorder
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root-env' `
+            -Backend $b -DepsDiskPath (Join-Path $TestDrive 'deps-root-env.vhdx')
+        $r.Status | Should -Be 'Success'
+        foreach ($p in $b.Made) { $p | Should -BeLike (Join-Path 'D:\vs-bld-env' 'bld-root-env*') }
+    }
+
+    It 'a relative -StorageRoot is refused before anything is created' {
+        $b = New-FakeHyperVBackend
+        { Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root-bad' -StorageRoot 'relative\dir' -Backend $b } |
+            Should -Throw -ExpectedMessage '*absolute local path*'
+        (& $b.GetVM @{ Name = 'bld-root-bad' }) | Should -BeNullOrEmpty
+    }
+}
+
+# ===========================================================================
+#  WorkloadTimeoutSeconds: explicit parameter > profile key > 600 (E3)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - the deadline comes from -WorkloadTimeoutSeconds, then the profile, then 600 (E3)' {
+
+    BeforeAll {
+        function script:New-BuilderProfileWithTimeout {
+            param($Timeout)
+            $p = @{} + (Import-WorkloadProfile -Path "$script:SkillRoot/profiles/builder.psd1" -TierProfileDir "$script:SkillRoot/tier-profiles")
+            if ($null -ne $Timeout) { $p['WorkloadTimeoutSeconds'] = $Timeout }
+            return $p
+        }
+    }
+    BeforeEach { Mock Wait-WorkloadComplete { @{ State = 'Off'; TimedOut = $false } } }
+
+    It 'uses the profile key when the parameter is not given' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout 3600) -Name 'bld-to-prof' -Backend $b `
+            -DepsDiskPath (Join-Path $TestDrive 'to-prof.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 3600 }
+    }
+
+    It 'an explicit parameter beats the profile key' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout 3600) -Name 'bld-to-exp' -Backend $b `
+            -WorkloadTimeoutSeconds 0 -DepsDiskPath (Join-Path $TestDrive 'to-exp.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 0 }
+    }
+
+    It 'falls back to 600 when neither is given' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout $null) -Name 'bld-to-def' -Backend $b `
+            -DepsDiskPath (Join-Path $TestDrive 'to-def.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
     }
 }

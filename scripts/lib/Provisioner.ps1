@@ -22,13 +22,15 @@
 
     FAIL-CLOSED: New-SandboxVM runs the backend's TestAvailable() preflight first; if
     Hyper-V is unreachable / this process is not elevated, it throws a clear, actionable
-    message BEFORE creating anything (no half-built VM).
+    message BEFORE creating anything (no half-built VM). A host free-RAM gate follows it (see
+    -HostMemoryMarginBytes): the guest's memory plus a margin must fit in the host's free physical
+    memory, and an unreadable host is refused, before anything is created.
 
     PROVISIONING ORDER (mirrors real Hyper-V dependencies so the fake's fidelity guards
     are satisfied — switch/VHD must exist before they're referenced):
         preflight -> idempotency check -> NewVHD (system disk) -> NewVM (Gen2, NoVHD)
-        -> SetMemory -> SetProcessor (+nested virt) -> SetFirmware (SecureBoot template)
-        -> SetComPort (COM1, Linux mgmt) -> NewSwitch + ConnectNetworkAdapter (VM tiers)
+        -> SetMemory -> SetProcessor (+nested virt, +optional CPU caps) -> SetFirmware (SecureBoot template)
+        -> SetComPort (COM1, Linux mgmt) -> NewSwitch + ConnectNetworkAdapter (IsolatedInternalSwitch VMs only)
         -> AddHardDiskDrive (attach system disk).
     The VM is left POWERED OFF — the Sealer runs before first boot.
 
@@ -56,6 +58,10 @@
         a Get so it's idempotent); fake = drops its in-memory record. (Also usable by the Sealer.)
         Teardown uses it as well: Remove-Sandbox removes the switches the descriptor records in
         CreatedSwitches, so a COMPLETED run leaves no per-VM switch behind either.
+    NIC POLICY (2026-10-03):
+      * Get-SealNicPolicy is the single predicate for whether a VM keeps a NIC, shared with Lock-Sandbox
+        and Assert-Sealed. New-SandboxVM records the profile's Network label on the descriptor so all
+        three compute the same answer. Only a Tier-1 non-processor gets a switch and a connected NIC.
     AUTOMATIC CHECKPOINTS (RC7 — gap CLOSED 2026-06-25):
       * Hyper-V defaults `AutomaticCheckpointsEnabled=ON`, which pins a differencing AVHDX per disk at
         VM start: the guest writes its result into the .avhdx while the host reads the empty BASE .vhdx,
@@ -221,25 +227,63 @@ function ConvertTo-Bytes {
 
 <#
 .SYNOPSIS
-    Compute the default sandbox storage root (host-side). Disks + the COM1 pipe live here.
+    Resolve the BASE directory that holds every sandbox's folder (host-side).
 .DESCRIPTION
-    Defaults to %ProgramData%\Voidseal\sandboxes\<vmName> on Windows, with a temp-dir
-    fallback for the non-Windows test/dev host (the fake backend never touches the FS, so
-    these are just record strings the descriptor carries — no directory is created here).
+    Precedence (E2): an explicit -StorageRoot beats the VOIDSEAL_STORAGE_ROOT environment variable,
+    which beats the default of %ProgramData%\Voidseal\sandboxes (a temp-dir fallback on a non-Windows
+    test/dev host). A blank or whitespace value counts as unset and falls through to the next source.
+
+    A chosen root must be an ABSOLUTE LOCAL path. A relative path, a drive-relative path (C:dir), a
+    rooted path with no drive (\dir) and any UNC, extended or device path (\\server\share, \\?\C:\dir,
+    \\.\C:\dir) is refused, fail closed, with a message naming which source supplied it. The guard keeps
+    a typo from landing a VM's disks relative to whatever the working directory happens to be, and keeps
+    the system and data disks off a network share. Nothing is created here: the fake backend never
+    touches the filesystem and the real NewVHD creates the files.
+#>
+function Resolve-SandboxStorageBase {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string] $StorageRoot)
+
+    $candidate = $null
+    $source    = $null
+    if (-not [string]::IsNullOrWhiteSpace($StorageRoot)) {
+        $candidate = $StorageRoot.Trim(); $source = '-StorageRoot'
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:VOIDSEAL_STORAGE_ROOT)) {
+        $candidate = $env:VOIDSEAL_STORAGE_ROOT.Trim(); $source = 'the VOIDSEAL_STORAGE_ROOT environment variable'
+    }
+
+    if ($null -ne $candidate) {
+        if (($candidate -match '^(\\\\|//)') -or -not [System.IO.Path]::IsPathFullyQualified($candidate)) {
+            throw ("Sandbox storage root: $source value '$candidate' is not an absolute local path " +
+                   "(for example 'D:\VoidsealSandboxes'). Relative, drive-relative, UNC, extended and device " +
+                   "paths are refused. Failing closed BEFORE anything is created.")
+        }
+        return $candidate
+    }
+
+    if ($env:ProgramData -and -not [string]::IsNullOrWhiteSpace($env:ProgramData)) {
+        return (Join-Path $env:ProgramData 'Voidseal\sandboxes')
+    }
+    return (Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\sandboxes')
+}
+
+<#
+.SYNOPSIS
+    Compute one sandbox's storage folder, <base>\<vmName> (host-side). Disks + the COM1 pipe live here.
+.DESCRIPTION
+    The base comes from Resolve-SandboxStorageBase: -StorageRoot, then VOIDSEAL_STORAGE_ROOT, then
+    %ProgramData%\Voidseal\sandboxes. The folder is always <base>\<vmName>.
 #>
 function Get-SandboxStorageRoot {
     [CmdletBinding()]
     [OutputType([string])]
-    param([Parameter(Mandatory)] [string] $Name)
-
-    $base = $null
-    if ($env:ProgramData -and -not [string]::IsNullOrWhiteSpace($env:ProgramData)) {
-        $base = Join-Path $env:ProgramData 'Voidseal\sandboxes'
-    }
-    else {
-        $base = Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\sandboxes'
-    }
-    return (Join-Path $base $Name)
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [string] $StorageRoot
+    )
+    return (Join-Path (Resolve-SandboxStorageBase -StorageRoot $StorageRoot) $Name)
 }
 
 <#
@@ -259,6 +303,7 @@ function New-SandboxDescriptor {
         [string]   $ComPipePath,
         [string]   $SwitchName,
         [string]   $SwitchType,
+        [string]   $Network = $null,               # the profile's Network posture label; with Tier it decides the NIC policy (Get-SealNicPolicy)
         [string]   $DiskPath,                      # the primary / system disk
         [string[]] $DiskPaths   = @(),             # all attached disks
         [string[]] $CreatedDisks = @(),            # disks THIS provision created (Remove -DeleteDisks targets these)
@@ -284,6 +329,7 @@ function New-SandboxDescriptor {
         ComPipePath                  = $ComPipePath
         SwitchName                   = $SwitchName
         SwitchType                   = $SwitchType
+        Network                      = $Network
         DiskPath                     = $DiskPath
         DiskPaths                    = @($DiskPaths)
         CreatedDisks                 = @($CreatedDisks)
@@ -307,6 +353,39 @@ function New-SandboxDescriptor {
     }
 }
 
+<#
+.SYNOPSIS
+    The ONE predicate for a sandbox VM's network-adapter posture: 'IsolatedInternalSwitch' or 'NoAdapter'.
+.DESCRIPTION
+    Three call sites used to answer "does this VM keep a NIC?" on their own: the Provisioner keyed on
+    Substrate, Lock-Sandbox on Tier, and Assert-Sealed on Tier plus a Network field that production
+    never recorded. They drifted, so a processor kept its default adapter through the seal and a Tier-1
+    processor was certified with a CONNECTED adapter. All three now ask this function.
+
+    The rule is an allow-list with one entry. A VM keeps a NIC (on an isolated Internal vSwitch) only
+    when its Tier is exactly 1 AND its Network label is present and is not 'None'. Every other input
+    returns 'NoAdapter': Tier 0, Tier >= 2, a processor (Network='None') at any tier, a blank label,
+    and an out-of-range tier. Unexpected input therefore lands on the strict side. The 'None' match is
+    case-insensitive, like the loader's processor rule, and it also trims surrounding whitespace, which
+    the loader does not, so this predicate is the stricter of the two.
+.PARAMETER Tier
+    The VM's risk tier (descriptor or profile Tier).
+.PARAMETER Network
+    The VM's Network posture label (descriptor or profile Network). Blank or $null means NoAdapter.
+#>
+function Get-SealNicPolicy {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [int] $Tier,
+        [Parameter(Mandatory)] [AllowNull()] [AllowEmptyString()] [string] $Network
+    )
+    if ($Tier -eq 1 -and -not [string]::IsNullOrWhiteSpace($Network) -and $Network.Trim() -ne 'None') {
+        return 'IsolatedInternalSwitch'
+    }
+    return 'NoAdapter'
+}
+
 # --------------------------------------------------------------------------
 # Public: New-SandboxVM  (the Provisioner)
 # --------------------------------------------------------------------------
@@ -328,6 +407,17 @@ function New-SandboxDescriptor {
     actionable message naming the `fsutil sparse setflag <path> 0` fix BEFORE any artifact is created.
 .PARAMETER SystemDiskSizeBytes
     (Optional) Size of a fresh system disk when no ParentDiskPath is given. Default 40GB.
+.PARAMETER StorageRoot
+    (Optional) the base directory under which this VM's folder (<root>\<name>) and every disk the
+    provision creates live. Beats the VOIDSEAL_STORAGE_ROOT environment variable, which beats the
+    %ProgramData%\Voidseal\sandboxes default. Must be an absolute local path (Resolve-SandboxStorageBase
+    refuses anything else, before any backend call). Teardown never recomputes it: Remove-Sandbox deletes
+    only the paths the descriptor recorded.
+.PARAMETER HostMemoryMarginBytes
+    (Optional) headroom the HOST must keep free on top of the guest's memory. Before creating anything,
+    New-SandboxVM reads the host's free physical memory through the backend's GetHostMemory and refuses
+    (fail closed) when FreeBytes < the guest's startup memory + this margin. It also refuses when the read
+    throws or returns nothing usable: an unreadable host is not assumed to have room. Default 2GB.
 .PARAMETER Backend
     The Hyper-V backend. Defaults to the real one; tests inject the fake.
 #>
@@ -339,6 +429,8 @@ function New-SandboxVM {
         [Parameter(Mandatory)] [AllowEmptyString()] [string] $Name,
         [string] $ParentDiskPath,
         [long]   $SystemDiskSizeBytes = 40GB,
+        [string] $StorageRoot,
+        [ValidateRange(0, [long]::MaxValue)] [long] $HostMemoryMarginBytes = 2GB,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -352,6 +444,10 @@ function New-SandboxVM {
     if ([string]::IsNullOrWhiteSpace($Name)) {
         throw "New-SandboxVM: -Name is blank. A sandbox VM needs a non-empty name."
     }
+    # E2: resolve (and validate) the storage root up front so a bad root fails closed before ANY backend
+    # call. PowerShell variable names are case-insensitive, so the per-VM folder is $vmStorageDir, not
+    # $storageRoot (which would alias the -StorageRoot parameter).
+    $vmStorageDir = Join-Path (Resolve-SandboxStorageBase -StorageRoot $StorageRoot) $Name
 
     # --- preflight: is Hyper-V usable? (fail-closed) ----------------------
     $probe = & $Backend.TestAvailable @{}
@@ -377,9 +473,50 @@ function New-SandboxVM {
     $secureTmpl  = if ($Profile.ContainsKey('SecureBootTemplate')) { [string]$Profile['SecureBootTemplate'] } else { $null }
     $mgmtChannel = if ($Profile.ContainsKey('ManagementChannel')) { [string]$Profile['ManagementChannel'] } else { $null }
 
+    # The Network posture label decides, with the tier, whether this VM keeps a NIC at all
+    # (Get-SealNicPolicy). It is recorded on the descriptor so Lock-Sandbox and Assert-Sealed enforce
+    # the SAME decision this provision makes. Before 2026-10-03 it was never recorded, which left the
+    # seal gate's processor check unable to fire in production.
+    $network   = if ($Profile.ContainsKey('Network')) { [string]$Profile['Network'] } else { $null }
+    $nicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
+
     $nestedVirt = $false
     if ($Profile.ContainsKey('NestedVirt') -and $null -ne $Profile['NestedVirt']) {
         $nestedVirt = [bool]$Profile['NestedVirt']
+    }
+
+    # Optional CPU caps (E1). Absent means Hyper-V's defaults, so they reach SetProcessor only when set.
+    $cpuMaxPercent  = $null
+    $cpuRelWeight   = $null
+    if ($Profile.ContainsKey('CpuMaximumPercent') -and $null -ne $Profile['CpuMaximumPercent']) { $cpuMaxPercent = [int]$Profile['CpuMaximumPercent'] }
+    if ($Profile.ContainsKey('CpuRelativeWeight') -and $null -ne $Profile['CpuRelativeWeight']) { $cpuRelWeight  = [int]$Profile['CpuRelativeWeight'] }
+
+    # --- host free-RAM gate (E1; fail-closed, BEFORE anything is created) -------------------
+    # A guest whose startup memory the host cannot actually supply either fails to start or starves the
+    # host, and with the memory now profile-sized a workload can ask for a lot. Read the host's free
+    # physical memory through the backend seam and refuse unless it covers the guest plus the margin.
+    # A read that throws, returns nothing, or returns a figure that is not a non-negative number is a
+    # REFUSAL, never a pass: an unreadable host is not assumed to have room. The message names both
+    # numbers so the operator can see which side to change (host load, profile Memory or the margin).
+    $hostMem = $null
+    try { $hostMem = & $Backend.GetHostMemory @{} }
+    catch {
+        throw ("New-SandboxVM: cannot read host memory ($($_.Exception.Message)); refusing to provision " +
+               "'$Name' because free RAM could not be verified. Failing closed BEFORE anything is created.")
+    }
+    $freeRaw = Get-VMField -VM $hostMem -Name 'FreeBytes'
+    $freeOk  = ($freeRaw -is [int] -or $freeRaw -is [long] -or $freeRaw -is [uint32] -or $freeRaw -is [uint64] -or $freeRaw -is [double]) -and ([double]$freeRaw -ge 0)
+    if (-not $freeOk) {
+        throw ("New-SandboxVM: the host memory read returned no usable FreeBytes (got '$freeRaw'); refusing to " +
+               "provision '$Name' because free RAM could not be verified. Failing closed BEFORE anything is created.")
+    }
+    $hostFreeBytes = [long]$freeRaw
+    $requiredRam   = $memoryBytes + $HostMemoryMarginBytes
+    if ($hostFreeBytes -lt $requiredRam) {
+        throw ("New-SandboxVM: refusing to provision '$Name': host free memory is $hostFreeBytes bytes but the " +
+               "guest needs $memoryBytes bytes plus a $HostMemoryMarginBytes byte margin ($requiredRam bytes in all). " +
+               "Free host memory, lower the profile's Memory, or lower -HostMemoryMarginBytes. " +
+               "Failing closed BEFORE anything is created.")
     }
 
     # --- sparse-parent preflight (fail-closed; pure host-FS, BEFORE any creation) ---------
@@ -404,8 +541,7 @@ function New-SandboxVM {
     }
 
     # Storage layout (record strings — the FS isn't touched here; the real NewVHD creates the file).
-    $storageRoot = Get-SandboxStorageRoot -Name $Name
-    $systemDisk  = Join-Path $storageRoot ("{0}-system.vhdx" -f $Name)
+    $systemDisk  = Join-Path $vmStorageDir ("{0}-system.vhdx" -f $Name)
     $comPipe     = "\\.\pipe\{0}-com1" -f $Name
 
     # --- host-free-space preflight (I6b; fail-closed; pure host-FS, BEFORE any creation) --
@@ -414,16 +550,18 @@ function New-SandboxVM {
     # PARENT's on-disk size is the conservative bound (the child grows toward the parent's data,
     # and a bad/sparse parent was already rejected above so the parent's Length is a real number
     # here); for a fresh disk, the full requested $SystemDiskSizeBytes (a dynamic disk's worst
-    # case at CREATE time, since currentFileSize≈0). Measures the volume hosting $storageRoot —
-    # the REAL sandbox storage root every provision uses (ProgramData or TEMP), not a caller-
-    # supplied path — so this never depends on a test's fake VM name resolving to a real drive.
+    # case at CREATE time, since currentFileSize≈0). Measures the volume hosting $vmStorageDir,
+    # the resolved sandbox storage folder every provision uses (-StorageRoot, the
+    # VOIDSEAL_STORAGE_ROOT variable, or the ProgramData default), so a relocated root is the volume
+    # that gets checked. The read goes through the backend seam, so a mock-backed run never depends
+    # on a fake VM name resolving to a real drive.
     $requiredBytes = if (-not [string]::IsNullOrWhiteSpace($ParentDiskPath)) {
         (Get-Item -LiteralPath $ParentDiskPath).Length
     }
     else {
         $SystemDiskSizeBytes
     }
-    $null = Test-HostFreeSpace -Path $storageRoot -RequiredBytes $requiredBytes -Backend $Backend
+    $null = Test-HostFreeSpace -Path $vmStorageDir -RequiredBytes $requiredBytes -Backend $Backend
 
     # --- artifact tracking for mid-provision ROLLBACK ---------------------
     # If ANY creation step below throws, the catch best-effort tears down EXACTLY what was
@@ -460,7 +598,7 @@ function New-SandboxVM {
         # NoVHD=$true: New-VM must NOT auto-create a blank boot VHD (real Hyper-V otherwise
         # emits a diskless-VM warning and/or makes a disk we don't want). We attach our own
         # system disk in step 8. (The fake ignores NoVHD; the real backend honors it.)
-        $null = & $Backend.NewVM @{ Name = $Name; Generation = $generation; MemoryStartupBytes = $memoryBytes; Path = $storageRoot; NoVHD = $true }
+        $null = & $Backend.NewVM @{ Name = $Name; Generation = $generation; MemoryStartupBytes = $memoryBytes; Path = $vmStorageDir; NoVHD = $true }
         $vmCreated = $true
 
         # --- 2a. disable automatic checkpoints (RC7) ----------------------
@@ -479,6 +617,8 @@ function New-SandboxVM {
         # --- 4. processor (+ expose virt extensions only when NestedVirt) -
         $procArgs = @{ VMName = $Name; Count = $cpuCount }
         if ($nestedVirt) { $procArgs.ExposeVirtualizationExtensions = $true }
+        if ($null -ne $cpuMaxPercent) { $procArgs.Maximum        = $cpuMaxPercent }   # E1: only when the profile sets it
+        if ($null -ne $cpuRelWeight)  { $procArgs.RelativeWeight = $cpuRelWeight }
         $null = & $Backend.SetProcessor $procArgs
 
         # --- 5. firmware: SecureBoot ON with the EFFECTIVE Secure Boot template -------
@@ -500,12 +640,14 @@ function New-SandboxVM {
             $null = & $Backend.SetComPort @{ VMName = $Name; Number = 1; Path = $comPipe }
         }
 
-        # --- 7. network: VM-tier switch + NIC -----------------------------
-        # v1 scope is Tier 0/1. Tier 1 (Substrate=HyperV-Gen2, Network=Internal+Allowlist)
-        # gets an Internal vSwitch + a connected NIC. (Tier 0 is a container substrate handled
-        # outside Hyper-V; a future no-NIC VM tier would skip this block.) Create the switch
-        # FIRST (the backend rejects connecting a NIC to a non-existent switch — real-HV parity).
-        if ($Profile['Substrate'] -eq 'HyperV-Gen2') {
+        # --- 7. network: switch + NIC ONLY for a VM that keeps one ---------
+        # Get-SealNicPolicy is the single predicate, shared with Lock-Sandbox and Assert-Sealed. Only an
+        # IsolatedInternalSwitch VM (Tier 1, non-processor) on the Hyper-V substrate gets an Internal
+        # vSwitch and a connected NIC. A NoAdapter VM (Tier 0, Tier >= 2, any processor) gets NO switch:
+        # the default adapter real New-VM creates stays unconnected until Lock-Sandbox removes it.
+        # Create the switch FIRST (the backend rejects connecting a NIC to a non-existent switch, as
+        # real Hyper-V does).
+        if ($Profile['Substrate'] -eq 'HyperV-Gen2' -and $nicPolicy -eq 'IsolatedInternalSwitch') {
             $switchType = 'Internal'
             $switchName = "{0}-int" -f $Name
             if ($null -eq (& $Backend.GetSwitch @{ Name = $switchName })) {
@@ -532,6 +674,7 @@ function New-SandboxVM {
             -ComPipePath        $comPipe `
             -SwitchName         $switchName `
             -SwitchType         $switchType `
+            -Network            $network `
             -DiskPath           $systemDisk `
             -DiskPaths          @($systemDisk) `
             -CreatedDisks       @($createdDisks) `

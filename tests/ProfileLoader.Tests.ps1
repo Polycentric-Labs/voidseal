@@ -541,6 +541,17 @@ Describe 'Mounts: declared, not wired (the docs must say so while no engine code
         @(script:Find-MountsKeyReference -Files $loader) | Should -Not -BeNullOrEmpty -Because 'the loader screens and merges Mounts, so a working scan must see it there'
     }
 
+    It 'the scan catches a reader written in any letter case (planted positive control)' {
+        # Profile hashtables ignore case, so $p['mounts'] and $p.MOUNTS read the same entry as
+        # $p['Mounts']. A case-sensitive match would let those readers evade the guard.
+        $planted = Join-Path $TestDrive 'planted-mounts-reader.ps1'
+        Set-Content -LiteralPath $planted -Encoding utf8 -Value @(
+            '$a = $p[''mounts'']'
+            '$b = $p.MOUNTS'
+        )
+        @(script:Find-MountsKeyReference -Files @(Get-Item -LiteralPath $planted)).Count | Should -Be 2
+    }
+
     It 'no engine script outside the loader reads the Mounts key' {
         $engine = @($script:MountsScanFiles | Where-Object Name -ne 'ProfileLoader.ps1')
         $engine.Count | Should -BeGreaterThan 5 -Because 'the scan must actually cover the engine'
@@ -737,19 +748,37 @@ Describe 'Packages: declared, not installed (the docs must say so while no engin
     # authoring guide used to say packages were "staged before the seal". These checks tie the docs
     # to the code in both directions: a new reader fails the first It, so the docs get revisited,
     # and while there is none, the docs must say the field installs nothing.
+    BeforeAll {
+        # Each place a script names the Packages key, as 'file:line'. Index reads ($p['Packages']),
+        # member reads ($p.Packages) and quoted names all parse to a string constant whose value is
+        # the bare key. Comments are not in the AST, and a here-string that merely mentions packages
+        # never equals the key. The match ignores case because profile hashtables do: $p['packages']
+        # reads the same entry, so a case-sensitive match would let such a reader evade the guard.
+        function script:Find-PackagesKeyReference {
+            param([System.IO.FileInfo[]] $Files)
+            foreach ($f in $Files) {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+                $ast.FindAll({ param($n)
+                    $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -eq 'Packages'
+                }, $true) | ForEach-Object { '{0}:{1}' -f $f.Name, $_.Extent.StartLineNumber }
+            }
+        }
+    }
+
+    It 'the scan catches a reader written in any letter case (planted positive control)' {
+        $planted = Join-Path $TestDrive 'planted-packages-reader.ps1'
+        Set-Content -LiteralPath $planted -Encoding utf8 -Value @(
+            '$a = $p[''packages'']'
+            '$b = $p.PACKAGES'
+        )
+        @(script:Find-PackagesKeyReference -Files @(Get-Item -LiteralPath $planted)).Count | Should -Be 2
+    }
+
     It 'no engine script outside the loader reads the Packages key' {
         $engineScripts = @(Get-ChildItem -Path (Join-Path $script:SkillRoot 'scripts') -Recurse -Filter '*.ps1' |
                            Where-Object { $_.Name -ne 'ProfileLoader.ps1' })
         $engineScripts.Count | Should -BeGreaterThan 5 -Because 'the scan must actually cover the engine'
-        $readers = foreach ($f in $engineScripts) {
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
-            # Index reads ($p['Packages']), member reads ($p.Packages) and quoted names all parse to a
-            # string constant whose value is exactly 'Packages'. Comments are not in the AST, and a
-            # here-string that merely mentions packages never equals the bare key.
-            $ast.FindAll({ param($n)
-                $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -ceq 'Packages'
-            }, $true) | ForEach-Object { '{0}:{1}' -f $f.Name, $_.Extent.StartLineNumber }
-        }
+        $readers = script:Find-PackagesKeyReference -Files $engineScripts
         @($readers) | Should -BeNullOrEmpty -Because 'Packages is unread today; a reader means the docs that call it declared-only must change with it'
     }
 
@@ -970,5 +999,161 @@ Describe 'Test-IsProcessorProfile: the single processor predicate' {
         $p = @{ Network = 'None'; ScreenConfig = @{} }
         Test-IsProcessorProfile -Profile $p | Should -BeTrue
         Test-UsesOutboxTransport -Profile $p | Should -BeTrue -Because 'a processor releases through the outbox; if these disagreed, the seed and the host would route it differently'
+    }
+}
+
+Describe 'Guest sizing keys: Memory / Cpu / CpuMaximumPercent / CpuRelativeWeight (E1)' {
+    # Memory and Cpu were tier-only and unchecked ([int] casts at provision time). They are now bounded
+    # at load for BOTH tier and merged workload profiles, and a workload may set them (they layer onto
+    # the tier like Entrypoint). The two CPU cap keys are optional; absent means Hyper-V's defaults.
+
+    Context 'tier profile bounds' {
+        It 'ACCEPTS the Memory boundaries 512MB and 64GB (and the equivalent byte count)' {
+            foreach ($mem in @('512MB', '64GB', '1024MB', '4 GB', 4GB)) {
+                $h = script:Get-ValidTier1Hashtable
+                $h.Memory = $mem
+                $path = script:New-Psd1File -Data $h -Name ("mem-ok-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+                { Import-TierProfile -Path $path } | Should -Not -Throw -Because "Memory '$mem' is inside 512MB..64GB"
+            }
+        }
+
+        It 'REJECTS Memory below 512MB, above 64GB, zero, unparseable or blank, naming the field' {
+            foreach ($mem in @('511MB', '65GB', '128GB', '0', '0GB', 'lots', '')) {
+                $h = script:Get-ValidTier1Hashtable
+                $h.Memory = $mem
+                $path = script:New-Psd1File -Data $h -Name ("mem-bad-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+                { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*Memory*' -Because "Memory '$mem' is outside 512MB..64GB or unparseable"
+            }
+        }
+
+        It 'ACCEPTS Cpu 1 and 32, REJECTS 0, 33, a negative, a string and a fraction, naming the field' {
+            foreach ($cpu in @(1, 32)) {
+                $h = script:Get-ValidTier1Hashtable
+                $h.Cpu = $cpu
+                $path = script:New-Psd1File -Data $h -Name ("cpu-ok-$cpu.psd1")
+                { Import-TierProfile -Path $path } | Should -Not -Throw
+            }
+            foreach ($cpu in @(0, 33, -2, '4', 2.5)) {
+                $h = script:Get-ValidTier1Hashtable
+                $h.Cpu = $cpu
+                $path = script:New-Psd1File -Data $h -Name ("cpu-bad-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+                { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*Cpu*' -Because "Cpu '$cpu' is not an integer in 1..32"
+            }
+        }
+
+        It 'ACCEPTS CpuMaximumPercent 1..100 and CpuRelativeWeight 1..10000, REJECTS outside values and non-integers' {
+            foreach ($pair in @(@(1, 1), @(100, 10000), @(50, 250))) {
+                $h = script:Get-ValidTier1Hashtable
+                $h.CpuMaximumPercent = $pair[0]; $h.CpuRelativeWeight = $pair[1]
+                $path = script:New-Psd1File -Data $h -Name ("cap-ok-{0}-{1}.psd1" -f $pair[0], $pair[1])
+                $loaded = Import-TierProfile -Path $path
+                $loaded.CpuMaximumPercent | Should -Be $pair[0]
+                $loaded.CpuRelativeWeight | Should -Be $pair[1]
+            }
+            foreach ($bad in @(0, 101, -5, '50', 12.5, $true)) {
+                $h = script:Get-ValidTier1Hashtable
+                $h.CpuMaximumPercent = $bad
+                $path = script:New-Psd1File -Data $h -Name ("capmax-bad-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+                { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*CpuMaximumPercent*' -Because "'$bad' is not an integer in 1..100"
+            }
+            foreach ($bad in @(0, 10001, -1, '100', 1.5, $false)) {
+                $h = script:Get-ValidTier1Hashtable
+                $h.CpuRelativeWeight = $bad
+                $path = script:New-Psd1File -Data $h -Name ("capwgt-bad-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+                { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*CpuRelativeWeight*' -Because "'$bad' is not an integer in 1..10000"
+            }
+        }
+
+        It 'treats absent cap keys as no cap (the shipped tiers carry neither)' {
+            foreach ($tierPath in @($script:Tier0Path, $script:Tier1Path)) {
+                $t = Import-TierProfile -Path $tierPath
+                $t.ContainsKey('CpuMaximumPercent') | Should -BeFalse
+                $t.ContainsKey('CpuRelativeWeight') | Should -BeFalse
+            }
+        }
+    }
+
+    Context 'workload layering' {
+        It 'a workload Memory and Cpu REPLACE the tier values' {
+            $wl = @{ BaseTier = 1; Name = 'sized'; Entrypoint = 'true'; Memory = '8GB'; Cpu = 6 }
+            $wlPath = script:New-Psd1File -Data $wl -Name 'sized.psd1'
+            $m = Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir
+            $m.Memory | Should -Be '8GB'
+            $m.Cpu    | Should -Be 6
+        }
+
+        It 'a workload that sets neither inherits the tier values' {
+            $wl = @{ BaseTier = 1; Name = 'unsized'; Entrypoint = 'true' }
+            $wlPath = script:New-Psd1File -Data $wl -Name 'unsized.psd1'
+            $m = Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir
+            $m.Memory | Should -Be '4GB'
+            $m.Cpu    | Should -Be 4
+        }
+
+        It 'a workload cap overrides a tier cap, and an inherited tier cap survives when the workload is silent' {
+            $scratch = Join-Path $TestDrive 'cap-tiers'
+            New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+            $t = script:Get-ValidTier1Hashtable
+            $t.CpuMaximumPercent = 80; $t.CpuRelativeWeight = 400
+            Set-Content -LiteralPath (Join-Path $scratch 'tier1.psd1') -Value (script:ConvertTo-Psd1Text -Value $t) -Encoding UTF8
+
+            $silent = script:New-Psd1File -Data @{ BaseTier = 1; Name = 'silent'; Entrypoint = 'true' } -Name 'silent-cap.psd1'
+            $m = Import-WorkloadProfile -Path $silent -TierProfileDir $scratch
+            $m.CpuMaximumPercent | Should -Be 80
+            $m.CpuRelativeWeight | Should -Be 400
+
+            $over = script:New-Psd1File -Data @{ BaseTier = 1; Name = 'over'; Entrypoint = 'true'; CpuMaximumPercent = 30 } -Name 'over-cap.psd1'
+            $m2 = Import-WorkloadProfile -Path $over -TierProfileDir $scratch
+            $m2.CpuMaximumPercent | Should -Be 30 -Because 'the workload wins'
+            $m2.CpuRelativeWeight | Should -Be 400 -Because 'the workload did not set it, so the tier value stays'
+        }
+
+        It 'the same bounds apply to a workload value (merged re-validation)' {
+            $cases = @(
+                @{ Key = 'Memory';            Value = '65GB' },
+                @{ Key = 'Memory';            Value = '256MB' },
+                @{ Key = 'Cpu';               Value = 64 },
+                @{ Key = 'CpuMaximumPercent'; Value = 150 },
+                @{ Key = 'CpuRelativeWeight'; Value = 0 }
+            )
+            foreach ($c in $cases) {
+                $wl = @{ BaseTier = 1; Name = 'oob'; Entrypoint = 'true' }
+                $wl[$c.Key] = $c.Value
+                $wlPath = script:New-Psd1File -Data $wl -Name ("oob-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+                { Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir } |
+                    Should -Throw -ExpectedMessage "*$($c.Key)*" -Because "workload $($c.Key)=$($c.Value) is out of bounds"
+            }
+        }
+    }
+}
+
+Describe 'WorkloadTimeoutSeconds profile key (E3)' {
+    It 'layers a workload WorkloadTimeoutSeconds onto the merged profile' {
+        $wl = @{ BaseTier = 1; Name = 'slow'; Entrypoint = 'true'; WorkloadTimeoutSeconds = 7200 }
+        $wlPath = script:New-Psd1File -Data $wl -Name 'slow.psd1'
+        (Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir).WorkloadTimeoutSeconds | Should -Be 7200
+    }
+
+    It 'is absent from the merged profile when the workload does not set it' {
+        $wl = @{ BaseTier = 1; Name = 'quiet'; Entrypoint = 'true' }
+        $wlPath = script:New-Psd1File -Data $wl -Name 'quiet.psd1'
+        (Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir).ContainsKey('WorkloadTimeoutSeconds') | Should -BeFalse
+    }
+
+    It 'ACCEPTS the boundaries 60 and 86400' {
+        foreach ($v in @(60, 86400)) {
+            $wl = @{ BaseTier = 1; Name = "t$v"; Entrypoint = 'true'; WorkloadTimeoutSeconds = $v }
+            $wlPath = script:New-Psd1File -Data $wl -Name "to-$v.psd1"
+            { Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir } | Should -Not -Throw
+        }
+    }
+
+    It 'REJECTS values outside 60..86400 and non-integers, naming the key' {
+        foreach ($v in @(0, 59, 86401, -1, '600', 90.5, $true)) {
+            $wl = @{ BaseTier = 1; Name = 'bad'; Entrypoint = 'true'; WorkloadTimeoutSeconds = $v }
+            $wlPath = script:New-Psd1File -Data $wl -Name ("to-bad-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+            { Import-WorkloadProfile -Path $wlPath -TierProfileDir $script:TierDir } |
+                Should -Throw -ExpectedMessage '*WorkloadTimeoutSeconds*' -Because "'$v' is not an integer in 60..86400"
+        }
     }
 }

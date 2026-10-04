@@ -66,8 +66,9 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 
 The loader **structurally enforces** the high-tier guarantees: a Tier ≥ 2 profile that
 declares any credential, egress mode, or allowlist entry is **refused at load time**
-(fail-closed), and the runtime seal gate refuses to mark a Tier-3 VM sealed if it detects
-any live NIC, secret volume, or egress route.
+(fail-closed). At runtime the seal gate refuses to certify any VM that must have no NIC
+(Tier 0, Tier ≥ 2, or a `Network='None'` processor) while the host still reports one, refuses
+any GPU partition adapter or assigned device at every tier, and refuses a secret or unrecorded volume.
 
 ## How to invoke
 
@@ -83,9 +84,12 @@ $report = Invoke-Voidseal -Tier 1 -Profile ralph `
     -Workload @{ ResultPath = 'C:\sandbox\ralph-workdir\out' } `
     -ParentDiskPath 'C:\sandbox\golden\debian-12-cloud.vhdx'
 
-# Tier-0 Firefox bookmark organizer (offline, on a profile COPY):
+# Tier-0 Firefox bookmark organizer (offline, on a profile COPY). Disk mode: $inputs holds the
+# organizer, a sample profile, and the guest helpers run_disk_workload.py + outbox.py (a run
+# without the helpers is refused up front). See docs/live-smoke-test.md section 4A.
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `
-    -Workload @{ ResultPath = 'C:\sandbox\firefox-organizer-out\bookmarks.html' }
+    -Workload @{ WorkloadMode = 'Disk'; Inputs = $inputs } `
+    -ParentDiskPath 'C:\sandbox\golden\debian-12-cloud.vhdx'
 
 $report.States        # the states traversed, in order (INIT..DESTROYED on success)
 $report.SealVerdict   # $true only if Assert-Sealed certified the VM

@@ -15,9 +15,9 @@
 
 Voidseal's security claim is narrow and specific: the **host-verified, fail-closed `Assert-Sealed` gate**
 (`scripts/lib/Sealer.ps1`) — a host-side proof, taken independently of anything the guest reports about
-itself, that a VM has been starved of the capabilities its tier says it must not have (network adapters,
+itself, that a VM has been starved of the capabilities its tier says it must not have (network adapters, passthrough devices,
 host↔guest channels, residual/secret disks, import media) **before** any untrusted workload is allowed to
-run — plus the tier isolation that gate verifies (no-NIC at Tier ≥ 2, isolated-Internal-vSwitch at Tier 1).
+run, plus the tier isolation that gate verifies (no NIC at Tier 0, at Tier ≥ 2 and for every processor; an isolated Internal vSwitch at Tier 1).
 
 What a workload **does once sealed and running** — whether its own logic is correct, whether it handles the
 data it's given safely, whether an agent loop it drives goes off the rails — is **not** something Voidseal
@@ -55,8 +55,9 @@ Legend: 🟢 **IN SCOPE** (a bug here is a Voidseal defect — see the gate name
 | Threat class | T0 | T1 | T2 | T3 |
 |---|---|---|---|---|
 | **VM-escape** (guest breaks the Hyper-V hypervisor boundary itself) | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Live NIC / egress route present at seal time** | 🟡 not host-verified for a non-processor profile | 🟢 must be an isolated Internal vSwitch, Default Switch refused by name | 🟢 zero NICs required | 🟢 zero NICs required |
-| **Egress filtering** (which destinations are reachable through whatever route exists) | 🟡 declared, not implemented | 🟡 in-guest defense-in-depth only, GuestRoot-disableable | ➖ no route exists | ➖ no route exists |
+| **Live NIC / egress route present at seal time** | 🟢 zero NICs required | 🟢 an isolated Internal vSwitch, Default Switch refused by name (zero NICs for a processor) | 🟢 zero NICs required | 🟢 zero NICs required |
+| **Passthrough device present at seal time** (GPU partition adapter, device assigned by DDA) | 🟢 | 🟢 | 🟢 | 🟢 |
+| **Egress filtering** (which destinations are reachable through whatever route exists) | ➖ no route exists | 🟡 in-guest defense-in-depth only, GuestRoot-disableable | ➖ no route exists | ➖ no route exists |
 | **Host↔guest channel left ON** (clipboard / shares / guest-services / enhanced-session) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Residual / import / secret-shaped disk left attached** | 🟢 best-effort backstop | 🟢 best-effort backstop | 🟢 structural, authoritative | 🟢 structural, authoritative |
 | **Malicious/malformed profile bypassing load-time invariants** | 🟢 | 🟢 | 🟢 | 🟢 |
@@ -73,33 +74,37 @@ bubblewrap draws for the Linux kernel primitives it wraps. Keeping the host patc
 itself is patched.
 
 **Live NIC / egress route present at seal time.**
-- **T2/T3 — IN SCOPE.** `Assert-Sealed` requires the backend's `GetNetworkAdapter` call to return zero
-  adapters for any Tier ≥ 2 VM, and — separately — for any "processor" profile (`Network='None'`) at *any*
-  tier. A live NIC found at certify time throws and refuses to seal.
-- **T1 — IN SCOPE, narrower.** Tier 1 legitimately keeps a NIC (net-restricted, not no-net).
-  `Assert-Sealed`'s Tier-1 block requires that NIC's vSwitch to host-verify as `SwitchType='Internal'`, and
-  separately refuses the built-in "Default Switch" **by name** (that switch is itself
-  `SwitchType=Internal`, so the type check alone cannot distinguish it from a purpose-built isolated
-  switch). A Tier-1 VM certified on an External/Private switch, or on the Default Switch, is a Voidseal
-  defect. *(A Tier-1 profile that is itself a "processor" skips this switch check and instead must have
-  literally zero NICs — the same rule as Tier ≥ 2.)* **Known gap inside this control:** the by-name refusal
-  matches only the switch's English friendly name; the GUID-based refusal
-  (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`) that would also catch a localized non-English "Default Switch"
-  name is Phase-6-live, not yet shipped (`phase-6-live-runbook.md` §4).
-- **T0 — KNOWN LIMITATION, TRACKED, not a currently-certified guarantee.** `Assert-Sealed`'s NIC check only
-  fires when the tier is ≥ 2 or the profile is a processor. A plain Tier-0 workload profile — `firefox.psd1`
-  does not set `Network='None'` — is **not** covered by this check: the seal does not verify there is no
-  live NIC on a Tier-0, non-processor VM. In practice, `Provisioner.ps1` only creates a switch and *connects* the VM's adapter to it when a
-  profile's `Substrate` is `'HyperV-Gen2'`, and Tier 0's schema `Substrate` is `'Container'`, so the shipped Tier-0 VM's default adapter is left **switch-less**
-  (unconnected, no egress route) today, rather than removed — but that is a side effect of the
-  container-substrate scope gap (`tier-reference.md`'s "Tier-0 substrate" accuracy note: the container
-  runtime is design-intent, not wired), not a host-verified invariant. Nothing in `Assert-Sealed` would
-  catch a future Tier-0 code path that *did* connect that NIC to a switch.
+- **T0, T2, T3, and every processor: IN SCOPE.** `Get-SealNicPolicy` (`scripts/lib/Provisioner.ps1`)
+  returns `NoAdapter` for all of them, and the Provisioner, `Lock-Sandbox` and `Assert-Sealed` all ask it.
+  The Provisioner builds no switch, `Lock-Sandbox` removes the one adapter real `New-VM` always creates,
+  and `Assert-Sealed` requires the backend's `GetNetworkAdapter` call to return zero adapters, naming the
+  reason (processor, Tier ≥ 2, or Tier 0) when it refuses. `New-SandboxVM` records the profile's
+  `Network` on the descriptor, and a descriptor that records none is refused before the check runs. Any
+  policy value the predicate does not recognize is refused too, and `Lock-Sandbox` removes the adapter
+  unless the policy is `IsolatedInternalSwitch`, so a future policy value fails closed in both places. A
+  live NIC found at certify time throws and refuses to seal. (Before 2026-10-03 the processor branch
+  read a descriptor field production never wrote, and Tier 0 had no adapter check at all.)
+- **T1 non-processor: IN SCOPE, narrower.** Tier 1 legitimately keeps a NIC (net-restricted, not
+  no-net). `Assert-Sealed`'s Tier-1 block requires that NIC's vSwitch to host-verify as
+  `SwitchType='Internal'`, and separately refuses the built-in "Default Switch" **by name** (that switch
+  is itself `SwitchType=Internal`, so the type check alone cannot distinguish it from a purpose-built
+  isolated switch). A Tier-1 VM certified on an External/Private switch, or on the Default Switch, is a
+  Voidseal defect. A Tier-1 processor is `NoAdapter` like the tiers above: it gets no switch and must
+  seal with zero adapters. **Known gap inside this control:** the by-name refusal matches only the
+  switch's English friendly name; the GUID-based refusal (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`) that
+  would also catch a localized non-English "Default Switch" name is Phase-6-live, not yet shipped
+  (`phase-6-live-runbook.md` §4).
+
+**Passthrough device present at seal time.** IN SCOPE, every tier. `Assert-Sealed` reads the backend's
+`GetGpuPartitionAdapters` and `GetAssignableDevices` from the host and refuses if either reports any
+device. Voidseal never assigns one, so any present was added outside the tool. A device assigned through
+Discrete Device Assignment can be a physical NIC that `GetNetworkAdapter` never lists, which is why this
+check sits beside the NIC check. Only the count is read, and a read that fails refuses the seal.
 
 **Egress filtering (which destinations are reachable through an existing route).**
-- **T0 — KNOWN LIMITATION.** `tier0.psd1` declares `EgressMode='HostProxy'`, but per `tier-reference.md`'s
-  P2 row this host-proxy allowlist is **not yet implemented** at all — no mechanism, in-guest or host-side,
-  filters Tier-0 egress today.
+- **T0: N/A.** A sealed Tier-0 VM has no network adapter (see the row above), so no route exists to
+  filter. `tier0.psd1` still declares `EgressMode='HostProxy'`; per `tier-reference.md`'s P2 row that
+  host-proxy allowlist is not implemented, and it stays moot unless a future Tier-0 design keeps an adapter.
 - **T1 — KNOWN LIMITATION, TRACKED (the worked example this document exists to fold in honestly).**
   `tier1.psd1`'s `EgressMode='InGuestSquid'` ships a real, mock-shape-asserted **in-guest** mechanism: the
   seed's iptables default-DROP OUTPUT plus a transparent Squid `dstdomain` allowlist. This is
@@ -194,8 +199,12 @@ below answers a different question, *"has this actually been exercised?"* — a 
 blend them: something can be correctly scoped as IN SCOPE and still be unproven live.
 
 - **Tier 0/1 provisioning + seal:** mock-proven against a fake Hyper-V backend (907 passed, 0 failed, 2 skipped, no
-  elevation, no real VM). The first live end-to-end run — the live smoke test — is the operator's own
-  elevated step; nothing in this document should be read as a claim that it has been exercised live.
+  elevation, no real VM). The Tier-0 `firefox` disk round-trip ran end-to-end on real Hyper-V on
+  2026-06-25, and again with the user-space outbox transport on 2026-07-21; Tier 1 has not had a live run,
+  which remains the operator's own elevated step.
+- **Zero-adapter seal and passthrough refusal:** mock-proven only. The real `RemoveNetworkAdapter` (now
+  part of every Tier-0 seal) and the two passthrough reads have not run on a live host; the next Tier-0
+  `firefox` re-run is their first exercise. Until then, treat them as shape-correct, not live-proven.
 - **Tier-1 in-guest egress:** shape-asserted only. The mock suite proves the rendered Squid config text,
   the iptables rule text, and the ACL substitution are correct — it does not prove a real Squid/iptables
   process has ever actually spliced or dropped a real packet (`phase-6-live-runbook.md` §5).

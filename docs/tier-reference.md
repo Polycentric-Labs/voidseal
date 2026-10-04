@@ -66,8 +66,14 @@ from the host side:
   host-read is structurally unreachable for a hostile tier (the extractor routes Tier ≥ 2 to
   a sink that **throws**).
 - **Secret-file refusal** — no secret-shaped mount source, any tier.
-- **Pre-seal gate** — `Assert-Sealed` refuses to certify a Tier-3 VM if it detects a live
-  NIC, a secret-shaped or unrecorded attached volume, or a non-empty egress route.
+- **Pre-seal gate**: `Assert-Sealed` refuses to certify a VM that must have no NIC (Tier 0,
+  Tier ≥ 2, any processor) while the host reports one, refuses any passthrough device at every
+  tier, and refuses a secret-shaped or unrecorded attached volume.
+- **Guest sizing bounds and the free-RAM gate**: the loader bounds `Memory` (`512MB` to `64GB`)
+  and `Cpu` (1 to 32) for every tier and workload, and `New-SandboxVM` refuses, before it creates
+  anything, to start a guest whose memory plus a margin (default 2GB) does not fit in the host's
+  free RAM. An unreadable host is refused too. This is a resource guard for the host, not a
+  containment boundary.
 
 ---
 
@@ -79,7 +85,7 @@ row is green across P1–P10.** Use this as the sign-off checklist before trusti
 | # | Principle | Deployer control | T0 | T1 | T2 | T3 |
 |---|---|---|---|---|---|---|
 | **P1** | Supervise **capability**, not behavior | the tier model itself — match isolation strength to task risk | ✅ | ✅ | ✅ | ✅ |
-| **P2** | **Default-deny egress** | allowlist (T0/T1) / **no NIC** (T2/T3) | ✅ offline by default (no NIC — the Provisioner's switch/NIC block is HyperV-Gen2-substrate-gated; the declared host-proxy allowlist is **not yet implemented**, and tier0's `EgressAllowlist` is empty — opt-in net steps escalate to Tier 1) | 🛡️ in-guest defense-in-depth ships (iptables default-DROP + Squid `dstdomain` allowlist over `EgressAllowlist`; mock-shape-asserted only, not live-exercised) — **not this tier's boundary**; the host-verified boundary is Phase-6 | ✅ no NIC | ✅ no NIC |
+| **P2** | **Default-deny egress** | allowlist (T0/T1) / **no NIC** (T2/T3) | ✅ offline, no NIC: the seal removes the default adapter and `Assert-Sealed` host-verifies zero adapters (`Get-SealNicPolicy` returns `NoAdapter` for Tier 0); the declared host-proxy allowlist is **not implemented**, tier0's `EgressAllowlist` is empty, and opt-in net steps escalate to Tier 1 | 🛡️ in-guest defense-in-depth ships (iptables default-DROP + Squid `dstdomain` allowlist over `EgressAllowlist`; mock-shape-asserted only, not live-exercised): **not this tier's boundary**; the host-verified boundary is Phase-6 | ✅ no NIC | ✅ no NIC |
 | **P3** | **Provenance proxy** (request attribution) | Phase-1B (v1 = FQDN + TLS-terminate; provenance deferred with credentials) | ➖ deferred | ➖ deferred | n/a (no egress) | n/a (no egress) |
 | **P4** | **Credentials out of env** | injected-at-proxy (T0) / starved (T2/T3); never `-e`, file bind-mount only | ✅ | ✅ default-none | ✅ none | ✅ none |
 | **P5** | **Least privilege** | non-root run-user, read-only code mounts, **secret-file refusal** | ✅ | ✅ | ✅ | ✅ |

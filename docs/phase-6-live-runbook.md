@@ -131,6 +131,8 @@ but nothing yet confines the child process.*
 | Assertion | Status |
 |---|---|
 | Single-NIC invariant | live-only addition (not yet asserted) |
+| Zero adapters for every NoAdapter VM (Tier 0, Tier >= 2, any processor) | **SHIPPED, mock-green**: `Get-SealNicPolicy` plus `Lock-Sandbox` removal plus `Assert-Sealed`'s zero-adapter refusal; the first live exercise is the next Tier-0 run |
+| No passthrough device (GPU partition adapter, DDA-assigned device) | **SHIPPED, mock-green**: `Assert-Sealed` reads `GetGpuPartitionAdapters` and `GetAssignableDevices` at every tier |
 | NIC's switch `SwitchType == Internal` | **SHIPPED, mock-green** — `Assert-Sealed`'s `SwitchType -ne 'Internal'` refusal in `scripts/lib/Sealer.ps1`'s Tier-1 block — locate by predicate |
 | By-name refusal of the built-in "Default Switch" | **SHIPPED, mock-green, this slice** — `Assert-Sealed`'s `$switchName.Trim() -ieq 'Default Switch'` refusal in `scripts/lib/Sealer.ps1`'s Tier-1 block — locate by predicate (commit `3c3a944`) |
 | No-uplink (`NetAdapterInterfaceDescription == null`) | live-only addition (not yet asserted) |
@@ -167,6 +169,13 @@ proves them.*
   hash and real raw-device transfer are Phase-6-only.
 - **SIGKILL-mid-transition.** Fault-injection coverage for a mid-lifecycle SIGKILL is mock-only; real
   process-kill timing against a live guest is unproven.
+- **Zero-adapter seal + passthrough reads.** `Lock-Sandbox` now removes the default adapter on every
+  Tier-0 seal through the hardened real `RemoveNetworkAdapter` (enumerate, then pipe to
+  `Remove-VMNetworkAdapter`), and the gate reads `Get-VMGpuPartitionAdapter` and `Get-VMAssignableDevice`.
+  All three are mock-verified only; the next Tier-0 `firefox` re-run is their first live exercise.
+  Before that run, in an elevated PowerShell, run `Get-VMGpuPartitionAdapter -VMName <an existing VM>` and
+  `Get-VMAssignableDevice -VMName <an existing VM>`. Each should return nothing, not an error. If either
+  errors on the host, `Assert-Sealed` refuses every seal (fail closed) until that is resolved.
 - **Real Squid domain-ACL packet behavior.** The builder seed's Squid egress config (SEC-2, mock-shipped
   per `progress.md`: default-DROP + minimal allow-list, `BlockProtocols` enforced by construction,
   DoH/DoT/QUIC dropped) is asserted at the level of seed **shape** only — the seed template is correct,

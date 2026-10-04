@@ -36,6 +36,26 @@ BeforeAll {
     # The canonical method manifest the lib must export (single source of truth).
     # Each entry: method name -> the named arg keys it accepts.
     $script:ExpectedMethods = Get-HyperVBackendMethodManifest
+
+    # AST helper shared by the Describes that pin a REAL backend method body (RemoveNetworkAdapter and the
+    # passthrough reads): `& $script:GetRealBackendAssign 'Method'` returns the AssignmentStatementAst of
+    # `$b.<Method> = { ... }` inside New-RealHyperVBackend, or $null when the factory defines no such method.
+    $helperTokens = $null; $helperErrors = $null
+    $helperAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $script:LibPath, [ref]$helperTokens, [ref]$helperErrors)
+    @($helperErrors).Count | Should -Be 0 -Because 'the backend lib must parse cleanly to be analyzed'
+    $script:RealFactoryAst = $helperAst.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $n.Name -eq 'New-RealHyperVBackend'
+    }, $true) | Select-Object -First 1
+    $script:RealFactoryAst | Should -Not -BeNullOrEmpty -Because 'the backend lib must define New-RealHyperVBackend'
+    $script:GetRealBackendAssign = {
+        param([string] $Method)
+        return $script:RealFactoryAst.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                      $n.Left.Extent.Text -eq ('$b.' + $Method)
+        }, $true) | Select-Object -First 1
+    }
 }
 
 # ===========================================================================
@@ -58,6 +78,8 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             'NewVM', 'GetVM', 'StartVM', 'StopVM', 'RemoveVM'
             # hardware
             'SetProcessor', 'SetMemory', 'SetFirmware', 'SetAutomaticCheckpoints', 'SetComPort', 'GetComPort'
+            # host resource read (the free-RAM gate)
+            'GetHostMemory'
             # guest command delivery (the Runner serial seam)
             'InvokeGuestCommand'
             # host channels (the seal surface)
@@ -66,6 +88,8 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'ReadVhdxRawRegion', 'GetVhdxImageHash', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
             # switch / network
             'NewSwitch', 'GetSwitch', 'RemoveSwitch', 'ConnectNetworkAdapter', 'RemoveNetworkAdapter', 'GetNetworkAdapter'
+            # passthrough devices (the seal gate's passthrough refusal)
+            'GetGpuPartitionAdapters', 'GetAssignableDevices'
             # checkpoint
             'Checkpoint', 'RestoreCheckpoint', 'GetCheckpoint', 'RemoveCheckpoint'
         )
@@ -74,13 +98,14 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
         }
     }
 
-    It 'documents a non-empty arg-key list for every method that takes args (only TestAvailable is arg-less)' {
+    It 'documents a non-empty arg-key list for every method that takes args (only TestAvailable and GetHostMemory are arg-less)' {
         # Arg-key drift guard: if a method silently grew/lost args, this catches the
-        # manifest going stale. TestAvailable is the sole documented arg-less method (@()).
+        # manifest going stale. TestAvailable (the capability probe) and GetHostMemory (a whole-host
+        # read) are the documented arg-less methods (@()).
         foreach ($name in $script:ExpectedMethods.Keys) {
             $argKeys = @($script:ExpectedMethods[$name])
-            if ($name -eq 'TestAvailable') {
-                $argKeys.Count | Should -Be 0 -Because 'TestAvailable is the capability probe and takes no named args'
+            if ($name -in @('TestAvailable', 'GetHostMemory')) {
+                $argKeys.Count | Should -Be 0 -Because "$name takes no named args"
             }
             else {
                 $argKeys.Count | Should -BeGreaterThan 0 -Because "$name is documented as taking named args; an empty list means the manifest drifted"
@@ -174,13 +199,15 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             AddHardDiskDrive = 'VMName'; RemoveHardDiskDrive = 'VMName'; SetDvdDrive = 'VMName'; RemoveDvdDrive = 'VMName'; GetDvdDrives = 'VMName'
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
+            GetGpuPartitionAdapters = 'VMName'; GetAssignableDevices = 'VMName'
             Checkpoint = 'VMName'; RestoreCheckpoint = 'VMName'; GetCheckpoint = 'VMName'; RemoveCheckpoint = 'VMName'
         }
 
-        # Sanity: the map covers exactly the non-TestAvailable manifest methods (so a NEW
-        # method added to the manifest forces this map — and thus the contract — to update).
+        # Sanity: the map covers exactly the arg-taking manifest methods (so a NEW
+        # method added to the manifest forces this map, and thus the contract, to update).
+        # TestAvailable and GetHostMemory are arg-less, so they have no primary key to drop.
         $covered  = @($primaryKey.Keys | Sort-Object)
-        $expected = @($script:ExpectedMethods.Keys | Where-Object { $_ -ne 'TestAvailable' } | Sort-Object)
+        $expected = @($script:ExpectedMethods.Keys | Where-Object { $_ -notin @('TestAvailable', 'GetHostMemory') } | Sort-Object)
         ($covered -join ',') | Should -Be ($expected -join ',') -Because 'every arg-taking manifest method must be in the primary-key drift map'
 
         foreach ($name in $primaryKey.Keys) {
@@ -328,6 +355,38 @@ Describe 'Fake backend — hardware (processor / memory / firmware / COM port)' 
         $vm = & $script:B.GetVM @{ Name = 'vm1' }
         $vm.ProcessorCount | Should -Be 4
         $vm.ExposeVirtualizationExtensions | Should -BeTrue
+    }
+
+    It 'a fresh VM carries Hyper-V''s own processor defaults (Maximum 100, RelativeWeight 100)' {
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.ProcessorMaximum        | Should -Be 100
+        $vm.ProcessorRelativeWeight | Should -Be 100
+    }
+
+    It 'SetProcessor records Maximum and RelativeWeight when supplied' {
+        & $script:B.SetProcessor @{ VMName = 'vm1'; Count = 2; Maximum = 50; RelativeWeight = 250 }
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.ProcessorMaximum        | Should -Be 50
+        $vm.ProcessorRelativeWeight | Should -Be 250
+        $vm.ProcessorCount          | Should -Be 2
+    }
+
+    It 'SetProcessor without Maximum/RelativeWeight leaves the recorded values untouched' {
+        & $script:B.SetProcessor @{ VMName = 'vm1'; Maximum = 40; RelativeWeight = 300 }
+        & $script:B.SetProcessor @{ VMName = 'vm1'; Count = 3 }
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.ProcessorMaximum        | Should -Be 40
+        $vm.ProcessorRelativeWeight | Should -Be 300
+        $vm.ProcessorCount          | Should -Be 3
+    }
+
+    It 'SetProcessor rejects what the real Set-VMProcessor rejects (Maximum outside 0..100, RelativeWeight outside 1..10000)' {
+        { & $script:B.SetProcessor @{ VMName = 'vm1'; Maximum = 101 } }          | Should -Throw -ExpectedMessage '*Maximum*'
+        { & $script:B.SetProcessor @{ VMName = 'vm1'; Maximum = -1 } }           | Should -Throw -ExpectedMessage '*Maximum*'
+        { & $script:B.SetProcessor @{ VMName = 'vm1'; RelativeWeight = 0 } }     | Should -Throw -ExpectedMessage '*RelativeWeight*'
+        { & $script:B.SetProcessor @{ VMName = 'vm1'; RelativeWeight = 10001 } } | Should -Throw -ExpectedMessage '*RelativeWeight*'
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.ProcessorMaximum | Should -Be 100 -Because 'a rejected call must not half-apply'
     }
 
     It 'SetMemory records startup/dynamic settings' {
@@ -1481,7 +1540,51 @@ Describe 'Fake backend — switch + network adapter' {
         $sw | Should -BeNullOrEmpty
     }
 
-    It 'ConnectNetworkAdapter adds a NIC bound to a switch; GetNetworkAdapter lists it' {
+    It 'NewVM without a SwitchName still creates ONE unconnected adapter (real New-VM always does)' {
+        # Microsoft Learn's New-VM reference (-SwitchName): Hyper-V gives every new VM one virtual network
+        # adapter, and connecting it to a switch is optional. The fake used to create none, which hid every
+        # no-NIC seal gap at Tier 0 (zero adapters on the fake, one on real Hyper-V).
+        $nics = & $script:B.GetNetworkAdapter @{ VMName = 'vm1' }
+        $nics.Count | Should -Be 1 -Because 'real New-VM creates exactly one adapter even with no -SwitchName'
+        [string]$nics[0].SwitchName | Should -BeNullOrEmpty -Because 'with no -SwitchName the default adapter is not connected'
+    }
+
+    It 'NewVM WITH a SwitchName creates ONE adapter, already connected to that switch' {
+        & $script:B.NewSwitch @{ Name = 'sw-new'; SwitchType = 'Internal' }
+        & $script:B.NewVM @{ Name = 'vm2'; Generation = 2; SwitchName = 'sw-new' }
+        $nics = & $script:B.GetNetworkAdapter @{ VMName = 'vm2' }
+        $nics.Count | Should -Be 1
+        $nics[0].SwitchName | Should -Be 'sw-new'
+    }
+
+    It 'ConnectNetworkAdapter CONNECTS the existing default adapter instead of adding a second one (real branch parity)' {
+        # The real ConnectNetworkAdapter reads the VM's first adapter and calls Connect-VMNetworkAdapter when
+        # one exists; it calls Add-VMNetworkAdapter only when the VM has none. A provisioned VM therefore
+        # ends with exactly ONE adapter, on the switch.
+        (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' }).Count | Should -Be 1 -Because 'precondition: the default adapter exists'
+        & $script:B.NewSwitch @{ Name = 'sw-int'; SwitchType = 'Internal' }
+        & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'sw-int' }
+        $nics = & $script:B.GetNetworkAdapter @{ VMName = 'vm1' }
+        $nics.Count | Should -Be 1 -Because 'connecting reuses the default adapter; it must not append a second NIC'
+        $nics[0].SwitchName | Should -Be 'sw-int'
+    }
+
+    It 'ConnectNetworkAdapter ADDS an adapter only when the VM has none (after a removal)' {
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        & $script:B.NewSwitch @{ Name = 'sw-int'; SwitchType = 'Internal' }
+        & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'sw-int' }
+        $nics = & $script:B.GetNetworkAdapter @{ VMName = 'vm1' }
+        $nics.Count | Should -Be 1
+        $nics[0].SwitchName | Should -Be 'sw-int'
+    }
+
+    It 'RemoveNetworkAdapter on a VM with no adapters is an idempotent no-op (matches the hardened real method)' {
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        { & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' } } | Should -Not -Throw
+        (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' }).Count | Should -Be 0
+    }
+
+    It 'ConnectNetworkAdapter binds the VM''s adapter to a switch; GetNetworkAdapter lists it' {
         & $script:B.NewSwitch @{ Name = 'sw-int'; SwitchType = 'Internal' }
         & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'sw-int' }
         # Read DIRECTLY (no @() wrap) — the backend preserves array semantics itself, so a
@@ -1497,8 +1600,10 @@ Describe 'Fake backend — switch + network adapter' {
         # network-isolation tier checks go false-green.
         { & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'never-created-switch' } } |
             Should -Throw -ExpectedMessage '*never-created-switch*' -Because 'connecting to a switch never created via NewSwitch must fail, as real Hyper-V does'
-        # And no phantom NIC should have been recorded on the VM (direct read, no @() wrap).
-        (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' }).Count | Should -Be 0
+        # And no phantom binding was recorded: the VM still has only its default adapter, unconnected.
+        $nics = & $script:B.GetNetworkAdapter @{ VMName = 'vm1' }
+        $nics.Count | Should -Be 1 -Because 'the failed connect must not add an adapter'
+        [string]$nics[0].SwitchName | Should -BeNullOrEmpty -Because 'the failed connect must not bind the default adapter to a phantom switch'
     }
 
     It 'ConnectNetworkAdapter to a switch that WAS created via NewSwitch still works (happy path preserved)' {
@@ -1531,6 +1636,191 @@ Describe 'Fake backend — switch + network adapter' {
 
         & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
         (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' }).Count | Should -Be 0 -Because 'sealing a Tier2/3 VM removes all NICs; Assert-Sealed verifies this from the host'
+    }
+}
+
+# ===========================================================================
+#  REAL RemoveNetworkAdapter: documented parameter sets only, idempotent (AST-pinned)
+# ===========================================================================
+#  Lock-Sandbox calls this on every NoAdapter seal (Tier 0, Tier >= 2, any processor). It has never run
+#  live, so its body must rely only on documented cmdlet behavior: enumerate the adapters, then pipe the
+#  objects to Remove-VMNetworkAdapter (the ResourceObject parameter set), and do nothing when there are
+#  none. The real body cannot run in this non-elevated session, so pin it via the AST.
+Describe 'RemoveNetworkAdapter: the REAL method uses only documented parameter sets and is idempotent (AST-pinned)' {
+
+    BeforeAll {
+        $script:RealRemoveNicAssign = & $script:GetRealBackendAssign 'RemoveNetworkAdapter'
+    }
+
+    It 'enumerates the adapters with Get-VMNetworkAdapter (the harness below proves the removal only receives what was enumerated)' {
+        $script:RealRemoveNicAssign | Should -Not -BeNullOrEmpty -Because 'the real factory must define RemoveNetworkAdapter'
+        $script:RealRemoveNicAssign.Right.Extent.Text |
+            Should -Match 'Get-VMNetworkAdapter\s+-VMName' -Because 'the adapters to remove are read from host truth first'
+    }
+
+    It 'removes by piping the adapter objects, never with Remove-VMNetworkAdapter -VMName' {
+        $body = $script:RealRemoveNicAssign.Right.Extent.Text
+        $body | Should -Match '\|\s*Remove-VMNetworkAdapter' -Because 'piping adapter objects uses the documented ResourceObject parameter set'
+        $body | Should -Not -Match 'Remove-VMNetworkAdapter\s+-VMName' -Because 'omitting -Name in the VMName set relies on undocumented remove-everything behavior'
+    }
+
+    It 'guards the removal on a non-zero adapter count (idempotent, like the fake)' {
+        $script:RealRemoveNicAssign.Right.Extent.Text |
+            Should -Match '\.Count\s+-gt\s+0' -Because 'a VM with no adapters must be a no-op, as the fake already is'
+    }
+}
+
+# ===========================================================================
+#  Passthrough-device reads: GetGpuPartitionAdapters + GetAssignableDevices
+# ===========================================================================
+#  Host-truth reads for the seal gate's passthrough refusal. A GPU partition adapter exposes the host
+#  GPU driver stack; a device assigned by Discrete Device Assignment can be a physical NIC that
+#  GetNetworkAdapter never lists. The real bodies cannot run in this non-elevated session, so they are
+#  pinned via the AST; the fake carries the behavioral checks.
+Describe 'Passthrough-device reads: GetGpuPartitionAdapters + GetAssignableDevices (real/fake parity; AST-pinned real)' {
+
+    BeforeAll {
+        # The text of `$b.<Method> = { ... }` inside the real factory, or $null when absent.
+        $script:RealPtBody = {
+            param([string] $Method)
+            $assign = & $script:GetRealBackendAssign $Method
+            if ($null -eq $assign) { return $null }
+            return $assign.Right.Extent.Text
+        }
+    }
+
+    It 'the manifest documents both reads taking exactly VMName' {
+        foreach ($m in 'GetGpuPartitionAdapters', 'GetAssignableDevices') {
+            $script:ExpectedMethods.Keys | Should -Contain $m
+            @($script:ExpectedMethods[$m]) | Should -Be @('VMName')
+        }
+    }
+
+    It 'the REAL GetGpuPartitionAdapters reads Get-VMGpuPartitionAdapter and returns a ,@(...) collection' {
+        $body = & $script:RealPtBody 'GetGpuPartitionAdapters'
+        $body | Should -Not -BeNullOrEmpty -Because 'the real factory must define GetGpuPartitionAdapters'
+        $body | Should -Match 'Get-VMGpuPartitionAdapter\s+-VMName'
+        $body | Should -Match 'return\s*,@\(' -Because 'a single adapter must keep .Count = 1 for an unwrapped caller'
+    }
+
+    It 'the REAL GetAssignableDevices reads Get-VMAssignableDevice and returns a ,@(...) collection' {
+        $body = & $script:RealPtBody 'GetAssignableDevices'
+        $body | Should -Not -BeNullOrEmpty -Because 'the real factory must define GetAssignableDevices'
+        $body | Should -Match 'Get-VMAssignableDevice\s+-VMName'
+        $body | Should -Match 'return\s*,@\(' -Because 'a single device must keep .Count = 1 for an unwrapped caller'
+    }
+
+    It 'the FAKE reports none by default, as arrays (no caller @() wrap needed)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        $gpu = & $b.GetGpuPartitionAdapters @{ VMName = 'vm1' }
+        $dda = & $b.GetAssignableDevices    @{ VMName = 'vm1' }
+        $gpu.Count | Should -Be 0
+        $dda.Count | Should -Be 0
+        ,$gpu | Should -BeOfType [System.Array]
+        ,$dda | Should -BeOfType [System.Array]
+    }
+
+    It 'the FAKE reports a seeded device with .Count = 1 (single-element array semantics)' {
+        $b = New-FakeHyperVBackend
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        $vm = & $b.GetVM @{ Name = 'vm1' }
+        $vm.GpuPartitionAdapters.Add(@{ Id = 'gpu-p-0' })
+        $vm.AssignableDevices.Add(@{ LocationPath = 'PCIROOT(0)#PCI(0300)' })
+        (& $b.GetGpuPartitionAdapters @{ VMName = 'vm1' }).Count | Should -Be 1
+        (& $b.GetAssignableDevices    @{ VMName = 'vm1' }).Count | Should -Be 1
+    }
+
+    It 'the FAKE throws for an unknown VM, like the other per-VM reads' {
+        $b = New-FakeHyperVBackend
+        { & $b.GetGpuPartitionAdapters @{ VMName = 'ghost' } } | Should -Throw -ExpectedMessage '*ghost*'
+        { & $b.GetAssignableDevices    @{ VMName = 'ghost' } } | Should -Throw -ExpectedMessage '*ghost*'
+    }
+
+    It 'the Sealer never invokes either cmdlet directly (the reads live only behind the backend seam)' {
+        $sealerPath = Join-Path $script:SkillRoot 'scripts/lib/Sealer.ps1'
+        $sTokens = $null; $sErrors = $null
+        $sealerAst = [System.Management.Automation.Language.Parser]::ParseFile($sealerPath, [ref]$sTokens, [ref]$sErrors)
+        @($sErrors).Count | Should -Be 0 -Because 'the Sealer must parse cleanly'
+        $raw = $sealerAst.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                      $n.GetCommandName() -in @('Get-VMGpuPartitionAdapter', 'Get-VMAssignableDevice')
+        }, $true)
+        @($raw).Count | Should -Be 0 -Because 'the Sealer reads passthrough state through the backend, never a raw cmdlet'
+    }
+}
+
+# ===========================================================================
+#  Seal-device methods: the REAL bodies, executed out of process against stub cmdlets
+# ===========================================================================
+#  The AST pins check the text; this runs the real bodies. A child pwsh dot-sources the lib beside
+#  recording stubs (the only interception that reaches a real closure) and prints what happened.
+Describe 'Seal-device methods: the REAL bodies, executed out of process against stub cmdlets' {
+
+    BeforeAll {
+        $harness = Join-Path $PSScriptRoot 'fixtures/Invoke-RealSealDeviceCapture.ps1'
+        Test-Path $harness | Should -BeTrue -Because 'the out-of-process seal-device harness must exist'
+        $pwsh = (Get-Process -Id $PID).Path   # the exact pwsh running these tests
+        if ([string]::IsNullOrWhiteSpace($pwsh)) { $pwsh = 'pwsh' }
+        $raw = & $pwsh -NoProfile -File $harness -LibPath $script:LibPath 2>&1
+        $rawText = ($raw | Out-String).Trim()
+        $jsonLine = ($rawText -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        $jsonLine | Should -Not -BeNullOrEmpty -Because "the harness must emit JSON; got: $rawText"
+        $script:SealDevCap = $jsonLine | ConvertFrom-Json
+    }
+
+    It 'RemoveNetworkAdapter on a VM with no adapter: enumerates it, removes nothing, does not throw' {
+        $script:SealDevCap.Remove_None.err | Should -BeNullOrEmpty
+        $script:SealDevCap.Remove_None.enumeratedVM | Should -Be 'vm1'
+        @($script:SealDevCap.Remove_None.removed).Count | Should -Be 0 -Because 'an idempotent removal must not call the cmdlet when there is nothing to remove'
+    }
+
+    It 'RemoveNetworkAdapter on a VM with one adapter: pipes exactly that adapter to the removal' {
+        $script:SealDevCap.Remove_One.err | Should -BeNullOrEmpty
+        @($script:SealDevCap.Remove_One.removed) | Should -Be @('nic-0')
+    }
+
+    It 'RemoveNetworkAdapter on a VM with two adapters: pipes both, and never names the VM on the removal' {
+        $script:SealDevCap.Remove_Two.err | Should -BeNullOrEmpty
+        @($script:SealDevCap.Remove_Two.removed) | Should -Be @('nic-0', 'nic-1')
+        $script:SealDevCap.Remove_Two.anyByVMName | Should -BeFalse -Because 'removal goes through the piped adapter objects, not the VMName parameter set'
+    }
+
+    It 'ConnectNetworkAdapter on a VM that has its default adapter: CONNECTS it and adds nothing (the production path)' {
+        $script:SealDevCap.Connect_Default.err | Should -BeNullOrEmpty
+        @($script:SealDevCap.Connect_Default.connected) | Should -Be @('vm1>sw0')
+        @($script:SealDevCap.Connect_Default.added).Count | Should -Be 0 -Because 'real New-VM always leaves an adapter, so the provisioner must reuse it rather than add a second'
+    }
+
+    It 'ConnectNetworkAdapter on a VM with no adapter: ADDS one bound to the switch and connects nothing' {
+        $script:SealDevCap.Connect_None.err | Should -BeNullOrEmpty
+        @($script:SealDevCap.Connect_None.added) | Should -Be @('vm1>sw0')
+        @($script:SealDevCap.Connect_None.connected).Count | Should -Be 0
+    }
+
+    It 'GetGpuPartitionAdapters returns an ARRAY with .Count 0, 1 and 2 for 0, 1 and 2 adapters (no caller @() wrap)' {
+        foreach ($case in @(@{ Key = 'Gpu_None'; N = 0 }, @{ Key = 'Gpu_One'; N = 1 }, @{ Key = 'Gpu_Two'; N = 2 })) {
+            $c = $script:SealDevCap.($case.Key)
+            $c.err       | Should -BeNullOrEmpty
+            $c.queriedVM | Should -Be 'vm1' -Because "$($case.Key): the real body must query the VM it was asked about"
+            $c.isArray   | Should -BeTrue -Because "$($case.Key): a single adapter must not unroll to a bare object across the two & boundaries"
+            $c.count     | Should -Be $case.N
+        }
+    }
+
+    It 'GetAssignableDevices returns an ARRAY with .Count 0 and 1 for 0 and 1 devices (no caller @() wrap)' {
+        foreach ($case in @(@{ Key = 'Dda_None'; N = 0 }, @{ Key = 'Dda_One'; N = 1 })) {
+            $c = $script:SealDevCap.($case.Key)
+            $c.err       | Should -BeNullOrEmpty
+            $c.queriedVM | Should -Be 'vm1' -Because "$($case.Key): the real body must query the VM it was asked about"
+            $c.isArray   | Should -BeTrue -Because "$($case.Key): a single device must not unroll to a bare object"
+            $c.count     | Should -Be $case.N
+        }
+    }
+
+    It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal)' {
+        $script:SealDevCap.Gpu_Throw.err | Should -Match 'simulated Get-VMGpuPartitionAdapter failure'
+        $script:SealDevCap.Gpu_Throw.queriedVM | Should -Be 'vm1' -Because 'the throwing cmdlet was still asked about the right VM'
     }
 }
 
@@ -1574,6 +1864,26 @@ Describe 'Fake backend — checkpoints' {
         (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' }).Count | Should -Be 1 -Because 'the checkpoint captured the NIC; restore brings it back'
     }
 
+    It 'a ConnectNetworkAdapter after a checkpoint does not leak into the snapshot (in-place NIC write stays isolated)' {
+        # The fake's ConnectNetworkAdapter rewrites an existing adapter in place, and GetNetworkAdapter hands
+        # back live records. The checkpoint deep-copies, so the snapshot must still show the old switch.
+        & $script:B.NewSwitch @{ Name = 'sw-a'; SwitchType = 'Internal' }
+        & $script:B.NewSwitch @{ Name = 'sw-b'; SwitchType = 'Internal' }
+        & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'sw-a' }
+        & $script:B.Checkpoint @{ VMName = 'vm1'; SnapshotName = 'on-a' }
+
+        & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'sw-b' }
+        (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' })[0].SwitchName | Should -Be 'sw-b'
+
+        & $script:B.RestoreCheckpoint @{ VMName = 'vm1'; SnapshotName = 'on-a' }
+        (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' })[0].SwitchName | Should -Be 'sw-a' -Because 'the snapshot was taken while the adapter sat on sw-a'
+
+        # Mutating the restored record must not reach back into the stored snapshot either.
+        & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'sw-b' }
+        & $script:B.RestoreCheckpoint @{ VMName = 'vm1'; SnapshotName = 'on-a' }
+        (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' })[0].SwitchName | Should -Be 'sw-a' -Because 'a second restore must still find the snapshot untouched'
+    }
+
     It 'RemoveCheckpoint deletes the named snapshot' {
         & $script:B.Checkpoint @{ VMName = 'vm1'; SnapshotName = 'golden' }
         & $script:B.RemoveCheckpoint @{ VMName = 'vm1'; SnapshotName = 'golden' }
@@ -1613,15 +1923,20 @@ Describe 'Fake backend — collection returns survive single-element unrolling' 
     }
 
     It 'GetNetworkAdapter returns an empty array (.Count = 0) when the VM has no NIC (no caller @() wrap)' {
+        # A fresh VM carries its default adapter (real New-VM parity); remove it to reach the no-NIC state.
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
         $nics = & $script:B.GetNetworkAdapter @{ VMName = 'vm1' }
         $nics.Count | Should -Be 0
     }
 
     It 'GetNetworkAdapter reports the right Count for multiple NICs (no caller @() wrap)' {
+        # Connect the default adapter, then seed a second adapter straight onto the fake VM record (the
+        # record-mutation idiom Sealer.Tests.ps1 uses). ConnectNetworkAdapter reuses an existing adapter
+        # rather than appending one, so it cannot build a two-NIC VM on its own.
         & $script:B.NewSwitch @{ Name = 'sw-a'; SwitchType = 'Internal' }
         & $script:B.NewSwitch @{ Name = 'sw-b'; SwitchType = 'Internal' }
         & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'sw-a' }
-        & $script:B.ConnectNetworkAdapter @{ VMName = 'vm1'; SwitchName = 'sw-b' }
+        (& $script:B.GetVM @{ Name = 'vm1' }).NetworkAdapters.Add(@{ SwitchName = 'sw-b'; Name = 'Network Adapter 2' })
         $nics = & $script:B.GetNetworkAdapter @{ VMName = 'vm1' }
         $nics.Count | Should -Be 2
     }
@@ -2386,5 +2701,96 @@ Describe 'Resolve-QemuImg (I5 version-floor + SHA-256 pin)' {
         Mock Get-FileSha256     { 'should-not-be-called' }
         Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
         Should -Invoke Get-FileSha256 -Times 0
+    }
+}
+
+# ===========================================================================
+#  GetHostMemory: the host free-RAM read behind the engine's pre-boot gate
+# ===========================================================================
+Describe 'Fake backend - GetHostMemory' {
+
+    It 'returns FreeBytes and TotalBytes as [long] byte counts, with a default that clears every shipped guest size' {
+        $b = New-FakeHyperVBackend
+        $m = & $b.GetHostMemory @{}
+        $m.FreeBytes  | Should -BeOfType [long]
+        $m.TotalBytes | Should -BeOfType [long]
+        $m.FreeBytes  | Should -BeGreaterThan 32GB
+        $m.TotalBytes | Should -BeGreaterOrEqual $m.FreeBytes
+    }
+
+    It 'is configurable through -SimulateHostFreeMemoryBytes / -SimulateHostTotalMemoryBytes' {
+        $b = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes 3GB -SimulateHostTotalMemoryBytes 16GB
+        $m = & $b.GetHostMemory @{}
+        $m.FreeBytes  | Should -Be 3GB
+        $m.TotalBytes | Should -Be 16GB
+    }
+
+    It 'throws under -SimulateHostMemoryReadError (the unreadable-host case the gate must fail closed on)' {
+        $b = New-FakeHyperVBackend -SimulateHostMemoryReadError
+        { & $b.GetHostMemory @{} } | Should -Throw -ExpectedMessage '*GetHostMemory*'
+    }
+}
+
+# ===========================================================================
+#  REAL backend: processor caps + the CIM host-memory read (out-of-process capture)
+# ===========================================================================
+#  The real bodies cannot run here (no elevation, no live Hyper-V). Like the SetProcessor pass-through
+#  above, they are driven out-of-process with recording shadow stubs: Set-VMProcessor records which
+#  parameters arrived, and Get-CimInstance returns the shape the real class has (UInt64 properties in
+#  KiB), so a missing unit conversion or a wrong class name shows up here and not on first live use.
+Describe 'Real backend - SetProcessor caps and GetHostMemory (out-of-process capture)' {
+
+    BeforeAll {
+        $harness = Join-Path $PSScriptRoot 'fixtures/Invoke-RealBackendCapture.ps1'
+        $pwsh = (Get-Process -Id $PID).Path
+        if ([string]::IsNullOrWhiteSpace($pwsh)) { $pwsh = 'pwsh' }
+        $raw = & $pwsh -NoProfile -File $harness -LibPath $script:LibPath 2>&1
+        $rawText = ($raw | Out-String).Trim()
+        $jsonLine = ($rawText -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+        $jsonLine | Should -Not -BeNullOrEmpty -Because "the harness must emit JSON; got: $rawText"
+        $script:Cap2 = $jsonLine | ConvertFrom-Json
+    }
+
+    It 'SetProcessor passes -Maximum and -RelativeWeight through when supplied' {
+        $script:Cap2.SetProcessor_Caps.err | Should -BeNullOrEmpty
+        $cap = $script:Cap2.SetProcessor_Caps.cap
+        $cap.MaximumGiven        | Should -BeTrue
+        $cap.Maximum             | Should -Be 60
+        $cap.RelativeWeightGiven | Should -BeTrue
+        $cap.RelativeWeight      | Should -Be 500
+        $cap.CountGiven          | Should -BeTrue
+        $cap.Count               | Should -Be 2
+    }
+
+    It 'SetProcessor OMITS -Maximum and -RelativeWeight when they are not supplied (Hyper-V defaults stay)' {
+        $cap = $script:Cap2.SetProcessor.cap
+        $cap.MaximumGiven        | Should -BeFalse
+        $cap.RelativeWeightGiven | Should -BeFalse
+    }
+
+    It 'SetProcessor passes only the one cap that was supplied' {
+        $cap = $script:Cap2.SetProcessor_MaxOnly.cap
+        $cap.MaximumGiven        | Should -BeTrue
+        $cap.RelativeWeightGiven | Should -BeFalse
+    }
+
+    It 'GetHostMemory reads Win32_OperatingSystem and converts KiB to bytes (x1024)' {
+        $script:Cap2.GetHostMemory.err | Should -BeNullOrEmpty
+        $script:Cap2.GetHostMemory.cap.ClassName | Should -Be 'Win32_OperatingSystem'
+        $script:Cap2.GetHostMemory.result.FreeBytes  | Should -Be (8388608 * 1024)  -Because 'FreePhysicalMemory is reported in KiB'
+        $script:Cap2.GetHostMemory.result.TotalBytes | Should -Be (16777216 * 1024) -Because 'TotalVisibleMemorySize is reported in KiB'
+    }
+
+    It 'GetHostMemory does not truncate a figure above the Int32 range (the CIM properties are UInt64)' {
+        $script:Cap2.GetHostMemory_Big.err | Should -BeNullOrEmpty
+        $script:Cap2.GetHostMemory_Big.result.FreeBytes | Should -Be ([long]4294967296 * 1024)
+    }
+
+    It 'GetHostMemory throws (fail closed) when the CIM read returns nothing' {
+        $script:Cap2.GetHostMemory_Null.err | Should -Match 'HyperVBackend\.GetHostMemory'
+    }
+
+    It 'GetHostMemory throws when the CIM instance carries no usable memory figures' {
+        $script:Cap2.GetHostMemory_Empty.err | Should -Match 'HyperVBackend\.GetHostMemory'
     }
 }

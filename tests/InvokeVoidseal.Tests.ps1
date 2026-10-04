@@ -38,6 +38,19 @@ BeforeAll {
     $script:BackendPath = Join-Path $script:SkillRoot 'scripts/lib/HyperVBackend.ps1'
     $script:TierDir     = Join-Path $script:SkillRoot 'tier-profiles'
 
+    # The files every outbox-transport Disk run must find on its INPUT disk: the in-guest producer and
+    # the outbox module it imports. The orchestrator's outbox preflight refuses a run without them, so
+    # every transport-only fixture below starts from a copy of this map (a processor also needs
+    # screener.py, which its own fixture adds). A function returns a fresh hashtable per call so a test
+    # that adds entries never leaks them into another.
+    function script:New-OutboxHelperInputs {
+        $h = @{}
+        foreach ($helper in @('run_disk_workload.py', 'outbox.py')) {
+            $h[$helper] = Get-Content -LiteralPath (Join-Path $script:SkillRoot "guest/$helper") -Raw
+        }
+        $h
+    }
+
     Test-Path $script:OrchPath    | Should -BeTrue -Because 'the orchestrator script must exist to be tested'
     Test-Path $script:BackendPath | Should -BeTrue -Because 'the backend must exist'
 
@@ -93,6 +106,27 @@ BeforeAll {
             & $origStartVM $P
         }.GetNewClosure()
         return $snap
+    }
+
+    # Spy on a backend's GetNetworkAdapter so a test can see what Assert-Sealed read at certify time.
+    # Invoke-Voidseal tears the VM down before it returns, so the adapters cannot be read afterward.
+    # Returns the list the wrapper appends to: one @{ VMName; Adapters; Switches } entry per read. The
+    # wrapper hands back exactly what the wrapped method returned (comma-wrapped to keep array semantics).
+    $script:SpyNicReads = {
+        param([hashtable] $Backend)
+        $inner = $Backend.GetNetworkAdapter
+        $reads = [System.Collections.Generic.List[object]]::new()
+        $Backend.GetNetworkAdapter = {
+            param([System.Collections.IDictionary] $P)
+            $nics = & $inner $P
+            $reads.Add(@{
+                VMName   = [string]$P['VMName']
+                Adapters = $nics.Count
+                Switches = @($nics | ForEach-Object { [string]$_.SwitchName })
+            })
+            return ,$nics
+        }.GetNewClosure()
+        return ,$reads
     }
 }
 
@@ -326,7 +360,7 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         $script:Tier0Disk = @{} + $script:Tier0Disk          # mutable copy
         $script:Tier0Disk['Name']         = 'firefox-test'
         $script:Tier0Disk['WorkloadMode'] = 'Disk'
-        $script:Tier0Disk['Inputs']       = @{}              # empty inputs -> input disk created with no files
+        $script:Tier0Disk['Inputs']       = script:New-OutboxHelperInputs   # the helpers the outbox preflight requires
         $script:Tier0Disk['FileSystem']   = 'exFAT'
         $script:Tier0Disk['OutboxOutput'] = $true
         Assert-TierProfileValid -Profile $script:Tier0Disk -Context 'TEST Tier-0 Disk-mode fixture'
@@ -375,6 +409,23 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:DiskB
         $report.States    | Should -Contain 'RUNNING' -Because 'profile WorkloadMode=Disk drives the disk path with no -Workload'
         $report.RunResult | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Disk mode with -StorageRoot places the system, INPUT, OUTPUT and seed disks beside each other under it (E2)' {
+        $root = 'D:\vs-orch-disk'
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
+            -Workload @{ WorkloadMode = 'Disk' } -StorageRoot $root `
+            -Name 'sbx-disk-root' -ArtifactRoot $script:Art -Destination $script:Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:DiskB
+        $report.States | Should -Contain 'SEALED'
+        $expectedDir = Join-Path $root 'sbx-disk-root'
+        $d = $report.Descriptor
+        foreach ($p in @($d.DiskPath, $d.InputDiskPath, $d.OutputDiskPath)) {
+            $p | Should -Not -BeNullOrEmpty
+            $p | Should -BeLike "$expectedDir*"
+        }
+        # The CIDATA seed disk exists only when the fixture carries an entrypoint; when it does, it sits there too.
+        if ($d.SeedDiskPath) { $d.SeedDiskPath | Should -BeLike "$expectedDir*" }
     }
 
     It 'Disk mode attaches BOTH data disks before the seal, folds them into CreatedDisks, and DETACHES them before the host read (proven via the call log)' {
@@ -435,7 +486,7 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
     }
 
     It 'Invoke-Voidseal Disk mode folds -Workload.Inputs onto the INPUT disk' {
-        # CONTRACT GAP: the profile's Inputs is empty (the .psd1 keeps it empty; live runs populate
+        # CONTRACT GAP: the shipped profile's Inputs is empty (the .psd1 keeps it empty; live runs populate
         # it at deploy time). The documented live-acceptance path passes the inputs through -Workload.Inputs.
         # Without the orchestrator folding -Workload.Inputs into the resolved profile BEFORE New-WorkloadDisks,
         # the override is silently dropped -> the INPUT disk is created with no files -> no organizer script in
@@ -443,9 +494,14 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         # volume through the orchestrator. We assert via the fake's WriteVhdxFile call log (which captures the
         # Content and survives teardown — the disk itself is deleted by the Reaper's -DeleteDisks pass at the
         # end of the lifecycle, so it can't be read back post-run).
-        $script:Tier0Disk['Inputs'] | Should -BeNullOrEmpty -Because 'the fixture profile carries an EMPTY Inputs — the override must be what populates the disk'
-        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
-            -Workload @{ WorkloadMode = 'Disk'; Inputs = @{ 'organize_bookmarks.py' = 'print(1)'; 'sample.json' = '{}' } } `
+        $emptyInputsProfile = @{} + $script:Tier0Disk
+        $emptyInputsProfile['Inputs'] = @{}
+        $emptyInputsProfile['Inputs'] | Should -BeNullOrEmpty -Because 'this profile copy carries an EMPTY Inputs, like the shipped firefox profile; the override must be what populates the disk'
+        $overrideInputs = script:New-OutboxHelperInputs      # the outbox preflight needs the helpers in the effective Inputs
+        $overrideInputs['organize_bookmarks.py'] = 'print(1)'
+        $overrideInputs['sample.json']           = '{}'
+        $report = Invoke-Voidseal -Tier 0 -Profile $emptyInputsProfile `
+            -Workload @{ WorkloadMode = 'Disk'; Inputs = $overrideInputs } `
             -Name 'sbx-inputs' -ArtifactRoot $script:Art -Destination $script:Dest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:DiskB
         $inPath = $report.Descriptor.InputDiskPath
@@ -551,7 +607,7 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
         $script:Tier0Seed = @{} + $script:Tier0Seed
         $script:Tier0Seed['Name']         = 'firefox-seed-test'
         $script:Tier0Seed['WorkloadMode'] = 'Disk'
-        $script:Tier0Seed['Inputs']       = @{}
+        $script:Tier0Seed['Inputs']       = script:New-OutboxHelperInputs
         $script:Tier0Seed['FileSystem']   = 'exFAT'
         $script:Tier0Seed['OutboxOutput'] = $true   # D: a non-processor Disk-mode fixture MUST be outbox/processor/builder-shaped now (structural C1 no-mount)
         $script:Tier0Seed['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
@@ -795,7 +851,7 @@ Describe 'StageAssets: attached before the seal, gone when the guest first boots
         $p['Name']         = 'stage-disk-test'
         $p['WorkloadMode'] = 'Disk'
         $p['OutboxOutput'] = $true
-        $p['Inputs']       = @{}
+        $p['Inputs']       = script:New-OutboxHelperInputs
         $p['Entrypoint']   = 'python3 /mnt/in/task.py --out /run/staging/result.html'
         $p['StageAssets']  = @{ $script:StageIso = 'synthetic test payload' }
         # No outbox blob is simulated, so the run fails its result read after StartVM; only the media
@@ -830,8 +886,8 @@ Describe 'StageAssets: attached before the seal, gone when the guest first boots
 Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
     BeforeEach {
-        # A Tier-0 PROCESSOR profile: Network='None' (structurally no-NIC; Tier-0 Container substrate
-        # wires no NIC, so it seals clean) + a ScreenConfig (mode='aggressive') that routes the post-
+        # A Tier-0 PROCESSOR profile: Network='None' (NoAdapter: the provisioner builds no switch and
+        # Lock-Sandbox removes the default adapter, so it seals clean) + a ScreenConfig (mode='aggressive') that routes the post-
         # detach gate, + WorkloadMode='Disk' (a processor IS a Disk-mode workload) + an Entrypoint (so
         # the disk-mode CIDATA seed disk is built, exactly like the RC6 path). EgressMode/EgressAllowlist
         # MUST be 'None'/@() for a Network='None' profile (the loader's processor rule).
@@ -1605,7 +1661,7 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
         $script:Fx = @{} + $script:Fx                    # mutable copy
         $script:Fx['Name']         = 'firefox-outbox-test'
         $script:Fx['WorkloadMode'] = 'Disk'
-        $script:Fx['Inputs']       = @{}
+        $script:Fx['Inputs']       = script:New-OutboxHelperInputs   # the helpers the outbox preflight requires
         $script:Fx['FileSystem']   = 'exFAT'
         $script:Fx['OutboxOutput'] = $true                # C1.1: Raw OUTPUT, no ScreenConfig -> transport-only
         $script:Fx['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
@@ -1658,6 +1714,69 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
         $mountOps = @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.Path -eq $outputPath })
         $rawOps.Count   | Should -BeGreaterThan 0 -Because 'the result must be read user-space via ReadVhdxRawRegion'
         $mountOps.Count | Should -Be 0 -Because 'the host must NEVER Mount-VHD / ReadVhdxFile a Raw OUTPUT with no filesystem'
+    }
+
+    It 'seals the Tier-0 VM with ZERO network adapters (the seal strips the default one) and still extracts the artifact' {
+        # Tier 0 is NoAdapter (Get-SealNicPolicy): real New-VM creates one adapter, Lock-Sandbox removes
+        # it, and the gate requires the host to report none. Removing an adapter this offline workload
+        # never used must not break the disk round-trip.
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+        $reads = & $script:SpyNicReads $b
+        $art  = Join-Path $script:TmpRoot ("art-fx-nonic-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $dest = Join-Path $script:TmpRoot ("dest-fx-nonic-{0}" -f ([guid]::NewGuid().ToString('N')))
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-fx-nonic' -ArtifactRoot $art -Destination $dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        $report.SealVerdict | Should -BeTrue
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' -and $_.VMName -eq 'sbx-fx-nonic' }).Count |
+            Should -Be 1 -Because 'Lock-Sandbox must remove the default adapter of a Tier-0 VM'
+        $gateRead = @($reads | Where-Object { $_.VMName -eq 'sbx-fx-nonic' })
+        $gateRead.Count       | Should -Be 1 -Because 'Assert-Sealed reads the adapters once for a NoAdapter VM'
+        $gateRead[0].Adapters | Should -Be 0 -Because 'the gate certified a Tier-0 VM whose host reports zero adapters'
+        $report.ExtractedArtifact | Should -Not -BeNullOrEmpty
+        [System.IO.File]::ReadAllBytes(@($report.ExtractedArtifact)[0]) | Should -Be $script:FxResultBytes
+    }
+
+    # The outbox preflight covers transport-only profiles too: without run_disk_workload.py and
+    # outbox.py on INPUT the guest producer exits non-zero and writes no outbox, which the host can
+    # only report as "outbox header missing". Refuse up front instead, before anything is provisioned.
+    It 'REFUSES a transport-only OutboxOutput profile whose Inputs lack both guest helpers, naming them, before anything is provisioned' {
+        $bare = @{} + $script:Fx
+        $bare['Inputs'] = @{ 'organize_bookmarks.py' = 'print(1)' }   # the workload alone, no guest helpers
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $err = { Invoke-Voidseal -Tier 0 -Profile $bare -Name 'sbx-fx-nohelpers' -ArtifactRoot $script:FxArt `
+                    -Destination $script:FxDest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+                Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike '*run_disk_workload.py*outbox.py*' -Because 'the operator needs to see which helpers are missing'
+        $err.Exception.Message | Should -Not -BeLike '*screener.py*' -Because 'a transport-only profile is not screened, so it does not need the screener'
+        (& $b.GetVM @{ Name = 'sbx-fx-nohelpers' }) | Should -BeNullOrEmpty -Because 'the refusal comes before provisioning, so no VM is created'
+    }
+
+    It 'REFUSES a transport-only profile missing only outbox.py, naming just that helper' {
+        $partial = @{} + $script:Fx
+        $partial['Inputs'] = script:New-OutboxHelperInputs
+        $partial['Inputs'].Remove('outbox.py')
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $err = { Invoke-Voidseal -Tier 0 -Profile $partial -Name 'sbx-fx-partial' -ArtifactRoot $script:FxArt `
+                    -Destination $script:FxDest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+                Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike '*lack outbox.py.*'
+        $err.Exception.Message | Should -Not -BeLike '*run_disk_workload.py,*' -Because 'the helper that is present must not be reported missing'
+    }
+
+    It 'the transport-only preflight honors -Workload.Inputs (a shipped-firefox-shaped profile with empty Inputs runs once the helpers arrive that way)' {
+        $emptyInputs = @{} + $script:Fx
+        $emptyInputs['Inputs'] = @{}
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+        $report = Invoke-Voidseal -Tier 0 -Profile $emptyInputs `
+            -Workload @{ WorkloadMode = 'Disk'; Inputs = (script:New-OutboxHelperInputs) } `
+            -Name 'sbx-fx-wlhelpers' -ArtifactRoot $script:FxArt -Destination $script:FxDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        $report.Error             | Should -BeNullOrEmpty
+        $report.ExtractedArtifact | Should -Not -BeNullOrEmpty -Because 'exactly the two helpers pass the transport-only preflight, with no screener.py'
     }
 
     It 'DENY-on-no-outbox: a clean power-off with NO outbox written -> header-magic probe fails closed, no artifact' {
@@ -1913,5 +2032,288 @@ Describe 'Invoke-Voidseal — input validation' {
         $b = New-FakeHyperVBackend
         { Invoke-Voidseal -Tier 1 -Profile (Join-Path $script:TmpRoot 'no-such-profile.psd1') -Backend $b } |
             Should -Throw -Because 'a profile path that does not exist must fail closed'
+    }
+}
+
+# ===========================================================================
+#  The NIC policy reaches the seal gate through the REAL orchestrator path
+# ===========================================================================
+#  Until 2026-10-03 the processor no-NIC check read a descriptor field production never wrote, so it
+#  fired only in tests that injected the field by hand. These tests drive Invoke-Voidseal end to end on
+#  the fake (which, like real New-VM, gives every VM one default adapter): Network must reach the
+#  descriptor, Lock-Sandbox must strip the adapter of every NoAdapter VM, and Assert-Sealed must refuse
+#  an adapter that survives. $script:SpyNicReads records what the gate read, since the VM is torn down
+#  before the report returns.
+Describe 'Invoke-Voidseal: the NIC policy reaches the seal gate (processors at Tier 0 and 1; Tier-1 non-processor)' {
+
+    BeforeAll {
+        # A processor profile (Network='None' plus a ScreenConfig) on the given base tier. EgressMode and
+        # EgressAllowlist must be 'None' and empty for a Network='None' profile (the loader's processor rule).
+        $script:NewProcessorProfile = {
+            param([int] $BaseTier)
+            $p = Import-TierProfile -Path (Join-Path $script:TierDir ("tier{0}.psd1" -f $BaseTier))
+            $p = @{} + $p
+            $p['Name']            = "nicpolicy-proc-t$BaseTier"
+            $p['WorkloadMode']    = 'Disk'
+            # The processor preflight refuses a run whose Inputs lack the in-guest helpers, so load them
+            # the way the $script:Proc fixture does.
+            $p['Inputs']          = @{}
+            foreach ($helper in @('run_disk_workload.py', 'outbox.py', 'screener.py')) {
+                $p['Inputs'][$helper] = Get-Content -LiteralPath (Join-Path $script:SkillRoot "guest/$helper") -Raw
+            }
+            $p['FileSystem']      = 'exFAT'
+            $p['Network']         = 'None'
+            $p['EgressMode']      = 'None'
+            $p['EgressAllowlist'] = @()
+            $p['ScreenConfig']    = @{ mode = 'aggressive' }
+            $p['Entrypoint']      = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
+            Assert-TierProfileValid -Profile $p -Context "TEST Tier-$BaseTier processor fixture"
+            return $p
+        }
+        # Fresh, GUID-named artifact, destination and rate-ledger paths for one run.
+        $script:NewRunPaths = {
+            param([string] $Tag)
+            return @{
+                Art    = Join-Path $script:TmpRoot ("art-$Tag-{0}"  -f ([guid]::NewGuid().ToString('N')))
+                Dest   = Join-Path $script:TmpRoot ("dest-$Tag-{0}" -f ([guid]::NewGuid().ToString('N')))
+                Ledger = Join-Path $script:TmpRoot ("ledger-$Tag-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+            }
+        }
+    }
+
+    It 'Tier-0 processor: Network reaches the descriptor, the seal strips the default adapter, the gate certifies' {
+        $proc  = & $script:NewProcessorProfile -BaseTier 0
+        $paths = & $script:NewRunPaths -Tag 'nic-proc0'
+        $b     = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $reads = & $script:SpyNicReads $b
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $proc -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-nic-proc0' -ArtifactRoot $paths.Art -Destination $paths.Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -RateLedgerPath $paths.Ledger `
+            -Backend $b -WarningAction SilentlyContinue
+
+        $report.Descriptor.Network | Should -Be 'None' -Because 'New-SandboxVM must record the profile Network on the descriptor'
+        $report.SealVerdict | Should -BeTrue
+        @($report.States) | Should -Contain 'SEALED'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' -and $_.VMName -eq 'sbx-nic-proc0' }).Count |
+            Should -Be 1 -Because 'Lock-Sandbox must remove the default adapter of a NoAdapter VM'
+        $gateRead = @($reads | Where-Object { $_.VMName -eq 'sbx-nic-proc0' })
+        $gateRead.Count       | Should -Be 1 -Because 'Assert-Sealed reads the adapters once for a NoAdapter VM'
+        $gateRead[0].Adapters | Should -Be 0 -Because 'the gate certified a processor whose host reports zero adapters'
+    }
+
+    It 'Tier-0 processor: an adapter that SURVIVES the seal is refused by the gate through Invoke-Voidseal itself' {
+        # The proof that the processor check fires through the real orchestrator path, not only in tests
+        # that inject Network onto a descriptor. RemoveNetworkAdapter becomes a no-op (the one-method
+        # failure injection Provisioner.Tests.ps1 uses for SetFirmware), so the default adapter survives
+        # Lock-Sandbox and only Assert-Sealed stands between it and RUNNING.
+        $proc  = & $script:NewProcessorProfile -BaseTier 0
+        $paths = & $script:NewRunPaths -Tag 'nic-proc0-stuck'
+        $b     = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $b.RemoveNetworkAdapter = { param($P) }.GetNewClosure()
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $proc -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-nic-proc0-stuck' -ArtifactRoot $paths.Art -Destination $paths.Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -RateLedgerPath $paths.Ledger `
+            -Backend $b -WarningAction SilentlyContinue
+
+        $report.SealVerdict | Should -BeFalse -Because 'a processor with a live adapter must never be certified'
+        @($report.States) | Should -Not -Contain 'SEALED'
+        @($report.States) | Should -Not -Contain 'RUNNING'
+        $report.Error | Should -Match 'certify processor VM' -Because 'the refusal must name the processor reason'
+        $report.Error | Should -Match 'network adapter'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0 -Because 'the VM never started'
+        (& $b.GetVM @{ Name = 'sbx-nic-proc0-stuck' }) | Should -BeNullOrEmpty -Because 'teardown still runs after a seal refusal'
+    }
+
+    It 'Tier-1 processor: no switch is ever built, the default adapter is removed, the gate certifies zero adapters' {
+        $proc  = & $script:NewProcessorProfile -BaseTier 1
+        $paths = & $script:NewRunPaths -Tag 'nic-proc1'
+        $b     = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $reads = & $script:SpyNicReads $b
+
+        $report = Invoke-Voidseal -Tier 1 -Profile $proc -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-nic-proc1' -ArtifactRoot $paths.Art -Destination $paths.Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -RateLedgerPath $paths.Ledger `
+            -Backend $b -WarningAction SilentlyContinue
+
+        $report.SealVerdict | Should -BeTrue
+        $report.Descriptor.Network    | Should -Be 'None'
+        $report.Descriptor.SwitchName | Should -BeNullOrEmpty -Because 'a processor is never wired to a switch, not even before the seal'
+        (& $b.GetSwitch @{ Name = 'sbx-nic-proc1-int' }) | Should -BeNullOrEmpty -Because 'no Internal switch is created for a NoAdapter VM'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' -and $_.VMName -eq 'sbx-nic-proc1' }).Count | Should -Be 1
+        $gateRead = @($reads | Where-Object { $_.VMName -eq 'sbx-nic-proc1' })
+        $gateRead.Count       | Should -Be 1
+        $gateRead[0].Adapters | Should -Be 0 -Because 'a Tier-1 processor must seal with zero adapters, not one on a switch'
+    }
+
+    It 'Tier-1 non-processor (ralph shape): keeps exactly one NIC, on its own sbx-nic-t1-int switch, and nothing is removed' {
+        $paths = & $script:NewRunPaths -Tag 'nic-t1'
+        $b     = New-FakeHyperVBackend
+        $reads = & $script:SpyNicReads $b
+        $wl    = & $script:NewWorkload -Tag 'nic-t1'
+
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $wl `
+            -Name 'sbx-nic-t1' -ArtifactRoot $paths.Art -Destination $paths.Dest -Backend $b
+
+        $report.SealVerdict | Should -BeTrue
+        $report.Descriptor.Network    | Should -Be 'Internal+Allowlist'
+        $report.Descriptor.SwitchName | Should -Be 'sbx-nic-t1-int'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' }).Count |
+            Should -Be 0 -Because 'a Tier-1 non-processor keeps its NIC; the seal must not remove it'
+        $gateRead = @($reads | Where-Object { $_.VMName -eq 'sbx-nic-t1' })
+        $gateRead.Count          | Should -Be 1
+        $gateRead[0].Adapters    | Should -Be 1 -Because 'one adapter: real New-VM creates it and the provisioner connects it'
+        $gateRead[0].Switches[0] | Should -Be 'sbx-nic-t1-int'
+    }
+}
+
+# ===========================================================================
+#  -HostMemoryMarginBytes reaches the provisioner's free-RAM gate (E1)
+# ===========================================================================
+Describe 'Invoke-Voidseal - passes -HostMemoryMarginBytes to the provisioner (E1)' {
+
+    It 'a margin the host cannot meet aborts before PROVISIONED with the free-memory message' {
+        $b = New-FakeHyperVBackend
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-ov-margin' `
+            -Workload @{ Entrypoint = 'true' } -HostMemoryMarginBytes 100GB `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-ov-margin') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -Match '(?i)free memory'
+        @($report.States) | Should -Not -Contain 'PROVISIONED'
+        (& $b.GetVM @{ Name = 'sbx-ov-margin' }) | Should -BeNullOrEmpty
+    }
+
+    It 'with the parameter omitted the provisioner''s own 2GB default applies' {
+        $b = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes (4GB + 2GB - 1)
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-ov-default' `
+            -Workload @{ Entrypoint = 'true' } -ArtifactRoot (Join-Path $script:TmpRoot 'art-ov-default') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -Match '(?i)free memory'
+        $report.Error | Should -Match ([regex]::Escape([string]2GB))
+    }
+}
+
+# ===========================================================================
+#  -StorageRoot / VOIDSEAL_STORAGE_ROOT place every disk of a run (E2)
+# ===========================================================================
+Describe 'Invoke-Voidseal - the storage root covers the system, seed and data disks (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    It 'a Serial run with -StorageRoot puts the system disk and the CIDATA seed disk under it' {
+        $b = New-FakeHyperVBackend
+        $root = 'D:\vs-orch'
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-root' `
+            -Workload @{ Entrypoint = 'true' } -StorageRoot $root `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-root') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -BeNullOrEmpty
+        $expectedDir = Join-Path $root 'sbx-orch-root'
+        $report.Descriptor.DiskPath     | Should -BeLike "$expectedDir*"
+        $report.Descriptor.SeedDiskPath | Should -BeLike "$expectedDir*"
+    }
+
+    It 'VOIDSEAL_STORAGE_ROOT is honored when -StorageRoot is omitted, and the parameter wins when both are given' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-orch-env'
+        $b1 = New-FakeHyperVBackend
+        $r1 = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-env' -Workload @{ Entrypoint = 'true' } `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-env') -Backend $b1 -WarningAction SilentlyContinue
+        $r1.Descriptor.DiskPath | Should -BeLike (Join-Path 'D:\vs-orch-env' 'sbx-orch-env*')
+
+        $b2 = New-FakeHyperVBackend
+        $r2 = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-both' -Workload @{ Entrypoint = 'true' } `
+            -StorageRoot 'D:\vs-orch-param' -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-both') -Backend $b2 -WarningAction SilentlyContinue
+        $r2.Descriptor.DiskPath | Should -BeLike (Join-Path 'D:\vs-orch-param' 'sbx-orch-both*')
+    }
+
+    It 'a relative -StorageRoot is a caller error: it throws before INIT and creates nothing' {
+        $b = New-FakeHyperVBackend
+        { Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-bad' -Workload @{ Entrypoint = 'true' } `
+            -StorageRoot 'relative\dir' -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-bad') -Backend $b } |
+            Should -Throw -ExpectedMessage '*absolute local path*'
+        (& $b.GetVM @{ Name = 'sbx-orch-bad' }) | Should -BeNullOrEmpty
+    }
+}
+
+# ===========================================================================
+#  WorkloadTimeoutSeconds: explicit parameter > profile key > 600 (E3)
+# ===========================================================================
+Describe 'Invoke-Voidseal - the workload deadline comes from -WorkloadTimeoutSeconds, then the profile, then 600 (E3)' {
+
+    BeforeAll {
+        # A Disk-mode (outbox) Tier-0 profile, like the fixture above, with room to add the timeout key.
+        function script:New-TimeoutDiskProfile {
+            param($Timeout)
+            $p = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+            $p = @{} + $p
+            $p['Name'] = 'timeout-test'; $p['WorkloadMode'] = 'Disk'; $p['Inputs'] = (script:New-OutboxHelperInputs)
+            $p['FileSystem'] = 'exFAT'; $p['OutboxOutput'] = $true
+            if ($null -ne $Timeout) { $p['WorkloadTimeoutSeconds'] = $Timeout }
+            return $p
+        }
+    }
+
+    BeforeEach {
+        # The wait is mocked so the test can read the deadline it was handed without sleeping. A guest that
+        # is already Off is the same observable outcome as the fake's self-power-off.
+        Mock Wait-WorkloadComplete { @{ State = 'Off'; TimedOut = $false } }
+        Mock Start-SandboxWorkload { @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $null; TimedOut = $false } }
+    }
+
+    Context 'Disk mode (Wait-WorkloadComplete)' {
+        It 'uses the profile key when -WorkloadTimeoutSeconds is not given' {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+            $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout 7200) -Name 'sbx-to-prof' `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-prof') -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 7200 }
+        }
+
+        It 'an explicit -WorkloadTimeoutSeconds beats the profile key, including an explicit 0' {
+            foreach ($explicit in @(120, 0)) {
+                $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+                $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout 7200) -Name "sbx-to-exp$explicit" `
+                    -WorkloadTimeoutSeconds $explicit -ArtifactRoot (Join-Path $script:TmpRoot "art-to-exp$explicit") `
+                    -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+                Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq $explicit }
+            }
+        }
+
+        It 'falls back to 600 when neither is given' {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+            $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout $null) -Name 'sbx-to-def' `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-def') -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+        }
+    }
+
+    Context 'Serial mode (Start-SandboxWorkload)' {
+        It 'passes the profile key as the serial command deadline when the parameter is not given' {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = 1800
+            $b = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-ser' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser') -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 1800 }
+        }
+
+        It 'an explicit parameter wins, and 600 applies when nothing is set' {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = 1800
+            $b = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-ser2' -Workload @{ Entrypoint = 'true' } `
+                -WorkloadTimeoutSeconds 90 -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser2') -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 90 }
+
+            $b2 = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-to-ser3' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser3') -Backend $b2 -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+        }
+    }
+
+    It 'an out-of-range profile key is a load error (the loader bounds are 60..86400)' {
+        foreach ($bad in @(30, 86401)) {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = $bad
+            { Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-bad' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-bad') -Backend (New-FakeHyperVBackend) } |
+                Should -Throw -ExpectedMessage '*WorkloadTimeoutSeconds*'
+        }
     }
 }

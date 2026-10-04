@@ -28,7 +28,7 @@ hand. **Read all four before milestone 1.**
 
 | # | Gap (verified against the built code) | What it means for a live run |
 |---|---|---|
-| **Gap 1** | **Tier 0 provisions a Hyper-V VM, not a container.** `New-SandboxVM` is Hyper-V-only; the `Substrate='Container'` value in `tier0.psd1` only causes the network block (`if ($Profile['Substrate'] -eq 'HyperV-Gen2')`) to be **skipped** — so a Tier-0 VM is a real **Gen2 VM with no NIC**. Documented in SKILL.md + tier-reference.md. | The `firefox` proof boots a **Debian Gen2 VM** (offline, no NIC), *not* `docker sbx`. You **must** pass `-ParentDiskPath` to the same golden Debian `.vhdx` you build for Tier 1 (tier0's `GuestImage='debian-12-slim'` is a container-image label the engine ignores — there is no container runtime to honor it). |
+| **Gap 1** | **Tier 0 provisions a Hyper-V VM, not a container.** `New-SandboxVM` is Hyper-V-only, and `Get-SealNicPolicy` returns `NoAdapter` for Tier 0: the provisioner builds no switch, the seal removes the default adapter real `New-VM` creates, and the gate host-verifies that none remains. A sealed Tier-0 VM is a real **Gen2 VM with no NIC**. (`Substrate='Container'` in `tier0.psd1` is aspirational and changes nothing at runtime.) Documented in SKILL.md + tier-reference.md. | The `firefox` proof boots a **Debian Gen2 VM** (offline, no NIC), *not* `docker sbx`. You **must** pass `-ParentDiskPath` to the same golden Debian `.vhdx` you build for Tier 1 (tier0's `GuestImage='debian-12-slim'` is a container-image label the engine ignores: there is no container runtime to honor it). |
 | **Gap 2** | **Profile `Mounts` are NOT wired into the guest.** The only consumer of `Mounts` is `Assert-NoSecretMounts` (secret-shape validation). Nothing in the Provisioner/Runner attaches a host↔guest bind mount (the backend has no 9p/virtiofs/SMB mount method). | The firefox input/output dirs and Ralph's OAuth-token + workdir mounts **will not appear inside the guest.** Only Disk-mode **`Inputs`** (the INPUT data disk) and **`DataDisks`** (pre-built, hash-verified disks mounted read-only; `scripts/New-VoidsealDataDisk.ps1` builds one from a directory, live-unproven) reach a running workload; `Inputs` is how firefox works now (§4A). A **`StageAssets`** ISO is attached and then ejected by the seal before the guest's only boot; a transfer VHDX attached by hand is an unrecorded disk that `Assert-Sealed` refuses; and the engine builds the **CIDATA seed** from the profile, so it cannot carry your files. A Serial profile such as Ralph has no file channel at all today. Plan the data path before you run. |
 | **Gap 3** | **The result must land on a host-readable path for extraction.** `Export-SandboxArtifact` (Tier 0/1) does a host **filesystem** read of `-Workload.ResultPath`. Because of Gap 2 there is no automatic shared dir, so a `ResultPath` like `C:\sandbox\...\out\bookmarks.html` is **not** populated by the guest through a bind mount. | Decide how the guest's output reaches a host path: e.g. the workload writes to an **attached output VHDX** you then mount/read on the host, or you copy it out over the serial seam. For this smoke test you may stage a **pre-seeded `ResultPath` file** to drive the extraction step to green (see §3/§2) while you validate the *boundary*, and treat real guest-produced output as a follow-up once a transfer-out path is wired. |
 | **Gap 4** | **The COM1 serial transport is live-only and best-effort v1.** `InvokeGuestCommand` (the real backend) opens `\\.\pipe\<vm>-com1` as a `NamedPipeClientStream`, writes `<cmd>; echo "__VMDEP_RC__:$?"`, and parses the RC marker. It is **never** exercised against a real guest (the fake carries all behavioral tests). It has **no per-command nonce** yet (deferred). | This is the single biggest live unknown. The guest **must** have `serial-getty@ttyS0` enabled with **autologin** (no password prompt — the client doesn't authenticate) and a shell that echoes the marker. If the pipe is unreachable or there's a login prompt, the Runner **times out** (`TimeoutSeconds`, default 300) and the run is reported as a failure — teardown still runs. |
@@ -229,8 +229,23 @@ When the dry run shows the full `INIT..DESTROYED` traversal with `SealVerdict=Tr
 
 ## 3. Milestone 1 — Firefox proof (Tier 0), LIVE, SYNTHETIC data
 
+> **Historical.** This section records Milestone 1, which predates firefox Disk mode. Its pre-seeded
+> `ResultPath` stand-in (Gap 3) is not how firefox runs today. For the current Tier-0 procedure,
+> use **[section 4A](#4a-milestone-3--firefox-tier-0-real-workload-round-trip-disk-mode)**. Read this
+> section for the lifecycle and seal-boundary checks it still describes, not as the way to run firefox.
+
 **Proves milestone 4.** The cleanest end-to-end exercise: offline (no NIC), no
 egress dependency. Per **Gap 1** this runs as a **Debian Gen2 VM with no NIC**, not a container.
+
+> **First live use of the zero-adapter seal (added 2026-10-03).** This milestone is now also the first
+> live exercise of the real `RemoveNetworkAdapter` (the seal strips the default adapter) and of the
+> passthrough reads (`Get-VMGpuPartitionAdapter`, `Get-VMAssignableDevice`). If the seal refuses with a
+> network-adapter or passthrough message, capture the exact error text. The refusal is fail-closed and
+> teardown still runs.
+>
+> Before the run, in an elevated PowerShell, run `Get-VMGpuPartitionAdapter -VMName <an existing VM>` and
+> `Get-VMAssignableDevice -VMName <an existing VM>`. Each should return nothing, not an error. If either
+> errors on the host, `Assert-Sealed` refuses every seal (fail closed) until that is resolved.
 
 ### 3.1 Synthetic data only (DATA-ACCESS rule — binding)
 
@@ -268,9 +283,8 @@ $report = Invoke-Voidseal -Tier 0 -Profile firefox `
 # (default -Backend is the REAL Hyper-V backend — no -Backend argument)
 ```
 
-> `-ParentDiskPath $GoldenVhdx` is **required here per Gap 1** — without a bootable parent disk
-> the Tier-0 VM has nothing to boot. (The operator-runbook's Tier-0 example omits it because
-> it predates this clarification; include it.)
+> `-ParentDiskPath $GoldenVhdx` is **required here per Gap 1**: without a bootable parent disk
+> the Tier-0 VM has nothing to boot. The operator runbook's Tier-0 example includes it as well.
 
 ### 3.4 What success looks like
 
@@ -375,8 +389,8 @@ $report.RunResult.ExitCode   # the Ralph loop's exit status over the serial seam
 $report.ExtractedArtifact    # the extracted workspace diff/output dir, copied to the host
 ```
 
-- The VM (**net-reachable, defense-in-depth-restricted**) keeps its NIC (Tier 1 is not no-NIC
-  — only Tier ≥ 2 removes the NIC). **In-guest egress control now ships, unproven live:** the
+- The VM (**net-reachable, defense-in-depth-restricted**) keeps its NIC (a Tier-1 non-processor is
+  the only VM that does; every other VM has its NIC removed). **In-guest egress control now ships, unproven live:** the
   ralph/Serial CIDATA seed's `CidataSerialEgressTemplate` installs **iptables default-DROP
   OUTPUT** plus a **transparent Squid `dstdomain` allowlist** over `EgressAllowlist`, so a
   working activation should filter `api.anthropic.com` from any other destination — but this
@@ -479,7 +493,7 @@ never assumes "Off == success".
   comes up in a sealed guest, until its own 120 s timeout expires. The seed's `bootcmd` mask cannot
   prevent it (it runs in a stage ordered *after* that unit, and a sandbox boots only once). The real
   fix is to mask the unit in the **golden image** at image-prep — **not done yet**. Nothing is broken
-  either way: the host `-WorkloadTimeoutSeconds` (default 600) bounds it comfortably.
+  either way: the host `-WorkloadTimeoutSeconds` (default 600, or the profile's `WorkloadTimeoutSeconds`) bounds it comfortably.
 - **`ds=nocloud`** on the guest kernel cmdline is a *marginal* speed tunable here, not the fix above —
   discovery is already ~2 s. See `guest-images/debian-12-cloud.md` for delivery paths.
 
@@ -650,7 +664,7 @@ $report.SealVerdict    # MUST be $true for BOTH milestones — the workload only
 ```
 
 - If `SealVerdict` is `$false`, the deploy **aborted before RUNNING** (the workload never
-  ran) and the report's `Error` says why (e.g. a NIC still attached at Tier ≥ 2, a host
+  ran) and the report's `Error` says why (e.g. a NIC still attached to a VM that must have none, a host
   channel still readable, a residual disk). The VM was still torn down. Inspect the profile's
   `HostChannels` (all `$false` for VM tiers) and that `Lock-Sandbox` ran — see the
   operator-runbook troubleshooting table.

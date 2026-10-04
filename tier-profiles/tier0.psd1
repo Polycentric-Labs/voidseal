@@ -1,12 +1,13 @@
 @{
-    # Voidseal — Tier 0 isolation contract. NOTE: v1 provisions this as a real Debian Gen2 VM
-    # whose NIC is left unconnected (no switch), NOT a container and NOT a networked guest. The
-    # Substrate='Container' value below is aspirational: its only runtime effect is to SKIP the
-    # provisioner's switch/NIC block, which is gated on Substrate -eq 'HyperV-Gen2'. The
-    # EgressMode='HostProxy' allowlist has no implementation. See docs/live-smoke-test.md Gap 1.
+    # Voidseal: Tier 0 isolation contract. NOTE: v1 provisions this as a real Debian Gen2 VM with NO
+    # network adapter: Get-SealNicPolicy returns NoAdapter for Tier 0, so the provisioner builds no
+    # switch, Lock-Sandbox removes the default adapter Hyper-V creates, and Assert-Sealed host-verifies
+    # that none remains. It is NOT a container: the Substrate='Container' value below is aspirational
+    # and changes nothing at runtime. The EgressMode='HostProxy' allowlist has no implementation and is
+    # moot while the VM has no adapter. See docs/live-smoke-test.md Gap 1.
     # For trusted productivity workloads (e.g. the Firefox organizer proof on a profile COPY).
     Tier            = 0
-    Description     = 'Container / lightweight sandbox, network allowed via host proxy. Trusted dev + productivity. Operates on copies, never live host data without explicit per-task authorization.'
+    Description     = 'Lightweight offline sandbox. v1 runs it as a Hyper-V VM sealed with no network adapter; the container substrate and the host-proxy network mode are declared, not built. Trusted dev + productivity. Operates on copies, never live host data without explicit per-task authorization.'
     Substrate       = 'Container'                 # Docker/devcontainer; docker sbx / @anthropic-ai/sandbox-runtime optional for untrusted code
     Network         = 'HostProxyAllowlist'
     EgressMode      = 'HostProxy'                 # credential-free; host firewall / proxy allowlist

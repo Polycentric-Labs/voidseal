@@ -24,8 +24,8 @@ rather than duplicating it.
 > - **Tier 2 and Tier 3 (disposable no-net / air-gapped detonation) are scaffold-only.** The
 >   cold-VHDX→quarantine extraction sink throws `NotImplemented` in v1. **Do not run live malware or
 >   untrusted-plugin detonation yet.**
-> - **Windows + Hyper-V only**, today. The "Tier-0 container" substrate is design-intent — v1 provisions
->   Tier 0 as a no-NIC Hyper-V VM.
+> - **Windows + Hyper-V only**, today. The "Tier-0 container" substrate is design-intent; v1 provisions
+>   Tier 0 as a Hyper-V VM whose seal removes its only network adapter, host-verified by the gate.
 > - **Tier-1 ships an in-guest egress control (iptables default-DROP + Squid allowlist) as
 >   defense-in-depth**; it is mock-shape-asserted only, not yet exercised live, and NOT a boundary — a
 >   compromised/root guest can disable it. The host-verified boundary is Phase-6. Don't rely on the
@@ -67,7 +67,8 @@ insider, and make the blast radius structurally small.
 | **3** | air-gapped + sinkhole | none | none | malware detonation *(scaffold-only in v1)* |
 
 Tier ≥ 2 profiles are **structurally refused** at load if they declare any credential or egress, and the
-seal gate refuses a Tier ≥ 2 VM that still has a NIC, a secret volume, or a residual transfer medium.
+seal gate refuses a VM that must have no NIC (Tier 0, Tier ≥ 2, any processor) while it still has one,
+and refuses a passthrough device, a secret volume, or a residual transfer medium.
 
 ## What makes it different
 
@@ -78,8 +79,8 @@ an **integrated combination on a specific delivery surface**:
 1. **A risk-tier *ladder* in one tool** — most sandbox tools expose a single fixed boundary; Voidseal
    escalates Tier 0 → 3 with one interface.
 2. **A host-side, fail-closed seal *verification* before run** — the host independently certifies the
-   tier's isolation contract and *refuses to run otherwise*. The adapter-count certification is
-   Tier >= 2 (and any `Network='None'` profile); at Tier 1 the host instead certifies the NIC's vSwitch
+   tier's isolation contract and *refuses to run otherwise*. The adapter-count certification covers
+   every VM except a Tier-1 non-processor; at Tier 1 the host instead certifies the NIC's vSwitch
    is a purpose-built isolated Internal switch. Media, disk and host-channel checks run at every tier.
    This is the part nobody else ships: runtime *enforcement* (gVisor/Kata) and agent *health checks*
    (Cuckoo/CAPE) are not the same as a pre-run, host-side proof that the box is starved.
@@ -120,8 +121,9 @@ pwsh scripts/Get-VoidsealGoldenImage.ps1        # add -Plan first to preview the
 ```powershell
 # From the repo root, dot-source the engine, then run the Tier-0 example.
 # firefox is a Disk-mode profile: populate -Workload.Inputs with the organizer script + a
-# sample bookmark profile first (built from profiles/firefox.psd1's InputFiles — see
-# docs/live-smoke-test.md §4A for the walkthrough).
+# sample bookmark profile first (built from profiles/firefox.psd1's InputFiles), plus the guest
+# helpers run_disk_workload.py and outbox.py. A run whose Inputs lack either helper is refused
+# before anything is provisioned. See docs/live-smoke-test.md §4A for the walkthrough.
 . .\scripts\Invoke-Voidseal.ps1
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `
     -ParentDiskPath <golden.vhdx> -Destination <out-dir> -Workload @{ Inputs = $inputs }

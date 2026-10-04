@@ -64,10 +64,14 @@ $script:CreatedVMs = [System.Collections.Generic.HashSet[string]]::new(
 #     EMITS a dummy object to the output stream — mimicking the REAL Hyper-V cmdlets that pollute
 #     the stream and which, uncaptured, leak into New-SandboxVM's return value. ----------------
 
+# Where New-VM / New-VHD were last asked to put things (E2: the storage root must reach both).
+$script:LastNewVMPath  = $null
+$script:LastNewVHDPath = $null
 function New-VHD {
     [CmdletBinding()]
     param([string] $Path, [long] $SizeBytes, [switch] $Differencing,
           [string] $ParentPath, [switch] $Dynamic, [switch] $Fixed)
+    $script:LastNewVHDPath = $Path
     # Real New-VHD emits a Microsoft.Vhd.PowerShell.VirtualHardDisk object.
     [pscustomobject]@{ __Stub = 'VHD'; Path = $Path }
 }
@@ -77,6 +81,7 @@ function New-VM {
     param([string] $Name, [int] $Generation, [long] $MemoryStartupBytes,
           [string] $Path, [string] $SwitchName, [switch] $NoVHD)
     [void]$script:CreatedVMs.Add($Name)
+    $script:LastNewVMPath = $Path
     # Real New-VM emits a Microsoft.HyperV.PowerShell.VirtualMachine object — the headline polluter
     # (this is the raw VM object that became element [0] of New-SandboxVM's return in the live bug).
     [pscustomobject]@{ __Stub = 'VM'; VMName = $Name; ProcessorCount = 0 }
@@ -87,9 +92,32 @@ function Set-VMMemory {
     [pscustomobject]@{ __Stub = 'SetVMMemory'; VMName = $VMName }
 }
 
+# Records every Set-VMProcessor call (E1): which of the real parameters actually arrived.
+$script:ProcCalls = [System.Collections.Generic.List[object]]::new()
 function Set-VMProcessor {
-    [CmdletBinding()] param([string] $VMName, [int] $Count, [bool] $ExposeVirtualizationExtensions)
+    # Real parameter types: -Maximum is UInt64 (percent), -RelativeWeight is Int32.
+    [CmdletBinding()] param([string] $VMName, [int] $Count, [bool] $ExposeVirtualizationExtensions,
+                            [uint64] $Maximum, [int] $RelativeWeight)
+    $script:ProcCalls.Add([ordered]@{
+        Count               = $Count
+        MaximumGiven        = $PSBoundParameters.ContainsKey('Maximum')
+        Maximum             = [long]$Maximum
+        RelativeWeightGiven = $PSBoundParameters.ContainsKey('RelativeWeight')
+        RelativeWeight      = $RelativeWeight
+    })
     [pscustomobject]@{ __Stub = 'SetVMProcessor'; VMName = $VMName }
+}
+
+# Get-CimInstance shadow for the free-RAM gate (E1): Win32_OperatingSystem reports UInt64 KiB.
+# $script:cimMode 'ok' = 64GiB free of 128GiB; 'low' = 1GiB free; 'none' = no instance at all.
+$script:cimMode = 'ok'
+function Get-CimInstance {
+    [CmdletBinding()] param([string] $ClassName)
+    switch ($script:cimMode) {
+        'ok'   { return [pscustomobject]@{ FreePhysicalMemory = [uint64]67108864; TotalVisibleMemorySize = [uint64]134217728 } }
+        'low'  { return [pscustomobject]@{ FreePhysicalMemory = [uint64]1048576;  TotalVisibleMemorySize = [uint64]134217728 } }
+        default { return $null }
+    }
 }
 
 function Set-VMFirmware {
@@ -128,12 +156,16 @@ function New-VMSwitch {
 
 function Get-VMNetworkAdapter {
     [CmdletBinding()] param([string] $VMName)
-    # ConnectNetworkAdapter probes for an existing NIC first; report none so the Add branch runs.
-    return $null
+    # Real New-VM always leaves one default adapter, so ConnectNetworkAdapter takes its Connect branch
+    # (the production path). Report that adapter here.
+    return [pscustomobject]@{ __Stub = 'VMNetworkAdapter'; VMName = $VMName; Name = 'Network Adapter'; SwitchName = $null }
 }
 
 function Add-VMNetworkAdapter {
     [CmdletBinding()] param([string] $VMName, [string] $SwitchName)
+    # Kept on purpose although the Get-VMNetworkAdapter stub above reports an adapter, so the Connect
+    # branch runs and the Add branch is unreachable here. If a future change makes ConnectNetworkAdapter
+    # add an adapter, the call must still resolve to this stub rather than a live cmdlet.
     # Real Add-VMNetworkAdapter emits a Microsoft.HyperV.PowerShell.VMNetworkAdapter object.
     [pscustomobject]@{ __Stub = 'VMNetworkAdapter'; VMName = $VMName }
 }
@@ -202,9 +234,44 @@ try {
 catch {
     $err = $_.Exception.Message
 }
-finally {
-    Remove-Item -LiteralPath $goldenParent -Force -ErrorAction SilentlyContinue
+
+# E1: the uncapped run's Set-VMProcessor call, then a capped run, then the two refusal shapes.
+$defaultProc = if ($script:ProcCalls.Count -gt 0) { $script:ProcCalls[0] } else { $null }
+
+$script:ProcCalls.Clear()
+$capsErr = $null
+try {
+    $capsProfile = $profile.Clone()
+    $capsProfile['CpuMaximumPercent'] = 40
+    $capsProfile['CpuRelativeWeight'] = 300
+    $null = New-SandboxVM -Profile $capsProfile -Name 'sbx-caps' -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend)
 }
+catch { $capsErr = $_.Exception.Message }
+$capsProc = if ($script:ProcCalls.Count -gt 0) { $script:ProcCalls[0] } else { $null }
+
+# E2: a run with an explicit -StorageRoot must hand New-VM and New-VHD paths under it.
+$rootBase = Join-Path ([System.IO.Path]::GetTempPath()) 'voidseal-root-capture'
+$rootErr = $null
+try { $null = New-SandboxVM -Profile $profile -Name 'sbx-root' -StorageRoot $rootBase -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend) }
+catch { $rootErr = $_.Exception.Message }
+$rootNewVMPath  = $script:LastNewVMPath
+$rootNewVHDPath = $script:LastNewVHDPath
+$rootExpectedDir = Join-Path $rootBase 'sbx-root'
+
+$script:cimMode = 'low'
+$lowMemErr = $null
+try { $null = New-SandboxVM -Profile $profile -Name 'sbx-lowmem' -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend) }
+catch { $lowMemErr = $_.Exception.Message }
+$lowMemNewVMCalled = $script:CreatedVMs.Contains('sbx-lowmem')
+
+$script:cimMode = 'none'
+$noMemErr = $null
+try { $null = New-SandboxVM -Profile $profile -Name 'sbx-nomem' -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend) }
+catch { $noMemErr = $_.Exception.Message }
+$noMemNewVMCalled = $script:CreatedVMs.Contains('sbx-nomem')
+$script:cimMode = 'ok'
+
+Remove-Item -LiteralPath $goldenParent -Force -ErrorAction SilentlyContinue
 
 $count             = if ($null -ne $result) { @($result).Count } else { 0 }
 $last              = if ($count -gt 0) { $result[$count - 1] } else { $null }
@@ -233,5 +300,21 @@ $out = [ordered]@{
     createdDisksGiven = [bool]$createdDisksGiven
     createdDisksCount = [int]$createdDisks.Count
     elem0HasName      = (-not [string]::IsNullOrWhiteSpace($elem0Name))
+    defaultProcMaximumGiven        = if ($null -ne $defaultProc) { [bool]$defaultProc.MaximumGiven } else { $null }
+    defaultProcRelativeWeightGiven = if ($null -ne $defaultProc) { [bool]$defaultProc.RelativeWeightGiven } else { $null }
+    defaultProcCount               = if ($null -ne $defaultProc) { [int]$defaultProc.Count } else { $null }
+    capsErr                        = $capsErr
+    capsProcMaximumGiven           = if ($null -ne $capsProc) { [bool]$capsProc.MaximumGiven } else { $null }
+    capsProcMaximum                = if ($null -ne $capsProc) { [long]$capsProc.Maximum } else { $null }
+    capsProcRelativeWeightGiven    = if ($null -ne $capsProc) { [bool]$capsProc.RelativeWeightGiven } else { $null }
+    capsProcRelativeWeight         = if ($null -ne $capsProc) { [int]$capsProc.RelativeWeight } else { $null }
+    rootErr                        = $rootErr
+    rootExpectedDir                = $rootExpectedDir
+    rootNewVMPath                  = $rootNewVMPath
+    rootNewVHDPath                 = $rootNewVHDPath
+    lowMemErr                      = $lowMemErr
+    lowMemNewVMCalled              = [bool]$lowMemNewVMCalled
+    noMemErr                       = $noMemErr
+    noMemNewVMCalled               = [bool]$noMemNewVMCalled
 }
 $out | ConvertTo-Json -Depth 6 -Compress

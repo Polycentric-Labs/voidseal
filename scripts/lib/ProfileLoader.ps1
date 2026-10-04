@@ -97,6 +97,20 @@ function Test-AllowlistCoversHost {
 # Required keys for a workload profile.
 $script:WorkloadRequiredKeys = @('BaseTier', 'Name', 'Entrypoint')
 
+# Guest-sizing and run-time bounds (E1/E3). Enforced at load for a bare tier AND for a merged workload,
+# so a profile cannot ask Hyper-V for a guest the host could not run or a deadline that never fires.
+# Memory is compared in bytes (the profile string is parsed first); the other bounds are inclusive.
+$script:ProfileMemoryMinBytes        = 512MB
+$script:ProfileMemoryMaxBytes        = 64GB
+$script:ProfileCpuMin                = 1
+$script:ProfileCpuMax                = 32
+$script:ProfileCpuMaximumPercentMin  = 1
+$script:ProfileCpuMaximumPercentMax  = 100
+$script:ProfileCpuRelativeWeightMin  = 1
+$script:ProfileCpuRelativeWeightMax  = 10000
+$script:ProfileWorkloadTimeoutMin    = 60
+$script:ProfileWorkloadTimeoutMax    = 86400
+
 # Linux guest-image detector (invariant 5).
 $script:LinuxImageRegex = '(?i)(debian|ubuntu|alpine|fedora|remnux|linux)'
 
@@ -458,6 +472,59 @@ function Assert-EnumMember {
 
 <#
 .SYNOPSIS
+    Parse a profile Memory value ('4GB', '512MB', '4 GB' or a byte count) into bytes, strictly.
+.DESCRIPTION
+    The loader's own copy of the grammar the Provisioner's ConvertTo-Bytes accepts (binary units, KB to
+    TB, a bare number meaning bytes), so a value the loader passes is a value the Provisioner parses to
+    the same number of bytes. The Provisioner test suite pins that equivalence. Returns $null for
+    anything that does not parse, so the caller can raise one clear schema error naming the field.
+#>
+function ConvertTo-ProfileMemoryBytes {
+    [CmdletBinding()]
+    [OutputType([System.Nullable[long]])]
+    param([AllowNull()] $Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [int] -or $Value -is [long]) { return [long]$Value }
+    if (-not ($Value -is [string])) { return $null }
+    $m = [regex]::Match($Value.Trim(), '^(?<num>\d+(?:\.\d+)?)\s*(?<unit>KB|MB|GB|TB|B)?$', 'IgnoreCase')
+    if (-not $m.Success) { return $null }
+    $mult = switch ($m.Groups['unit'].Value.ToUpperInvariant()) {
+        'KB'    { 1KB }
+        'MB'    { 1MB }
+        'GB'    { 1GB }
+        'TB'    { 1TB }
+        default { 1 }
+    }
+    return [long]([double]$m.Groups['num'].Value * $mult)
+}
+
+<#
+.SYNOPSIS
+    Assert that an optional profile key, when present, is an integer inside an inclusive range.
+.DESCRIPTION
+    A key that is absent or $null passes (the caller decides whether it is required). A present value
+    must be a true integer: a string, a fraction or a bool is refused rather than coerced, because the
+    provisioner casts these straight into Hyper-V parameters.
+#>
+function Assert-OptionalIntInRange {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [hashtable] $Profile,
+        [Parameter(Mandatory)] [string] $Key,
+        [Parameter(Mandatory)] [int] $Min,
+        [Parameter(Mandatory)] [int] $Max,
+        [Parameter(Mandatory)] [string] $Context
+    )
+    if (-not $Profile.ContainsKey($Key) -or $null -eq $Profile[$Key]) { return }
+    $v = $Profile[$Key]
+    if (-not (($v -is [int]) -or ($v -is [long])) -or $v -lt $Min -or $v -gt $Max) {
+        throw "Schema validation: '$Context' field '$Key' must be an integer in $Min..$Max (got '$v')."
+    }
+}
+
+<#
+.SYNOPSIS
     Validates a (tier-shaped) profile hashtable against the schema + invariants 1-5.
     Used both for a bare tier profile and for the merged tier+workload result.
 #>
@@ -474,6 +541,24 @@ function Assert-TierProfileValid {
             throw "Schema validation: '$Context' is missing required key '$key'."
         }
     }
+
+    # --- guest sizing + run-time bounds (E1/E3) ---------------------------
+    # Memory: parseable and 512MB..64GB. Cpu: an integer 1..32. The two cap keys and the workload
+    # timeout are optional and validated only when present.
+    $memBytes = ConvertTo-ProfileMemoryBytes -Value $Profile['Memory']
+    if ($null -eq $memBytes) {
+        throw "Schema validation: '$Context' field 'Memory' value '$($Profile['Memory'])' is not a memory size (expected e.g. '4GB', '512MB', or a byte count)."
+    }
+    if ($memBytes -lt $script:ProfileMemoryMinBytes -or $memBytes -gt $script:ProfileMemoryMaxBytes) {
+        throw "Schema validation: '$Context' field 'Memory' value '$($Profile['Memory'])' ($memBytes bytes) is outside the allowed 512MB..64GB."
+    }
+    $cpuVal = $Profile['Cpu']
+    if (-not (($cpuVal -is [int]) -or ($cpuVal -is [long])) -or $cpuVal -lt $script:ProfileCpuMin -or $cpuVal -gt $script:ProfileCpuMax) {
+        throw "Schema validation: '$Context' field 'Cpu' must be an integer in $($script:ProfileCpuMin)..$($script:ProfileCpuMax) (got '$cpuVal')."
+    }
+    Assert-OptionalIntInRange -Profile $Profile -Key 'CpuMaximumPercent' -Min $script:ProfileCpuMaximumPercentMin -Max $script:ProfileCpuMaximumPercentMax -Context $Context
+    Assert-OptionalIntInRange -Profile $Profile -Key 'CpuRelativeWeight' -Min $script:ProfileCpuRelativeWeightMin -Max $script:ProfileCpuRelativeWeightMax -Context $Context
+    Assert-OptionalIntInRange -Profile $Profile -Key 'WorkloadTimeoutSeconds' -Min $script:ProfileWorkloadTimeoutMin -Max $script:ProfileWorkloadTimeoutMax -Context $Context
 
     # Tier int 0..3
     $tier = $Profile['Tier']
@@ -742,6 +827,8 @@ function Import-TierProfile {
     Merge rules (SCHEMA.md "Workload-profile keys"):
       - ExtraAllowlist  UNIONS onto the tier's EgressAllowlist (deduped, case-insensitive).
       - Packages / Mounts / Entrypoint / StageAssets / Name / BaseTier layer onto the tier.
+      - Memory / Cpu / CpuMaximumPercent / CpuRelativeWeight / WorkloadTimeoutSeconds layer onto the tier
+        too: a workload value replaces the tier's, and a key the workload omits keeps the tier's.
     The merged result is re-validated through Assert-TierProfileValid so a
     workload cannot smuggle in a secret mount or break Tier>=2 starvation.
 .PARAMETER Path
@@ -842,6 +929,7 @@ function Import-WorkloadProfile {
     foreach ($layerKey in @('Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
                             'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
                             'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput',
+                            'Memory', 'Cpu', 'CpuMaximumPercent', 'CpuRelativeWeight', 'WorkloadTimeoutSeconds',
                             'DataDisks')) {
         if ($raw.ContainsKey($layerKey)) {
             $merged[$layerKey] = $raw[$layerKey]

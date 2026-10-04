@@ -55,6 +55,7 @@ Set-StrictMode -Version Latest
 # from any working directory.
 # --------------------------------------------------------------------------
 $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
+. (Join-Path $script:DeployLibDir 'PythonResolver.ps1')
 . (Join-Path $script:DeployLibDir 'HyperVBackend.ps1')
 . (Join-Path $script:DeployLibDir 'ProfileLoader.ps1')
 . (Join-Path $script:DeployLibDir 'Provisioner.ps1')
@@ -64,73 +65,6 @@ $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
 . (Join-Path $script:DeployLibDir 'SeedBuilder.ps1')
 . (Join-Path $script:DeployLibDir 'SensitivityGate.ps1')
 . (Join-Path $script:DeployLibDir 'DataDisks.ps1')
-
-# --------------------------------------------------------------------------
-# Fold-in #1: Resolve-PythonExe — robust host python3/python resolution.
-#
-# A hard `& python3` BREAKS the Windows host: the Windows Python installer provides
-# `python`, not `python3`. The in-guest binary is `python3` (Debian), but the HOST
-# shelling `host/read_outbox.py` at the seam-#2 gate is Windows PowerShell, which
-# needs the Windows `python` executable. Get-Command probes both names; throw fail-
-# closed naming both if NEITHER resolves (prefer python3 on non-Windows for safety).
-#
-# Windows App Execution Aliases (zero-byte python.exe / python3.exe reparse points under
-# %LOCALAPPDATA%\Microsoft\WindowsApps) are skipped. Launching one goes through MSIX package
-# activation, and what runs next is up to the package: the Store redirector, a packaged
-# interpreter, or the Python install manager's launcher, which picks a runtime from its own
-# settings. So the interpreter that parses a guest-written outbox can be chosen by something
-# other than PATH, and activation adds a step that can fail. PowerShell 7 reports a failed first
-# launch as "StandardOutputEncoding is only supported when standard output is redirected" (its
-# ShellExecute retry keeps the encoding it set for captured output), which hides the Win32 error.
-# The result is the first non-alias match: python3 before python, each name in PATH order.
-# --------------------------------------------------------------------------
-<#
-.SYNOPSIS
-    Resolve the host Python executable path (python3 preferred, python fallback).
-.DESCRIPTION
-    A hard `& python3` breaks on Windows hosts where the Python installer provides
-    `python`. This asks Get-Command for every Application match of each name and returns
-    the first real interpreter, skipping Windows App Execution Aliases. Throws a clear
-    fail-closed message naming both candidates if neither resolves, listing any alias it
-    skipped.
-.PARAMETER CommandLookup
-    Returns the PATH-ordered Application matches for one command name. Defaults to
-    Get-Command -Name <name> -CommandType Application -All; tests inject a fake so the
-    result does not depend on the machine's PATH.
-#>
-function Resolve-PythonExe {
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [scriptblock] $CommandLookup = {
-            param($Name) Get-Command -Name $Name -CommandType Application -All -ErrorAction SilentlyContinue
-        }
-    )
-
-    $skippedAliases = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in 'python3', 'python') {
-        foreach ($cmd in @(& $CommandLookup $name)) {
-            if ($null -eq $cmd) { continue }
-            # Aliases are recognized by location: a \Microsoft\WindowsApps\ segment pair matches the
-            # alias directory under any profile root plus its per-package subfolders, with no
-            # file-system access, so the choice depends only on what the lookup returned.
-            if ($cmd.Source -match '[\\/]Microsoft[\\/]WindowsApps[\\/]') {
-                $skippedAliases.Add($cmd.Source)
-                continue
-            }
-            return $cmd.Source
-        }
-    }
-
-    $aliasNote = ''
-    if ($skippedAliases.Count -gt 0) {
-        $aliasNote = (' as a real interpreter (skipped Windows App Execution Alias stub(s), which ' +
-                      'launch through MSIX package activation: {0})') -f ($skippedAliases -join ', ')
-    }
-    throw ("Resolve-PythonExe: neither 'python3' nor 'python' was found on PATH$aliasNote. " +
-           "Install Python and ensure it is on the PATH (Windows: the Python installer " +
-           "adds 'python'; Linux/macOS: 'python3'). Failing closed.")
-}
 
 # --------------------------------------------------------------------------
 # C1.2: shared outbox-producer READ template — user-space, NEVER Mount-VHD.
@@ -366,7 +300,9 @@ function Get-WorkloadField {
     deadline — so it bounds the ACTUAL delivered command, not a pre-dispatch clock check. When that
     guest command reports TimedOut=$true (the guest hung and never completed in time — a REPORTED
     outcome from InvokeGuestCommand, not a thrown error), Invoke-Voidseal force-stops the VM and
-    records a Failed RunResult, mirroring the Disk-mode timeout shape. Default 600. Tests use the fake
+    records a Failed RunResult, mirroring the Disk-mode timeout shape. Where the value comes from (E3):
+    this parameter wins only when it is explicitly bound (an explicit 0 counts); otherwise the profile's
+    WorkloadTimeoutSeconds key (60..86400, validated by the loader); otherwise 600. Tests use the fake
     backend's -SimulateGuestCommandTimeout switch (not a 0 value) to exercise this deterministically,
     since a real elapsed-time trip cannot be forced instantaneously through a mock without a live
     blocking primitive. NOTE (LIVE-ONLY-UNPROVEN, Phase 6): the real InvokeGuestCommand's timeout
@@ -386,6 +322,17 @@ function Get-WorkloadField {
 .PARAMETER MaxReleasesPerDay
     (Optional) C2.6 per-profile, per-UTC-day release-event cap passed through to Invoke-SensitivityGate.
     Default 5 (ReleaseGovernor.ps1's own conservative FORK default for Allen, tunable at Phase 6).
+.PARAMETER StorageRoot
+    (Optional) the base directory for this run's disks: the VM folder is <StorageRoot>\<Name> and holds the
+    system, CIDATA seed, INPUT and OUTPUT disks. Beats the VOIDSEAL_STORAGE_ROOT environment variable, which
+    beats the %ProgramData%\Voidseal\sandboxes default. Must be an absolute local path; a relative, UNC or
+    device path throws before the run starts (a caller error, like a bad -Tier). -ArtifactRoot is separate
+    and unchanged.
+.PARAMETER HostMemoryMarginBytes
+    (Optional) headroom the host must keep free beyond the guest's memory, passed to New-SandboxVM's
+    free-RAM gate. Omit it to take the provisioner's default (2GB); the gate refuses a run, before
+    anything is created, when the host's free memory is below guest memory plus this margin, or when
+    host memory cannot be read.
 .PARAMETER Backend
     The Hyper-V backend. Defaults to the real one; tests inject the fake.
 #>
@@ -400,11 +347,13 @@ function Invoke-Voidseal {
         [string] $ArtifactRoot,
         [string] $Destination,
         [string] $ParentDiskPath,
+        [string] $StorageRoot,
         [int]    $BootWaitSeconds = 180,
         [int]    $BootPollDelaySeconds = 5,
         [int]    $WorkloadTimeoutSeconds = 600,
         [string] $RateLedgerPath,
         [ValidateRange(1, [int]::MaxValue)] [int] $MaxReleasesPerDay = 5,
+        [ValidateRange(0, [long]::MaxValue)] [long] $HostMemoryMarginBytes,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -425,6 +374,11 @@ function Invoke-Voidseal {
     if ([string]::IsNullOrWhiteSpace($Name)) {
         $Name = "sbx-{0}-{1}" -f $Tier, ([guid]::NewGuid().ToString('N').Substring(0, 8))
     }
+    # E2: resolve the storage root ONCE (a bad root is a caller error and throws before INIT). The same
+    # base goes to New-SandboxVM, and every later disk uses $vmStorageDir, so the system, seed, INPUT and
+    # OUTPUT disks all land beside each other under one root.
+    $storageBase  = Resolve-SandboxStorageBase -StorageRoot $StorageRoot
+    $vmStorageDir = Join-Path $storageBase $Name
     if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
         $ArtifactRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("Voidseal\artifacts\{0}" -f $Name)
     }
@@ -439,6 +393,18 @@ function Invoke-Voidseal {
     # leakage backstop. See the .PARAMETER RateLedgerPath doc above for the full rationale.
     if ([string]::IsNullOrWhiteSpace($RateLedgerPath)) {
         $RateLedgerPath = Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\state\release-ledger.json'
+    }
+
+    # E3: the overall workload deadline. An explicitly bound -WorkloadTimeoutSeconds wins (so a caller, or a
+    # test passing 0, always gets exactly what it asked for), then the profile's WorkloadTimeoutSeconds
+    # (bounds already enforced by the loader), then the 600 default. $PSBoundParameters is what separates
+    # "the caller said 600" from "nobody said anything".
+    $effectiveTimeoutSeconds = if ($PSBoundParameters.ContainsKey('WorkloadTimeoutSeconds')) {
+        $WorkloadTimeoutSeconds
+    } elseif ($resolved.ContainsKey('WorkloadTimeoutSeconds') -and $null -ne $resolved['WorkloadTimeoutSeconds']) {
+        [int]$resolved['WorkloadTimeoutSeconds']
+    } else {
+        600
     }
 
     # The entrypoint: prefer the workload spec, fall back to a workload profile's Entrypoint.
@@ -493,28 +459,40 @@ function Invoke-Voidseal {
                "(Invoke-BuilderVM) and must never be passed to Invoke-Voidseal directly. Fail closed.")
     }
 
-    # --- PROCESSOR preflight: the in-guest producer, outbox module and screener must ride INPUT ---
-    # A processor's seed runs `python3 /mnt/in/run_disk_workload.py --mode <mode>`, which imports
-    # outbox.py and runs screener.py from its own directory. If any of the three is missing, the guest
-    # producer exits non-zero and writes no outbox, and all the host can report is "outbox header
-    # missing", which reads like a transport fault. Refuse here instead, before anything is
-    # provisioned. The effective Inputs follow the same rule the Disk branch applies when it folds the
-    # override in: a non-empty -Workload.Inputs wins, otherwise the profile's own Inputs count.
-    # (Transport-only profiles such as firefox are not checked: the mock suite runs them with empty
-    # Inputs by design, and their helper delivery is the documented live-run step.)
-    if ($workloadMode -eq 'Disk' -and (Test-IsProcessorProfile -Profile $resolved)) {
+    # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT ---
+    # Every outbox-transport Disk run (a processor, or a transport-only OutboxOutput profile such as
+    # firefox) executes `python3 /mnt/in/run_disk_workload.py` from the INPUT disk, and that script
+    # imports outbox.py from its own directory. A processor also runs screener.py beside them. If any
+    # required file is missing, the guest producer exits non-zero and writes no outbox, and all the
+    # host can report is "outbox header missing", which reads like a transport fault. Refuse here
+    # instead, before anything is provisioned. The effective Inputs follow the same rule the Disk
+    # branch applies when it folds the override in: a non-empty -Workload.Inputs wins, otherwise the
+    # profile's own Inputs count. The shipped firefox profile declares empty Inputs on purpose (a
+    # .psd1 cannot inline a Python file), so a live run supplies the helpers through
+    # -Workload.Inputs, as docs/live-smoke-test.md section 4A shows. Both profile kinds come from the
+    # shared predicates in ProfileLoader.ps1 (Test-UsesOutboxTransport / Test-IsProcessorProfile).
+    if ($workloadMode -eq 'Disk' -and (Test-UsesOutboxTransport -Profile $resolved)) {
+        $isProcessorShape = Test-IsProcessorProfile -Profile $resolved
+        $requiredHelpers  = if ($isProcessorShape) { @('run_disk_workload.py', 'outbox.py', 'screener.py') }
+                            else                   { @('run_disk_workload.py', 'outbox.py') }
         $effectiveInputs = Get-WorkloadField -Workload $Workload -Name 'Inputs'
         if (-not ($effectiveInputs -is [System.Collections.IDictionary] -and $effectiveInputs.Count -gt 0)) {
             $effectiveInputs = if ($resolved.ContainsKey('Inputs')) { $resolved['Inputs'] } else { $null }
         }
-        $missingHelpers = @(@('run_disk_workload.py', 'outbox.py', 'screener.py') | Where-Object {
+        $missingHelpers = @($requiredHelpers | Where-Object {
             -not ($effectiveInputs -is [System.Collections.IDictionary] -and $effectiveInputs.Contains($_))
         })
         if ($missingHelpers.Count -gt 0) {
-            throw ("Invoke-Voidseal: REFUSING processor '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
-                   "processor's in-guest runner executes run_disk_workload.py from the INPUT disk, and that script " +
-                   "imports outbox.py and runs screener.py beside it. Stage all three from the repo's guest/ " +
-                   "directory in Inputs (or -Workload.Inputs). Fail closed.")
+            if ($isProcessorShape) {
+                throw ("Invoke-Voidseal: REFUSING processor '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
+                       "processor's in-guest runner executes run_disk_workload.py from the INPUT disk, and that script " +
+                       "imports outbox.py and runs screener.py beside it. Stage all three from the repo's guest/ " +
+                       "directory in Inputs (or -Workload.Inputs). Fail closed.")
+            }
+            throw ("Invoke-Voidseal: REFUSING outbox profile '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
+                   "in-guest runner executes run_disk_workload.py from the INPUT disk, and that script imports " +
+                   "outbox.py beside it. Stage both from the repo's guest/ directory in Inputs (or " +
+                   "-Workload.Inputs). Fail closed.")
         }
     }
 
@@ -539,7 +517,6 @@ function Invoke-Voidseal {
         }
         $preDepsPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
         if ([string]::IsNullOrWhiteSpace($preDepsPath) -and $resolved.ContainsKey('DepsDiskPath')) { $preDepsPath = [string]$resolved['DepsDiskPath'] }
-        $storageBase = Split-Path -Parent (Get-SandboxStorageRoot -Name $Name)
         Assert-DataDiskPathsIsolated -DataDisks $dataDisks -StorageRoot $storageBase `
             -DepsDiskPath $preDepsPath -ParentDiskPath $ParentDiskPath
         # The seed builder reads the names from here to emit one read-only mount per disk.
@@ -582,8 +559,10 @@ function Invoke-Voidseal {
 
     try {
         # --- PROVISIONED ---------------------------------------------------
-        $provArgs = @{ Profile = $resolved; Name = $Name; Backend = $Backend }
+        $provArgs = @{ Profile = $resolved; Name = $Name; StorageRoot = $storageBase; Backend = $Backend }
         if (-not [string]::IsNullOrWhiteSpace($ParentDiskPath)) { $provArgs.ParentDiskPath = $ParentDiskPath }
+        # Pass the margin only when the caller bound it, so New-SandboxVM's own default stays the single truth.
+        if ($PSBoundParameters.ContainsKey('HostMemoryMarginBytes')) { $provArgs.HostMemoryMarginBytes = $HostMemoryMarginBytes }
         $descriptor = New-SandboxVM @provArgs
         $report.Descriptor = $descriptor
         $states.Add('PROVISIONED')
@@ -615,7 +594,7 @@ function Invoke-Voidseal {
         # DISK: built below, alongside the INPUT/OUTPUT disks; there the seed carries the disk-mode runner.
         if ($workloadMode -ne 'Disk' -and -not [string]::IsNullOrWhiteSpace($entrypoint)) {
             $descriptor = New-WorkloadSeedDisk -Descriptor $descriptor -Profile $resolved `
-                -StorageRoot (Get-SandboxStorageRoot -Name $Name) -Backend $Backend
+                -StorageRoot $vmStorageDir -Backend $Backend
             $report.Descriptor = $descriptor
         }
 
@@ -623,7 +602,7 @@ function Invoke-Voidseal {
         # The INPUT/OUTPUT data disks must be attached AND recorded on the descriptor (InputDiskPath/
         # OutputDiskPath) BEFORE Lock-Sandbox so Assert-Sealed's host-truth scan accepts them as known
         # data disks (an UNRECORDED attached disk fails the seal gate). Use the SAME storage root the
-        # provisioner derives for the system disk (Get-SandboxStorageRoot -Name $Name) so the data disks
+        # provisioner derives for the system disk ($vmStorageDir, resolved once above) so the data disks
         # land beside it and the Reaper's storage-root cleanup covers them. Serial mode skips this.
         if ($workloadMode -eq 'Disk') {
             # Allow -Workload.Inputs to override/populate the profile's Inputs (innerName -> content), so a
@@ -640,7 +619,7 @@ function Invoke-Voidseal {
                 $resolved['Inputs'] = $workloadInputs
             }
 
-            $diskStorageRoot = Get-SandboxStorageRoot -Name $Name
+            $diskStorageRoot = $vmStorageDir
             # New-WorkloadDisks now RECORDS each data disk on the descriptor INCREMENTALLY (its path
             # field AND a deduped append to CreatedDisks) right after it is created — so the INPUT/
             # OUTPUT VHDX files are on CreatedDisks for the Reaper's -DeleteDisks pass, and a mid-
@@ -775,13 +754,13 @@ function Invoke-Voidseal {
             # DISK MODE: the guest runs its boot workload off the SEED, writes its result + an
             # exit-code sentinel onto the OUTPUT data disk, then powers ITSELF off. There is NO live
             # control channel (the Sealer severed them), so the host learns completion by POLLING VM
-            # State until Off (Wait-WorkloadComplete) — or until WorkloadTimeoutSeconds force-stops a
+            # State until Off (Wait-WorkloadComplete), or until the effective deadline force-stops a
             # hung guest. Then the host DETACHES the data disks (VM is Off) and reads + classifies the
             # result off the OUTPUT volume.
             $null = & $Backend.StartVM @{ Name = $Name }
             $states.Add('RUNNING')
             $wait = Wait-WorkloadComplete -Descriptor $descriptor -Backend $Backend `
-                        -TimeoutSeconds $WorkloadTimeoutSeconds -PollDelaySeconds $BootPollDelaySeconds
+                        -TimeoutSeconds $effectiveTimeoutSeconds -PollDelaySeconds $BootPollDelaySeconds
             $states.Add('CAPTURED')
             # Detach the data disks BEFORE the host reads the output (VM is Off, or force-stopped on
             # timeout). The host must not read a disk still attached to a (potentially live) guest.
@@ -915,7 +894,7 @@ function Invoke-Voidseal {
             if (-not [string]::IsNullOrWhiteSpace($entrypoint)) {
                 # I6a: the OVERALL wall-clock DENY (Disk-mode parity). Disk mode already force-stops a
                 # hung guest on an overall deadline (Wait-WorkloadComplete -TimeoutSeconds
-                # $WorkloadTimeoutSeconds, above). Serial mode's real mechanism: $WorkloadTimeoutSeconds
+                # $effectiveTimeoutSeconds, above). Serial mode's real mechanism: $effectiveTimeoutSeconds
                 # is passed as the OUTER bound (-TimeoutSeconds) of the single serial guest-command run
                 # (Start-SandboxWorkload -> InvokeGuestCommand). When that guest command reports
                 # TimedOut=$true (the guest hung and never completed before the deadline — a REPORTED
@@ -928,7 +907,7 @@ function Invoke-Voidseal {
                 # command's reported timeout, not a pre-dispatch clock comparison.
                 $runResult = Start-SandboxWorkload -Descriptor $descriptor -Entrypoint $entrypoint `
                     -ArtifactRoot $ArtifactRoot -BootWaitSeconds $BootWaitSeconds `
-                    -BootPollDelaySeconds $BootPollDelaySeconds -TimeoutSeconds $WorkloadTimeoutSeconds `
+                    -BootPollDelaySeconds $BootPollDelaySeconds -TimeoutSeconds $effectiveTimeoutSeconds `
                     -Backend $Backend
                 $report.RunResult = $runResult
                 $states.Add('RUNNING')
