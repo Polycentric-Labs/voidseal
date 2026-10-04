@@ -1458,3 +1458,70 @@ Describe 'Seal coverage: the four integration services are disabled by the seal 
             Should -Throw -ExpectedMessage '*INJECTED: integration-service enumeration failed*'
     }
 }
+
+# ===========================================================================
+#  Seal coverage (design E6): COM2
+# ===========================================================================
+#  Voidseal wires only COM1 (the serial management channel). A named pipe on COM2 is a second byte stream
+#  between guest and host that the tool never created, so the gate refuses it at every tier, serial-managed
+#  or not. The COM1 logic is unchanged. A COM2 read that throws refuses too.
+Describe 'Seal coverage: Assert-Sealed refuses a VM whose COM2 has a path' {
+
+    BeforeAll {
+        $script:NewSealedCom = {
+            param([hashtable] $Backend, [int] $Tier, [string] $Name)
+            $p = $script:Tier1
+            if ($Tier -eq 0) {
+                $p = $script:Tier1.Clone()
+                $p['Tier']        = 0
+                $p['Description'] = 'TEST FIXTURE: Tier 0 for the COM2 gate.'
+            }
+            elseif ($Tier -eq 2) { $p = $script:Tier2 }
+            $d = New-SandboxVM -Profile $p -Name $Name -Backend $Backend
+            Lock-Sandbox -Descriptor $d -Backend $Backend
+            return @{ Backend = $Backend; Desc = $d }
+        }
+    }
+
+    It 'a clean seal leaves COM2 without a path and certifies (the default fake models an empty COM2)' {
+        $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-com2-clean'
+        (& $sb.Backend.GetComPort @{ VMName = 'sbx-com2-clean'; Number = 2 }) | Should -BeNullOrEmpty
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+
+    It 'REFUSES a COM2 path at Tiers 0, 1 and 2 (SimulateCom2Path), naming the pipe' {
+        foreach ($t in 0, 1, 2) {
+            $pipe = "\\.\pipe\sbx-com2-$t-extra"
+            $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend -SimulateCom2Path $pipe) -Tier $t -Name "sbx-com2-$t"
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage "*COM2 port is connected to '$pipe'*" -Because "a COM2 pipe must be refused at Tier $t"
+        }
+    }
+
+    It 'REFUSES a COM2 path wired after the seal, on a descriptor that is not serial-managed' {
+        $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-com2-late'
+        Set-DescriptorField -Descriptor $sb.Desc -Name 'ManagementChannel' -Value $null
+        Set-DescriptorField -Descriptor $sb.Desc -Name 'ComPipePath' -Value $null
+        & $sb.Backend.SetComPort @{ VMName = 'sbx-com2-late'; Number = 2; Path = '\\.\pipe\late-com2' }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*COM2 port is connected to '\\.\pipe\late-com2'*" -Because 'the COM2 rule does not depend on the COM1 serial-management test'
+    }
+
+    It 'REFUSES (fail closed) when the COM2 read throws, and still reads COM1 through the same method' {
+        $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend) -Tier 1 -Name 'sbx-com2-throw'
+        $real = $sb.Backend.GetComPort
+        $sb.Backend.GetComPort = {
+            param($P)
+            if ([int]$P['Number'] -eq 2) { throw 'INJECTED: COM2 query failed' }
+            return (& $real $P)
+        }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not read its COM2 port (INJECTED: COM2 query failed)*'
+    }
+
+    It 'COM1 logic is unchanged: a serial-managed VM with COM1 attached and COM2 empty still certifies' {
+        $sb = & $script:NewSealedCom -Backend (New-FakeHyperVBackend) -Tier 0 -Name 'sbx-com2-com1ok'
+        (& $sb.Backend.GetComPort @{ VMName = 'sbx-com2-com1ok'; Number = 1 }) | Should -Not -BeNullOrEmpty -Because 'precondition: COM1 is wired'
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+}

@@ -164,7 +164,8 @@ function Get-HyperVBackendMethodManifest {
         # still attached after sealing. The Sealer MUST NOT reach for a raw Get-VMComPort. Follows the
         # GetDvdDrives / SetHostChannel / RemoveVHD addendum precedent (manifest + both factories +
         # parity/drift tests). REAL = Get-VMComPort -VMName <vm> -Number <n>; FAKE = reads the
-        # com-port state SetComPort records.
+        # com-port state SetComPort records. Since 2026-10-03 the gate also reads COM2 through it and refuses
+        # any path there; a failed read throws rather than returning $null, so that refusal cannot fail open.
         GetComPort           = @('VMName', 'Number')               # -> @{ Number; Path } or $null
 
         # ---- guest command delivery (RUNNER serial seam) ----
@@ -958,12 +959,17 @@ function New-RealHyperVBackend {
     # have NOT severed it. Returns @{ Number; Path } when the port carries a pipe path, or $null when
     # there is no such port OR its path is empty (an unattached / placeholder COM port is "not live").
     # Hoist $P reads into locals BEFORE $InvokeOp (see NewVHD note).
+    #
+    # A FAILED read throws (-ErrorAction Stop), it is not reported as "no port". Until 2026-10-03 this used
+    # SilentlyContinue, which was harmless for COM1 (a $null there already refuses) but would have made
+    # the COM2 refusal fail OPEN: an unreadable COM2 would have read as "no path". Every Gen2 VM has both
+    # COM1 and COM2, so a healthy read always returns a port object; only an empty Path maps to $null.
     $b.GetComPort = {
         param([System.Collections.IDictionary] $P)
         $vm  = & $AssertArg $P 'VMName' 'GetComPort'
         $num = [int](& $GetArg $P 'Number' 1)
         & $InvokeOp {
-            $port = Get-VMComPort -VMName $vm -Number $num -ErrorAction SilentlyContinue
+            $port = Get-VMComPort -VMName $vm -Number $num -ErrorAction Stop
             if ($null -eq $port) { return $null }
             $portPath = [string]$port.Path
             if ([string]::IsNullOrWhiteSpace($portPath)) { return $null }
@@ -1821,6 +1827,10 @@ $script:SbCopyFakeVM = {
     Lock-Sandbox. Models a service left enabled by a disable that failed quietly or was undone outside
     the tool, so a test can prove Assert-Sealed reads host truth instead of trusting the seal's own
     calls. Default: none.
+.PARAMETER SimulateCom2Path
+    A named-pipe path NewVM records on every new VM's COM2, modeling a second serial channel wired
+    outside the tool. Default: none, matching real Hyper-V, where a new Gen2 VM's COM2 has an empty path
+    (GetComPort then returns $null).
 .PARAMETER SimulateGuestCommandFailure
     Make InvokeGuestCommand return a NON-ZERO ExitCode (simulating a guest workload that exited
     with failure). Used to exercise the Runner's "a non-zero guest exit is a RUN OUTCOME reported
@@ -1911,6 +1921,7 @@ function New-FakeHyperVBackend {
         [switch] $SimulateUnavailable,
         [switch] $SimulateChannelReadError,
         [string[]] $SimulateChannelStuckOn = @(),
+        [string] $SimulateCom2Path,
         [switch] $SimulateGuestCommandFailure,
         [switch] $SimulateGuestCommandTimeout,
         [switch] $SimulateStartVMError,
@@ -1944,6 +1955,8 @@ function New-FakeHyperVBackend {
         }
     }
     $channelsStuckOn = @($SimulateChannelStuckOn)
+    # Captured by the NewVM closure: a COM2 pipe path to seed on every new VM (see param help).
+    $com2Seed = $SimulateCom2Path
     # Captured by the relevant method closures (see param help) — test-only failure seams.
     $guestCmdFails     = $SimulateGuestCommandFailure.IsPresent
     $guestCmdTimesOut  = $SimulateGuestCommandTimeout.IsPresent
@@ -2075,6 +2088,7 @@ function New-FakeHyperVBackend {
         # no-NIC seal check passed on the fake alone.
         $sw = & $GetArg $P 'SwitchName'
         $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
+        if (-not [string]::IsNullOrWhiteSpace($com2Seed)) { $vm.ComPorts[2] = $com2Seed }
         $state.VMs[$name] = $vm
     }.GetNewClosure()
 

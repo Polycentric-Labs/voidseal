@@ -99,6 +99,26 @@ function Get-VMAssignableDevice {
     foreach ($d in $script:stubDda) { $d }
 }
 
+# Get-VMComPort stub for GetComPort (the COM1 liveness read and the COM2 refusal). It reports a failure
+# the way a real cmdlet does, as a NON-terminating error, so -ErrorAction decides whether the caller sees
+# it: under SilentlyContinue the read would come back empty, which is exactly the fail-open the real body
+# must not have.
+$script:stubComPorts  = @{}
+$script:stubComFail   = $false
+$script:capComRead    = $null
+function Get-VMComPort {
+    [CmdletBinding()]
+    param([string[]] $VMName, [int] $Number)
+    $script:capComRead = "$(@($VMName) -join ',')#$Number"
+    if ($script:stubComFail) {
+        $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new('stub: simulated Get-VMComPort failure'),
+            'StubComPortFailure', [System.Management.Automation.ErrorCategory]::ReadError, $Number))
+        return
+    }
+    [pscustomobject]@{ Number = $Number; Path = [string]$script:stubComPorts[$Number] }
+}
+
 . $LibPath
 $b = New-RealHyperVBackend
 
@@ -159,6 +179,24 @@ function Invoke-ReadScenario {
     }
 }
 
+# Run the real GetComPort for one port number with the given stub paths; report the record or the error.
+function Invoke-ComScenario {
+    param([int] $Number, [hashtable] $Paths = @{}, [switch] $Fail)
+    $script:stubComPorts = $Paths
+    $script:stubComFail  = $Fail.IsPresent
+    $script:capComRead   = $null
+    $err = $null; $r = $null
+    try { $r = & $b.GetComPort @{ VMName = 'vm1'; Number = $Number } } catch { $err = $_.Exception.Message }
+    $script:stubComFail = $false
+    return [ordered]@{
+        err     = $err
+        read    = $script:capComRead
+        isNull  = ($null -eq $r)
+        number  = if ($r -is [System.Collections.IDictionary]) { $r['Number'] } else { $null }
+        path    = if ($r -is [System.Collections.IDictionary]) { $r['Path'] } else { $null }
+    }
+}
+
 $out = [ordered]@{
     Remove_None = Invoke-RemoveScenario -Adapters @()
     Remove_One  = Invoke-RemoveScenario -Adapters @((New-StubAdapter 'nic-0'))
@@ -171,6 +209,10 @@ $out = [ordered]@{
     Gpu_Throw = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @() -Throw
     Dda_None  = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @()
     Dda_One   = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @([pscustomobject]@{ LocationPath = 'PCIROOT(0)#PCI(0300)' })
+    Com2_Empty = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '' }
+    Com2_Path  = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '\\.\pipe\extra' }
+    Com2_Fail  = Invoke-ComScenario -Number 2 -Fail
+    Com1_Path  = Invoke-ComScenario -Number 1 -Paths @{ 1 = '\\.\pipe\vm1-com1' }
 }
 
 $out | ConvertTo-Json -Depth 6 -Compress

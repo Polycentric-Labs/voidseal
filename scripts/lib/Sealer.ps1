@@ -772,6 +772,32 @@ function Assert-Sealed {
         }
     }
 
+    # --- COM2 carries NO path (any tier, host-verified) -------------------
+    # Voidseal wires only COM1, the serial management channel checked further down. A named pipe on COM2
+    # is a second byte stream between guest and host that the tool never created, so it is refused at
+    # every tier, whether or not the run is serial-managed. The read goes through GetComPort like COM1's;
+    # a read that throws is a refusal, because an inability to check is never a pass.
+    $com2 = $null
+    try {
+        $com2 = & $Backend.GetComPort @{ VMName = $vmName; Number = 2 }
+    }
+    catch {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not read its COM2 " +
+               "port ($($_.Exception.Message)). Fail closed.")
+    }
+    if ($null -ne $com2) {
+        $com2Path = if ($com2 -is [System.Collections.IDictionary] -and $com2.Contains('Path')) { [string]$com2['Path'] } else { '' }
+        if ([string]::IsNullOrWhiteSpace($com2Path)) {
+            # GetComPort returns $null for an empty port, so a record without a readable path is a shape the
+            # gate does not understand. Refuse it rather than guess.
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host returned a COM2 record " +
+                   "with no readable path. Fail closed.")
+        }
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because its COM2 port is connected to " +
+               "'$com2Path'. Voidseal wires only COM1 (the serial management channel); a path on COM2 is a " +
+               "second host<->guest byte stream added outside the tool. Fail closed.")
+    }
+
     # --- NO import DVD/ISO attached (any tier) ----------------------------
     # Read DVD state from HOST TRUTH via the backend's GetDvdDrives,
     # NOT off the GetVM object (a real Get-VM object has no DvdDrive property — the old scalar read

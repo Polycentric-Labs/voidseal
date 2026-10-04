@@ -1135,6 +1135,27 @@ Describe 'GetComPort — real⇄fake shape parity (host-truth COM1 read; AST-pin
         $body | Should -Match '(?s)return\s+\$null' -Because 'the real GetComPort must return $null for an absent/empty port'
     }
 
+    It 'the REAL GetComPort reads with -ErrorAction Stop, never SilentlyContinue (an unreadable port must throw)' {
+        $call = @($script:RealComAssign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-VMComPort'
+        }, $true))
+        $call.Count | Should -Be 1
+        $call[0].Extent.Text | Should -Match '-ErrorAction\s+Stop'
+        $call[0].Extent.Text | Should -Not -Match 'SilentlyContinue' -Because 'a swallowed failure would make the COM2 refusal fail open'
+    }
+
+    It 'the FAKE models an empty COM2 by default and a wired one with -SimulateCom2Path' {
+        $b = New-FakeHyperVBackend
+        & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+        (& $b.GetComPort @{ VMName = 'vm1'; Number = 2 }) | Should -BeNullOrEmpty
+        $w = New-FakeHyperVBackend -SimulateCom2Path '\\.\pipe\extra'
+        & $w.NewVM @{ Name = 'vm1'; Generation = 2 }
+        $port = & $w.GetComPort @{ VMName = 'vm1'; Number = 2 }
+        $port.Number | Should -Be 2
+        $port.Path   | Should -Be '\\.\pipe\extra'
+        (& $w.GetComPort @{ VMName = 'vm1'; Number = 1 }) | Should -BeNullOrEmpty -Because 'the switch seeds COM2 only'
+    }
+
     It 'the REAL GetComPort lives ONLY in the backend (no raw Get-VMComPort CALL leaks into the Sealer)' {
         # Self-review guard: the new raw Hyper-V cmdlet must live in the REAL backend method only.
         # Pin the INVOCATION (a CommandAst whose command name is Get-VMComPort), not a prose mention.
@@ -1948,6 +1969,23 @@ Describe 'Seal-device methods: the REAL bodies, executed out of process against 
             $c.isArray   | Should -BeTrue -Because "$($case.Key): a single device must not unroll to a bare object"
             $c.count     | Should -Be $case.N
         }
+    }
+
+    It 'GetComPort returns $null for an empty COM2 and the pipe record for a wired one, reading the port it was asked for' {
+        $script:SealDevCap.Com2_Empty.err    | Should -BeNullOrEmpty
+        $script:SealDevCap.Com2_Empty.read   | Should -Be 'vm1#2'
+        $script:SealDevCap.Com2_Empty.isNull | Should -BeTrue -Because 'an empty COM2 path is not a live channel'
+        $script:SealDevCap.Com2_Path.err     | Should -BeNullOrEmpty
+        $script:SealDevCap.Com2_Path.number  | Should -Be 2
+        $script:SealDevCap.Com2_Path.path    | Should -Be '\\.\pipe\extra'
+        $script:SealDevCap.Com1_Path.path    | Should -Be '\\.\pipe\vm1-com1' -Because 'the COM1 read is unchanged'
+    }
+
+    It 'GetComPort THROWS when Get-VMComPort fails (never reads an unreadable COM2 as "no path")' {
+        # The stub reports a non-terminating error like a real cmdlet. Under the old -ErrorAction
+        # SilentlyContinue this came back $null with no error, which the COM2 refusal would read as clean.
+        $script:SealDevCap.Com2_Fail.err  | Should -Match 'simulated Get-VMComPort failure'
+        $script:SealDevCap.Com2_Fail.read | Should -Be 'vm1#2'
     }
 
     It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal)' {
