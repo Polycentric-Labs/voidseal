@@ -33,6 +33,20 @@ places where a check is an argument rather than a measurement.
   wrote, so it could not fire, and a Tier-1 processor was certified with a connected NIC. The gate also
   refuses any GPU partition adapter or Discrete Device Assignment device at every tier, and the fake
   backend now models the default adapter real `New-VM` creates. Not yet exercised live.
+- Seal coverage: `Lock-Sandbox` now also turns off the Time Synchronization, Key-Value Pair Exchange,
+  Backup (VSS) and Heartbeat integration services, and `Assert-Sealed` reads each back from the host,
+  matched by component GUID rather than the localized display name, refusing when one is on or
+  unreadable. Shutdown stays on because the engine's `StopVM` calls ask the guest to shut down through
+  it, and disabling Time Synchronization does not stop the guest reading the host-paced reference TSC
+  page. The gate also refuses a pipe path on COM2, automatic checkpoints, and any existing checkpoint;
+  the new `GetAutomaticCheckpoints` read backs the last two, and `GetComPort` now throws on a failed read
+  instead of returning "no port". Not yet exercised live.
+- Seal fixes from a review of the network-adapter policy: a Tier-1 NIC must now be the VM's only NIC and
+  sit on the switch `New-SandboxVM` recorded for it, so a NIC re-pointed at another Internal switch no
+  longer certifies; a network-adapter read that returns nothing refuses instead of certifying at Tier 1;
+  the Tier-1 allow-list matches only the exact `Internal+Allowlist` label and refuses any other Tier-1
+  label; and `Get-SealNicPolicy` moved to `scripts/lib/SealPolicy.ps1` so the Sealer loads without the
+  Provisioner.
 - Live acceptance status: the **Tier-0 `firefox` disk round-trip ran end-to-end on real Hyper-V**,
   first with the legacy exFAT OUTPUT disk (2026-06-25) and then with the current user-space outbox
   transport (2026-07-21). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see

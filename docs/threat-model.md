@@ -59,6 +59,10 @@ Legend: 🟢 **IN SCOPE** (a bug here is a Voidseal defect — see the gate name
 | **Passthrough device present at seal time** (GPU partition adapter, device assigned by DDA) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Egress filtering** (which destinations are reachable through whatever route exists) | ➖ no route exists | 🟡 in-guest defense-in-depth only, GuestRoot-disableable | ➖ no route exists | ➖ no route exists |
 | **Host↔guest channel left ON** (clipboard / shares / guest-services / enhanced-session) | 🟢 | 🟢 | 🟢 | 🟢 |
+| **Integration service left ON** (Time Synchronization, Key-Value Pair Exchange, Backup, Heartbeat) | 🟢 | 🟢 | 🟢 | 🟢 |
+| **Host time reaching the guest** (reference TSC page, after Time Synchronization is off) | 🟡 | 🟡 | 🟡 | 🟡 |
+| **Second serial channel** (a pipe path on COM2) | 🟢 | 🟢 | 🟢 | 🟢 |
+| **Checkpoint present, or automatic checkpoints on** | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Residual / import / secret-shaped disk left attached** | 🟢 best-effort backstop | 🟢 best-effort backstop | 🟢 structural, authoritative | 🟢 structural, authoritative |
 | **Malicious/malformed profile bypassing load-time invariants** | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Hostile-output extraction / quarantine** | ➖ not a presumed-hostile tier | ➖ not a presumed-hostile tier | 🟡 designed in scope; sink is a scaffold | 🟡 designed in scope; sink is a scaffold |
@@ -122,6 +126,43 @@ check sits beside the NIC check. Only the count is read, and a read that fails r
 closed both if any channel is ON *and* if a channel's state cannot be read at all. A channel silently left
 enabled after `Lock-Sandbox` runs is a Voidseal defect at any tier.
 
+**Integration service left ON.** IN SCOPE, every tier, since 2026-10-03. Time Synchronization, Key-Value
+Pair Exchange, Backup (VSS) and Heartbeat are live VMBus channels the engine never uses. `Lock-Sandbox`
+turns each one off and `Assert-Sealed` reads each back from the host, refusing by name when one is on and
+failing closed when the host gives no state for it. Unlike clipboard, shares and enhanced-session, these
+are real reads, not constants: the real `GetHostChannels` enumerates the VM's services with
+`Get-VMIntegrationService` and checks each one's `Enabled`. Services are matched by the component GUID at
+the end of their `Id`, because display names are localized; a missing or duplicated match throws.
+- **Heartbeat goes off.** Nothing in `scripts/` reads heartbeat state. Boot readiness is a probe over the
+  COM1 serial console (`Wait-GuestBootReady`), and Disk-mode completion is the VM's power state
+  (`Wait-WorkloadComplete` polls `GetVM` until `Off`).
+- **Shutdown stays on.** The engine stops VMs in three places (`Remove-Sandbox`, `Wait-WorkloadComplete`
+  on a timeout, and the Serial-mode timeout in `Invoke-Voidseal`), each as `StopVM -Force` without
+  `TurnOff`. On real Hyper-V that is `Stop-VM -Force`, which asks the guest to shut down through the
+  Shutdown service. Shutdown only carries a host-to-guest request; the guest cannot send data over it.
+  Switching those calls to `TurnOff` would let the seal close Shutdown too; that is left as an open choice.
+- **Live status:** mock-proven. The component GUIDs and the piped `Enable/Disable-VMIntegrationService`
+  calls have not run on a live host. A wrong GUID fails closed: the seal refuses, it never certifies a
+  service it could not read.
+
+**Host time reaching the guest.** KNOWN LIMITATION, TRACKED. Turning off Time Synchronization stops the
+host pushing time samples over VMBus, but the Hyper-V reference TSC page (the paravirtual clock source a
+Linux guest reads through `hyperv_clocksource_tsc_page`) stays available and is paced by the host. The
+seal narrows the guest's view of host time; it does not remove it. No per-VM setting is known to close
+the page, so the gate has nothing to verify here.
+
+**Second serial channel.** IN SCOPE, every tier, since 2026-10-03. Voidseal wires only COM1, its serial
+management channel. `Assert-Sealed` reads COM2 through `GetComPort` and refuses any pipe path, whether or
+not the run is serial-managed; a read that throws refuses too. The COM1 liveness check is unchanged.
+
+**Checkpoint present, or automatic checkpoints on.** IN SCOPE, every tier, since 2026-10-03. A checkpoint
+holds the VM's state from before the seal, so restoring it would undo the seal without the gate seeing
+it, and automatic checkpoints also pin a differencing disk per drive (the RC7 trap). `New-SandboxVM` turns
+automatic checkpoints off and the engine never takes a checkpoint, so `Assert-Sealed` refuses either one.
+It reads the setting through `GetAutomaticCheckpoints` and the list through `GetCheckpoint`; a throw, a
+setting that is not a boolean, or a list that is not a collection refuses. (`Lifecycle='SnapshotRevert'`
+is declared in `tier1.psd1` but not wired; wiring it would have to work with this rule.)
+
 **Residual / import / secret-shaped disk left attached.** IN SCOPE, every tier, with a strength gradient
 the code itself draws:
 - Every tier: any attached disk matching a secret-shaped path (`Test-IsSecretPath` — the same
@@ -181,6 +222,10 @@ blend them: something can be correctly scoped as IN SCOPE and still be unproven 
 - **Zero-adapter seal and passthrough refusal:** mock-proven only. The real `RemoveNetworkAdapter` (now
   part of every Tier-0 seal) and the two passthrough reads have not run on a live host; the next Tier-0
   `firefox` re-run is their first exercise. Until then, treat them as shape-correct, not live-proven.
+- **Integration-service, COM2 and checkpoint checks:** mock-proven only (2026-10-03). The real reads
+  (`Get-VMIntegrationService` matched by component GUID, `Get-VMComPort -Number 2`, `Get-VM`'s
+  `AutomaticCheckpointsEnabled`, `Get-VMSnapshot`) run here only against stub cmdlets. A live failure
+  refuses the seal.
 - **Tier-1 in-guest egress:** shape-asserted only. The mock suite proves the rendered Squid config text,
   the iptables rule text, and the ACL substitution are correct — it does not prove a real Squid/iptables
   process has ever actually spliced or dropped a real packet (`phase-6-live-runbook.md` §5).

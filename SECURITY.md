@@ -15,7 +15,9 @@ cut, the **host** (never the guest's self-report) certifies the VM against its t
 workload is structurally unreachable unless that certification returns true. What gets certified is
 tier-scoped, and the scope matters. At every tier the host verifies that no import DVD or ISO is still
 attached, that no secret-shaped or unrecorded volume remains, that the host channels it can read report
-off, and that no passthrough device is assigned: no GPU partition adapter and no device handed over by
+off (including the Time Synchronization, Key-Value Pair Exchange, Backup and Heartbeat integration
+services), that COM2 carries no pipe path, that no checkpoint exists and automatic checkpoints are off,
+and that no passthrough device is assigned: no GPU partition adapter and no device handed over by
 Discrete Device Assignment, which could be a physical NIC that the virtual-adapter read never sees.
 **Every VM except a Tier-1 non-processor must seal with zero network adapters.** One predicate,
 `Get-SealNicPolicy` in `scripts/lib/SealPolicy.ps1`, makes that call for the Provisioner, `Lock-Sandbox`
@@ -229,15 +231,27 @@ full privileges of whoever invokes it — here, the host operator.
   `iptables` rules or kill its own Squid process — the untrusted principal cannot be trusted to police
   itself, by construction. Treat these in-guest rules as defense-in-depth (they raise the bar for an
   unsophisticated or non-adversarial workload) — not as the security boundary.
-- **Three of the four host channels are reported off by construction, not measured.** `Assert-Sealed`
-  iterates all four (clipboard, shares, guest-services, enhanced-session), but the real backend's
-  `GetHostChannels` (`scripts/lib/HyperVBackend.ps1`) returns a hardcoded `$false` for clipboard,
-  shares and enhanced-session, and reads only `GuestServices` from the host. That read is genuinely
+- **Three of the eight host channels are reported off by construction, not measured.** `Assert-Sealed`
+  iterates all eight (clipboard, shares, guest-services, enhanced-session, and since 2026-10-03 the Time
+  Synchronization, Key-Value Pair Exchange, Backup and Heartbeat integration services), but the real
+  backend's `GetHostChannels` (`scripts/lib/HyperVBackend.ps1`) returns a hardcoded `$false` for
+  clipboard, shares and enhanced-session. It reads `GuestServices` from the host by its English display
+  name, and the four integration services by the component GUID at the end of each service's `Id`, so
+  their read does not depend on the host's language. That read is genuinely
   fail-closed: it rethrows rather than coercing an unreadable channel to off. The other three rest on
   an argument, documented in that function, that Hyper-V exposes no per-VM Enhanced Session signal and
   that the ESM facets are structurally absent on a stock Linux guest. Treat the host-channel gate as
-  one host-verified channel plus three asserted-absent ones. The fake backend models all four as
-  readable, so the mock suite exercises a check the real host cannot perform.
+  five host-verified channels plus three asserted-absent ones. The fake backend models all eight as
+  readable, so for those three the mock suite exercises a check the real host cannot perform.
+- **Shutdown stays enabled, and host time still reaches the guest.** The seal leaves the Shutdown
+  integration service on because the engine's `StopVM` calls pass `Force` without `TurnOff`, which asks
+  the guest to shut down through it; it carries a host-to-guest request only. Turning off Time
+  Synchronization narrows the guest's view of host time but does not remove it: the Hyper-V reference
+  TSC page stays readable and host-paced, and no per-VM setting is known to close it.
+- **The integration-service, COM2 and checkpoint checks are mock-proven only.** Since 2026-10-03 the
+  gate also refuses a path on COM2, automatic checkpoints, and any existing checkpoint. The component
+  GUIDs, `Get-VMComPort -Number 2`, `Get-VM`'s `AutomaticCheckpointsEnabled` and `Get-VMSnapshot` have
+  run only against stub cmdlets; every one fails closed, so a live surprise is a refused seal.
 - **The secret-path denylist is a lint, not a control.** `Test-IsSecretPath`
   (`scripts/lib/ProfileLoader.ps1`) matches filename globs and directory segments against the `Mounts`
   and `StageAssets` source keys. It never opens or inspects a file, so it cannot tell a real credential
