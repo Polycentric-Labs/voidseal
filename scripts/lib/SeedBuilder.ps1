@@ -402,8 +402,10 @@ $script:CidataBuilderRunnerTemplate = @'
 #cloud-config
 # Voidseal builder disk-mode seed — Tier-1 net-restricted builder VM (Phase 2.2).
 # Network is ENABLED; a transparent Squid SNI proxy gatekeeps 80/443 to the EgressAllowlist only
-# (default-deny). The workload fetches deps over Squid into /mnt/out, writes a manifest, and powers
-# off. The host reads deps-manifest.json from the OUTPUT disk.
+# (default-deny). The workload fetches deps over Squid into /mnt/out (the exFAT deps disk, which the host
+# never mounts), writes a manifest there, and then packs its verdict (the exit code and a copy of the
+# manifest) into a small RAW verdict disk with the shared outbox producer and powers off. The host reads
+# the verdict from that raw disk in user space.
 
 # RC2: create the non-root sandbox user (identically to the serial baseline + offline disk runner).
 users:
@@ -451,16 +453,18 @@ write_files:
     permissions: '0755'
     content: |
       #!/bin/sh
-      # Voidseal builder runner: bring up Squid SNI proxy, mount data disks, run the dep-fetch
-      # entrypoint as the non-root 'sandbox' user, write result + sentinel to OUTPUT, power off.
+      # Voidseal builder runner: bring up Squid SNI proxy, mount the data disks, pick out the raw verdict
+      # disk, run the dep-fetch entrypoint as the non-root 'sandbox' user (deps land on the exFAT OUTPUT
+      # disk), pack the verdict into the raw verdict disk, power off.
       set +e
       # SERIAL DIAGNOSTICS (Phase-6 live-debug observability — the same discipline whose markers
       # pinned BOTH Tier-0 live root causes in the OutboxOutput runner). Phase 6 is the FIRST live
       # egress: a failed fetch must be attributable to squid-down vs REDIRECT-not-applied vs
       # mount-failure vs the fetch itself. Invoke-BuilderVM reads result.exitcode and deps-manifest.json
-      # off the OUTPUT disk and reports Success only for an exit code of exactly 0 with the manifest
-      # present, else FetchFailed with the reason; teardown then deletes the OUTPUT disk, so this console
-      # narration is the second source and the only one that says WHERE the guest stopped.
+      # out of the raw verdict disk (the shared outbox container, user space, no host mount) and reports
+      # Success only for an exit code of exactly 0 with the manifest present, else FetchFailed with the
+      # reason; a failed run's disks are then deleted, so this console narration is the second source and
+      # the only one that says WHERE the guest stopped.
       # STRUCTURAL ONLY: liveness, rc values, file COUNTS, manifest presence — NEVER fetched-artifact
       # bytes (contract-consistency with the shared outbox runner; serial stays a control-flow record,
       # not a payload mirror). Never alters control flow: runs under `set +e`, writes to /dev/console
@@ -532,14 +536,44 @@ write_files:
       OUT_SANDBOX_OWNED=0
       if mount -o uid=$SBX_UID,gid=$SBX_GID LABEL=OUTPUT /mnt/out 2>/dev/null; then OUT_SANDBOX_OWNED=1; fi
       mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out 2>/dev/null
-      # Both fail-closed branches below were SILENT `poweroff` guards — the exact silent-runner class
-      # that hid the Tier-0 root causes. Each now names its branch first. The no-OUTPUT branch writes
-      # nothing, so the host sees no exit-code file (FetchFailed); the no-INPUT branch writes the rc70
-      # sentinel, which the host reads as a non-zero exit code (FetchFailed). Serial names which branch.
+      # Each fail-closed branch below was a SILENT `poweroff` guard (the exact silent-runner class that hid
+      # the Tier-0 root causes) and now names its branch first. None of them can pack a verdict (the
+      # producer script lives on INPUT, and the raw verdict disk is not chosen yet in the first two), so the
+      # host finds no valid verdict outbox and reports FetchFailed. Serial names which branch.
       if ! mountpoint -q /mnt/out; then diag "ABORT output-not-mounted (LABEL=OUTPUT did not mount at /mnt/out - exfat module missing on this kernel? label mismatch?)"; poweroff; exit 0; fi
       diag "output_mounted=yes owner_sandbox=$OUT_SANDBOX_OWNED"
-      if ! mountpoint -q /mnt/in; then diag "ABORT input-not-mounted (LABEL=INPUT did not mount at /mnt/in; rc70 sentinel written to OUTPUT)"; printf '%s' 70 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
+      if ! mountpoint -q /mnt/in; then diag "ABORT input-not-mounted (LABEL=INPUT did not mount at /mnt/in; no producer to pack a verdict)"; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
       diag "input_mounted=yes input_files=$(ls -1 /mnt/in 2>/dev/null | wc -l)"
+
+      # --- Identify the raw VERDICT block device POSITIVELY (same rule as the outbox runner's OUTPUT) ---
+      # The verdict disk is the ONLY attached whole disk that is RAW: host-created with NO partition table
+      # and NO filesystem. EVERY other disk in a builder run is partitioned and/or formatted: the
+      # system/root disk, the exFAT INPUT disk, the exFAT OUTPUT (deps) disk, and the FAT32 CIDATA seed
+      # disk. So select on that defining property instead of excluding known disks: an exclusion list has
+      # to track every disk we ever attach (the live 2026-07-20 abort came from exactly that), and the
+      # deps disk must never be mistaken for the verdict disk. Done BEFORE the fetch so a run that cannot
+      # report a verdict stops early instead of after a long fetch.
+      # FAIL-CLOSED: anything other than exactly one candidate -> poweroff, no verdict written.
+      ROOT_SRC=$(findmnt -no SOURCE / 2>/dev/null)
+      ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null)
+      [ -z "$ROOT_DISK" ] && ROOT_DISK=$(basename "$ROOT_SRC")
+      diag "root_src=$ROOT_SRC root_disk=$ROOT_DISK"
+      diag "sysblock_sd=$(ls /sys/block 2>/dev/null | grep '^sd' | tr '\n' ' ')"
+      VERDICT_CANDIDATES=""
+      for d in /sys/block/sd*; do
+        dev=$(basename "$d")
+        [ "$dev" = "$ROOT_DISK" ] && continue
+        if ls -d "$d/$dev"[0-9]* >/dev/null 2>&1; then diag "skip $dev (has partitions)"; continue; fi
+        if blkid -p "/dev/$dev" >/dev/null 2>&1; then diag "skip $dev (has a filesystem signature)"; continue; fi
+        VERDICT_CANDIDATES="$VERDICT_CANDIDATES $dev"
+      done
+      VERDICT_CANDIDATES=$(echo "$VERDICT_CANDIDATES" | xargs)
+      set -- $VERDICT_CANDIDATES
+      diag "verdict_candidates=[$VERDICT_CANDIDATES] count=$#"
+      if [ "$#" -ne 1 ]; then diag "ABORT verdict-candidates-not-1 (need exactly one RAW disk - no partitions, no filesystem; got $#: [$VERDICT_CANDIDATES])"; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
+      VERDICT_DEV="/dev/$1"
+      diag "verdict_dev=$VERDICT_DEV"
+      mkdir -p /run/vstaging
 
       # --- Run the dep-fetch entrypoint ---
       diag "entrypoint start"
@@ -549,13 +583,27 @@ write_files:
         /bin/sh -c '__ENTRYPOINT__' > /mnt/out/stdout.log 2> /mnt/out/stderr.txt
       fi
       rc=$?
-      printf '%s' "$rc" > /mnt/out/result.exitcode
-      # fetch_deps.py exits 2 on the FIRST failed fetcher; that rc reaches result.exitcode on the
-      # OUTPUT disk, which the host reads as the verdict. Narrate it too, plus the per-fetcher
-      # artifact COUNTS (never names/bytes) and the manifest verdict. write_manifest runs only after
-      # ALL fetchers succeed, so manifest_present=yes is the single yes/no of a fully-green fetch.
+      # fetch_deps.py exits 2 on the FIRST failed fetcher. That rc goes into the verdict (result.exitcode),
+      # not onto the exFAT deps disk, so the deps disk carries no verdict file for anyone to mount. The
+      # manifest is copied across only when it is a regular file. Narrate rc too, plus the per-fetcher
+      # artifact COUNTS (never names/bytes) and the manifest verdict. write_manifest runs only after ALL
+      # fetchers succeed, so manifest_present=yes is the single yes/no of a fully-green fetch.
+      printf '%s' "$rc" > /run/vstaging/result.exitcode
+      if [ -f /mnt/out/deps-manifest.json ]; then cp /mnt/out/deps-manifest.json /run/vstaging/deps-manifest.json 2>/dev/null; fi
       diag "entrypoint_rc=$rc"
       diag "fetched pip=$(find /mnt/out/pip -type f 2>/dev/null | wc -l) apt=$(find /mnt/out/apt -type f 2>/dev/null | wc -l) hf=$(find /mnt/out/hf -type f 2>/dev/null | wc -l) manifest_present=$([ -f /mnt/out/deps-manifest.json ] && echo yes || echo no)"
+      # Pack the verdict with the SAME producer the outbox runner uses (no new on-disk format). The staging
+      # dir holds exactly result.exitcode and deps-manifest.json; --transport-only writes the placeholder
+      # verdicts.json ([]) that keeps the container parseable by the host's existing reader. The producer
+      # writes the container to the raw verdict device from offset 0.
+      python3 /mnt/in/run_disk_workload.py --staging /run/vstaging --verdicts /run/vverdicts.json --out "$VERDICT_DEV" --transport-only 2> /run/vproducer.err
+      prc=$?
+      diag "verdict_producer_rc=$prc"
+      # The producer's stderr is FIXED structural strings (see the outbox runner), so a bounded tail is safe.
+      [ "$prc" -ne 0 ] && diag "verdict_producer_err=$(tail -c 400 /run/vproducer.err 2>/dev/null | tr '\n' '|')"
+      # Read back ONLY the container's 8-byte magic (VSOUTBX1) from the verdict device: proves whether a
+      # valid outbox landed there. Magic only; no record table, no payload.
+      diag "verdict_head=$(dd if=$VERDICT_DEV bs=8 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n') (want 56534f5554425831 = VSOUTBX1)"
       sync
       umount /mnt/out
       i=0; while mountpoint -q /mnt/out && [ $i -lt 10 ]; do sleep 1; umount /mnt/out 2>/dev/null; i=$((i+1)); done

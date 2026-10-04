@@ -140,11 +140,13 @@ practice, and `guest/fetch_deps.py` for the enforcement.
 
 ### 0.5 Builder result: the verdict and the deps disk
 
-`Invoke-BuilderVM` returns a hashtable. `Status` is `Success` only when the guest wrote `result.exitcode`
-with exactly `0` and `deps-manifest.json` is present on the OUTPUT disk; a missing, unparsable or
+`Invoke-BuilderVM` returns a hashtable. `Status` is `Success` only when the verdict the guest packed into
+its small raw verdict disk (read by the host in user space; nothing is mounted) carries `result.exitcode`
+with exactly `0` and a non-empty `deps-manifest.json`; a missing or invalid verdict, an unparsable or
 non-zero exit code, or a missing manifest, is `FetchFailed` (the reason is in `Error`, the code in
-`ExitCode`), and a timeout or any other lifecycle error is `Failed`. A power-off alone no longer counts
-as success. Only a `Success` run emits a disk:
+`ExitCode`), and a timeout or any other lifecycle error, including a host read that itself fails, is
+`Failed`. A power-off alone does not count as success. The deps disk is never read by the host, only
+moved and hashed. Only a `Success` run emits a disk:
 
 | Field | Meaning |
 |---|---|

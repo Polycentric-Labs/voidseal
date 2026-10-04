@@ -11,19 +11,23 @@
     FLOW:
       INIT        load + validate the builder profile (must be EgressMode='SquidSniProxy').
       PROVISION   New-SandboxVM — Tier-1 VM with NIC (the fetch needs the net).
-      DISKS       New-WorkloadDisks — INPUT (runner+DepsSpec) + OUTPUT (deps.vhdx-to-be).
+      DISKS       New-WorkloadDisks - INPUT (runner+DepsSpec) + OUTPUT (deps.vhdx-to-be, exFAT, never
+                  host-mounted); New-BuilderVerdictDisk - a small RAW verdict disk beside them.
       SEED        New-WorkloadSeedDisk — CIDATA data disk carrying the Squid seed (RC6).
       RC7         SetAutomaticCheckpoints Enabled=$false — so guest writes land in the base
                   .vhdx, not a differencing .avhdx, which is what the host hashes.
       NO SEAL     The builder is Tier-1 NET-RESTRICTED — it KEEPS its NIC + Squid egress for
                   the whole run (it must fetch deps). Do NOT call Lock-Sandbox/Assert-Sealed.
       RUN         StartVM -> Wait-WorkloadComplete (the guest fetches deps, self-powers-off).
-      DETACH      RemoveHardDiskDrive the OUTPUT/deps disk BEFORE the verdict read, the move and the
-                  hash (an attached disk is locked; the fake THROWS on GetVhdxImageHash while attached).
-      VERDICT     Read-BuilderVerdict: the guest's exit-code file and the deps manifest, read off the
-                  detached OUTPUT disk through the backend's ReadVhdxFile. Success needs the file to read
-                  exactly 0 AND the manifest to be present; anything else is Status='FetchFailed' with the
-                  reason, fail-closed (no artifact is emitted and teardown deletes the disk).
+      DETACH      RemoveHardDiskDrive the OUTPUT/deps disk AND the verdict disk BEFORE the verdict read,
+                  the move and the hash (an attached disk is locked; the fake THROWS on GetVhdxImageHash
+                  while attached).
+      VERDICT     Read-BuilderVerdict: the guest packs result.exitcode and deps-manifest.json into the raw
+                  verdict disk with the shared outbox producer, and the host reads that outbox in user
+                  space (Read-OutboxToGateInput: ReadVhdxRawRegion + host/read_outbox.py), mounting
+                  nothing. Success needs the exit code to read exactly 0 AND the manifest to be present
+                  and non-empty; anything else is Status='FetchFailed' with the reason, fail-closed (no
+                  artifact is emitted and teardown deletes the disks).
       MOVE        MoveVhdxFile: the finished deps.vhdx leaves the sandbox folder for -DepsOutputDir (default
                   <ArtifactRoot>\deps), a place that is never in CreatedDisks, so teardown cannot delete it.
       HASH        GetVhdxImageHash on the MOVED file: whole-file SHA-256 in USER-SPACE (NEVER Mount-VHD),
@@ -34,13 +38,14 @@
                   storage root (Resolve-BuilderDepsDestination refuses anything inside it), so it survives.
 
     DESIGN DECISIONS (resolved, do not redesign):
-      * The integrity artifact is the whole-image hash (GetVhdxImageHash, raw, no mount). The ONE host read
-        of the OUTPUT disk is the verdict (two small files through ReadVhdxFile, a Mount-VHD of the guest-
-        written exFAT volume, done before the hash). It is isolated in Read-BuilderVerdict so a different
-        verdict transport can replace it without touching the rest of the flow.
-      * Success = the exit-code file reads exactly 0 and the manifest is present. A power-off that never
-        wrote the file (crash, abort branch) or wrote anything else is 'FetchFailed'; a timeout or any other
-        lifecycle error is 'Failed'. The serial [voidseal-diag] markers stay the second source.
+      * The integrity artifact is the whole-image hash (GetVhdxImageHash, raw, no mount). The deps disk is
+        never mounted or read by the host at all (C1: the host never mounts a file system the guest wrote).
+        The verdict travels on a second, small RAW disk in the user-space outbox format, so this file never
+        calls ReadVhdxFile, ReadVhdxFileBytes or Mount-VHD (a test pins that on the AST).
+      * Success = the verdict's exit code reads exactly 0 and its manifest is present and non-empty. A
+        power-off that never packed a valid verdict (crash, abort branch) or packed anything else is
+        'FetchFailed'; a timeout or any other lifecycle error (including a host read that itself fails, such
+        as a locked disk) is 'Failed'. The serial [voidseal-diag] markers stay the second source.
       * deps.vhdx survives teardown: it is moved out to a path the run did not create, and its hash is taken
         there. DepsDiskPath and DepsImageHash in the result go straight to -Workload.DepsDiskPath and
         -Workload.DepsImageHash of a later run, which attaches a verified working copy of it.
@@ -65,6 +70,53 @@ Set-StrictMode -Version Latest
 # NOTE: Resolve-PythonExe is defined in scripts/lib/PythonResolver.ps1, which
 # Invoke-Voidseal.ps1 dot-sources. Always dot-source Invoke-Voidseal.ps1 BEFORE this file. The test BeforeAll
 # does this; the function is available without re-defining it here.
+
+# --------------------------------------------------------------------------
+# The raw verdict disk: sized to the outbox bounds, created and recorded per run
+# --------------------------------------------------------------------------
+# guest/outbox.py is the single source of the container format: MAX_ENTRIES = 256 records of 104 bytes,
+# a 24-byte header, and at most MAX_TOTAL = 64 MiB of payload. The largest blob the producer can write is
+# therefore 24 + 256 * 104 + 64 MiB bytes, so a disk of that size (rounded up to a whole MiB, the unit a
+# fixed VHDX is created in) can never truncate a container the format allows. A test pins these numbers
+# against outbox.py itself. The real verdict is two small files; the size is the format's bound, not the
+# expected payload.
+$script:BuilderVerdictDiskBytes = [long]([math]::Ceiling((24 + (256 * 104) + 64MB) / 1MB) * 1MB)
+
+<#
+.SYNOPSIS
+    Create, record and attach the builder's raw verdict disk.
+.DESCRIPTION
+    A Raw disk (NewOutputVhdx FileSystem='Raw': a fixed VHDX with no partition table and no file system),
+    labelled 'VERDICT' (a discovery tag the fake uses; a real raw disk has no label). The guest finds it by
+    that rawness (the only whole disk with no partition table and no file system signature), packs the
+    verdict into it with the shared outbox producer, and the host reads it back in user space.
+    Recorded on the descriptor (VerdictDiskPath, and a deduped append to CreatedDisks) right after the
+    CREATE and before the attach, the same incremental-record rule New-WorkloadDisks follows, so that
+    teardown (Remove-Sandbox -DeleteDisks, which deletes exactly CreatedDisks) removes it even if the
+    attach throws. Returns the mutated descriptor.
+#>
+function New-BuilderVerdictDisk {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] $Descriptor,
+        [Parameter(Mandatory)] [string] $StorageRoot,
+        [hashtable] $Backend = (New-RealHyperVBackend)
+    )
+    $name = [string]$Descriptor.Name
+    $path = Join-Path $StorageRoot ("{0}-verdict.vhdx" -f $name)
+
+    $null = & $Backend.NewOutputVhdx @{ Path = $path; Label = 'VERDICT'; FileSystem = 'Raw'; SizeBytes = $script:BuilderVerdictDiskBytes }
+    Set-DescriptorField -Descriptor $Descriptor -Name 'VerdictDiskPath' -Value $path
+    $set = [System.Collections.Generic.List[string]]::new()
+    foreach ($cd in @($Descriptor.CreatedDisks)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$cd)) { $set.Add([string]$cd) }
+    }
+    if ($set -notcontains $path) { $set.Add($path) }
+    $Descriptor.CreatedDisks = $set.ToArray()
+    $null = & $Backend.AddHardDiskDrive @{ VMName = $name; Path = $path }
+    return $Descriptor
+}
 
 # --------------------------------------------------------------------------
 # Internal: where the finished deps.vhdx goes, and the checks that keep it safe
@@ -149,17 +201,58 @@ function Resolve-BuilderDepsDestination {
 
 <#
 .SYNOPSIS
-    Read the builder's verdict off its detached OUTPUT disk: the guest's exit-code file and the deps manifest.
+    True when the file exists and holds at least one byte that is not ASCII whitespace.
 .DESCRIPTION
-    The runner writes the entrypoint's exit status to 'result.exitcode' on the OUTPUT volume as its last
-    act, and fetch_deps.py writes 'deps-manifest.json' there only after every fetcher succeeded. Both are
-    read through the backend's ReadVhdxFile (a host read of the guest-written volume; the one the builder
-    flow makes, see the header). The verdict is fail-closed:
-      * no exit-code file            -> not ok (the runner never reached its write, or aborted before it);
-      * the file is not exactly '0'  -> not ok (a non-zero code, or content that is not a plain number);
-      * exit code 0 but no manifest  -> not ok.
-    Only a file that reads exactly 0 (surrounding whitespace aside) AND a non-empty manifest give Ok.
-    The reason never repeats the file's content, only its length when it is not a number.
+    Scans in chunks and stops at the first such byte, so a manifest of any size costs one small read at
+    best. Used for the manifest's "present and non-empty" rule without loading the file as text.
+#>
+function Test-BuilderManifestPresent {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $buf = [byte[]]::new(8192)
+        while (($n = $stream.Read($buf, 0, $buf.Length)) -gt 0) {
+            for ($i = 0; $i -lt $n; $i++) {
+                $c = $buf[$i]
+                if ($c -ne 32 -and ($c -lt 9 -or $c -gt 13)) { return $true }
+            }
+        }
+        return $false
+    }
+    finally { $stream.Dispose() }
+}
+
+<#
+.SYNOPSIS
+    Read the builder's verdict off its detached raw verdict disk: the guest's exit code and the deps manifest.
+.DESCRIPTION
+    The runner packs 'result.exitcode' and 'deps-manifest.json' into the raw verdict disk with the shared
+    outbox producer (guest/run_disk_workload.py, no new on-disk format), and the host reads that outbox in
+    USER SPACE with the reader every other OUTPUT read uses: Read-OutboxToGateInput, which is
+    ReadVhdxRawRegion (a qemu-img slice of the detached disk) and host/read_outbox.py. Nothing is mounted,
+    so the host's partition and file system drivers never parse anything the guest wrote. The disk path
+    passed in must be the verdict disk, never the deps disk: the deps disk is not read at all.
+
+    The verdict is fail-closed:
+      * no valid outbox on the disk   -> not ok (the runner aborted before packing one, packed nothing the
+                                         reader accepts, or the container failed its checks: bad magic,
+                                         bounds, name, hash). The reason is fixed text; it never repeats
+                                         anything from the container or the reader's own message;
+      * no exit-code entry            -> not ok;
+      * the entry is not exactly '0'  -> not ok (a non-zero code, or content that is not a plain number);
+      * exit code 0 but no manifest   -> not ok.
+    Only an entry that reads exactly 0 (surrounding whitespace aside) AND a non-empty manifest give Ok. The
+    reason never repeats entry content, only its length when it is not a number.
+
+    A failure of the READ itself (the disk missing, still locked, qemu-img unavailable) is not the guest's
+    verdict, so it propagates and the run becomes Failed, never a guessed Success or FetchFailed.
+
+    The outbox is parsed into a private temp folder that is removed before this returns (it holds bytes
+    the guest wrote, up to the container's bound). Pass -WorkDir to keep it somewhere you own; the caller
+    then owns the cleanup.
 .OUTPUTS
     [hashtable] @{ Ok [bool]; ExitCode [int] or $null; ManifestPresent [bool]; Reason [string] or $null }.
 #>
@@ -167,37 +260,66 @@ function Read-BuilderVerdict {
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
-        [Parameter(Mandatory)] [string] $OutputDiskPath,
+        [Parameter(Mandatory)] [string] $VerdictDiskPath,
         [Parameter(Mandatory)] [hashtable] $Backend,
+        [string] $WorkDir,
         [string] $ExitCodeInnerName = 'result.exitcode',
         [string] $ManifestInnerName = 'deps-manifest.json'
     )
 
-    $raw = & $Backend.ReadVhdxFile @{ Path = $OutputDiskPath; InnerPath = $ExitCodeInnerName }
-    if ($null -eq $raw) {
-        return @{ Ok = $false; ExitCode = $null; ManifestPresent = $false
-                  Reason = "no exit-code file '$ExitCodeInnerName' on the OUTPUT disk (the runner crashed, aborted before the fetch, or never mounted OUTPUT)" }
+    $ownsWorkDir = [string]::IsNullOrWhiteSpace($WorkDir)
+    if ($ownsWorkDir) {
+        $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('voidseal-verdict-{0}' -f [guid]::NewGuid().ToString('N'))
     }
-    $text = ([string]$raw).Trim()
-    if ($text -ceq '0') {
-        $rc = 0
-    }
-    elseif ($text -match '^[1-9][0-9]{0,8}$') {
-        $rc = [int]$text
-        return @{ Ok = $false; ExitCode = $rc; ManifestPresent = $false
-                  Reason = "the builder exited non-zero (exit code $rc)" }
-    }
-    else {
-        return @{ Ok = $false; ExitCode = $null; ManifestPresent = $false
-                  Reason = "the exit-code file '$ExitCodeInnerName' is not a plain exit code ($($text.Length) character(s))" }
-    }
+    try {
+        try {
+            $gateInput = Read-OutboxToGateInput -OutputDiskPath $VerdictDiskPath -Destination $WorkDir -Backend $Backend
+        }
+        catch {
+            # Read-OutboxToGateInput prefixes every guest-caused refusal 'outbox read:' (header missing or
+            # not the magic, count/total over the bound, read_outbox.py rejecting the container). Anything
+            # else is the host's own failure and propagates.
+            if ($_.Exception.Message -like 'outbox read:*') {
+                return @{ Ok = $false; ExitCode = $null; ManifestPresent = $false
+                          Reason = 'no valid verdict outbox on the verdict disk (the runner aborted before packing one, packed nothing readable, or the container failed its checks)' }
+            }
+            throw
+        }
 
-    $manifest = & $Backend.ReadVhdxFile @{ Path = $OutputDiskPath; InnerPath = $ManifestInnerName }
-    if ([string]::IsNullOrWhiteSpace([string]$manifest)) {
-        return @{ Ok = $false; ExitCode = 0; ManifestPresent = $false
-                  Reason = "the builder exited 0 but '$ManifestInnerName' is absent or empty on the OUTPUT disk" }
+        $staging  = Join-Path $gateInput 'staging'
+        $exitPath = Join-Path $staging $ExitCodeInnerName
+        if (-not (Test-Path -LiteralPath $exitPath -PathType Leaf)) {
+            return @{ Ok = $false; ExitCode = $null; ManifestPresent = $false
+                      Reason = "the verdict outbox has no '$ExitCodeInnerName' entry (the runner never reached its pack step)" }
+        }
+        $size = (Get-Item -LiteralPath $exitPath).Length
+        if ($size -gt 32) {
+            return @{ Ok = $false; ExitCode = $null; ManifestPresent = $false
+                      Reason = "the exit-code entry '$ExitCodeInnerName' is not a plain exit code ($size byte(s))" }
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($exitPath)).Trim()
+        if ($text -ceq '0') {
+            $rc = 0
+        }
+        elseif ($text -match '^[1-9][0-9]{0,8}$') {
+            $rc = [int]$text
+            return @{ Ok = $false; ExitCode = $rc; ManifestPresent = $false
+                      Reason = "the builder exited non-zero (exit code $rc)" }
+        }
+        else {
+            return @{ Ok = $false; ExitCode = $null; ManifestPresent = $false
+                      Reason = "the exit-code entry '$ExitCodeInnerName' is not a plain exit code ($($text.Length) character(s))" }
+        }
+
+        if (-not (Test-BuilderManifestPresent -Path (Join-Path $staging $ManifestInnerName))) {
+            return @{ Ok = $false; ExitCode = 0; ManifestPresent = $false
+                      Reason = "the builder exited 0 but '$ManifestInnerName' is absent or empty in the verdict outbox" }
+        }
+        return @{ Ok = $true; ExitCode = 0; ManifestPresent = $true; Reason = $null }
     }
-    return @{ Ok = $true; ExitCode = 0; ManifestPresent = $true; Reason = $null }
+    finally {
+        if ($ownsWorkDir) { Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -225,7 +347,9 @@ function Read-BuilderVerdict {
     (the same default Invoke-Voidseal uses). Only the default -DepsOutputDir comes from it.
 .PARAMETER RunnerScriptPath
     (Optional) the host path to the in-guest fetch_deps.py runner (seeded into the INPUT disk).
-    Defaults to guest/fetch_deps.py under the skill root.
+    Defaults to guest/fetch_deps.py under the skill root. The verdict producer the runner packs its
+    verdict with (guest/run_disk_workload.py and guest/outbox.py) is always taken from the skill's
+    guest folder and seeded beside it; a missing helper fails the run before anything is created.
 .PARAMETER WorkloadTimeoutSeconds
     (Optional) wall-clock deadline for the guest to self-power-off. An explicitly bound value wins (an
     explicit 0 counts), then the profile's WorkloadTimeoutSeconds key (60..86400), then 600. Pass 0 in
@@ -308,6 +432,18 @@ function Invoke-BuilderVM {
         'fetch_deps.py'  = $runnerContent
         'deps-spec.json' = $depsSpecJson
     }
+    # The guest packs its verdict into the raw verdict disk with the shared outbox producer, which rides
+    # the INPUT disk like the runner does. A builder that cannot ship it could not report a verdict, so a
+    # missing helper is a caller-side defect: refuse now, before the first backend call.
+    $guestDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'guest'
+    foreach ($helper in @('run_disk_workload.py', 'outbox.py')) {
+        $helperPath = Join-Path $guestDir $helper
+        if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+            throw ("Invoke-BuilderVM: the verdict producer helper '$helper' is missing at '$helperPath'. The builder " +
+                   "packs its verdict with it, so there would be no way to report one. Failing closed before anything is created.")
+        }
+        $resolved['Inputs'][$helper] = [System.IO.File]::ReadAllText($helperPath)
+    }
 
     # --- lifecycle state + result ---
     $states = [System.Collections.Generic.List[string]]::new()
@@ -338,7 +474,12 @@ function Invoke-BuilderVM {
         # New-WorkloadDisks records both on the descriptor (InputDiskPath / OutputDiskPath +
         # CreatedDisks) so teardown's Remove-Sandbox -DeleteDisks cleans them up.
         $descriptor = New-WorkloadDisks -Descriptor $descriptor -Profile $resolved `
-            -StorageRoot $diskStorageRoot -Backend $Backend
+            -StorageRoot $diskStorageRoot -ExtraBudgetBytes $script:BuilderVerdictDiskBytes -Backend $Backend
+
+        # The raw verdict disk (the free-space preflight above already counted it): the guest packs its
+        # verdict here and the host reads it in user space. Recorded as a run-created disk, so teardown
+        # deletes it with the rest.
+        $descriptor = New-BuilderVerdictDisk -Descriptor $descriptor -StorageRoot $diskStorageRoot -Backend $Backend
 
         # CIDATA seed disk (RC6): the builder seed rides a recorded data disk, not a DVD,
         # so it survives through to the boot cloud-init reads it. The builder profile
@@ -377,7 +518,7 @@ function Invoke-BuilderVM {
         }
         $states.Add('CAPTURED')
 
-        # --- DETACH the OUTPUT/deps disk BEFORE the host read and hash ---
+        # --- DETACH the OUTPUT/deps disk and the verdict disk BEFORE the host read and hash ---
         # An attached disk is locked (Hyper-V worker holds the file handle while the VM
         # ran); the fake's GetVhdxImageHash THROWS on an attached-while-Running disk.
         # Detach BEFORE the hash so GetVhdxImageHash can open the file. After power-off
@@ -387,17 +528,25 @@ function Invoke-BuilderVM {
         if ($descriptor.OutputDiskPath) {
             $null = & $Backend.RemoveHardDiskDrive @{ VMName = $Name; Path = $descriptor.OutputDiskPath }
         }
+        if ($descriptor.VerdictDiskPath) {
+            $null = & $Backend.RemoveHardDiskDrive @{ VMName = $Name; Path = $descriptor.VerdictDiskPath }
+        }
         $states.Add('DETACHED')
 
-        # --- VERDICT: the exit-code file must read exactly 0 and the manifest must be present ---
-        # Read BEFORE the move and the hash: the read touches the volume, so the hash below is of the final
-        # bytes. Fail-closed: a missing, unparsable or non-zero exit code, or a missing manifest, is a
-        # FetchFailed run with the reason; nothing is emitted and teardown deletes the disk.
+        # --- VERDICT: the exit code must read exactly 0 and the manifest must be present ---
+        # Read from the raw verdict disk in user space (an outbox read, no mount); the deps disk is not read
+        # at all, so nothing the host does touches it before the hash below. Fail-closed: no valid verdict,
+        # an unparsable or non-zero exit code, or a missing manifest, is a FetchFailed run with the reason;
+        # nothing is emitted and teardown deletes the disks.
         $outputPath = [string]$descriptor.OutputDiskPath
         if ([string]::IsNullOrWhiteSpace($outputPath)) {
             throw "Invoke-BuilderVM: descriptor has no OutputDiskPath after disk creation."
         }
-        $verdict = Read-BuilderVerdict -OutputDiskPath $outputPath -Backend $Backend
+        $verdictPath = [string]$descriptor.VerdictDiskPath
+        if ([string]::IsNullOrWhiteSpace($verdictPath)) {
+            throw "Invoke-BuilderVM: descriptor has no VerdictDiskPath after disk creation."
+        }
+        $verdict = Read-BuilderVerdict -VerdictDiskPath $verdictPath -Backend $Backend
         $result.ExitCode = $verdict.ExitCode
         $states.Add('VERDICT')
         if (-not $verdict.Ok) {
@@ -451,7 +600,7 @@ function Invoke-BuilderVM {
     finally {
         # --- DESTROYED: teardown ALWAYS runs (no orphaned VM/disk/switch) ---
         # Remove-Sandbox -DeleteDisks deletes the descriptor's CreatedDisks (the system disk + INPUT +
-        # OUTPUT + seed disk) and nothing else. After a good run the OUTPUT disk has been moved out, so its
+        # OUTPUT + verdict + seed disk) and nothing else. After a good run the OUTPUT disk has been moved out, so its
         # old path is already gone (RemoveVHD is a no-op on an absent file), and the moved deps.vhdx is
         # neither on that list nor under the storage root: it survives. After a failed run the OUTPUT disk
         # is still in the sandbox folder and is deleted with the rest.

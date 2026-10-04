@@ -2385,6 +2385,16 @@ $script:SbCopyFakeVM = {
     file content the real streaming hash reads). Same write-flush gate as the outbox: no clean power-off
     -> no recorded blob -> hash returns SHA-256 of empty bytes (fail-closed, not a false match). Models
     the builder supply-chain artifact fingerprint path (Task 2.3/Phase 3).
+.PARAMETER SimulateVerdictBlob
+    A byte array representing the verdict outbox the BUILDER guest "wrote" to its small raw VERDICT disk
+    (guest/outbox.py container holding result.exitcode and deps-manifest.json), recorded at StartVM when
+    paired with -SimulateSelfPowerOff. The VERDICT disk is the Raw disk labelled 'VERDICT' that
+    Invoke-BuilderVM attaches beside the exFAT deps disk. The same write-flush gate and the same RC7 axis
+    as -SimulateOutboxBlob apply: no clean power-off -> nothing recorded (the host reads zeros); with
+    automatic checkpoints ON the blob lands in the OutboxChildLayer a host base read cannot see; with
+    them OFF it lands in the base OutboxRegion that ReadVhdxRawRegion returns. A fake-only simulation
+    switch on the EXISTING StartVM method, NOT a new backend method (no manifest change); the real
+    guest's side of this (selecting the raw disk, packing, the raw write) is live-only.
 .PARAMETER SimulateDetachError
     Make RemoveHardDiskDrive THROW — modelling a transient real-Hyper-V detach failure right after a
     force-stop (VM still settling / slot already detached). The orchestrator detaches the data disks
@@ -2456,6 +2466,7 @@ function New-FakeHyperVBackend {
         [hashtable] $SimulateWorkloadOutput,
         [byte[]] $SimulateOutboxBlob,
         [byte[]] $SimulateDepsImageBlob,
+        [byte[]] $SimulateVerdictBlob,
         [int] $SimulateDetachSettleLag = 0,
         [switch] $SimulateDetachError,
         [switch] $SimulateWriteEnospc,
@@ -2518,6 +2529,7 @@ function New-FakeHyperVBackend {
     $workloadOutput    = $SimulateWorkloadOutput
     $outboxBlob = $SimulateOutboxBlob   # raw bytes the guest "wrote" to the OUTPUT disk's outbox region
     $depsImageBlob = $SimulateDepsImageBlob   # deps bytes the builder guest "wrote" to the OUTPUT (deps) disk
+    $verdictBlob = $SimulateVerdictBlob       # verdict outbox the builder guest "wrote" to its raw VERDICT disk
     # Captured by the ReadVhdxRawRegion closure: model the RC8 detach settle-lag — qemu-img's first open can
     # hit a transient sharing violation while the Hyper-V worker-process handle is still releasing. A lag
     # WITHIN the read's internal retry budget (matches the real SbInvokeWithLockRetry MaxAttempts default of
@@ -2591,6 +2603,20 @@ function New-FakeHyperVBackend {
             if ($state.VHDs.ContainsKey([string]$hd)) {
                 $rec = $state.VHDs[[string]$hd]
                 if ($rec.Contains('Label') -and [string]$rec['Label'] -eq 'OUTPUT') { return [string]$hd }
+            }
+        }
+        return $null
+    }.GetNewClosure()
+
+    # Helper: find the raw VERDICT-labelled VHD attached to a VM record, or $null. Invoke-BuilderVM labels
+    # the builder's small raw verdict disk 'VERDICT' (a mock-internal discovery tag on a Raw disk, exactly
+    # like the OUTPUT label above), so StartVM can model the builder guest packing its verdict outbox there.
+    $findVerdictDisk = {
+        param($vm)
+        foreach ($hd in @($vm.HardDrives)) {
+            if ($state.VHDs.ContainsKey([string]$hd)) {
+                $rec = $state.VHDs[[string]$hd]
+                if ($rec.Contains('Label') -and [string]$rec['Label'] -eq 'VERDICT') { return [string]$hd }
             }
         }
         return $null
@@ -2734,6 +2760,20 @@ function New-FakeHyperVBackend {
                     $state.VHDs[$outDisk]['OutboxChildLayer'] = [byte[]]$outboxBlob   # base raw-read can't see it (RC7)
                 } else {
                     $state.VHDs[$outDisk]['OutboxRegion'] = [byte[]]$outboxBlob        # base raw-read sees it
+                }
+            }
+        }
+        # SimulateVerdictBlob (paired with SimulateSelfPowerOff): model the BUILDER guest packing its verdict
+        # outbox (result.exitcode + deps-manifest.json, guest/outbox.py) onto the raw VERDICT disk and powering
+        # off. Same write-flush gate and same RC7 axis as the OUTPUT outbox branch above: no clean power-off ->
+        # nothing recorded; checkpoints ON -> the blob sits in the .avhdx child a host base read cannot see.
+        if ($null -ne $verdictBlob -and $selfPowerOff) {
+            $verdictDisk = & $findVerdictDisk $vm
+            if ($null -ne $verdictDisk) {
+                if ([bool]$vm['AutomaticCheckpointsEnabled']) {
+                    $state.VHDs[$verdictDisk]['OutboxChildLayer'] = [byte[]]$verdictBlob
+                } else {
+                    $state.VHDs[$verdictDisk]['OutboxRegion'] = [byte[]]$verdictBlob
                 }
             }
         }

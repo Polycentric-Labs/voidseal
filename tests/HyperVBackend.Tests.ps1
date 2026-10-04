@@ -2752,6 +2752,54 @@ Describe 'GetVhdxImageHash — whole-image deps fingerprint (fake axes + real ne
     }
 }
 
+Describe 'fake -SimulateVerdictBlob (the builder guest packing its verdict into the raw VERDICT disk)' {
+    BeforeAll {
+        # A VM with an OUTPUT (deps) disk and a raw VERDICT disk; $Setup tweaks the fake or VM before StartVM.
+        function script:New-VerdictVm {
+            param([hashtable] $FakeArgs, [bool] $CheckpointsOff = $true)
+            $f = New-FakeHyperVBackend @FakeArgs
+            & $f.NewVM @{ Name = 'vv'; Generation = 2 }
+            if ($CheckpointsOff) { & $f.SetAutomaticCheckpoints @{ VMName = 'vv'; Enabled = $false } }
+            & $f.NewOutputVhdx @{ Path = 'C:\s\deps.vhdx'; Label = 'OUTPUT'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+            & $f.NewOutputVhdx @{ Path = 'C:\s\verdict.vhdx'; Label = 'VERDICT'; FileSystem = 'Raw'; SizeBytes = 64MB }
+            & $f.AddHardDiskDrive @{ VMName = 'vv'; Path = 'C:\s\deps.vhdx' }
+            & $f.AddHardDiskDrive @{ VMName = 'vv'; Path = 'C:\s\verdict.vhdx' }
+            return $f
+        }
+    }
+    It 'after a clean power-off the blob is in the base region of the VERDICT disk only, and reads back byte for byte' {
+        $f = script:New-VerdictVm -FakeArgs @{ SimulateSelfPowerOff = $true; SimulateVerdictBlob = [byte[]](1..16) }
+        & $f.StartVM @{ Name = 'vv' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'vv'; Path = 'C:\s\verdict.vhdx' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'vv'; Path = 'C:\s\deps.vhdx' }
+        $v = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\verdict.vhdx'; Offset = 0; Length = 16 }
+        ($v -join ',') | Should -Be ((1..16) -join ',')
+        $d = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\deps.vhdx'; Offset = 0; Length = 16 }
+        @($d | Where-Object { $_ -ne 0 }).Count | Should -Be 0 -Because 'the deps disk never receives the verdict'
+    }
+    It 'write-flush gate: a guest that never powers off leaves the verdict disk all zeros' {
+        $f = script:New-VerdictVm -FakeArgs @{ SimulateNeverOff = $true; SimulateVerdictBlob = [byte[]](1..16) }
+        & $f.StartVM @{ Name = 'vv' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'vv'; Path = 'C:\s\verdict.vhdx' }
+        $v = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\verdict.vhdx'; Offset = 0; Length = 16 }
+        @($v | Where-Object { $_ -ne 0 }).Count | Should -Be 0
+    }
+    It 'RC7: with automatic checkpoints left ON the blob hides in the child layer and a base read sees zeros' {
+        $f = script:New-VerdictVm -FakeArgs @{ SimulateSelfPowerOff = $true; SimulateVerdictBlob = [byte[]](1..16) } -CheckpointsOff $false
+        & $f.StartVM @{ Name = 'vv' }
+        & $f.RemoveHardDiskDrive @{ VMName = 'vv'; Path = 'C:\s\verdict.vhdx' }
+        $v = & $f.ReadVhdxRawRegion @{ Path = 'C:\s\verdict.vhdx'; Offset = 0; Length = 16 }
+        @($v | Where-Object { $_ -ne 0 }).Count | Should -Be 0
+    }
+    It 'no VERDICT-labelled disk attached means nothing is recorded (and nothing throws)' {
+        $f = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateVerdictBlob ([byte[]](1..16))
+        & $f.NewVM @{ Name = 'vv'; Generation = 2 }
+        & $f.NewOutputVhdx @{ Path = 'C:\s\deps.vhdx'; Label = 'OUTPUT'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+        & $f.AddHardDiskDrive @{ VMName = 'vv'; Path = 'C:\s\deps.vhdx' }
+        { & $f.StartVM @{ Name = 'vv' } } | Should -Not -Throw
+    }
+}
+
 Describe 'ReadVhdxRawRegion — user-space raw read (fake axes + real never-mounts)' {
     BeforeEach {
         $script:fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([byte[]](1..16))

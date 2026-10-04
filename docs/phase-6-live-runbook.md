@@ -270,6 +270,13 @@ proves them.*
   errors on the host, `Assert-Sealed` refuses every seal (fail closed) until that is resolved.
 - **HostProxy, end to end.** Every check in §2.2. Until they pass, the host enforcement is proven in the
   mock suite only.
+- **Builder raw verdict disk.** The mock proves the shell logic (the raw-disk selection and the pack step
+  both run under a POSIX sh in the suite) and the host read against the fake backend. Live, three things are
+  unproven: the real `New-VHD -Fixed` of the ~65 MB verdict disk, the guest's `blkid -p` selection picking
+  it out among the system, INPUT, exFAT deps and CIDATA disks (watch `verdict_candidates=` and
+  `verdict_dev=`), and the real `ReadVhdxRawRegion` read-back of that disk after the detach (watch
+  `verdict_head=` against `Status`). Confirm that no `deps-manifest.json` copy is lost: the exFAT deps disk
+  keeps its own.
 - **Real Squid domain-ACL packet behavior (builder and InGuestSquid only).** The builder seed's Squid egress config (SEC-2, mock-shipped
   per `progress.md`: default-DROP + minimal allow-list, `BlockProtocols` enforced by construction,
   DoH/DoT/QUIC dropped) is asserted at the level of seed **shape** only — the seed template is correct,
@@ -284,10 +291,12 @@ correctness, not proof of live behavior.
 Attach the COM1 serial capture **before starting the VM** — it is the project's default live-debug
 tool (it pinned both Tier-0 live root causes). For the builder it is the **second** source of fetch
 outcome, and the only one that says where the guest stopped. `Invoke-BuilderVM`'s `Status` now carries
-the exit code: the runner writes `result.exitcode` to the OUTPUT disk, the host reads it (and
-`deps-manifest.json`) after the detach, and `Status='Success'` needs the file to read exactly `0` with
-the manifest present. A missing, unparsable or non-zero exit code, or a missing manifest, is
-`Status='FetchFailed'` with the reason in `Error` and the code in `ExitCode`; a timeout is `Failed`.
+the exit code: the runner packs `result.exitcode` and `deps-manifest.json` into a small raw verdict disk
+with the outbox producer, the host reads that outbox in user space after the detach (it mounts nothing,
+and never reads the deps disk), and `Status='Success'` needs the exit code to read exactly `0` with the
+manifest present. A missing or invalid verdict, an unparsable or non-zero exit code, or a missing
+manifest, is `Status='FetchFailed'` with the reason in `Error` and the code in `ExitCode`; a timeout, or a
+host read that itself fails, is `Failed`.
 The builder runner narrates structural `[voidseal-diag]` markers to the serial console (mirroring the
 OutboxOutput runner's discipline; asserted by `SeedBuilder.Tests.ps1`):
 
@@ -296,7 +305,9 @@ OutboxOutput runner's discipline; asserted by `SeedBuilder.Tests.ps1`):
 | `squid_active=` | a dead Squid (every fetch becomes an opaque connection failure) |
 | `egress_lockdown=v4-applied redirect80_rc= redirect443_rc=` | lockdown applied; an unapplied REDIRECT silently bypasses the domain-ACL |
 | `ip6_lockdown=applied\|skipped` | the IPv6 belt-and-braces outcome |
-| `ABORT output-not-mounted` / `ABORT input-not-mounted` | the two fail-closed poweroff branches (formerly silent) |
+| `ABORT output-not-mounted` / `ABORT input-not-mounted` / `ABORT verdict-candidates-not-1` | the fail-closed poweroff branches (formerly silent); the last means the raw verdict disk could not be picked out |
+| `verdict_candidates=` / `verdict_dev=` and `skip <dev> (has partitions\|has a filesystem signature)` | which whole disks the runner considered and the one it chose to pack the verdict into |
+| `verdict_producer_rc=` / `verdict_head=` | the producer's exit code, and the container magic read back from the verdict device (`56534f5554425831` = `VSOUTBX1`) |
 | `output_mounted= owner_sandbox=` / `input_mounted= input_files=` | data-disk mounts + who may write |
 | `entrypoint_rc=` | `fetch_deps.py` rc (2 = first failed fetcher; fail-closed) |
 | `fetched pip= apt= hf= manifest_present=` | per-fetcher artifact **counts** + the single yes/no of a fully-green fetch (`write_manifest` runs only after all fetchers succeed) |

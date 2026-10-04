@@ -762,9 +762,9 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
     # The builder runner had ZERO serial markers, while the OutboxOutput runner's diag lines are what
     # pinned BOTH Tier-0 live root causes (D4-D). Phase 6 is the project's FIRST live egress: a failed
     # fetch must be attributable to squid-down vs REDIRECT-not-applied vs mount-failure vs the fetch
-    # itself. Invoke-BuilderVM now reads the exit-code file and manifest off the OUTPUT disk for its
-    # verdict (Success or FetchFailed), but teardown then DELETES that disk, so the serial console is
-    # the second source and the only one that says where the guest stopped. Same
+    # itself. Invoke-BuilderVM now reads the exit code and manifest out of a raw verdict disk for its
+    # verdict (Success or FetchFailed), but a failed run's disks are then DELETED, so the serial console
+    # is the second source and the only one that says where the guest stopped. Same
     # discipline as the outbox runner: STRUCTURAL ONLY — liveness, rc values, file COUNTS, manifest
     # presence; never fetched-artifact bytes.
     It 'emits structural [voidseal-diag] serial markers (the silent-runner class already cost two live debug rounds)' {
@@ -792,10 +792,11 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         $ud | Should -Match 'manifest_present='     -Because 'write_manifest only runs after ALL fetchers succeed; its presence is the single yes/no of a fully-green fetch'
     }
 
-    It 'echoes a DISTINCT ABORT reason before each of the two fail-closed poweroffs (no-OUTPUT vs no-INPUT+rc70)' {
+    It 'echoes a DISTINCT ABORT reason before each of the fail-closed poweroffs (no-OUTPUT, no-INPUT, no single raw verdict disk)' {
         $ud = New-CidataUserData -Profile $script:builderProfile
-        $ud | Should -Match 'diag "ABORT output-not-mounted' -Because 'the no-OUTPUT branch powers off with NOTHING written anywhere; only serial can say why'
-        $ud | Should -Match 'diag "ABORT input-not-mounted'  -Because 'the no-INPUT branch writes the rc70 sentinel, which the host reads as a failed verdict; serial must name the branch'
+        $ud | Should -Match 'diag "ABORT output-not-mounted' -Because 'the no-OUTPUT branch powers off before any verdict can be packed; only serial can say why'
+        $ud | Should -Match 'diag "ABORT input-not-mounted'  -Because 'the no-INPUT branch has no producer to pack a verdict with, so the host reads a missing verdict; serial must name the branch'
+        $ud | Should -Match 'diag "ABORT verdict-candidates-not-1' -Because 'the raw verdict disk could not be told apart from the others'
     }
 
     It 'builder diag markers are STRUCTURAL only — no fetched-artifact bytes on the serial console (same contract as the outbox runner)' {
@@ -808,6 +809,232 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         # control-flow record rather than a payload mirror.)
         $leaky = @($diagLines | Where-Object { $_ -match '/mnt/out' -and $_ -match '\b(cat|head|tail|od|xxd|hexdump|dd|strings)\b' })
         $leaky | Should -BeNullOrEmpty -Because 'serial narrates structure (liveness/rc/counts/presence), never dependency payload bytes'
+    }
+}
+
+Describe 'Builder runner - the verdict goes to a raw verdict disk, packed with the shared outbox producer' {
+
+    BeforeAll {
+        $script:BvProfile = @{
+            WorkloadMode = 'Disk'; EgressMode = 'SquidSniProxy'
+            Entrypoint = 'python3 /mnt/in/fetch_deps.py --spec /mnt/in/deps-spec.json --out /mnt/out'
+            EgressAllowlist = @('pypi.org', 'files.pythonhosted.org')
+        }
+        $script:BvUd = New-CidataUserData -Profile $script:BvProfile
+
+        # The content block of the builder runner script embedded in the user-data, dedented.
+        $lines = $script:BvUd -split "`n"
+        $start = [array]::IndexOf($lines, '  - path: /usr/local/sbin/vmdep-builder')
+        $start | Should -BeGreaterOrEqual 0
+        $body = [System.Collections.Generic.List[string]]::new()
+        for ($i = $start + 3; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^  - path: ' -or $lines[$i] -match '^\S') { break }
+            $body.Add(($lines[$i] -replace '^      ', ''))
+        }
+        $script:BvRunner = ($body -join "`n")
+
+        # A POSIX sh for `-n` checks and for running extracted blocks. On Windows use Git for Windows' dash
+        # (never the WSL launcher); its sibling tools (basename, xargs, tr, ...) live in the same folder.
+        $script:BvSh = $null
+        if ($IsWindows) {
+            foreach ($git in @(Get-Command git -CommandType Application -All -ErrorAction SilentlyContinue)) {
+                $dir = Split-Path -Parent $git.Source
+                for ($up = 0; $up -lt 3 -and -not $script:BvSh -and $dir; $up++) {
+                    $dir = Split-Path -Parent $dir
+                    foreach ($c in 'usr\bin\dash.exe', 'usr\bin\sh.exe') {
+                        $cand = Join-Path $dir $c
+                        if (Test-Path -LiteralPath $cand) { $script:BvSh = $cand; break }
+                    }
+                }
+                if ($script:BvSh) { break }
+            }
+        }
+        else {
+            $sh = Get-Command dash, sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sh) { $script:BvSh = $sh.Source }
+        }
+
+        # Run $Script under the POSIX sh with its sibling tools on PATH; returns @{ Out; Code }.
+        function script:Invoke-BvSh {
+            param([string] $Script)
+            $f = Join-Path ([System.IO.Path]::GetTempPath()) ('vs-bv-{0}.sh' -f [guid]::NewGuid().ToString('N'))
+            [System.IO.File]::WriteAllText($f, $Script, [System.Text.UTF8Encoding]::new($false))
+            $savedPath = $env:PATH
+            try {
+                $env:PATH = "$(Split-Path -Parent $script:BvSh)$([System.IO.Path]::PathSeparator)$env:PATH"
+                $out = & $script:BvSh $f 2>&1
+                return @{ Out = @($out | ForEach-Object { [string]$_ }); Code = $LASTEXITCODE }
+            }
+            finally { $env:PATH = $savedPath; Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        }
+
+        # The runner's raw-disk selection block (root disk lookup through the chosen device), with /sys/block
+        # pointed at a fake tree and the Linux-only tools shimmed. Each disk is @{ Name; Partitions = n;
+        # Signature = bool }; the root disk is the first one.
+        function script:Invoke-VerdictSelection {
+            param([object[]] $Disks)
+            $m = [regex]::Match($script:BvRunner, '(?ms)^ROOT_SRC=.*?^diag "verdict_dev=[^\n]*$')
+            $m.Success | Should -BeTrue -Because 'the selection block must be findable'
+            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('vs-sel-{0}' -f [guid]::NewGuid().ToString('N'))
+            $sys = Join-Path $tmp 'sysblock'; $sig = Join-Path $tmp 'sig'
+            New-Item -ItemType Directory -Path $sys, $sig -Force | Out-Null
+            try {
+                foreach ($d in $Disks) {
+                    New-Item -ItemType Directory -Path (Join-Path $sys $d.Name) -Force | Out-Null
+                    for ($p = 1; $p -le [int]$d.Partitions; $p++) { New-Item -ItemType Directory -Path (Join-Path $sys "$($d.Name)/$($d.Name)$p") -Force | Out-Null }
+                    if ($d.Signature) { Set-Content -LiteralPath (Join-Path $sig $d.Name) -Value 'sig' }
+                }
+                $root = $Disks[0].Name
+                $block = $m.Value.Replace('/sys/block', '$SYSBLOCK')
+                $harness = @(
+                    'set +e'
+                    ('SYSBLOCK="{0}"' -f ($sys -replace '\\', '/'))
+                    ('SIGDIR="{0}"' -f ($sig -replace '\\', '/'))
+                    'diag() { echo "diag: $*"; }'
+                    ('findmnt() { echo /dev/' + $root + '1; }')
+                    ('lsblk() { echo ' + $root + '; }')
+                    'blkid() { for a in "$@"; do :; done; [ -f "$SIGDIR/$(basename "$a")" ]; }'
+                    'sync() { :; }'
+                    'umount() { :; }'
+                    'poweroff() { echo POWEROFF; }'
+                    $block
+                    'echo "CHOSEN=$VERDICT_DEV"'
+                ) -join "`n"
+                $res = script:Invoke-BvSh -Script $harness
+                $text = $res.Out -join "`n"
+                return @{ Text = $text; Chosen = ([regex]::Match($text, '(?m)^CHOSEN=(.*)$').Groups[1].Value); PoweredOff = ($text -match '(?m)^POWEROFF$') }
+            }
+            finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'packs the exit code and the manifest with the shared producer, in transport-only mode, onto the raw device' {
+        $script:BvRunner | Should -Match 'python3 /mnt/in/run_disk_workload\.py --staging /run/vstaging --verdicts /run/vverdicts\.json --out "\$VERDICT_DEV" --transport-only'
+        $script:BvRunner | Should -Match ([regex]::Escape('printf ''%s'' "$rc" > /run/vstaging/result.exitcode'))
+        $script:BvRunner | Should -Match ([regex]::Escape('cp /mnt/out/deps-manifest.json /run/vstaging/deps-manifest.json'))
+    }
+
+    It 'no longer writes any verdict onto the exFAT deps disk (the host never reads that disk)' {
+        $script:BvRunner | Should -Not -Match '/mnt/out/result\.exitcode'
+        $script:BvRunner | Should -Not -Match 'rc70'
+    }
+
+    It 'identifies the raw verdict disk POSITIVELY: no partitions and no filesystem signature, never by an exclusion list' {
+        $script:BvRunner | Should -Match 'blkid -p'
+        $script:BvRunner | Should -Match 'has partitions'
+        $script:BvRunner | Should -Match 'has a filesystem signature'
+        $script:BvRunner | Should -Not -Match 'blkid -L INPUT' -Because 'an exclusion list must track every disk we attach; the raw-ness test does not'
+        $script:BvRunner | Should -Not -Match 'blkid -L OUTPUT'
+    }
+
+    It 'chooses the verdict disk and aborts on anything but exactly one candidate, BEFORE the entrypoint runs' {
+        $script:BvRunner | Should -Match 'if \[ "\$#" -ne 1 \]; then diag "ABORT verdict-candidates-not-1'
+        $pick = $script:BvRunner.IndexOf('VERDICT_DEV="/dev/$1"')
+        $run  = $script:BvRunner.IndexOf("runuser -u sandbox -- /bin/sh -c '")
+        $pick | Should -BeGreaterThan 0
+        $pick | Should -BeLessThan $run -Because 'a run that cannot report a verdict must stop before a long fetch, not after it'
+        $abort = ($script:BvRunner -split "`n" | Where-Object { $_ -match 'ABORT verdict-candidates-not-1' } | Select-Object -First 1)
+        $abort | Should -Match 'poweroff; exit 0'
+    }
+
+    It 'narrates the selection and the pack: candidates, chosen device, producer rc and the container magic, structurally' {
+        foreach ($marker in 'diag "verdict_candidates=', 'diag "verdict_dev=', 'diag "verdict_producer_rc=', 'diag "verdict_head=', 'diag "ABORT verdict-candidates-not-1') {
+            $script:BvRunner | Should -BeLike "*$marker*" -Because "the live capture needs $marker"
+        }
+        $diagLines = @(($script:BvRunner -split "`n") | Where-Object { $_ -match 'diag "' })
+        @($diagLines | Where-Object { $_ -match '/run/vstaging' -and $_ -match '\b(cat|head|tail|od|xxd|hexdump|strings)\b' }).Count | Should -Be 0 -Because 'serial narrates structure, never staged bytes'
+    }
+
+    It 'the whole runner still parses as POSIX sh (sh -n)' {
+        if (-not $script:BvSh) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $f = Join-Path ([System.IO.Path]::GetTempPath()) ('vs-bv-n-{0}.sh' -f [guid]::NewGuid().ToString('N'))
+        try {
+            [System.IO.File]::WriteAllText($f, $script:BvRunner, [System.Text.UTF8Encoding]::new($false))
+            $out = & $script:BvSh -n $f 2>&1
+            $LASTEXITCODE | Should -Be 0 -Because "sh -n reported: $out"
+        }
+        finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'selection, run for real under sh: the only raw disk is chosen, never the deps, INPUT, CIDATA or root disk' {
+        if (-not $script:BvSh) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $r = script:Invoke-VerdictSelection -Disks @(
+            @{ Name = 'sda'; Partitions = 2; Signature = $true },    # root
+            @{ Name = 'sdb'; Partitions = 1; Signature = $true },    # INPUT (exFAT on a GPT partition)
+            @{ Name = 'sdc'; Partitions = 1; Signature = $true },    # OUTPUT / deps (exFAT on a GPT partition)
+            @{ Name = 'sdd'; Partitions = 1; Signature = $true },    # CIDATA seed (FAT32)
+            @{ Name = 'sde'; Partitions = 0; Signature = $false })   # the raw verdict disk
+        $r.Chosen | Should -Be '/dev/sde'
+        $r.PoweredOff | Should -BeFalse
+        $r.Text | Should -Match 'skip sdb \(has partitions\)'
+        $r.Text | Should -Match 'skip sdc \(has partitions\)'
+    }
+
+    It 'selection: a whole disk with a filesystem signature but no partition table is skipped, not mistaken for raw' {
+        if (-not $script:BvSh) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $r = script:Invoke-VerdictSelection -Disks @(
+            @{ Name = 'sda'; Partitions = 1; Signature = $true },
+            @{ Name = 'sdb'; Partitions = 0; Signature = $true },    # superfloppy-style deps disk
+            @{ Name = 'sdc'; Partitions = 0; Signature = $false })
+        $r.Chosen | Should -Be '/dev/sdc'
+        $r.Text | Should -Match 'skip sdb \(has a filesystem signature\)'
+    }
+
+    It 'selection: no raw disk, or two raw disks, powers off with no device chosen (fail closed)' -ForEach @(
+        @{ Case = 'none'; Disks = @(@{ Name = 'sda'; Partitions = 1; Signature = $true }, @{ Name = 'sdb'; Partitions = 1; Signature = $true }) }
+        @{ Case = 'two';  Disks = @(@{ Name = 'sda'; Partitions = 1; Signature = $true }, @{ Name = 'sdb'; Partitions = 0; Signature = $false }, @{ Name = 'sdc'; Partitions = 0; Signature = $false }) }
+    ) {
+        if (-not $script:BvSh) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $r = script:Invoke-VerdictSelection -Disks $Disks
+        $r.PoweredOff | Should -BeTrue
+        $r.Text | Should -Match 'ABORT verdict-candidates-not-1'
+        $r.Text | Should -Not -Match '(?m)^CHOSEN='
+    }
+
+    It 'the pack block, run for real under sh with the real producer, writes a container the host reader accepts: exit code and manifest, nothing else' -ForEach @(
+        @{ Case = 'with manifest'; Rc = '0'; Manifest = '{"files":[]}'; Want = @('deps-manifest.json', 'result.exitcode', 'verdicts.json') }
+        @{ Case = 'no manifest';   Rc = '2'; Manifest = $null;          Want = @('result.exitcode', 'verdicts.json') }
+    ) {
+        if (-not $script:BvSh) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $m = [regex]::Match($script:BvRunner, '(?ms)^printf .%s. "\$rc" > /run/vstaging/result\.exitcode.*?^diag "verdict_producer_rc=[^\n]*$')
+        $m.Success | Should -BeTrue
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('vs-pack-{0}' -f [guid]::NewGuid().ToString('N'))
+        $outDir = Join-Path $tmp 'out'; $stage = Join-Path $tmp 'vstaging'
+        New-Item -ItemType Directory -Path $outDir, $stage -Force | Out-Null
+        try {
+            if ($null -ne $Manifest) { [System.IO.File]::WriteAllText((Join-Path $outDir 'deps-manifest.json'), $Manifest, [System.Text.UTF8Encoding]::new($false)) }
+            $fwd = { param($p) $p -replace '\\', '/' }
+            $block = $m.Value.
+                Replace('/mnt/in/run_disk_workload.py', '"$PRODUCER"').
+                Replace('/mnt/out/', ((& $fwd $outDir) + '/')).
+                Replace('/run/vstaging', (& $fwd $stage)).
+                Replace('/run/vverdicts.json', ((& $fwd $tmp) + '/vv.json')).
+                Replace('/run/vproducer.err', ((& $fwd $tmp) + '/vp.err'))
+            $device = (& $fwd $tmp) + '/verdict.raw'
+            $harness = @(
+                'set +e'
+                ('PRODUCER="{0}"' -f (& $fwd (Join-Path $script:SkillRoot 'guest/run_disk_workload.py')))
+                ('VERDICT_DEV="{0}"' -f $device)
+                ('rc={0}' -f $Rc)
+                'diag() { echo "diag: $*"; }'
+                ('python3() {{ "{0}" "$@"; }}' -f (& $fwd (Resolve-PythonExe)))
+                $block
+            ) -join "`n"
+            $res = script:Invoke-BvSh -Script $harness
+            ($res.Out -join "`n") | Should -Match 'verdict_producer_rc=0'
+            Test-Path -LiteralPath $device | Should -BeTrue
+
+            # Feed it to the host's own reader and list what came out.
+            $dest = Join-Path $tmp 'gate'
+            $py = Resolve-PythonExe
+            $null = & $py (Join-Path $script:SkillRoot 'host/read_outbox.py') --blob $device --out $dest
+            $LASTEXITCODE | Should -Be 0
+            $got = @(Get-ChildItem -LiteralPath $dest -Recurse -File | ForEach-Object { $_.Name } | Sort-Object)
+            $got | Should -Be @($Want | Sort-Object)
+            [System.IO.File]::ReadAllText((Join-Path $dest 'staging/result.exitcode')) | Should -BeExactly $Rc
+            if ($null -ne $Manifest) { [System.IO.File]::ReadAllText((Join-Path $dest 'staging/deps-manifest.json')) | Should -BeExactly $Manifest }
+        }
+        finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 

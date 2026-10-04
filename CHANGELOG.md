@@ -47,6 +47,15 @@ places where a check is an argument rather than a measurement.
   the Tier-1 allow-list matches only the exact `Internal+Allowlist` label and refuses any other Tier-1
   label; and `Get-SealNicPolicy` moved to `scripts/lib/SealPolicy.ps1` so the Sealer loads without the
   Provisioner.
+- Builder verdict without a host mount: `Invoke-BuilderVM` no longer reads `result.exitcode` and
+  `deps-manifest.json` off the guest-written exFAT deps disk with `ReadVhdxFile` (a read-write
+  `Mount-VHD`). The builder gains a second, small Raw verdict disk, sized to the outbox bounds and
+  recorded as a run-created disk; the guest packs the two entries into it with the existing outbox
+  producer, picks it out as the only whole disk with no partition table and no file system signature,
+  and the host reads it with the same user-space outbox reader as every other OUTPUT read. The rules are
+  unchanged (exit code exactly `0` and a non-empty manifest for Success, otherwise `FetchFailed`); a
+  test pins that `BuilderVM.ps1` never calls `ReadVhdxFile`, `ReadVhdxFileBytes` or `Mount-VHD`. The
+  fake backend gains `-SimulateVerdictBlob`. Not yet exercised live.
 - Live acceptance status: the **Tier-0 `firefox` disk round-trip ran end-to-end on real Hyper-V**,
   first with the legacy exFAT OUTPUT disk (2026-06-25) and then with the current user-space outbox
   transport (2026-07-21). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see

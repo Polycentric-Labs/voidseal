@@ -247,17 +247,30 @@ be a Voidseal defect.
   not affect this run and shows up in `DataDiskChanged`.
 
 **Builder verdict and deps disk.** IN SCOPE (the Tier-1 builder, `scripts/lib/BuilderVM.ps1`).
-- **What the host reads from the builder guest.** After power-off and detach, `Read-BuilderVerdict` reads two
-  small files off the OUTPUT disk, `result.exitcode` and `deps-manifest.json`, through `ReadVhdxFile`, and
-  uses them only for the Success or `FetchFailed` verdict: Success needs the first to read exactly `0` and
-  the second to be non-empty. Anything else fails closed. The reason text never repeats file content.
-- **The exposure this adds.** `ReadVhdxFile` is a read-write `Mount-VHD` of a volume the guest wrote, so the
-  host's partition and filesystem drivers parse guest-controlled metadata. This is the one place the engine
-  does that; every other OUTPUT read is the user-space outbox read. The builder is the guest most likely to
-  be hostile (it installs dependency code from the network). The mount is short and only reads, and the
-  whole-image hash is taken after it, so the hash describes the bytes a later run copies. It is recorded as
-  an open design question: a verdict carried in a small Raw region read with `ReadVhdxRawRegion` would avoid
-  the mount, at the cost of a second Raw disk. `Read-BuilderVerdict` is the single place to change.
+- **What the host reads from the builder guest.** The builder has two data disks it writes: the exFAT deps
+  disk (the OUTPUT disk, which becomes `deps.vhdx`) and a second, small **Raw verdict disk** (a fixed VHDX
+  with no partition table and no file system, sized to the outbox bounds of `guest/outbox.py` and recorded
+  on the descriptor as a run-created disk, so teardown deletes it). At the end of its run the guest packs
+  `result.exitcode` and `deps-manifest.json` into the verdict disk with the same outbox producer every other
+  guest uses (`guest/run_disk_workload.py`, no new on-disk format). After power-off and detach,
+  `Read-BuilderVerdict` reads that outbox with the shared user-space reader, `Read-OutboxToGateInput`
+  (`ReadVhdxRawRegion` plus `host/read_outbox.py`). It uses the two entries only for the Success or
+  `FetchFailed` verdict: Success needs the exit code to read exactly `0` and the manifest to be non-empty.
+  Anything else, including a missing, truncated or tampered container, fails closed with a fixed reason that
+  never repeats guest content. A host-side failure of the read itself (a locked disk, no qemu-img) is not a
+  verdict and makes the run `Failed`.
+- **Nothing the guest wrote is mounted.** The host never calls `ReadVhdxFile`, `ReadVhdxFileBytes` or
+  `Mount-VHD` on a builder disk, so its partition and file system drivers never parse guest-controlled
+  metadata (the C1 rule, the same one the structural validator in `Invoke-Voidseal` enforces for every
+  other OUTPUT read). `tests/BuilderVM.Tests.ps1` pins that on the AST of `BuilderVM.ps1` and on the call
+  log of a run. The deps disk is never read by the host at all: it is only detached, moved and hashed in
+  user space. The guest finds the verdict disk by its defining property, the only whole disk with no
+  partition table and no file system signature, so the exFAT deps disk, the INPUT disk and the CIDATA seed
+  are never mistaken for it, and anything other than exactly one such disk aborts the run before the fetch.
+- **What this does not change.** A hostile builder can still write a forged verdict, exactly as before: a
+  verdict is the guest's own word, and the integrity check on the artifact is the whole-image hash, not the
+  exit code. What changed is the parsing surface the host exposes to that guest, which is now the bounded,
+  hash-checked outbox container instead of a mounted volume.
 - **What survives.** The finished disk is moved out of the sandbox folder (`MoveVhdxFile`, a plain file move)
   into a destination `Resolve-BuilderDepsDestination` has checked: absolute and local, `.vhdx`, not already
   present, and outside the sandbox storage root both lexically and after following links. Teardown deletes
