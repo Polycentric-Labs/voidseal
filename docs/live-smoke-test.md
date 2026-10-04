@@ -229,6 +229,11 @@ When the dry run shows the full `INIT..DESTROYED` traversal with `SealVerdict=Tr
 
 ## 3. Milestone 1 — Firefox proof (Tier 0), LIVE, SYNTHETIC data
 
+> **Historical.** This section records Milestone 1, which predates firefox Disk mode. Its pre-seeded
+> `ResultPath` stand-in (Gap 3) is not how firefox runs today. For the current Tier-0 procedure,
+> use **[section 4A](#4a-milestone-3--firefox-tier-0-real-workload-round-trip-disk-mode)**. Read this
+> section for the lifecycle and seal-boundary checks it still describes, not as the way to run firefox.
+
 **Proves milestone 4.** The cleanest end-to-end exercise: offline (no NIC), no
 egress dependency. Per **Gap 1** this runs as a **Debian Gen2 VM with no NIC**, not a container.
 
@@ -268,9 +273,8 @@ $report = Invoke-Voidseal -Tier 0 -Profile firefox `
 # (default -Backend is the REAL Hyper-V backend — no -Backend argument)
 ```
 
-> `-ParentDiskPath $GoldenVhdx` is **required here per Gap 1** — without a bootable parent disk
-> the Tier-0 VM has nothing to boot. (The operator-runbook's Tier-0 example omits it because
-> it predates this clarification; include it.)
+> `-ParentDiskPath $GoldenVhdx` is **required here per Gap 1**: without a bootable parent disk
+> the Tier-0 VM has nothing to boot. The operator runbook's Tier-0 example includes it as well.
 
 ### 3.4 What success looks like
 
