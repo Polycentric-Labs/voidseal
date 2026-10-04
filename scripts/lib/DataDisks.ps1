@@ -250,3 +250,45 @@ function Assert-DataDiskPathsIsolated {
         }
     }
 }
+
+<#
+.SYNOPSIS
+    Re-hash every recorded data disk after the run and report whether any of them changed.
+.DESCRIPTION
+    Called once the VM is gone (after teardown), so every data disk is detached and no guest can be
+    writing to it. Each recorded entry gets PostRunImageHash (the new hash, or $null when it could not
+    be read) and Changed. A mismatch, or a hash that cannot be taken at all, counts as changed and
+    writes a warning naming the disk: the data disk is an input, so this never fails a run that
+    otherwise succeeded, but the report must say the operator's file is no longer the one recorded.
+    Returns $null when no data disk was recorded (nothing to check), else $true or $false.
+.PARAMETER Descriptor
+    The run descriptor (its DataDisks list, as recorded at attach time).
+.PARAMETER VMName
+    The run's VM name (messages only).
+.PARAMETER Backend
+    The Hyper-V backend; the hash goes through GetVhdxImageHash (user space, never Mount-VHD).
+#>
+function Test-DataDiskChanged {
+    [CmdletBinding()]
+    param([AllowNull()] $Descriptor, [Parameter(Mandatory)] [string] $VMName, [Parameter(Mandatory)] [hashtable] $Backend)
+
+    $entries = @(Get-DescriptorField -Descriptor $Descriptor -Name 'DataDisks' -Default @())
+    if ($entries.Count -eq 0) { return $null }
+    $anyChanged = $false
+    foreach ($e in $entries) {
+        $post = $null
+        $why  = $null
+        try   { $post = ([string](& $Backend.GetVhdxImageHash @{ Path = [string]$e.Path })).Trim().ToLowerInvariant() }
+        catch { $why = $_.Exception.Message }
+        $same = (-not [string]::IsNullOrWhiteSpace($post)) -and ($post -eq ([string]$e.ImageHash).ToLowerInvariant())
+        Add-Member -InputObject $e -MemberType NoteProperty -Name 'PostRunImageHash' -Value $post -Force
+        Add-Member -InputObject $e -MemberType NoteProperty -Name 'Changed' -Value (-not $same) -Force
+        if (-not $same) {
+            $anyChanged = $true
+            $detail = if ($null -ne $why) { "could not be re-hashed ($why)" } else { "now hashes to '$post', not the recorded '$($e.ImageHash)'" }
+            Write-Warning ("Invoke-Voidseal: '$VMName' data disk '$($e.Name)' ('$($e.Path)') $detail. Treat it as changed: " +
+                           "rebuild it with New-VoidsealDataDisk.ps1 (or restore it) before another run relies on it.")
+        }
+    }
+    return $anyChanged
+}

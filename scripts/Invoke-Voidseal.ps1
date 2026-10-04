@@ -570,6 +570,11 @@ function Invoke-Voidseal {
         Released          = $null
         Held              = $null
         SensitivityReport = $null
+        # Pre-built data disks (DataDisks.ps1): $null when none were attached; otherwise $true when any
+        # recorded data disk no longer matches its recorded hash after the run (or could not be
+        # re-hashed), else $false. Reported, never a run failure; per-disk detail is on
+        # Descriptor.DataDisks (PostRunImageHash, Changed).
+        DataDiskChanged   = $null
     }
 
     $descriptor = $null
@@ -987,6 +992,16 @@ function Invoke-Voidseal {
         catch {
             $report.TeardownStatus = "FAILED: $($_.Exception.Message)"
             Write-Warning "Invoke-Voidseal: teardown of '$Name' failed: $($_.Exception.Message)"
+        }
+        # --- data disks: re-hash AFTER teardown, when the VM is gone and every data disk is detached ---
+        # A data disk is attached read-write at the Hyper-V level; the guest mounts it read-only, but a
+        # guest with root can write raw blocks. A change is reported (DataDiskChanged + a warning), not
+        # turned into a failed run: the disk is an input. Teardown never deletes data disks (they are
+        # not on CreatedDisks), so the file is still there to hash. Never throws out of the finally.
+        try { $report.DataDiskChanged = Test-DataDiskChanged -Descriptor $descriptor -VMName $Name -Backend $Backend }
+        catch {
+            $report.DataDiskChanged = $true
+            Write-Warning "Invoke-Voidseal: '$Name' data disk re-check failed: $($_.Exception.Message)"
         }
         $report.States = $states.ToArray()
     }

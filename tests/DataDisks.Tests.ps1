@@ -366,10 +366,13 @@ Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
 
         # A fake backend with N pre-built data disks registered, plus an attach recorder.
         $script:NewDataRun = {
-            param([string[]] $Names, [switch] $NoBlob, [switch] $NeverOff)
+            param([string[]] $Names, [switch] $NoBlob, [switch] $NeverOff, [string[]] $GuestWrites = @())
             $fakeArgs = @{ SimulateSelfPowerOff = $true }
             if ($NeverOff) { $fakeArgs = @{ SimulateNeverOff = $true } }
             elseif (-not $NoBlob) { $fakeArgs.SimulateOutboxBlob = $script:DdBlob }
+            if ($GuestWrites.Count -gt 0) {
+                $fakeArgs.SimulateGuestDiskWrite = @($GuestWrites | ForEach-Object { Join-Path $script:DataRoot "$_.vhdx" })
+            }
             $b = New-FakeHyperVBackend @fakeArgs
             $attached = [System.Collections.Generic.List[string]]::new()
             $orig = $b.AddHardDiskDrive
@@ -440,6 +443,73 @@ Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
         $report = & $script:RunWith $run 'sbx-dd-diff' @(@{ Name = 'diff'; Path = $p; ImageHash = ('a' * 64) })
         $report.Error | Should -Match 'DIFFERENCING'
         @($report.States) | Should -Not -Contain 'SEALED'
+    }
+
+    It 'reports DataDiskChanged = $false when every data disk re-hashes to its recorded value' {
+        $run = & $script:NewDataRun -Names @('corpus', 'wheels')
+        $report = & $script:RunWith $run 'sbx-dd-same'
+        $report.DataDiskChanged | Should -BeFalse
+        foreach ($d in @($report.Descriptor.DataDisks)) {
+            $d.Changed | Should -BeFalse
+            $d.PostRunImageHash | Should -Be $d.ImageHash
+        }
+    }
+
+    It 'a guest write to a data disk sets DataDiskChanged and warns, without failing a good run' {
+        $run = & $script:NewDataRun -Names @('corpus', 'wheels') -GuestWrites @('wheels')
+        $report = & $script:RunWith $run 'sbx-dd-tamper'
+        $report.RunResult.Status | Should -Be 'Success' -Because 'the data disk is an input; a change is reported, not a run failure'
+        $report.Error | Should -BeNullOrEmpty
+        $report.DataDiskChanged | Should -BeTrue
+        $byName = @{}; foreach ($d in @($report.Descriptor.DataDisks)) { $byName[$d.Name] = $d }
+        $byName['wheels'].Changed | Should -BeTrue
+        $byName['wheels'].PostRunImageHash | Should -Not -Be $byName['wheels'].ImageHash
+        $byName['corpus'].Changed | Should -BeFalse
+    }
+
+    It 'the warning names the changed disk' {
+        $run = & $script:NewDataRun -Names @('corpus') -GuestWrites @('corpus')
+        $null = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = $run.Decl } `
+            -Name 'sbx-dd-warn' -ArtifactRoot (Join-Path $TestDrive 'art-warn') -Destination (Join-Path $TestDrive 'dest-warn') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $run.Backend -WarningVariable wv -WarningAction SilentlyContinue
+        (@($wv) -join "`n") | Should -Match "data disk 'corpus'.*not the recorded"
+    }
+
+    It 'the re-hash runs after teardown (the VM is gone, so every data disk is detached)' {
+        $run = & $script:NewDataRun -Names @('corpus')
+        $null = & $script:RunWith $run 'sbx-dd-order'
+        $log = @($run.Backend.FakeCallLog)
+        $hashes = @(for ($i = 0; $i -lt $log.Count; $i++) { if ($log[$i].Op -eq 'GetVhdxImageHash' -and $log[$i].Path -eq $run.Decl[0].Path) { $i } })
+        $hashes.Count | Should -Be 3 -Because 'one in the test setup, one before attach, one after the run'
+        $startIdx = @(for ($i = 0; $i -lt $log.Count; $i++) { if ($log[$i].Op -eq 'StartVM') { $i } })[0]
+        $hashes[2] | Should -BeGreaterThan $startIdx
+        (& $run.Backend.GetVM @{ Name = 'sbx-dd-order' }) | Should -BeNullOrEmpty
+    }
+
+    It 'a data disk that cannot be re-hashed counts as changed (fail closed on the report)' {
+        $run = & $script:NewDataRun -Names @('corpus')
+        $calls = @(0)
+        $orig = $run.Backend.GetVhdxImageHash
+        $run.Backend.GetVhdxImageHash = { param($P) $calls[0]++; if ($calls[0] -ge 2) { throw 'simulated: file vanished' }; & $orig $P }.GetNewClosure()
+        $report = & $script:RunWith $run 'sbx-dd-gone'
+        $report.DataDiskChanged | Should -BeTrue
+        @($report.Descriptor.DataDisks)[0].PostRunImageHash | Should -BeNullOrEmpty
+    }
+
+    It 'a guest write also counts when the guest hangs and is force-stopped' {
+        $run = & $script:NewDataRun -Names @('corpus') -NeverOff -GuestWrites @('corpus')
+        $report = & $script:RunWith $run 'sbx-dd-hang'
+        $report.RunResult.Status | Should -Be 'Failed'
+        $report.DataDiskChanged | Should -BeTrue
+    }
+
+    It 'leaves DataDiskChanged $null when no data disk was attached' {
+        $run = & $script:NewDataRun -Names @()
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-dd-none' -ArtifactRoot (Join-Path $TestDrive 'art-none') -Destination (Join-Path $TestDrive 'dest-none') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $run.Backend -WarningAction SilentlyContinue
+        $report.PSObject.Properties.Name | Should -Contain 'DataDiskChanged'
+        $report.DataDiskChanged | Should -BeNullOrEmpty
     }
 
     It 'refuses data disks when there is no Entrypoint (no seed would mount them read-only)' {

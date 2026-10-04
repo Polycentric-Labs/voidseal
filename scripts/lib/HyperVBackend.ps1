@@ -1777,6 +1777,12 @@ $script:SbCopyFakeVM = {
     and RE-THROWS (fail-closed — a partial-write disk-full must abort the run, never swallow-and-
     continue with a missing OUTPUT disk). A GUEST filling the OUTPUT disk during its own run is a
     separate, live-only/run-time concern this seam does NOT model (see Workload.ps1).
+.PARAMETER SimulateGuestDiskWrite
+    Disk paths a hostile guest writes raw blocks to while it runs (at StartVM, only for a path attached
+    to that VM). Models a guest with root writing to a data disk it mounted read-only: Hyper-V cannot
+    attach a VHDX read-only (D3), so the host's post-run re-hash is what notices. The bytes are appended
+    to the image-byte stand-in the fake GetVhdxImageHash reads. A fake-only simulation switch on an
+    existing method, NOT a new backend method (no manifest change).
 .PARAMETER SimulateCreateEnospc
     Make NewOutputVhdx THROW a System.IO.IOException carrying the Win32 ERROR_DISK_FULL HResult on its
     FIRST call (the INPUT disk create in New-WorkloadDisks) — modelling a HOST-side disk-full CREATING a
@@ -1805,7 +1811,8 @@ function New-FakeHyperVBackend {
         [switch] $SimulateDetachError,
         [switch] $SimulateWriteEnospc,
         [switch] $SimulateCreateEnospc,
-        [long] $SimulateFreeSpaceBytes = 500GB
+        [long] $SimulateFreeSpaceBytes = 500GB,
+        [string[]] $SimulateGuestDiskWrite = @()
     )
 
     # Hoist shared helpers into factory-locals so the method closures capture them
@@ -1852,6 +1859,8 @@ function New-FakeHyperVBackend {
     # Captured by the NewOutputVhdx closure: model a host-side disk-full CREATE (review-fix OUTPUT/INPUT
     # create-path coverage) — distinct from $writeEnospc, which models a disk-full POPULATE.
     $createEnospc      = $SimulateCreateEnospc.IsPresent
+    # Captured by the StartVM closure: disk paths a hostile guest writes raw blocks to while it runs.
+    $guestDiskWrites   = @($SimulateGuestDiskWrite)
 
     # ---- in-memory state (captured by every method closure) --------------
     $state = @{
@@ -2030,6 +2039,18 @@ function New-FakeHyperVBackend {
                 } else {
                     $state.VHDs[$depsDisk]['DepsImageRegion'] = [byte[]]$depsImageBlob        # checkpoints OFF (the RC7 fix) -> deps in the base, host hash sees them
                 }
+            }
+        }
+        # SimulateGuestDiskWrite: model a guest with root writing raw blocks to an attached disk it was
+        # meant to mount read-only (a data disk; Hyper-V attaches every VHDX read-write, D3). Only a disk
+        # actually attached to THIS VM can be written. The bytes land in the image-byte stand-in the
+        # fake GetVhdxImageHash reads, so a host re-hash after the run sees the change, as the real
+        # whole-file hash would. Not gated on a clean power-off: a hung guest's writes still land.
+        foreach ($wp in $guestDiskWrites) {
+            if ((@($vm.HardDrives) -contains $wp) -and $state.VHDs.ContainsKey($wp)) {
+                $before = if ($state.VHDs[$wp].ContainsKey('DepsImageRegion')) { [byte[]]$state.VHDs[$wp]['DepsImageRegion'] } else { [byte[]]::new(0) }
+                if ($null -eq $before) { $before = [byte[]]::new(0) }
+                $state.VHDs[$wp]['DepsImageRegion'] = [byte[]]($before + [System.Text.Encoding]::ASCII.GetBytes('guest-write'))
             }
         }
         # SimulateSelfPowerOff: the guest booted, ran its boot workload, and powered itself off before
