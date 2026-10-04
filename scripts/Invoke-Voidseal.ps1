@@ -498,6 +498,21 @@ function Invoke-Voidseal {
                "(Invoke-BuilderVM) and must never be passed to Invoke-Voidseal directly. Fail closed.")
     }
 
+    # --- HostProxy preflight: no Disk-mode runner points its workload at the host proxy ------------------
+    # A VM that keeps its NIC (the seal NIC policy is IsolatedInternalSwitch) and whose profile says
+    # EgressMode='HostProxy' gets its egress from the seed's proxy settings and static network-config,
+    # which only the Serial-mode seed carries. New-CidataUserData refuses the combination too, but only
+    # after the system, INPUT and OUTPUT disks were created and copied. Refuse here, before anything
+    # exists; the seed-builder check stays as the backstop for a caller that reaches it another way.
+    if ($workloadMode -eq 'Disk' -and
+        [string]$resolved['EgressMode'] -eq 'HostProxy' -and
+        (Get-SealNicPolicy -Tier ([int]$resolved['Tier']) -Network ([string]$resolved['Network'])) -eq 'IsolatedInternalSwitch') {
+        throw ("Invoke-Voidseal: REFUSING a Disk-mode workload for '$Name': this VM keeps its NIC and its profile sets " +
+               "EgressMode='HostProxy', but no Disk-mode runner points its workload at the host proxy (the seed's proxy " +
+               "settings and static network-config exist only in Serial mode). Run it in Serial mode, or use a profile " +
+               "with no NIC (Network='None'). Nothing was provisioned. Fail closed.")
+    }
+
     # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT ---
     # Every outbox-transport Disk run (a processor, or a transport-only OutboxOutput profile such as
     # firefox) executes `python3 /mnt/in/run_disk_workload.py` from the INPUT disk, and that script

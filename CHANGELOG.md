@@ -188,3 +188,6 @@ places where a check is an argument rather than a measurement.
   the removal command. New backend read `GetHostFirewallRuleNames` (manifest, real, fake, parity). Not yet
   run live: the first elevated run must confirm the cmdlet accepts the store
   (`docs/phase-6-live-runbook.md` section 2).
+- A Disk-mode workload on a VM that keeps its NIC under `EgressMode='HostProxy'` is now refused by an
+  `Invoke-Voidseal` preflight, before anything is created. Previously only the seed builder refused it,
+  after the system, INPUT and OUTPUT disks had been created and copied; that check stays as a backstop.

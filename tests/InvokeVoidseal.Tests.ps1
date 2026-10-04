@@ -2504,6 +2504,47 @@ Describe 'Get-OutboxWorkloadExitCode' {
 # ===========================================================================
 #  Profile key strictness + ResultInnerName layering (hashtable -Profile path)
 # ===========================================================================
+Describe 'Invoke-Voidseal: a Disk-mode workload under HostProxy is refused before anything is provisioned' {
+
+    BeforeAll {
+        $t1 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier1.psd1')
+        $p  = @{} + $t1
+        $p['Name']         = 'hp-disk'
+        $p['WorkloadMode'] = 'Disk'
+        $p['Inputs']       = script:New-OutboxHelperInputs
+        $p['FileSystem']   = 'exFAT'
+        $p['OutboxOutput'] = $true
+        $p['Entrypoint']   = 'python3 /mnt/in/work.py --out /run/staging/result.html'
+        $script:HpDiskProfile = $p
+    }
+
+    It 'the fixture really is a networked Tier-1 HostProxy Disk profile' {
+        $script:HpDiskProfile['EgressMode'] | Should -Be 'HostProxy'
+        (Get-SealNicPolicy -Tier ([int]$script:HpDiskProfile['Tier']) -Network ([string]$script:HpDiskProfile['Network'])) | Should -Be 'IsolatedInternalSwitch'
+    }
+
+    It 'refuses up front, naming HostProxy and Disk mode, and creates no VM, switch or disk' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $made = [System.Collections.Generic.List[string]]::new()
+        foreach ($m in @('NewVHD', 'NewOutputVhdx', 'CopyVhdxFile', 'NewSwitch', 'NewVM')) {
+            $orig = $b[$m]; $name = $m
+            $b[$m] = { param([System.Collections.IDictionary] $P) $made.Add($name); & $orig $P }.GetNewClosure()
+        }
+        { Invoke-Voidseal -Tier 1 -Profile $script:HpDiskProfile -Name 'sbx-hp-disk' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage "*Disk-mode workload*EgressMode='HostProxy'*"
+        (& $b.GetVM @{ Name = 'sbx-hp-disk' }) | Should -BeNullOrEmpty
+        (& $b.GetSwitch @{ Name = 'sbx-hp-disk-int' }) | Should -BeNullOrEmpty
+        @($b.FakeCallLog | Where-Object { $_.Op -in @('StartVM', 'AddSwitchHostIPAddress', 'NewHostFirewallRule', 'WriteVhdxFile', 'WriteVhdxFileBytes') }).Count | Should -Be 0
+        $made.Count | Should -Be 0 -Because 'nothing (no VM, switch, disk or copy) was created before the refusal'
+    }
+
+    It 'a Disk-mode Tier-0 outbox profile (no NIC) is not affected' {
+        $t0 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $t0['EgressMode'] | Should -Not -Be 'InGuestSquid'
+        (Get-SealNicPolicy -Tier ([int]$t0['Tier']) -Network ([string]$t0['Network'])) | Should -Be 'NoAdapter'
+    }
+}
+
 Describe 'Invoke-Voidseal: unknown profile keys and ResultInnerName layering' {
 
     BeforeAll {
