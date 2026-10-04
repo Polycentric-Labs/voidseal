@@ -35,7 +35,8 @@
         2. for a NoAdapter VM (Tier 0, Tier >= 2, any processor; see Get-SealNicPolicy in
            Provisioner.ps1) `RemoveNetworkAdapter` (remove, not disconnect),
         3. turn OFF every host<->guest channel (clipboard / shares / guest-services /
-           enhanced-session) via the backend's SetHostChannel,
+           enhanced-session, plus the Time Synchronization, Key-Value Pair Exchange, Backup and
+           Heartbeat integration services) via the backend's SetHostChannel,
         4. mark the descriptor State='Sealed'.
       It does NOT power the VM on (the seal runs before first boot) and it does NOT itself filter
       egress: Tier-1 net-restriction relies on in-guest controls (Squid SNI proxy + allowlist) as
@@ -69,7 +70,8 @@
           descriptor's recorded disk set — at Tier-1 it is a best-effort backstop layered on the
           name-shape (Test-IsSecretPath) + descriptor import/transfer-denylist checks above; the
           STRUCTURAL no-net guarantee remains the Tier>=2 rule.
-        * all four host channels MUST be off.
+        * every host channel MUST be off: the four original ones plus the Time Synchronization,
+          Key-Value Pair Exchange, Backup and Heartbeat integration services (Shutdown stays on).
         * POSITIVE COM1-liveness (serial-managed guests only): for a Com1Serial / ComPipePath-bearing
           descriptor, COM1 MUST still be attached after sealing — the seal must never collaterally
           sever the Runner's serial command channel (the only no-NIC management path for a Linux guest).
@@ -109,7 +111,18 @@ Set-StrictMode -Version Latest
 # The host<->guest channels the seal turns OFF and the gate host-verifies. Mirrors
 # $script:HostChannelNames in HyperVBackend.ps1 and the tier-profile HostChannels keys
 # (SCHEMA.md). Re-declared here so this file is usable when dot-sourced standalone.
-$script:SealHostChannels = @('Clipboard', 'Shares', 'GuestServices', 'EnhancedSession')
+#
+# Since 2026-10-03 (design E6) the set also closes four Hyper-V integration services the engine never
+# uses: TimeSync (Time Synchronization), KeyValueExchange (Key-Value Pair Exchange), Backup (VSS) and
+# Heartbeat. Nothing in scripts/ reads heartbeat state: boot readiness is a COM1 probe and Disk-mode
+# completion is the VM's power state. Shutdown is NOT in the set, because Remove-Sandbox,
+# Wait-WorkloadComplete and Invoke-Voidseal stop VMs with StopVM -Force and no TurnOff, which asks the
+# guest to shut down through that service. Disabling Time Synchronization narrows the guest's view of host
+# time but does not remove it: the Hyper-V reference TSC page stays readable (docs/threat-model.md).
+$script:SealHostChannels = @(
+    'Clipboard', 'Shares', 'GuestServices', 'EnhancedSession',
+    'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat'
+)
 
 # --------------------------------------------------------------------------
 # Internal helpers
@@ -442,7 +455,8 @@ function Dismount-SandboxAsset {
       2. detach every transfer VHD recorded on the descriptor (scripted — NOT inherently one-way),
       3. for a NoAdapter VM (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): RemoveNetworkAdapter
          (remove, not disconnect; real New-VM always creates one adapter, so there is always one to remove),
-      4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session),
+      4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session /
+         time sync / key-value exchange / backup / heartbeat),
       5. set the descriptor State = 'Sealed'.
     It does NOT power the VM on, and does NOT itself filter egress: Tier-1 net-restriction today
     relies on in-guest controls (Squid SNI proxy + allowlist) as defense-in-depth, not this
@@ -583,7 +597,8 @@ function Lock-Sandbox {
         rule above does not run), but is only as complete as the descriptor's recorded disk set — so
         at Tier-1 it layers on the name-shape + import/transfer-denylist checks rather than replacing
         the structural rule. A RECORDED data disk is expected; an UNRECORDED attached disk is refused.
-      * every host channel (clipboard / shares / guest-services / enhanced-session) MUST be off.
+      * every host channel (clipboard / shares / guest-services / enhanced-session / time sync /
+        key-value exchange / backup / heartbeat) MUST be off; a channel the host cannot report refuses.
       * POSITIVE COM1-liveness (serial-managed guests only): COM1 MUST still be attached after sealing
         so the seal cannot have severed the Runner's serial command channel. Read from host truth via
         the backend's GetComPort. Skipped for a non-serial tier (no ComPipePath, not Com1Serial).
@@ -935,9 +950,9 @@ function Assert-Sealed {
                    "'$channel' state from the host. Fail closed.")
         }
         if ($on) {
-            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED — host channel '$channel' is still ON. " +
-                   "All host<->guest channels (clipboard / shares / guest-services / enhanced-session) MUST be " +
-                   "off in a sealed sandbox. Fail closed.")
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because host channel '$channel' is still ON. " +
+                   "All host<->guest channels (clipboard / shares / guest-services / enhanced-session / " +
+                   "time sync / key-value exchange / backup / heartbeat) MUST be off in a sealed sandbox. Fail closed.")
         }
     }
 

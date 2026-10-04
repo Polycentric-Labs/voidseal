@@ -1386,3 +1386,75 @@ Describe 'Assert-Sealed: refuses any passthrough device (GPU partition adapter o
             Should -Throw -ExpectedMessage '*could not report*'
     }
 }
+
+# ===========================================================================
+#  Seal coverage (design E6): integration services
+# ===========================================================================
+#  Time Synchronization, Key-Value Pair Exchange, Backup (VSS) and Heartbeat are live VMBus channels the
+#  engine never uses. Lock-Sandbox turns them off and Assert-Sealed host-verifies they read off, failing
+#  closed when one cannot be read. Shutdown is left on: the engine's StopVM calls (no TurnOff) ask the
+#  guest to shut down through it. A service "left on" is modeled with -SimulateChannelStuckOn, a disable
+#  that silently does not take, so the gate is shown to read host truth rather than trust the seal.
+Describe 'Seal coverage: the four integration services are disabled by the seal and host-verified off' {
+
+    BeforeAll {
+        $script:IsChannels = @('TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat')
+        # Provision (on the given backend) and seal at Tier 0, 1 or 2; returns @{ Backend; Desc }.
+        $script:NewSealedOn = {
+            param([hashtable] $Backend, [int] $Tier, [string] $Name)
+            $p = $script:Tier1
+            if ($Tier -eq 0) {
+                $p = $script:Tier1.Clone()
+                $p['Tier']        = 0
+                $p['Description'] = 'TEST FIXTURE: Tier 0 for the seal-coverage gate.'
+            }
+            elseif ($Tier -eq 2) { $p = $script:Tier2 }
+            $d = New-SandboxVM -Profile $p -Name $Name -Backend $Backend
+            Lock-Sandbox -Descriptor $d -Backend $Backend
+            return @{ Backend = $Backend; Desc = $d }
+        }
+    }
+
+    It 'the Sealer seals exactly the backend''s channel set, which includes the four services and not Shutdown' {
+        ($script:SealHostChannels -join ',') | Should -Be ($script:HostChannelNames -join ',')
+        foreach ($c in $script:IsChannels) { $script:SealHostChannels | Should -Contain $c }
+        $script:SealHostChannels | Should -Not -Contain 'Shutdown'
+    }
+
+    It 'Lock-Sandbox turns each of the four services OFF at Tiers 0, 1 and 2, and the gate certifies' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedOn -Backend (New-FakeHyperVBackend) -Tier $t -Name "sbx-is-clean$t"
+            $ch = & $sb.Backend.GetHostChannels @{ VMName = "sbx-is-clean$t" }
+            foreach ($c in $script:IsChannels) { $ch[$c] | Should -BeFalse -Because "Lock-Sandbox must disable $c at Tier $t" }
+            Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+        }
+    }
+
+    It 'REFUSES a VM whose <Channel> service is still ON after the seal (named refusal)' -ForEach @(
+        @{ Channel = 'TimeSync' }, @{ Channel = 'KeyValueExchange' }, @{ Channel = 'Backup' }, @{ Channel = 'Heartbeat' }
+    ) {
+        $sb = & $script:NewSealedOn -Backend (New-FakeHyperVBackend -SimulateChannelStuckOn $Channel) -Tier 1 -Name "sbx-is-on-$Channel"
+        (& $sb.Backend.GetHostChannels @{ VMName = "sbx-is-on-$Channel" })[$Channel] |
+            Should -BeTrue -Because 'precondition: the stuck service survived the seal'
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*host channel '$Channel' is still ON*" -Because "a live $Channel service must be refused by name"
+    }
+
+    It 'REFUSES (fail closed) when the host reports no state for <Channel>' -ForEach @(
+        @{ Channel = 'TimeSync' }, @{ Channel = 'KeyValueExchange' }, @{ Channel = 'Backup' }, @{ Channel = 'Heartbeat' }
+    ) {
+        $sb = & $script:NewSealedOn -Backend (New-FakeHyperVBackend) -Tier 1 -Name "sbx-is-unread-$Channel"
+        $real = $sb.Backend.GetHostChannels
+        $drop = $Channel
+        $sb.Backend.GetHostChannels = { param($P) $h = & $real $P; $h.Remove($drop); return $h }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*could not read host-channel '$Channel' state*"
+    }
+
+    It 'REFUSES (fail closed) when the host-channel read throws, at Tier 0' {
+        $sb = & $script:NewSealedOn -Backend (New-FakeHyperVBackend) -Tier 0 -Name 'sbx-is-throw'
+        $sb.Backend.GetHostChannels = { param($P) throw 'INJECTED: integration-service enumeration failed' }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*INJECTED: integration-service enumeration failed*'
+    }
+}
