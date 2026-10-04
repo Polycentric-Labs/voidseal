@@ -533,6 +533,10 @@ function Invoke-Voidseal {
                    "'$workloadMode' mode. Data disks are mounted only by the Disk-mode runners; a Serial-mode guest " +
                    "would get a writable disk nothing mounts read-only. Fail closed.")
         }
+        if ([string]::IsNullOrWhiteSpace($entrypoint)) {
+            throw ("Invoke-Voidseal: REFUSING '$Name': it declares data disks but has no Entrypoint, so no seed is " +
+                   "built and nothing in the guest would mount them read-only. Fail closed.")
+        }
         $preDepsPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
         if ([string]::IsNullOrWhiteSpace($preDepsPath) -and $resolved.ContainsKey('DepsDiskPath')) { $preDepsPath = [string]$resolved['DepsDiskPath'] }
         $storageBase = Split-Path -Parent (Get-SandboxStorageRoot -Name $Name)
@@ -709,6 +713,37 @@ function Invoke-Voidseal {
                 Set-DescriptorField -Descriptor $descriptor -Name 'DepsDiskPath'  -Value $depsDiskPath
                 Set-DescriptorField -Descriptor $descriptor -Name 'DepsImageHash' -Value $actualHash
                 $report.Descriptor = $descriptor
+            }
+
+            # --- DATA DISKS: verify ALL, then attach + RECORD each, BEFORE the seal -----------------
+            # Every declared data disk passes the same Assert-DiskImageVerified the DEPS disk uses
+            # (readable, not differencing, operator-recorded hash present and equal) BEFORE the first
+            # one is attached, so a refusal leaves no data disk attached. Each verified disk is then
+            # attached and recorded on the descriptor's DataDisks list (Name, Path, verified hash) right
+            # away, which is what lets Assert-Sealed accept it. Like the DEPS disk, a data disk is the
+            # operator's file: it is NEVER added to CreatedDisks, so teardown never deletes it. The host
+            # attach is read-write (Hyper-V has no read-only attach, D3); the guest mounts it read-only
+            # and the post-run re-hash (in the finally below) reports any change.
+            if ($dataDisks.Count -gt 0) {
+                $verifiedData = [System.Collections.Generic.List[object]]::new()
+                foreach ($dd in $dataDisks) {
+                    $ddName = [string]$dd['Name']
+                    $ddPath = [string]$dd['Path']
+                    $ddHash = Assert-DiskImageVerified -VMName $Name -Path $ddPath -ExpectedHash ([string]$dd['ImageHash']) `
+                        -DiskLabel "data disk '$ddName'" -DiskKind 'data disk' -HashOrigin 'operator-recorded' -Backend $Backend `
+                        -MissingHashMessage ("Invoke-Voidseal: '$Name' data disk '$ddName' ('$ddPath') has no ImageHash: refusing " +
+                            "to attach an UNVERIFIED data disk. Failing closed.")
+                    $verifiedData.Add([pscustomobject]@{
+                        Name = $ddName; Path = $ddPath; Label = (Get-DataDiskLabel -Name $ddName); ImageHash = $ddHash
+                    })
+                }
+                $recorded = [System.Collections.Generic.List[object]]::new()
+                foreach ($v in $verifiedData) {
+                    $null = & $Backend.AddHardDiskDrive @{ VMName = $Name; Path = $v.Path }
+                    $recorded.Add($v)
+                    Set-DescriptorField -Descriptor $descriptor -Name 'DataDisks' -Value $recorded.ToArray()
+                    $report.Descriptor = $descriptor
+                }
             }
         }
         $states.Add('STAGED')

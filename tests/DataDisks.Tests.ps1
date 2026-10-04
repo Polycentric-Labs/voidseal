@@ -347,3 +347,160 @@ Describe 'Invoke-Voidseal data-disk preflight (refused before anything is provis
         @($r3 | ForEach-Object { $_.Name }) | Should -Be @('one')
     }
 }
+
+Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
+
+    BeforeAll {
+        # A transport-only outbox carrying result.html, so a run can reach Success end to end.
+        $stage = Join-Path $TestDrive 'dd-staging'
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $stage 'result.html'), [System.Text.Encoding]::UTF8.GetBytes('<p>summary</p>'))
+        $verdicts = Join-Path $TestDrive 'dd-verdicts.json'
+        '[]' | Set-Content -LiteralPath $verdicts -Encoding utf8 -NoNewline
+        $blobFile = Join-Path $TestDrive 'dd-outbox.bin'
+        Push-Location $script:SkillRoot
+        try { & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$stage', r'$verdicts', r'$blobFile')" }
+        finally { Pop-Location }
+        $LASTEXITCODE | Should -Be 0
+        $script:DdBlob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        # A fake backend with N pre-built data disks registered, plus an attach recorder.
+        $script:NewDataRun = {
+            param([string[]] $Names, [switch] $NoBlob, [switch] $NeverOff)
+            $fakeArgs = @{ SimulateSelfPowerOff = $true }
+            if ($NeverOff) { $fakeArgs = @{ SimulateNeverOff = $true } }
+            elseif (-not $NoBlob) { $fakeArgs.SimulateOutboxBlob = $script:DdBlob }
+            $b = New-FakeHyperVBackend @fakeArgs
+            $attached = [System.Collections.Generic.List[string]]::new()
+            $orig = $b.AddHardDiskDrive
+            $b.AddHardDiskDrive = { param($P) $attached.Add([string]$P.Path); & $orig $P }.GetNewClosure()
+            $decl = foreach ($n in @($Names)) {
+                $p = Join-Path $script:DataRoot "$n.vhdx"
+                & $b.NewVHD @{ Path = $p; SizeBytes = 1GB; Dynamic = $true }
+                @{ Name = $n; Path = $p; ImageHash = [string](& $b.GetVhdxImageHash @{ Path = $p }) }
+            }
+            return @{ Backend = $b; Attached = $attached; Decl = @($decl) }
+        }
+        $script:RunWith = {
+            param($Run, [string] $VmName, $Decl)
+            if ($null -eq $Decl) { $Decl = $Run.Decl }
+            Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = $Decl } `
+                -Name $VmName -ArtifactRoot (Join-Path $TestDrive "art-$VmName") -Destination (Join-Path $TestDrive "dest-$VmName") `
+                -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $Run.Backend -WarningAction SilentlyContinue
+        }
+    }
+
+    It 'verifies, attaches and records each data disk; the seal certifies; the run succeeds' {
+        $run = & $script:NewDataRun -Names @('corpus', 'wheels')
+        $report = & $script:RunWith $run 'sbx-dd-ok'
+        $report.Error | Should -BeNullOrEmpty
+        @($report.States) | Should -Contain 'SEALED'
+        $report.SealVerdict | Should -BeTrue
+        $report.RunResult.Status | Should -Be 'Success'
+        $rec = @($report.Descriptor.DataDisks)
+        $rec.Count | Should -Be 2
+        $rec[0].Name | Should -Be 'corpus'
+        $rec[0].Label | Should -BeExactly 'VSDCORPUS'
+        $rec[0].ImageHash | Should -Be $run.Decl[0].ImageHash
+        $rec[1].Path | Should -Be $run.Decl[1].Path
+        foreach ($d in $run.Decl) { $run.Attached | Should -Contain $d.Path }
+    }
+
+    It 'never adds a data disk to CreatedDisks, so teardown leaves the file in place' {
+        $run = & $script:NewDataRun -Names @('corpus')
+        $report = & $script:RunWith $run 'sbx-dd-gc'
+        @($report.Descriptor.CreatedDisks) | Should -Not -Contain $run.Decl[0].Path
+        (& $run.Backend.GetVHDInfo @{ Path = $run.Decl[0].Path }) | Should -Not -BeNullOrEmpty -Because 'the operator data disk survives teardown'
+        (& $run.Backend.GetVM @{ Name = 'sbx-dd-gc' }) | Should -BeNullOrEmpty -Because 'the VM itself is gone'
+    }
+
+    It 'a hash mismatch on ANY disk attaches NO data disk and never seals' {
+        $run = & $script:NewDataRun -Names @('corpus', 'wheels')
+        $second = @{} + $run.Decl[1]
+        $second.ImageHash = 'f' * 64
+        $report = & $script:RunWith $run 'sbx-dd-mismatch' @($run.Decl[0], $second)
+        $report.Error | Should -Match "data disk 'wheels' integrity check FAILED"
+        @($report.States) | Should -Not -Contain 'SEALED'
+        foreach ($d in $run.Decl) { $run.Attached | Should -Not -Contain $d.Path -Because 'all disks are verified before the first attach' }
+        @($run.Backend.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0
+    }
+
+    It 'refuses a data disk the host cannot read, before any attach' {
+        $run = & $script:NewDataRun -Names @('corpus')
+        $decl = @($run.Decl[0], @{ Name = 'ghost'; Path = (Join-Path $script:DataRoot 'ghost.vhdx'); ImageHash = ('a' * 64) })
+        $report = & $script:RunWith $run 'sbx-dd-ghost' $decl
+        $report.Error | Should -Match 'unreadable via GetVHDInfo'
+        $run.Attached | Should -Not -Contain $run.Decl[0].Path
+    }
+
+    It 'refuses a differencing data disk' {
+        $run = & $script:NewDataRun -Names @()
+        $p = Join-Path $script:DataRoot 'diff.vhdx'
+        & $run.Backend.NewVHD @{ Path = $p; Differencing = $true; ParentPath = 'C:\elsewhere\base.vhdx' }
+        $report = & $script:RunWith $run 'sbx-dd-diff' @(@{ Name = 'diff'; Path = $p; ImageHash = ('a' * 64) })
+        $report.Error | Should -Match 'DIFFERENCING'
+        @($report.States) | Should -Not -Contain 'SEALED'
+    }
+
+    It 'refuses data disks when there is no Entrypoint (no seed would mount them read-only)' {
+        $run = & $script:NewDataRun -Names @('corpus')
+        $noEp = @{} + $script:Fx
+        $noEp.Remove('Entrypoint')
+        { Invoke-Voidseal -Tier 0 -Profile $noEp -Workload @{ WorkloadMode = 'Disk'; DataDisks = $run.Decl } `
+            -Name 'sbx-dd-noep' -Backend $run.Backend } | Should -Throw -ExpectedMessage '*no Entrypoint*'
+    }
+}
+
+Describe 'Assert-Sealed and recorded data disks' {
+
+    BeforeAll {
+        $script:SealedWithDisk = {
+            param([string] $Name, [int] $Tier = 0)
+            $t = @{} + $script:Fx
+            $t['Tier'] = $Tier
+            if ($Tier -ge 2) {
+                $t['Network'] = 'Private-NoNIC'; $t['EgressMode'] = 'None'; $t['EgressAllowlist'] = @()
+                $t['Extraction'] = 'ColdVHDX-Quarantine-CDR'
+            }
+            $b = New-FakeHyperVBackend
+            $d = New-SandboxVM -Profile $t -Name $Name -Backend $b
+            Lock-Sandbox -Descriptor $d -Backend $b
+            $p = Join-Path $script:DataRoot "$Name-corpus.vhdx"
+            & $b.NewVHD @{ Path = $p; SizeBytes = 64MB; Dynamic = $true }
+            & $b.AddHardDiskDrive @{ VMName = $Name; Path = $p }
+            return @{ Backend = $b; Desc = $d; Path = $p }
+        }
+    }
+
+    It 'an attached but UNRECORDED data disk is refused as a residual' {
+        $s = & $script:SealedWithDisk 'sbx-seal-unrec'
+        { Assert-Sealed -Descriptor $s.Desc -Backend $s.Backend } | Should -Throw -ExpectedMessage '*unexpected*'
+    }
+
+    It 'a RECORDED data disk is accepted (any tier, including the Tier>=2 structural rule)' {
+        foreach ($tier in 0, 2) {
+            $s = & $script:SealedWithDisk "sbx-seal-rec$tier" $tier
+            Set-DescriptorField -Descriptor $s.Desc -Name 'DataDisks' -Value @([pscustomobject]@{ Name = 'corpus'; Path = $s.Path; ImageHash = ('a' * 64) })
+            Assert-Sealed -Descriptor $s.Desc -Backend $s.Backend | Should -BeTrue
+        }
+    }
+
+    It 'recording one data disk does not admit a second, unrecorded one' {
+        $s = & $script:SealedWithDisk 'sbx-seal-two'
+        Set-DescriptorField -Descriptor $s.Desc -Name 'DataDisks' -Value @(@{ Name = 'corpus'; Path = $s.Path; ImageHash = ('a' * 64) })
+        $rogue = Join-Path $script:DataRoot 'rogue.vhdx'
+        & $s.Backend.NewVHD @{ Path = $rogue; SizeBytes = 64MB; Dynamic = $true }
+        & $s.Backend.AddHardDiskDrive @{ VMName = 'sbx-seal-two'; Path = $rogue }
+        { Assert-Sealed -Descriptor $s.Desc -Backend $s.Backend } | Should -Throw -ExpectedMessage '*unexpected*'
+    }
+
+    It 'a secret-shaped path is refused even when recorded as a data disk' {
+        $s = & $script:SealedWithDisk 'sbx-seal-secret'
+        $secret = Join-Path $script:DataRoot 'id_rsa.vhdx'
+        & $s.Backend.NewVHD @{ Path = $secret; SizeBytes = 64MB; Dynamic = $true }
+        & $s.Backend.AddHardDiskDrive @{ VMName = 'sbx-seal-secret'; Path = $secret }
+        Set-DescriptorField -Descriptor $s.Desc -Name 'DataDisks' -Value @(
+            @{ Name = 'corpus'; Path = $s.Path; ImageHash = ('a' * 64) }, @{ Name = 'key'; Path = $secret; ImageHash = ('a' * 64) })
+        { Assert-Sealed -Descriptor $s.Desc -Backend $s.Backend } | Should -Throw -ExpectedMessage '*secret*'
+    }
+}
