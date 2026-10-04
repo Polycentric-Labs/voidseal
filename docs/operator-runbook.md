@@ -221,6 +221,8 @@ $report = Invoke-Voidseal -Tier 0 -Profile firefox `
 
 $report.States              # INIT..DESTROYED on success
 $report.RunResult.Status    # Success when the sentinel parses 0 AND result.html is present
+                            # (an OutboxOutput profile: Success on entrypoint exit code 0, WorkloadFailed
+                            # with RunResult.ExitCode set when it exits non-zero)
 $report.ExtractedArtifact   # the emitted Netscape-HTML file (result.html), copied to the host
 ```
 

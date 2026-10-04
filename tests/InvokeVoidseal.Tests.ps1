@@ -373,7 +373,7 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         $diskVerdicts = Join-Path $script:TmpRoot ("disk-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
         '[]' | Set-Content -LiteralPath $diskVerdicts -Encoding utf8 -NoNewline
         $diskBlobFile = Join-Path $script:TmpRoot ("disk-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$diskStaging', r'$diskVerdicts', r'$diskBlobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$diskStaging', r'$diskVerdicts', r'$diskBlobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $script:DiskBlob = [System.IO.File]::ReadAllBytes($diskBlobFile)
 
@@ -571,7 +571,7 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         $noCandidateVerdicts = Join-Path $script:TmpRoot ("disk-nocandidate-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
         '[]' | Set-Content -LiteralPath $noCandidateVerdicts -Encoding utf8 -NoNewline
         $noCandidateBlobFile = Join-Path $script:TmpRoot ("disk-nocandidate-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$noCandidateStaging', r'$noCandidateVerdicts', r'$noCandidateBlobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$noCandidateStaging', r'$noCandidateVerdicts', r'$noCandidateBlobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'a verdicts-only outbox (no candidate files) must still pack cleanly — the container format allows it'
         $noCandidateBlob = [System.IO.File]::ReadAllBytes($noCandidateBlobFile)
 
@@ -624,7 +624,7 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
         $seedVerdicts = Join-Path $script:TmpRoot ("seed-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
         '[]' | Set-Content -LiteralPath $seedVerdicts -Encoding utf8 -NoNewline
         $seedBlobFile = Join-Path $script:TmpRoot ("seed-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$seedStaging', r'$seedVerdicts', r'$seedBlobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$seedStaging', r'$seedVerdicts', r'$seedBlobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $script:SeedBlob = [System.IO.File]::ReadAllBytes($seedBlobFile)
 
@@ -972,7 +972,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
     It 'releases the SAFE candidates end-to-end: detached OUTPUT outbox -> ReadVhdxRawRegion -> read_outbox.py -> gate' {
         # Build a REAL outbox blob from the SAME staging + verdicts the old test injected, via guest/outbox.py.
         $blobFile = Join-Path $script:TmpRoot ("outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $blob = [System.IO.File]::ReadAllBytes($blobFile)
 
@@ -1005,9 +1005,45 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         foreach ($n in @($report.Released | ForEach-Object { $_.name })) { $n | Should -Match '^[0-9a-f]{64}$' }
     }
 
+    It 'a processor whose entrypoint exited non-zero still runs the gate unchanged but reports WorkloadFailed with the code' {
+        $blobFile = Join-Path $script:TmpRoot ("outbox-wf-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=4)"
+        $LASTEXITCODE | Should -Be 0
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([System.IO.File]::ReadAllBytes($blobFile))
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-wf' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -WarningAction SilentlyContinue
+
+        $report.RunResult.Status   | Should -Be 'WorkloadFailed'
+        $report.RunResult.ExitCode | Should -Be 4
+        $report.Descriptor.GateRan | Should -BeTrue -Because 'the screener-governed release is decided exactly as before'
+        $gateReport = Get-Content $report.SensitivityReport -Raw | ConvertFrom-Json
+        @($gateReport.released_audit | ForEach-Object { $_.original_name }) | Should -Not -Contain 'creds.txt'
+        @($report.Held | ForEach-Object { $_.name }) | Should -Contain 'creds.txt'
+        $report.Error | Should -BeNullOrEmpty
+    }
+
+    It 'a processor outbox with exit code 0 reports Success and ExitCode 0' {
+        $blobFile = Join-Path $script:TmpRoot ("outbox-ok0-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=0)"
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([System.IO.File]::ReadAllBytes($blobFile))
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-ok0' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -WarningAction SilentlyContinue
+        $report.RunResult.Status   | Should -Be 'Success'
+        $report.RunResult.ExitCode | Should -Be 0
+    }
+
     It 'DENY-on-tamper: a corrupted OUTPUT outbox -> read_outbox.py exits non-zero -> gate releases NOTHING' {
         $blobFile = Join-Path $script:TmpRoot ("outbox-bad-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=0)"
         $bad = [System.IO.File]::ReadAllBytes($blobFile)
         $bad[$bad.Length - 1] = $bad[$bad.Length - 1] -bxor 0xFF   # flip a payload byte -> SHA mismatch
 
@@ -1083,7 +1119,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         ) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $allHeld -Encoding utf8
 
         $blobFile = Join-Path $script:TmpRoot ("outbox-allheld-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$allHeld', r'$blobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$allHeld', r'$blobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $blob = [System.IO.File]::ReadAllBytes($blobFile)
 
@@ -1350,7 +1386,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         Test-Path -LiteralPath $ledger | Should -BeFalse -Because 'the ledger must not pre-exist — its creation proves the orchestrator wired the call through'
 
         $blobFile = Join-Path $script:TmpRoot ("outbox-ratecap-wired-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $blob = [System.IO.File]::ReadAllBytes($blobFile)
 
@@ -1396,7 +1432,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $seedDoc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ledger -Encoding utf8
 
         $blobFile = Join-Path $script:TmpRoot ("outbox-ratecap-overcap-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $blob = [System.IO.File]::ReadAllBytes($blobFile)
 
@@ -1426,7 +1462,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         # A processor has a Raw OUTPUT disk (no FS to mount; host-mounting untrusted guest data is P0 risk).
         # The gate runs via ReadVhdxRawRegion (user-space); ReadVhdxFile must NEVER touch the OUTPUT path.
         $blobFile = Join-Path $script:TmpRoot ("outbox-nohostmount-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $blob = [System.IO.File]::ReadAllBytes($blobFile)
 
@@ -1473,7 +1509,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
     # -----------------------------------------------------------------------
     It '(c / M1) processor DETACH FAILURE: a VALID outbox proves the gate WOULD have released, but the failed detach skips the gate entirely (Failed run, no lifecycle abort, clean teardown)' {
         $blobFile = Join-Path $script:TmpRoot ("outbox-detachfail-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $blob = [System.IO.File]::ReadAllBytes($blobFile)
 
@@ -1594,6 +1630,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
                 '^/run/staging$'        { $argv.Add($script:GateStaging); break }
                 '^/run/verdicts\.json$' { $argv.Add($verdicts); break }
                 '^\$OUTPUT_DEV$'        { $argv.Add($blobFile); break }
+                '^\$erc$'               { $argv.Add('0'); break }     # the runner's entrypoint exit code
                 default                 { $argv.Add($t) }
             }
         }
@@ -1683,7 +1720,7 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
         '[]' | Set-Content -LiteralPath $script:FxVerdicts -Encoding utf8 -NoNewline
 
         $script:FxBlobFile = Join-Path $script:TmpRoot ("fx-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
-        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:FxStaging', r'$script:FxVerdicts', r'$script:FxBlobFile')"
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:FxStaging', r'$script:FxVerdicts', r'$script:FxBlobFile', workload_rc=0)"
         $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
         $script:FxBlob = [System.IO.File]::ReadAllBytes($script:FxBlobFile)
     }
@@ -1777,6 +1814,92 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
         $report.Error             | Should -BeNullOrEmpty
         $report.ExtractedArtifact | Should -Not -BeNullOrEmpty -Because 'exactly the two helpers pass the transport-only preflight, with no screener.py'
+    }
+
+    # The entrypoint's exit code reaches the host through the outbox (workload.json). The fixtures below are
+    # built by the REAL guest producer path (write_outbox_from_dir), differing only in the code it records.
+    Context 'the entrypoint exit code (workload.json in the outbox)' {
+        BeforeAll {
+            function script:New-FxOutbox {
+                param([Nullable[int]] $Rc, [hashtable] $Files = @{ 'result.html' = '<html>staged</html>' })
+                $id = [guid]::NewGuid().ToString('N')
+                $stage = Join-Path $script:TmpRoot "fxrc-stage-$id"
+                New-Item -ItemType Directory -Path $stage -Force | Out-Null
+                foreach ($n in $Files.Keys) { [System.IO.File]::WriteAllText((Join-Path $stage $n), [string]$Files[$n]) }
+                $v = Join-Path $script:TmpRoot "fxrc-verdicts-$id.json"
+                '[]' | Set-Content -LiteralPath $v -Encoding utf8 -NoNewline
+                $bin = Join-Path $script:TmpRoot "fxrc-outbox-$id.bin"
+                $rcArg = if ($null -eq $Rc) { '' } else { ", workload_rc=$Rc" }
+                & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$stage', r'$v', r'$bin'$rcArg)"
+                $LASTEXITCODE | Should -Be 0
+                return , [System.IO.File]::ReadAllBytes($bin)
+            }
+            function script:Invoke-FxRun {
+                param([byte[]] $Blob, [string] $Name)
+                $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $Blob
+                $dest = Join-Path $script:TmpRoot ("dest-fxrc-{0}" -f ([guid]::NewGuid().ToString('N')))
+                $r = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk' } `
+                        -Name $Name -ArtifactRoot (Join-Path $script:TmpRoot "art-$Name") -Destination $dest `
+                        -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+                return @{ Report = $r; Dest = $dest; Backend = $b }
+            }
+        }
+
+        It 'reports ExitCode 0 on success when the producer recorded it' {
+            $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc 0) -Name 'sbx-fxrc-ok'
+            $run.Report.RunResult.Status   | Should -Be 'Success'
+            $run.Report.RunResult.ExitCode | Should -Be 0
+            [System.IO.File]::ReadAllText(@($run.Report.ExtractedArtifact)[0]) | Should -Be '<html>staged</html>'
+        }
+
+        It 'a non-zero entrypoint exit code is a distinct WorkloadFailed result carrying the code, and releases nothing' {
+            $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc 3) -Name 'sbx-fxrc-fail'
+            $r = $run.Report
+            $r.RunResult.Status       | Should -Be 'WorkloadFailed'
+            $r.RunResult.ExitCode     | Should -Be 3
+            $r.RunResult.ArtifactPath | Should -BeNullOrEmpty
+            $r.RunResult.Reason       | Should -Match 'code 3'
+            $r.ExtractedArtifact      | Should -BeNullOrEmpty -Because 'a failed workload is not a deliverable'
+            Test-Path -LiteralPath (Join-Path $run.Dest 'result.html') | Should -BeFalse -Because 'nothing is copied to the destination'
+            @($r.States) | Should -Not -Contain 'EXTRACTED'
+            $r.Error | Should -BeNullOrEmpty -Because 'a failed workload is not a lifecycle failure; teardown still completes'
+            @($r.States) | Should -Contain 'DESTROYED'
+            $r.TeardownStatus | Should -Match '^OK'
+            $outputPath = [string]$r.Descriptor.OutputDiskPath
+            @($run.Backend.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.Path -eq $outputPath }).Count | Should -Be 0
+        }
+
+        It 'a failed workload that staged nothing reports its exit code, not a missing result.html candidate' {
+            $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc 1 -Files @{}) -Name 'sbx-fxrc-empty'
+            $run.Report.RunResult.Status   | Should -Be 'WorkloadFailed'
+            $run.Report.RunResult.ExitCode | Should -Be 1
+            $run.Report.RunResult.Reason   | Should -Not -Match 'candidate'
+            $run.Report.Error              | Should -BeNullOrEmpty
+        }
+
+        It 'never echoes staged content in the failure message or the report' {
+            $secret = 'SECRET-STAGED-CONTENT-98765'
+            $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc 2 -Files @{ 'result.html' = $secret }) -Name 'sbx-fxrc-secret'
+            ($run.Report.RunResult | ConvertTo-Json -Depth 4) | Should -Not -Match $secret
+            [string]$run.Report.Error | Should -Not -Match $secret
+        }
+
+        It 'an outbox with no recorded exit code keeps the old success behavior and reports ExitCode as null' {
+            $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc $null) -Name 'sbx-fxrc-none'
+            $run.Report.RunResult.Status | Should -Be 'Success'
+            $run.Report.RunResult.ExitCode | Should -BeNullOrEmpty
+            $run.Report.ExtractedArtifact | Should -Not -BeNullOrEmpty
+        }
+
+        It 'a malformed workload.json entry fails the outbox read closed and releases nothing' {
+            $bin = Join-Path $script:TmpRoot ("fxrc-bad-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+            & python -c "import sys; sys.path.insert(0, 'guest'); import outbox, pathlib, json; pathlib.Path(r'$bin').write_bytes(outbox.pack_outbox([('verdicts.json', b'[]'), ('workload.json', json.dumps({'exit_code': 999}).encode()), ('result.html', b'x')]))"
+            $LASTEXITCODE | Should -Be 0
+            $run = script:Invoke-FxRun -Blob ([System.IO.File]::ReadAllBytes($bin)) -Name 'sbx-fxrc-bad'
+            $run.Report.RunResult.Status | Should -Be 'Failed'
+            $run.Report.ExtractedArtifact | Should -BeNullOrEmpty
+            $run.Report.Error | Should -Match 'read_outbox'
+        }
     }
 
     It 'DENY-on-no-outbox: a clean power-off with NO outbox written -> header-magic probe fails closed, no artifact' {
@@ -2315,5 +2438,121 @@ Describe 'Invoke-Voidseal - the workload deadline comes from -WorkloadTimeoutSec
                 -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-bad') -Backend (New-FakeHyperVBackend) } |
                 Should -Throw -ExpectedMessage '*WorkloadTimeoutSeconds*'
         }
+    }
+}
+
+# ===========================================================================
+#  Get-OutboxWorkloadExitCode: the host side of workload.json
+# ===========================================================================
+Describe 'Get-OutboxWorkloadExitCode' {
+
+    It 'returns null when read_outbox.py wrote no workload.json (no exit code was recorded)' {
+        $dir = Join-Path $TestDrive ("gi-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Get-OutboxWorkloadExitCode -GateInput $dir | Should -BeNullOrEmpty
+    }
+
+    It 'returns the recorded code, including 0 and 255' {
+        foreach ($code in @(0, 1, 127, 255)) {
+            $dir = Join-Path $TestDrive ("gi-{0}" -f ([guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $dir 'workload.json') -Value ('{"exit_code":' + $code + '}') -Encoding utf8
+            $got = Get-OutboxWorkloadExitCode -GateInput $dir
+            $got | Should -Be $code
+            $got | Should -BeOfType ([int])
+        }
+    }
+
+    It 'throws on any other shape, without echoing the file content' {
+        $bad = @('not json', '[]', '{}', '{"exit_code":256}', '{"exit_code":-1}', '{"exit_code":"3"}', '{"exit_code":true}',
+                 '{"exit_code":3,"x":1}', '{"Exit_Code":3}', '{"exit_code":"SECRET-TOKEN-123"}')
+        foreach ($text in $bad) {
+            $dir = Join-Path $TestDrive ("gi-{0}" -f ([guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $dir 'workload.json') -Value $text -Encoding utf8
+            $err = { Get-OutboxWorkloadExitCode -GateInput $dir } | Should -Throw -PassThru
+            $err.Exception.Message | Should -Match 'workload.json is malformed'
+            $err.Exception.Message | Should -Not -Match 'SECRET-TOKEN'
+        }
+    }
+}
+
+# ===========================================================================
+#  Profile key strictness + ResultInnerName layering (hashtable -Profile path)
+# ===========================================================================
+Describe 'Invoke-Voidseal: unknown profile keys and ResultInnerName layering' {
+
+    BeforeAll {
+        $fx = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $fx = @{} + $fx
+        $fx['Name']         = 'rin-test'
+        $fx['WorkloadMode'] = 'Disk'
+        $fx['Inputs']       = script:New-OutboxHelperInputs
+        $fx['FileSystem']   = 'exFAT'
+        $fx['OutboxOutput'] = $true
+        $fx['Entrypoint']   = 'python3 /mnt/in/work.py --out /run/staging/report.html'
+        $script:RinProfile  = $fx
+
+        # An outbox whose sole candidate is report.html (not the default result.html).
+        $staging = Join-Path $script:TmpRoot ("rin-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        $script:RinBytes = [System.Text.Encoding]::UTF8.GetBytes('<html>report</html>')
+        [System.IO.File]::WriteAllBytes((Join-Path $staging 'report.html'), $script:RinBytes)
+        $verdicts = Join-Path $script:TmpRoot ("rin-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        '[]' | Set-Content -LiteralPath $verdicts -Encoding utf8 -NoNewline
+        $blobFile = Join-Path $script:TmpRoot ("rin-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$staging', r'$verdicts', r'$blobFile', workload_rc=0)"
+        $LASTEXITCODE | Should -Be 0
+        $script:RinBlob = [System.IO.File]::ReadAllBytes($blobFile)
+    }
+
+    It 'refuses a hashtable -Profile that carries an unknown key, naming it, before anything is provisioned' {
+        $bad = @{} + $script:RinProfile
+        $bad['ResultInnerNam'] = 'report.html'
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        { Invoke-Voidseal -Tier 0 -Profile $bad -Name 'sbx-rin-unknown' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage "*unknown key 'ResultInnerNam'*"
+        (& $b.GetVM @{ Name = 'sbx-rin-unknown' }) | Should -BeNullOrEmpty
+    }
+
+    It 'refuses a workload .psd1 passed by path that carries an unknown key' {
+        $wl = Join-Path $script:TmpRoot ("rin-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+        Set-Content -LiteralPath $wl -Encoding UTF8 -Value "@{ BaseTier = 0; Name = 'rin-path'; Entrypoint = 'true'; Bogus = 1 }"
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        { Invoke-Voidseal -Tier 0 -Profile $wl -Name 'sbx-rin-path' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage "*unknown key 'Bogus'*"
+    }
+
+    It 'a profile ResultInnerName names the file a transport-only run releases' {
+        $p = @{} + $script:RinProfile
+        $p['ResultInnerName'] = 'report.html'
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:RinBlob
+        $dest = Join-Path $script:TmpRoot ("dest-rin-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $p -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-rin-profile' -ArtifactRoot (Join-Path $script:TmpRoot 'art-rin1') -Destination $dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        $report.Error | Should -BeNullOrEmpty
+        $report.RunResult.Status | Should -Be 'Success'
+        [System.IO.Path]::GetFileName(@($report.ExtractedArtifact)[0]) | Should -Be 'report.html'
+        [System.IO.File]::ReadAllBytes(@($report.ExtractedArtifact)[0]) | Should -Be $script:RinBytes
+    }
+
+    It 'a -Workload ResultInnerName wins over the profile value' {
+        $p = @{} + $script:RinProfile
+        $p['ResultInnerName'] = 'result.html'          # the profile says one thing ...
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:RinBlob
+        $dest = Join-Path $script:TmpRoot ("dest-rin-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $p -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'report.html' } `
+            -Name 'sbx-rin-override' -ArtifactRoot (Join-Path $script:TmpRoot 'art-rin2') -Destination $dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b    # ... and the run overrides it
+        $report.Error | Should -BeNullOrEmpty
+        [System.IO.Path]::GetFileName(@($report.ExtractedArtifact)[0]) | Should -Be 'report.html'
+    }
+
+    It 'refuses a -Workload ResultInnerName that is not a plain file name' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:RinBlob
+        { Invoke-Voidseal -Tier 0 -Profile $script:RinProfile -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = '..\escape.html' } `
+            -Name 'sbx-rin-bad' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage '*ResultInnerName*'
     }
 }

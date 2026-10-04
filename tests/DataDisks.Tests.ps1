@@ -520,7 +520,7 @@ Describe 'Invoke-Voidseal copies, verifies, attaches and seals data disks' {
         '[]' | Set-Content -LiteralPath $verdicts -Encoding utf8 -NoNewline
         $blobFile = Join-Path $TestDrive 'dd-outbox.bin'
         Push-Location $script:SkillRoot
-        try { & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$stage', r'$verdicts', r'$blobFile')" }
+        try { & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$stage', r'$verdicts', r'$blobFile', workload_rc=0)" }
         finally { Pop-Location }
         $LASTEXITCODE | Should -Be 0
         $script:DdBlob = [System.IO.File]::ReadAllBytes($blobFile)

@@ -135,3 +135,28 @@ places where a check is an argument rather than a measurement.
   and package presence, Squid and IPv6 state, the lockdown's REDIRECT return codes), through the same
   `diag()` helper, so a misbehaving ralph seed can be told apart from the serial capture alone. Counts
   and yes/no facts only, never file content or workload names.
+- Unknown profile keys are refused. `Import-WorkloadProfile`, `Import-TierProfile` and the hashtable
+  path of `Invoke-Voidseal -Profile` now throw on any key outside the documented schema and name it
+  (matched case-insensitively), where such a key used to vanish without a word: a typo, or a tier-owned
+  key such as `Credentials` set from a workload. The accepted lists are built from the loader's own key
+  constants (`Get-ProfileSchemaKeys`), `tier-profiles/SCHEMA.md` now documents the Disk-mode, builder
+  and processor keys it had skipped (`WorkloadMode`, `Inputs`, `InputFiles`, `FileSystem`,
+  `InputLabel`, `OutputLabel`, `DepsSpec`, `ScreenConfig`, `DepsDiskPath`, `OutboxOutput`), and a drift
+  test fails when the file and the loader disagree in either direction. A profile that set a key the
+  engine never read now fails to load.
+- `ResultInnerName` is a workload-profile key, layered like `Entrypoint`: the profile value names the
+  file a transport-only run releases, `-Workload.ResultInnerName` still wins, and the default stays
+  `result.html`. The name must be a plain outbox file name; `verdicts.json` and `workload.json` are
+  reserved.
+- The entrypoint's exit code now reaches the host for an outbox run. The in-guest runner passes the code it
+  captured to `run_disk_workload.py --workload-rc`, which records it in the outbox container as a small
+  fixed-name `workload.json` entry (`{"exit_code": N}`, N an integer in 0..255, at most 64 bytes; the container
+  format and its bounds are otherwise unchanged, and `verdicts.json` plus `workload.json` now both count toward
+  the 256-entry limit). `guest/outbox.py` validates it on both sides, `host/read_outbox.py` hands it to the
+  orchestrator as `<out>/workload.json` and never treats it as a candidate, and a staged file may not use the
+  name. When the code is non-zero a transport-only run reports `RunResult.Status = 'WorkloadFailed'` with
+  `ExitCode` set and releases nothing, where it used to report only a missing `result.html` candidate; a
+  processor run still runs its gate exactly as before and reports the same status. A zero code is reported as
+  `ExitCode = 0` on success, and an outbox with no recorded code (an older producer) keeps the old success
+  behavior with `ExitCode` null. A malformed entry fails the whole read closed, and no message echoes staged
+  content.

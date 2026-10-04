@@ -145,6 +145,35 @@ function Read-OutboxToGateInput {
     return $gateInput
 }
 
+<#
+.SYNOPSIS
+    The workload entrypoint's exit code, as the outbox producer recorded it, or $null when it recorded none.
+.DESCRIPTION
+    host/read_outbox.py writes <gate-input>/workload.json ({"exit_code": N}) only when the outbox carried a
+    valid workload.json entry (guest/outbox.py validates it: one key, an integer in 0..255). This reads it
+    back and checks the shape again. Anything else THROWS, so the caller fails closed. The messages never
+    include the file's content.
+#>
+function Get-OutboxWorkloadExitCode {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $GateInput)
+
+    $metaPath = Join-Path $GateInput 'workload.json'
+    if (-not (Test-Path -LiteralPath $metaPath -PathType Leaf)) { return $null }
+    try {
+        $obj = Get-Content -LiteralPath $metaPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $names = @($obj.PSObject.Properties.Name)
+        $code  = $obj.exit_code
+        if ($names.Count -ne 1 -or $names[0] -cne 'exit_code' -or -not ($code -is [int] -or $code -is [long]) -or $code -lt 0 -or $code -gt 255) {
+            throw 'unexpected shape'
+        }
+    }
+    catch {
+        throw 'outbox read: workload.json is malformed (expected {"exit_code": 0..255}); releasing nothing.'
+    }
+    return [int]$code
+}
+
 # --------------------------------------------------------------------------
 # Internal: resolve the -Profile argument to a normalized profile hashtable (loader output).
 # --------------------------------------------------------------------------
@@ -191,6 +220,9 @@ function Resolve-DeployProfile {
     if ($Profile -is [System.Collections.IDictionary]) {
         $clone = @{}
         foreach ($k in $Profile.Keys) { $clone[$k] = $Profile[$k] }
+        # A hand-built hashtable gets the same unknown-key refusal as a loaded file: a key outside the
+        # schema would otherwise be dropped without a word.
+        Assert-KnownProfileKeys -Profile $clone -Kind Resolved -Context 'Invoke-Voidseal -Profile (hashtable)'
         Assert-TierProfileValid -Profile $clone -Context 'Invoke-Voidseal -Profile (hashtable)'
         return $clone
     }
@@ -424,7 +456,12 @@ function Invoke-Voidseal {
         $workloadMode = [string]$resolved['WorkloadMode']
     }
     if ([string]::IsNullOrWhiteSpace($workloadMode)) { $workloadMode = 'Serial' }
-    $resultInnerName   = [string](Get-WorkloadField -Workload $Workload -Name 'ResultInnerName'   -Default 'result.html')
+    # ResultInnerName layers like Entrypoint: the -Workload value wins, then the profile's own key
+    # (a workload profile may set it), then 'result.html'. The loader already validated the profile's
+    # value; the final one is checked here so a -Workload override is held to the same plain-name rule.
+    $profileResultName = if ($resolved.ContainsKey('ResultInnerName') -and $null -ne $resolved['ResultInnerName']) { [string]$resolved['ResultInnerName'] } else { 'result.html' }
+    $resultInnerName   = [string](Get-WorkloadField -Workload $Workload -Name 'ResultInnerName'   -Default $profileResultName)
+    Assert-ResultInnerName -Value $resultInnerName -Context 'Invoke-Voidseal -Workload'
     $sentinelInnerName = [string](Get-WorkloadField -Workload $Workload -Name 'SentinelInnerName' -Default 'result.exitcode')
 
     # --- D (structural C1 no-mount): refuse a Disk-mode profile that would reach the legacy
@@ -870,6 +907,8 @@ function Invoke-Voidseal {
                     $gateInput  = Read-OutboxToGateInput -OutputDiskPath $outboxPath -Destination $Destination -Backend $Backend
                     $gateStaging  = Join-Path $gateInput 'staging'
                     $gateVerdicts = Join-Path $gateInput 'verdicts.json'
+                    # The entrypoint's exit code, when the in-guest producer recorded one ($null otherwise).
+                    $workloadExit = Get-OutboxWorkloadExitCode -GateInput $gateInput
 
                     if ($isProcessorProfile) {
                         $gateOut   = Join-Path $Destination 'gate'
@@ -890,7 +929,19 @@ function Invoke-Voidseal {
                         $report.Released          = $gateResult.Released
                         $report.Held              = $gateResult.Held
                         $report.SensitivityReport = $gateResult.ManifestPath
-                        $report.RunResult = @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $gateResult.ManifestPath; Reason = $null }
+                        # The gate above decided what is released, exactly as before. A non-zero entrypoint exit
+                        # code changes only the reported status: the run is not a success even if the screener
+                        # passed whatever the failed workload staged.
+                        if ($null -ne $workloadExit -and $workloadExit -ne 0) {
+                            $report.RunResult = @{ Status = 'WorkloadFailed'; ExitCode = $workloadExit; ArtifactPath = $gateResult.ManifestPath; Reason = "the workload entrypoint exited with code $workloadExit" }
+                        } else {
+                            $report.RunResult = @{ Status = 'Success'; ExitCode = $workloadExit; ArtifactPath = $gateResult.ManifestPath; Reason = $null }
+                        }
+                    } elseif ($null -ne $workloadExit -and $workloadExit -ne 0) {
+                        # C1.2 transport-only, failed workload: the entrypoint exited non-zero, so the staged
+                        # result is not trusted as a deliverable. Report the code (it used to surface only as
+                        # a missing 'result.html' candidate) and materialize nothing.
+                        $report.RunResult = @{ Status = 'WorkloadFailed'; ExitCode = $workloadExit; ArtifactPath = $null; Reason = "the workload entrypoint exited with code $workloadExit; nothing was released" }
                     } else {
                         # C1.2 transport-only: materialize the outbox's sole candidate verbatim — NOT
                         # screened/Released. LOCKED design (plan Task C1.2): firefox's result rides the
@@ -902,9 +953,10 @@ function Invoke-Voidseal {
                         $artifact = Join-Path $Destination $resultInnerName
                         Copy-Item -LiteralPath $resultSrc -Destination $artifact -Force
                         $report.ExtractedArtifact = $artifact
-                        $report.RunResult = @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $artifact; Reason = $null }
+                        $report.RunResult = @{ Status = 'Success'; ExitCode = $workloadExit; ArtifactPath = $artifact; Reason = $null }
                     }
-                    $states.Add('EXTRACTED')
+                    # Nothing was extracted when a transport-only workload failed, so EXTRACTED is not traversed.
+                    if ($isProcessorProfile -or $report.RunResult.Status -ne 'WorkloadFailed') { $states.Add('EXTRACTED') }
                 }
                 catch {
                     # Fail-closed like the seal gate: record + let teardown run. APPEND (do not clobber a

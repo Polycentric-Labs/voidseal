@@ -11,6 +11,13 @@ VERSION = 1
 MAX_ENTRIES = 256
 MAX_TOTAL = 64 * 1024 * 1024
 _NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,40}$')
+# Reserved entry names. verdicts.json is the screener's output; workload.json carries the exit code of
+# the workload's entrypoint (see pack_workload_meta). Neither is ever a released candidate, and a staged
+# file may not use either name.
+VERDICTS_NAME = "verdicts.json"
+META_NAME = "workload.json"
+META_MAX_BYTES = 64
+EXIT_CODE_MAX = 255                       # a POSIX shell's $? is 0..255
 _HEADER = struct.Struct("<8sHHIQ")        # magic, version, reserved, entry_count, payload_total_len
 _REC = struct.Struct("<40sQQ32s16x")      # name, offset, length, sha256, 16 reserved
 assert _HEADER.size == 24 and _REC.size == 104  # actual sizes on all CPython platforms
@@ -82,19 +89,57 @@ def unpack_outbox(blob, allowed_names=None):
         out[name] = data
     return out
 
-def write_outbox_from_dir(staging_dir, verdicts_path, out_path):
-    """In-guest: pack verdicts.json + every flat file in staging_dir into out_path."""
-    entries = [("verdicts.json", pathlib.Path(verdicts_path).read_bytes())]
+def _check_exit_code(code):
+    # bool is an int subclass: True would otherwise pass as 1.
+    if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= EXIT_CODE_MAX:
+        raise OutboxError(f"workload exit code must be an integer in 0..{EXIT_CODE_MAX}")
+    return code
+
+def pack_workload_meta(exit_code):
+    """Bytes of the workload.json entry: the entrypoint's exit code, in a fixed one-key JSON object."""
+    return json.dumps({"exit_code": _check_exit_code(exit_code)}, separators=(",", ":")).encode("ascii")
+
+def parse_workload_meta(data):
+    """Host: validate a workload.json entry and return the exit code. Anything other than the exact
+    shape pack_workload_meta writes (a small JSON object whose only key is an in-range integer
+    exit_code) raises OutboxError. The message never includes the entry's bytes."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) > META_MAX_BYTES:
+        raise OutboxError("workload.json is missing or over its size bound")
+    try:
+        obj = json.loads(bytes(data).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise OutboxError("workload.json is not valid JSON") from e
+    if not isinstance(obj, dict) or set(obj) != {"exit_code"}:
+        raise OutboxError("workload.json must be an object with exactly one key, exit_code")
+    return _check_exit_code(obj["exit_code"])
+
+def write_outbox_from_dir(staging_dir, verdicts_path, out_path, workload_rc=None):
+    """In-guest: pack verdicts.json + every flat file in staging_dir into out_path. With workload_rc
+    (the entrypoint's exit code) a workload.json entry records it for the host."""
+    entries = [(VERDICTS_NAME, pathlib.Path(verdicts_path).read_bytes())]
+    if workload_rc is not None:
+        entries.append((META_NAME, pack_workload_meta(workload_rc)))
     for p in sorted(pathlib.Path(staging_dir).iterdir()):
         if p.is_file():
+            if p.name == META_NAME:
+                raise OutboxError(f"staged file uses the reserved name {META_NAME!r}")
             entries.append((p.name, p.read_bytes()))
     pathlib.Path(out_path).write_bytes(pack_outbox(entries))
 
-def read_and_verify(blob, allowed_names=None):
-    """Host: returns (verdicts_obj, {candidate_name: bytes}); verdicts.json must be present."""
+def read_and_verify_full(blob, allowed_names=None):
+    """Host: returns (verdicts_obj, {candidate_name: bytes}, exit_code); verdicts.json must be present.
+    exit_code is the validated workload exit code from workload.json, or None when the producer
+    recorded none. workload.json is never returned as a candidate."""
     files = unpack_outbox(blob, allowed_names=allowed_names)
-    if "verdicts.json" not in files:
+    if VERDICTS_NAME not in files:
         raise OutboxError("outbox missing verdicts.json")
-    verdicts = json.loads(files["verdicts.json"].decode("utf-8"))
-    candidates = {k: v for k, v in files.items() if k != "verdicts.json"}
+    verdicts = json.loads(files[VERDICTS_NAME].decode("utf-8"))
+    exit_code = parse_workload_meta(files[META_NAME]) if META_NAME in files else None
+    candidates = {k: v for k, v in files.items() if k not in (VERDICTS_NAME, META_NAME)}
+    return verdicts, candidates, exit_code
+
+def read_and_verify(blob, allowed_names=None):
+    """Host: returns (verdicts_obj, {candidate_name: bytes}); verdicts.json must be present.
+    A workload.json entry is validated but not returned; use read_and_verify_full for the exit code."""
+    verdicts, candidates, _exit_code = read_and_verify_full(blob, allowed_names=allowed_names)
     return verdicts, candidates
