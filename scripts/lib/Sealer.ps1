@@ -53,8 +53,9 @@
         * an unrecognized network-adapter policy (anything but NoAdapter or IsolatedInternalSwitch) is
           refused before either NIC check runs.
         * NoAdapter VMs (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): GetNetworkAdapter
-          MUST be empty (no NIC, no live egress route). A Tier-1 non-processor keeps one NIC, which
-          must sit on an isolated Internal vSwitch that is not the Default Switch.
+          MUST be empty (no NIC, no live egress route). A Tier-1 non-processor keeps exactly one NIC,
+          which must sit on the VM's own recorded Internal switch (descriptor SwitchName), not the
+          Default Switch and not any other switch. A $null adapter read refuses in both branches.
         * ANY tier: no GPU partition adapter and no device assigned by Discrete Device Assignment
           (GetGpuPartitionAdapters / GetAssignableDevices; a read that fails refuses).
         * ANY tier: no path on COM2 (GetComPort Number=2; Voidseal wires only COM1).
@@ -582,7 +583,8 @@ function Lock-Sandbox {
       * NoAdapter VMs (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): GetNetworkAdapter MUST
         be empty (no NIC = no live egress route). Only a Tier-1 non-processor keeps a NIC; the media
         and channel checks apply to every tier.
-      * IsolatedInternalSwitch (Tier 1, non-processor): every NIC MUST be on an isolated Internal vSwitch (I4). Its
+      * IsolatedInternalSwitch (Tier 1, non-processor): exactly ONE NIC, bound to the descriptor's recorded
+        SwitchName (the VM's own "<vm>-int" switch; a blank record refuses), on an Internal vSwitch (I4). Its
         SwitchType is host-verified via GetSwitch. An External, Private, or unresolvable switch
         bypasses the host-controlled egress chokepoint and is refused, fail-closed. The
         built-in Default Switch is itself SwitchType=Internal (ICS/internet-connected), so the
@@ -745,6 +747,22 @@ function Assert-Sealed {
             throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not report its " +
                    "network adapters (the read returned no collection). Fail closed.")
         }
+        # Bind the NIC to the VM's OWN switch (review finding, 2026-10-03). The type and Default-Switch checks
+        # below accepted a NIC on ANY Internal switch not named "Default Switch", and any number of NICs, so
+        # a Tier-1 VM re-pointed at another sandbox's switch, or at one the host had NAT'ed, sealed green.
+        # New-SandboxVM records the switch it built ("<vm>-int") as the descriptor's SwitchName; the gate now
+        # requires exactly one NIC, on exactly that switch. The per-NIC checks still run first, so an
+        # External, unresolvable or Default switch keeps its own, more specific refusal.
+        $recordedSwitch = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'SwitchName')
+        if ([string]::IsNullOrWhiteSpace($recordedSwitch)) {
+            throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because the descriptor records no " +
+                   "SwitchName, so its NIC cannot be bound to the VM's own switch. Fail closed.")
+        }
+        if ($nics.Count -ne 1) {
+            throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because $($nics.Count) network " +
+                   "adapters are attached; a Tier-1 VM must have exactly one, on its own switch '$recordedSwitch'. " +
+                   "Fail closed.")
+        }
         foreach ($nic in $nics) {
             $switchName = [string]$nic.SwitchName
             if ([string]::IsNullOrWhiteSpace($switchName)) {
@@ -778,6 +796,11 @@ function Assert-Sealed {
                        "ICS/internet-connected switch (unmediated egress the host gateway does not control), NOT an " +
                        "isolated Tier-1 Internal vSwitch. A Tier-1 VM MUST ride a purpose-built isolated Internal " +
                        "switch (host-controlled egress chokepoint). Fail closed.")
+            }
+            if ($switchName -ne $recordedSwitch) {
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because its NIC is on switch " +
+                       "'$switchName', not this VM's own recorded switch '$recordedSwitch'. An Internal switch built " +
+                       "for another sandbox, or one the host routes or NATs, is not this VM's isolated switch. Fail closed.")
             }
         }
     }

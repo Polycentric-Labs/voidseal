@@ -27,9 +27,14 @@ entry: a Tier-1 VM keeps a NIC only when its `Network` label is exactly `Interna
 `tier-profiles/tier1.psd1` ships. Any other Tier-1 label stops `New-SandboxVM` before it creates
 anything and is refused by the gate. For a
 Tier-1 VM, which legitimately keeps a NIC
-(net-restricted, not no-net), the seal instead certifies that NIC's vSwitch is an isolated **Internal**
-switch — never an unfiltered External or Private switch — so the guest's only possible route off-box is
-the host-controlled gateway on that Internal switch. That is a host-verified **switch-isolation**
+(net-restricted, not no-net), the seal instead certifies that the VM has **exactly one** NIC and that it
+sits on the VM's **own recorded switch**: the `<vm>-int` Internal switch `New-SandboxVM` built and
+recorded as the descriptor's `SwitchName`, which must still read as `SwitchType=Internal` and never as an
+unfiltered External or Private switch. The guest's only possible route off-box is therefore the
+host-controlled gateway on that one switch. Since 2026-10-03 a NIC re-pointed at any other Internal
+switch (another sandbox's, or one the host routes or NATs), a second NIC, and a descriptor with no
+recorded `SwitchName` are all refused; before then any Internal switch not named "Default Switch"
+certified. That is a host-verified **switch-isolation**
 guarantee (reachability) for a **purpose-built** Internal switch, not a claim about which domains/IPs the
 guest can reach once on that route — see "Tier-1 egress" below for why the two are not the same thing.
 **Caveat:** the built-in "Default Switch" is itself `SwitchType=Internal` (it is Hyper-V's ICS/internet-
@@ -239,8 +244,9 @@ full privileges of whoever invokes it — here, the host operator.
   from a file that merely looks like one, and it does not fire on a credential the caller renamed. It
   reduces accidents. It is not a cryptographic or content-based boundary.
   - **What IS host-verified today: switch isolation, not egress filtering.** `Assert-Sealed` verifies
-    (from the host, never the guest's self-report) that a Tier-1 VM's NIC sits on an isolated **Internal**
-    vSwitch rather than an External or Private switch. That is a genuine host-enforced guarantee that the
+    (from the host, never the guest's self-report) that a Tier-1 VM has exactly one NIC and that it sits
+    on the VM's own recorded **Internal** switch (the descriptor's `SwitchName`), not on an External or
+    Private switch and not on any other Internal switch. That is a genuine host-enforced guarantee that the
     guest's only possible network path leaves through the host-controlled gateway on that Internal
     switch — an unfiltered External/Private switch is refused, fail-closed. It says nothing about *which*
     destinations are reachable through that gateway; today, nothing on the host filters what crosses it.

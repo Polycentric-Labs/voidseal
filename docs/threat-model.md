@@ -17,7 +17,7 @@ Voidseal's security claim is narrow and specific: the **host-verified, fail-clos
 (`scripts/lib/Sealer.ps1`) — a host-side proof, taken independently of anything the guest reports about
 itself, that a VM has been starved of the capabilities its tier says it must not have (network adapters, passthrough devices,
 host↔guest channels, residual/secret disks, import media) **before** any untrusted workload is allowed to
-run, plus the tier isolation that gate verifies (no NIC at Tier 0, at Tier ≥ 2 and for every processor; an isolated Internal vSwitch at Tier 1).
+run, plus the tier isolation that gate verifies (no NIC at Tier 0, at Tier ≥ 2 and for every processor; exactly one NIC, on the VM's own recorded Internal switch, at Tier 1).
 
 What a workload **does once sealed and running** — whether its own logic is correct, whether it handles the
 data it's given safely, whether an agent loop it drives goes off the rails — is **not** something Voidseal
@@ -55,7 +55,7 @@ Legend: 🟢 **IN SCOPE** (a bug here is a Voidseal defect — see the gate name
 | Threat class | T0 | T1 | T2 | T3 |
 |---|---|---|---|---|
 | **VM-escape** (guest breaks the Hyper-V hypervisor boundary itself) | ⚪ | ⚪ | ⚪ | ⚪ |
-| **Live NIC / egress route present at seal time** | 🟢 zero NICs required | 🟢 an isolated Internal vSwitch, Default Switch refused by name (zero NICs for a processor) | 🟢 zero NICs required | 🟢 zero NICs required |
+| **Live NIC / egress route present at seal time** | 🟢 zero NICs required | 🟢 exactly one NIC, on the VM's own recorded Internal switch (zero NICs for a processor) | 🟢 zero NICs required | 🟢 zero NICs required |
 | **Passthrough device present at seal time** (GPU partition adapter, device assigned by DDA) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Egress filtering** (which destinations are reachable through whatever route exists) | ➖ no route exists | 🟡 in-guest defense-in-depth only, GuestRoot-disableable | ➖ no route exists | ➖ no route exists |
 | **Host↔guest channel left ON** (clipboard / shares / guest-services / enhanced-session) | 🟢 | 🟢 | 🟢 | 🟢 |
@@ -84,14 +84,16 @@ itself is patched.
   live NIC found at certify time throws and refuses to seal. (Before 2026-10-03 the processor branch
   read a descriptor field production never wrote, and Tier 0 had no adapter check at all.)
 - **T1 non-processor: IN SCOPE, narrower.** Tier 1 legitimately keeps a NIC (net-restricted, not
-  no-net). `Assert-Sealed`'s Tier-1 block requires that NIC's vSwitch to host-verify as
-  `SwitchType='Internal'`, and separately refuses the built-in "Default Switch" **by name** (that switch
-  is itself `SwitchType=Internal`, so the type check alone cannot distinguish it from a purpose-built
-  isolated switch). A Tier-1 VM certified on an External/Private switch, or on the Default Switch, is a
+  no-net), and only when its `Network` label is exactly `Internal+Allowlist`. `Assert-Sealed`'s Tier-1
+  block requires exactly one NIC, requires its vSwitch to host-verify as `SwitchType='Internal'`, refuses
+  the built-in "Default Switch" **by name** (that switch is itself `SwitchType=Internal`), and, since
+  2026-10-03, binds the NIC to the VM's **own** switch: its `SwitchName` must equal the `<vm>-int` switch
+  `New-SandboxVM` recorded on the descriptor. A Tier-1 VM certified with a second NIC, on an
+  External/Private switch, on the Default Switch, or on any Internal switch other than its own is a
   Voidseal defect. A Tier-1 processor is `NoAdapter` like the tiers above: it gets no switch and must
-  seal with zero adapters. **Known gap inside this control:** the by-name refusal matches only the
-  switch's English friendly name; the GUID-based refusal (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`) that
-  would also catch a localized non-English "Default Switch" name is Phase-6-live, not yet shipped
+  seal with zero adapters. The by-name Default-Switch refusal matches only the English friendly name,
+  but the binding now also refuses a localized Default Switch (it is not the recorded switch); the
+  GUID-based refusal (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`) stays a Phase-6-live defense in depth
   (`phase-6-live-runbook.md` §4).
 
 **Passthrough device present at seal time.** IN SCOPE, every tier. `Assert-Sealed` reads the backend's

@@ -584,7 +584,7 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         & $b.NewSwitch @{ Name = 'ext-sw'; SwitchType = 'External'; NetAdapterName = 'Ethernet' }
         & $b.ConnectNetworkAdapter @{ VMName = 'sbx-i4-external'; SwitchName = 'ext-sw' }
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Internal*' -Because 'an External switch bypasses the host-controlled egress chokepoint; the seal must refuse'
+            Should -Throw -ExpectedMessage "*its NIC is on switch 'ext-sw' (SwitchType=External), not an isolated Internal vSwitch*" -Because 'an External switch bypasses the host-controlled egress chokepoint; the seal must refuse'
     }
 
     It 'Tier-1: REFUSES when the NIC is on an unresolvable switch name (no matching VMSwitch on host)' {
@@ -599,7 +599,7 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         $vm = & $b.GetVM @{ Name = 'sbx-i4-unresolvable' }
         $vm.NetworkAdapters.Add(@{ SwitchName = 'orphan-switch-zz9'; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Internal*' -Because 'a NIC on a switch name with no resolvable host VMSwitch object cannot be verified isolated; fail closed'
+            Should -Throw -ExpectedMessage "*its NIC is on switch 'orphan-switch-zz9' (SwitchType=(switch not found on host))*" -Because 'a NIC on a switch name with no resolvable host VMSwitch object cannot be verified isolated; fail closed'
     }
 
     It 'Tier-1: REFUSES when the NIC is on the built-in "Default Switch" (type-Internal but ICS/internet)' {
@@ -616,7 +616,7 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         $vm = & $b.GetVM @{ Name = 'sbx-i4-defaultswitch' }
         $vm.NetworkAdapters.Add(@{ SwitchName = 'Default Switch'; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Default Switch*' `
+            Should -Throw -ExpectedMessage "*its NIC is on the built-in 'Default Switch'*" `
                 -Because 'the Default Switch is ICS/internet egress the host does not control; a Tier-1 seal must refuse it by name even though it reports type-Internal'
     }
 
@@ -628,7 +628,49 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         $vm = & $b.GetVM @{ Name = 'sbx-i4-noswitch' }
         $vm.NetworkAdapters.Add(@{ SwitchName = ''; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*Internal*' -Because 'a NIC not attached to any resolvable vSwitch cannot be verified isolated; fail closed'
+            Should -Throw -ExpectedMessage '*a network adapter is not on any vSwitch (no SwitchName)*' -Because 'a NIC not attached to any resolvable vSwitch cannot be verified isolated; fail closed'
+    }
+
+    It 'Tier-1: REFUSES a NIC re-pointed at ANOTHER Internal switch (type-Internal, not Default, but not this VM''s own)' {
+        # The gap the review found: any Internal switch not named "Default Switch" used to certify, e.g.
+        # another sandbox's switch or one the host has NAT'ed. The gate now binds the NIC to the switch the
+        # Provisioner recorded on the descriptor.
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-repoint'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        $d.SwitchName | Should -Be 'sbx-i4-repoint-int' -Because 'precondition: the Provisioner records its own switch'
+        & $b.NewSwitch @{ Name = 'sbx-other-int'; SwitchType = 'Internal' }
+        & $b.ConnectNetworkAdapter @{ VMName = 'sbx-i4-repoint'; SwitchName = 'sbx-other-int' }
+        @(& $b.GetNetworkAdapter @{ VMName = 'sbx-i4-repoint' }).Count | Should -Be 1 -Because 'precondition: still one NIC, only re-pointed'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*its NIC is on switch 'sbx-other-int', not this VM's own recorded switch 'sbx-i4-repoint-int'*"
+    }
+
+    It 'Tier-1: REFUSES a second NIC, even when both sit on the VM''s own switch' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-twonics'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        (& $b.GetVM @{ Name = 'sbx-i4-twonics' }).NetworkAdapters.Add(@{ SwitchName = 'sbx-i4-twonics-int'; Name = 'Network Adapter 2' })
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*because 2 network adapters are attached; a Tier-1 VM must have exactly one*"
+    }
+
+    It 'Tier-1: REFUSES zero NICs too (the seal must find the one adapter the Provisioner connected)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-nonic'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        & $b.RemoveNetworkAdapter @{ VMName = 'sbx-i4-nonic' }
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*because 0 network adapters are attached; a Tier-1 VM must have exactly one*"
+    }
+
+    It 'Tier-1: REFUSES a descriptor that records no SwitchName (nothing to bind the NIC to)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-i4-noswname'
+        $b = $sb.Backend; $d = $sb.Desc
+        Lock-Sandbox -Descriptor $d -Backend $b
+        $d.SwitchName = $null
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*because the descriptor records no SwitchName, so its NIC cannot be bound to the VM's own switch*"
     }
 
     It 'Tier>=2/processor (no-NIC) regression: the switch-isolation check does not fire when there is no NIC' {
