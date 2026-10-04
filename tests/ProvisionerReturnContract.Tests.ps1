@@ -92,3 +92,30 @@ Describe 'Real backend — New-SandboxVM returns EXACTLY the descriptor (output-
         $script:Cap.elem0HasName | Should -BeTrue -Because 'with a single-object return, element [0] is the descriptor and carries the VM Name'
     }
 }
+
+Describe 'Real backend - New-SandboxVM applies the CPU caps and the free-RAM gate (out-of-process; E1)' {
+
+    It 'an uncapped provision passes NO -Maximum / -RelativeWeight to Set-VMProcessor' {
+        $script:Cap.defaultProcMaximumGiven        | Should -BeFalse
+        $script:Cap.defaultProcRelativeWeightGiven | Should -BeFalse
+        $script:Cap.defaultProcCount               | Should -Be 4
+    }
+
+    It 'a capped provision reaches Set-VMProcessor with -Maximum and -RelativeWeight' {
+        $script:Cap.capsErr | Should -BeNullOrEmpty
+        $script:Cap.capsProcMaximumGiven        | Should -BeTrue
+        $script:Cap.capsProcMaximum             | Should -Be 40
+        $script:Cap.capsProcRelativeWeightGiven | Should -BeTrue
+        $script:Cap.capsProcRelativeWeight      | Should -Be 300
+    }
+
+    It 'the real free-RAM read feeds the gate: a host with 1GiB free refuses a 4GB guest before New-VM runs' {
+        $script:Cap.lowMemErr           | Should -Match '(?i)free memory'
+        $script:Cap.lowMemNewVMCalled   | Should -BeFalse -Because 'the gate must refuse before anything is created'
+    }
+
+    It 'a host whose CIM read yields nothing refuses (fail closed) before New-VM runs' {
+        $script:Cap.noMemErr         | Should -Match '(?i)host memory'
+        $script:Cap.noMemNewVMCalled | Should -BeFalse
+    }
+}

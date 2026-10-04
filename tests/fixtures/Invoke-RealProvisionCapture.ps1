@@ -87,9 +87,32 @@ function Set-VMMemory {
     [pscustomobject]@{ __Stub = 'SetVMMemory'; VMName = $VMName }
 }
 
+# Records every Set-VMProcessor call (E1): which of the real parameters actually arrived.
+$script:ProcCalls = [System.Collections.Generic.List[object]]::new()
 function Set-VMProcessor {
-    [CmdletBinding()] param([string] $VMName, [int] $Count, [bool] $ExposeVirtualizationExtensions)
+    # Real parameter types: -Maximum is UInt64 (percent), -RelativeWeight is Int32.
+    [CmdletBinding()] param([string] $VMName, [int] $Count, [bool] $ExposeVirtualizationExtensions,
+                            [uint64] $Maximum, [int] $RelativeWeight)
+    $script:ProcCalls.Add([ordered]@{
+        Count               = $Count
+        MaximumGiven        = $PSBoundParameters.ContainsKey('Maximum')
+        Maximum             = [long]$Maximum
+        RelativeWeightGiven = $PSBoundParameters.ContainsKey('RelativeWeight')
+        RelativeWeight      = $RelativeWeight
+    })
     [pscustomobject]@{ __Stub = 'SetVMProcessor'; VMName = $VMName }
+}
+
+# Get-CimInstance shadow for the free-RAM gate (E1): Win32_OperatingSystem reports UInt64 KiB.
+# $script:cimMode 'ok' = 64GiB free of 128GiB; 'low' = 1GiB free; 'none' = no instance at all.
+$script:cimMode = 'ok'
+function Get-CimInstance {
+    [CmdletBinding()] param([string] $ClassName)
+    switch ($script:cimMode) {
+        'ok'   { return [pscustomobject]@{ FreePhysicalMemory = [uint64]67108864; TotalVisibleMemorySize = [uint64]134217728 } }
+        'low'  { return [pscustomobject]@{ FreePhysicalMemory = [uint64]1048576;  TotalVisibleMemorySize = [uint64]134217728 } }
+        default { return $null }
+    }
 }
 
 function Set-VMFirmware {
@@ -202,9 +225,35 @@ try {
 catch {
     $err = $_.Exception.Message
 }
-finally {
-    Remove-Item -LiteralPath $goldenParent -Force -ErrorAction SilentlyContinue
+
+# E1: the uncapped run's Set-VMProcessor call, then a capped run, then the two refusal shapes.
+$defaultProc = if ($script:ProcCalls.Count -gt 0) { $script:ProcCalls[0] } else { $null }
+
+$script:ProcCalls.Clear()
+$capsErr = $null
+try {
+    $capsProfile = $profile.Clone()
+    $capsProfile['CpuMaximumPercent'] = 40
+    $capsProfile['CpuRelativeWeight'] = 300
+    $null = New-SandboxVM -Profile $capsProfile -Name 'sbx-caps' -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend)
 }
+catch { $capsErr = $_.Exception.Message }
+$capsProc = if ($script:ProcCalls.Count -gt 0) { $script:ProcCalls[0] } else { $null }
+
+$script:cimMode = 'low'
+$lowMemErr = $null
+try { $null = New-SandboxVM -Profile $profile -Name 'sbx-lowmem' -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend) }
+catch { $lowMemErr = $_.Exception.Message }
+$lowMemNewVMCalled = $script:CreatedVMs.Contains('sbx-lowmem')
+
+$script:cimMode = 'none'
+$noMemErr = $null
+try { $null = New-SandboxVM -Profile $profile -Name 'sbx-nomem' -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend) }
+catch { $noMemErr = $_.Exception.Message }
+$noMemNewVMCalled = $script:CreatedVMs.Contains('sbx-nomem')
+$script:cimMode = 'ok'
+
+Remove-Item -LiteralPath $goldenParent -Force -ErrorAction SilentlyContinue
 
 $count             = if ($null -ne $result) { @($result).Count } else { 0 }
 $last              = if ($count -gt 0) { $result[$count - 1] } else { $null }
@@ -233,5 +282,17 @@ $out = [ordered]@{
     createdDisksGiven = [bool]$createdDisksGiven
     createdDisksCount = [int]$createdDisks.Count
     elem0HasName      = (-not [string]::IsNullOrWhiteSpace($elem0Name))
+    defaultProcMaximumGiven        = if ($null -ne $defaultProc) { [bool]$defaultProc.MaximumGiven } else { $null }
+    defaultProcRelativeWeightGiven = if ($null -ne $defaultProc) { [bool]$defaultProc.RelativeWeightGiven } else { $null }
+    defaultProcCount               = if ($null -ne $defaultProc) { [int]$defaultProc.Count } else { $null }
+    capsErr                        = $capsErr
+    capsProcMaximumGiven           = if ($null -ne $capsProc) { [bool]$capsProc.MaximumGiven } else { $null }
+    capsProcMaximum                = if ($null -ne $capsProc) { [long]$capsProc.Maximum } else { $null }
+    capsProcRelativeWeightGiven    = if ($null -ne $capsProc) { [bool]$capsProc.RelativeWeightGiven } else { $null }
+    capsProcRelativeWeight         = if ($null -ne $capsProc) { [int]$capsProc.RelativeWeight } else { $null }
+    lowMemErr                      = $lowMemErr
+    lowMemNewVMCalled              = [bool]$lowMemNewVMCalled
+    noMemErr                       = $noMemErr
+    noMemNewVMCalled               = [bool]$noMemNewVMCalled
 }
 $out | ConvertTo-Json -Depth 6 -Compress

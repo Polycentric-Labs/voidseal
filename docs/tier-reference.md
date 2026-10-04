@@ -68,6 +68,11 @@ from the host side:
 - **Secret-file refusal** — no secret-shaped mount source, any tier.
 - **Pre-seal gate** — `Assert-Sealed` refuses to certify a Tier-3 VM if it detects a live
   NIC, a secret-shaped or unrecorded attached volume, or a non-empty egress route.
+- **Guest sizing bounds and the free-RAM gate**: the loader bounds `Memory` (`512MB` to `64GB`)
+  and `Cpu` (1 to 32) for every tier and workload, and `New-SandboxVM` refuses, before it creates
+  anything, to start a guest whose memory plus a margin (default 2GB) does not fit in the host's
+  free RAM. An unreadable host is refused too. This is a resource guard for the host, not a
+  containment boundary.
 
 ---
 

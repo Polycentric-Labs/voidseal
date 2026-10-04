@@ -256,3 +256,18 @@ Describe 'Resolve-PythonExe — robust host python resolution (fold-in #1)' {
         Resolve-PythonExe | Should -Be $script:RealPython
     }
 }
+
+# ===========================================================================
+#  -HostMemoryMarginBytes reaches the provisioner's free-RAM gate (E1)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - passes -HostMemoryMarginBytes to the provisioner (E1)' {
+
+    It 'a margin the host cannot meet fails the run before anything is created' {
+        $b = New-FakeHyperVBackend
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-margin' `
+            -HostMemoryMarginBytes 100GB -Backend $b -WarningAction SilentlyContinue
+        $r.Status | Should -Be 'Failed'
+        $r.Error  | Should -Match '(?i)free memory'
+        (& $b.GetVM @{ Name = 'bld-margin' }) | Should -BeNullOrEmpty
+    }
+}

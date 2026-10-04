@@ -385,6 +385,11 @@ function Get-WorkloadField {
 .PARAMETER MaxReleasesPerDay
     (Optional) C2.6 per-profile, per-UTC-day release-event cap passed through to Invoke-SensitivityGate.
     Default 5 (ReleaseGovernor.ps1's own conservative FORK default for Allen, tunable at Phase 6).
+.PARAMETER HostMemoryMarginBytes
+    (Optional) headroom the host must keep free beyond the guest's memory, passed to New-SandboxVM's
+    free-RAM gate. Omit it to take the provisioner's default (2GB); the gate refuses a run, before
+    anything is created, when the host's free memory is below guest memory plus this margin, or when
+    host memory cannot be read.
 .PARAMETER Backend
     The Hyper-V backend. Defaults to the real one; tests inject the fake.
 #>
@@ -404,6 +409,7 @@ function Invoke-Voidseal {
         [int]    $WorkloadTimeoutSeconds = 600,
         [string] $RateLedgerPath,
         [ValidateRange(1, [int]::MaxValue)] [int] $MaxReleasesPerDay = 5,
+        [ValidateRange(0, [long]::MaxValue)] [long] $HostMemoryMarginBytes,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -546,6 +552,8 @@ function Invoke-Voidseal {
         # --- PROVISIONED ---------------------------------------------------
         $provArgs = @{ Profile = $resolved; Name = $Name; Backend = $Backend }
         if (-not [string]::IsNullOrWhiteSpace($ParentDiskPath)) { $provArgs.ParentDiskPath = $ParentDiskPath }
+        # Pass the margin only when the caller bound it, so New-SandboxVM's own default stays the single truth.
+        if ($PSBoundParameters.ContainsKey('HostMemoryMarginBytes')) { $provArgs.HostMemoryMarginBytes = $HostMemoryMarginBytes }
         $descriptor = New-SandboxVM @provArgs
         $report.Descriptor = $descriptor
         $states.Add('PROVISIONED')

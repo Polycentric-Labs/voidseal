@@ -17,7 +17,9 @@
 | `Credentials` | `'None'`\|`'ScopedOnDemand'` | credential posture. **MUST be `'None'` for Tier ≥ 2** |
 | `GuestImage` | string | base image id |
 | `SecureBootTemplate` | (opt) `'MicrosoftWindows'`\|`'MicrosoftUEFICertificateAuthority'`\|`'OpenSourceShieldedVM'` | (Gen2) `MicrosoftUEFICertificateAuthority` for Debian. Absent = Hyper-V default. Validated when present (an invalid value is a real Set-VMFirmware reject). |
-| `Memory`/`Cpu` | string/int | hardware |
+| `Memory`/`Cpu` | string/int | hardware. Bounded at load, for a tier and for a merged workload alike: `Memory` is a size string such as `'4GB'` (or a byte count) from `512MB` to `64GB`; `Cpu` is an integer from 1 to 32. A workload profile may set both (see the workload table) |
+| `CpuMaximumPercent` | int 1–100 | (opt) cap on the share of each virtual processor the guest may use (`Set-VMProcessor -Maximum`). Absent = Hyper-V's default, so no cap |
+| `CpuRelativeWeight` | int 1–10000 | (opt) scheduling weight against the other VMs on the host (`Set-VMProcessor -RelativeWeight`). Absent = Hyper-V's default |
 | `NestedVirt` | bool | (opt) expose virt extensions |
 | `ManagementChannel` | `'Com1Serial'`\|`'PSDirect'` | how the host drives the guest. Linux ⇒ `Com1Serial` (PS Direct is Windows-guest-only) |
 | `HostChannels` | hashtable | clipboard/shares/guest-services/enhanced-session toggles (all `$false` for VM tiers) |
@@ -34,9 +36,18 @@
 | `Packages` | string[] | (opt) **declared but NOT installed.** The loader layers it onto the tier, but no engine code reads it, so no package is installed or staged from this list. What the workload needs must already be in the golden image (a Disk-mode guest runs offline and cannot install anything). The list still records what the workload expects |
 | `Mounts` | hashtable | (opt) **declared but NOT wired into the guest**: nothing in the Provisioner or Runner attaches a host-guest bind mount (`docs/live-smoke-test.md` Gap 2). The loader still screens its source keys for secret-shaped paths. Files reach a running workload only through Disk-mode `Inputs`: a `StageAssets` ISO is ejected by the seal before the guest's only boot, and the seed is built from the profile |
 | `Entrypoint` | string | workload command run by the Runner |
+| `Memory` / `Cpu` | string / int | (opt) guest sizing for this workload. Layers onto the tier like `Entrypoint`: a workload value replaces the tier's, an omitted key keeps the tier's. Same format and bounds as the tier keys (`Memory` `512MB` to `64GB`, `Cpu` 1 to 32), enforced on the merged profile |
+| `CpuMaximumPercent` / `CpuRelativeWeight` | int | (opt) the CPU caps described in the tier table, settable from a workload; the workload value wins over a tier value. Absent from both = no cap |
 | `ExtraAllowlist` | string[] | (opt) additional FQDNs unioned onto the tier allowlist |
 | `StageAssets` | hashtable | (opt) host source path → a free-text pin note (for example a commit SHA; no hash is checked on this path). `Invoke-Voidseal` attaches each key as a read-only ISO before the seal (`Import-SandboxAsset -As Iso`, which fails closed on a missing file), and the seal ejects it before the guest's only boot, so nothing in it reaches a running workload; use Disk-mode `Inputs` for that. Its source keys are still screened by invariant 1 below |
 | `SeedIso` | string | (opt) **not read by `Invoke-Voidseal`.** Only `New-CidataSeed` uses it, as the default output path for a `CIDATA` seed ISO built by hand. The engine builds the cloud-init seed itself from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (`New-WorkloadSeedDisk`), for every run that boots a guest: in Serial mode serial-getty autologin on ttyS0 (the Runner's command channel), the run-user and the seed's packages, plus the in-guest egress layer for an `InGuestSquid` profile; in Disk mode the disk-mode runner. A seed DVD would be ejected by the seal before the guest's only boot. |
+
+## Provision-time resource gate (not a loader rule)
+Before it creates anything, `New-SandboxVM` reads the host's free physical memory (backend method
+`GetHostMemory`) and refuses unless free memory covers the guest's `Memory` plus a margin
+(`-HostMemoryMarginBytes`, default 2GB). A host-memory read that throws or returns nothing usable is a
+refusal, not a pass. The check lives in the provisioner, not the loader, because it depends on the host
+at run time, not on the profile alone.
 
 ## Loader invariants (MUST be enforced by `Import-TierProfile` / `Import-WorkloadProfile`; these are must-pass tests)
 1. **Secret-shaped-path refusal (a name lint, not a content check):** reject any `Mounts` **or**

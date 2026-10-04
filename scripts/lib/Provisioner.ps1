@@ -22,12 +22,14 @@
 
     FAIL-CLOSED: New-SandboxVM runs the backend's TestAvailable() preflight first; if
     Hyper-V is unreachable / this process is not elevated, it throws a clear, actionable
-    message BEFORE creating anything (no half-built VM).
+    message BEFORE creating anything (no half-built VM). A host free-RAM gate follows it (see
+    -HostMemoryMarginBytes): the guest's memory plus a margin must fit in the host's free physical
+    memory, and an unreadable host is refused, before anything is created.
 
     PROVISIONING ORDER (mirrors real Hyper-V dependencies so the fake's fidelity guards
     are satisfied — switch/VHD must exist before they're referenced):
         preflight -> idempotency check -> NewVHD (system disk) -> NewVM (Gen2, NoVHD)
-        -> SetMemory -> SetProcessor (+nested virt) -> SetFirmware (SecureBoot template)
+        -> SetMemory -> SetProcessor (+nested virt, +optional CPU caps) -> SetFirmware (SecureBoot template)
         -> SetComPort (COM1, Linux mgmt) -> NewSwitch + ConnectNetworkAdapter (VM tiers)
         -> AddHardDiskDrive (attach system disk).
     The VM is left POWERED OFF — the Sealer runs before first boot.
@@ -328,6 +330,11 @@ function New-SandboxDescriptor {
     actionable message naming the `fsutil sparse setflag <path> 0` fix BEFORE any artifact is created.
 .PARAMETER SystemDiskSizeBytes
     (Optional) Size of a fresh system disk when no ParentDiskPath is given. Default 40GB.
+.PARAMETER HostMemoryMarginBytes
+    (Optional) headroom the HOST must keep free on top of the guest's memory. Before creating anything,
+    New-SandboxVM reads the host's free physical memory through the backend's GetHostMemory and refuses
+    (fail closed) when FreeBytes < the guest's startup memory + this margin. It also refuses when the read
+    throws or returns nothing usable: an unreadable host is not assumed to have room. Default 2GB.
 .PARAMETER Backend
     The Hyper-V backend. Defaults to the real one; tests inject the fake.
 #>
@@ -339,6 +346,7 @@ function New-SandboxVM {
         [Parameter(Mandatory)] [AllowEmptyString()] [string] $Name,
         [string] $ParentDiskPath,
         [long]   $SystemDiskSizeBytes = 40GB,
+        [ValidateRange(0, [long]::MaxValue)] [long] $HostMemoryMarginBytes = 2GB,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -380,6 +388,40 @@ function New-SandboxVM {
     $nestedVirt = $false
     if ($Profile.ContainsKey('NestedVirt') -and $null -ne $Profile['NestedVirt']) {
         $nestedVirt = [bool]$Profile['NestedVirt']
+    }
+
+    # Optional CPU caps (E1). Absent means Hyper-V's defaults, so they reach SetProcessor only when set.
+    $cpuMaxPercent  = $null
+    $cpuRelWeight   = $null
+    if ($Profile.ContainsKey('CpuMaximumPercent') -and $null -ne $Profile['CpuMaximumPercent']) { $cpuMaxPercent = [int]$Profile['CpuMaximumPercent'] }
+    if ($Profile.ContainsKey('CpuRelativeWeight') -and $null -ne $Profile['CpuRelativeWeight']) { $cpuRelWeight  = [int]$Profile['CpuRelativeWeight'] }
+
+    # --- host free-RAM gate (E1; fail-closed, BEFORE anything is created) -------------------
+    # A guest whose startup memory the host cannot actually supply either fails to start or starves the
+    # host, and with the memory now profile-sized a workload can ask for a lot. Read the host's free
+    # physical memory through the backend seam and refuse unless it covers the guest plus the margin.
+    # A read that throws, returns nothing, or returns a figure that is not a non-negative number is a
+    # REFUSAL, never a pass: an unreadable host is not assumed to have room. The message names both
+    # numbers so the operator can see which side to change (host load, profile Memory or the margin).
+    $hostMem = $null
+    try { $hostMem = & $Backend.GetHostMemory @{} }
+    catch {
+        throw ("New-SandboxVM: cannot read host memory ($($_.Exception.Message)); refusing to provision " +
+               "'$Name' because free RAM could not be verified. Failing closed BEFORE anything is created.")
+    }
+    $freeRaw = Get-VMField -VM $hostMem -Name 'FreeBytes'
+    $freeOk  = ($freeRaw -is [int] -or $freeRaw -is [long] -or $freeRaw -is [uint32] -or $freeRaw -is [uint64] -or $freeRaw -is [double]) -and ([double]$freeRaw -ge 0)
+    if (-not $freeOk) {
+        throw ("New-SandboxVM: the host memory read returned no usable FreeBytes (got '$freeRaw'); refusing to " +
+               "provision '$Name' because free RAM could not be verified. Failing closed BEFORE anything is created.")
+    }
+    $hostFreeBytes = [long]$freeRaw
+    $requiredRam   = $memoryBytes + $HostMemoryMarginBytes
+    if ($hostFreeBytes -lt $requiredRam) {
+        throw ("New-SandboxVM: refusing to provision '$Name': host free memory is $hostFreeBytes bytes but the " +
+               "guest needs $memoryBytes bytes plus a $HostMemoryMarginBytes byte margin ($requiredRam bytes in all). " +
+               "Free host memory, lower the profile's Memory, or lower -HostMemoryMarginBytes. " +
+               "Failing closed BEFORE anything is created.")
     }
 
     # --- sparse-parent preflight (fail-closed; pure host-FS, BEFORE any creation) ---------
@@ -479,6 +521,8 @@ function New-SandboxVM {
         # --- 4. processor (+ expose virt extensions only when NestedVirt) -
         $procArgs = @{ VMName = $Name; Count = $cpuCount }
         if ($nestedVirt) { $procArgs.ExposeVirtualizationExtensions = $true }
+        if ($null -ne $cpuMaxPercent) { $procArgs.Maximum        = $cpuMaxPercent }   # E1: only when the profile sets it
+        if ($null -ne $cpuRelWeight)  { $procArgs.RelativeWeight = $cpuRelWeight }
         $null = & $Backend.SetProcessor $procArgs
 
         # --- 5. firmware: SecureBoot ON with the EFFECTIVE Secure Boot template -------

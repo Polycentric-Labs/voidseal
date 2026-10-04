@@ -1915,3 +1915,27 @@ Describe 'Invoke-Voidseal — input validation' {
             Should -Throw -Because 'a profile path that does not exist must fail closed'
     }
 }
+
+# ===========================================================================
+#  -HostMemoryMarginBytes reaches the provisioner's free-RAM gate (E1)
+# ===========================================================================
+Describe 'Invoke-Voidseal - passes -HostMemoryMarginBytes to the provisioner (E1)' {
+
+    It 'a margin the host cannot meet aborts before PROVISIONED with the free-memory message' {
+        $b = New-FakeHyperVBackend
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-ov-margin' `
+            -Workload @{ Entrypoint = 'true' } -HostMemoryMarginBytes 100GB `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-ov-margin') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -Match '(?i)free memory'
+        @($report.States) | Should -Not -Contain 'PROVISIONED'
+        (& $b.GetVM @{ Name = 'sbx-ov-margin' }) | Should -BeNullOrEmpty
+    }
+
+    It 'with the parameter omitted the provisioner''s own 2GB default applies' {
+        $b = New-FakeHyperVBackend -SimulateHostFreeMemoryBytes (4GB + 2GB - 1)
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-ov-default' `
+            -Workload @{ Entrypoint = 'true' } -ArtifactRoot (Join-Path $script:TmpRoot 'art-ov-default') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -Match '(?i)free memory'
+        $report.Error | Should -Match ([regex]::Escape([string]2GB))
+    }
+}

@@ -78,6 +78,9 @@ Set-StrictMode -Version Latest
 .PARAMETER WorkloadTimeoutSeconds
     (Optional) wall-clock deadline for the guest to self-power-off. Default 600. Pass 0 in
     tests (one instant poll then trips the deadline — no real sleep).
+.PARAMETER HostMemoryMarginBytes
+    (Optional) headroom the host must keep free beyond the guest's memory, passed to New-SandboxVM's
+    free-RAM gate (see Invoke-Voidseal). Omit it to take the provisioner's default (2GB).
 .PARAMETER Backend
     The Hyper-V backend. Defaults to the real one; tests inject the fake.
 #>
@@ -90,6 +93,7 @@ function Invoke-BuilderVM {
         [string]    $DepsDiskPath,
         [string]    $RunnerScriptPath = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'guest\fetch_deps.py'),
         [int]       $WorkloadTimeoutSeconds = 600,
+        [ValidateRange(0, [long]::MaxValue)] [long] $HostMemoryMarginBytes,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -140,7 +144,9 @@ function Invoke-BuilderVM {
 
     try {
         # --- PROVISIONED: create the Tier-1 VM (NIC stays up — net-restricted, not no-NIC) ---
-        $descriptor = New-SandboxVM -Profile $resolved -Name $Name -Backend $Backend
+        $provArgs = @{ Profile = $resolved; Name = $Name; Backend = $Backend }
+        if ($PSBoundParameters.ContainsKey('HostMemoryMarginBytes')) { $provArgs.HostMemoryMarginBytes = $HostMemoryMarginBytes }
+        $descriptor = New-SandboxVM @provArgs
         $states.Add('PROVISIONED')
 
         # --- STAGED: workload data disks + CIDATA seed disk (RC6, mirrors the disk-mode path) ---

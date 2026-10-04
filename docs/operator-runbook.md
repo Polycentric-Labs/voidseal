@@ -289,6 +289,41 @@ Remove-Sandbox -Name '<vm-name>' -DeleteDisks
 Remove-VMSwitch -Name '<vm-name>-int' -Force        # only if Get-VMSwitch still shows it
 ```
 
+### 1.5 Sizing a run: Memory, Cpu, CPU caps and the host free-RAM gate
+
+A workload profile may size its own guest instead of taking the tier's numbers:
+
+```powershell
+@{
+    BaseTier   = 1
+    Name       = 'bigger-job'
+    Entrypoint = '/usr/local/bin/run.sh'
+    Memory     = '8GB'             # 512MB..64GB
+    Cpu        = 6                 # 1..32
+    CpuMaximumPercent = 50         # optional: each virtual processor may use at most 50%
+    CpuRelativeWeight = 200        # optional: scheduling weight vs other VMs (Hyper-V default 100)
+}
+```
+
+The caps are optional. Leave them out and Hyper-V's defaults apply. When set they reach
+`Set-VMProcessor -Maximum` / `-RelativeWeight`.
+
+Before it creates anything, `New-SandboxVM` compares the host's free physical memory with the guest's
+`Memory` plus a margin. The margin defaults to 2GB and is the `-HostMemoryMarginBytes` parameter on
+`Invoke-Voidseal` and `Invoke-BuilderVM`:
+
+```powershell
+$report = Invoke-Voidseal -Tier 1 -Profile bigger-job -HostMemoryMarginBytes 4GB ...
+$report.Error   # on a refusal: '... host free memory is <n> bytes but the guest needs <m> bytes plus a <k> byte margin ...'
+```
+
+A refusal ends the run at `INIT` with nothing provisioned. The gate also refuses when the host's memory
+cannot be read at all. Two things to know on a live host. The figure is Windows' *free* physical memory,
+which does not count the standby cache, so it reads lower than Task Manager's "Available"; close
+something or lower the margin if a roomy-looking host is refused. And the real read
+(`Get-CimInstance Win32_OperatingSystem`, KiB converted to bytes) is pinned by an out-of-process stub
+test but has not run on a live host yet.
+
 ---
 
 ## 2. Credential handling (binding — a strict secret-handling protocol)
@@ -364,4 +399,5 @@ do not ship. Run the Python suite too if you touched anything under `guest/`:
 | `declares a secret-shaped mount source …` at load | a `Mounts` source matches the secret list (e.g. the live `.credentials.json`) | mount a copied `.token` file in a non-secret path instead (§2) |
 | `seal gate did not certify …` in the report | `Assert-Sealed` failed (NIC still attached / a host channel readable) | inspect the profile's `HostChannels` (all `$false` for VM tiers) + that `Lock-Sandbox` removed the NIC; the abort already tore the VM down |
 | `Tier-… cold-VHDX … is NOT IMPLEMENTED` | a Tier ≥ 2 extraction was attempted | expected — Tier ≥ 2 extraction is post-v1; do not run hostile tiers live in v1 |
+| `refusing to provision ...: host free memory is ... bytes but the guest needs ...` | the host's free RAM is below the guest's `Memory` plus the margin, or the host memory read failed | free host memory, lower the profile's `Memory`, or lower `-HostMemoryMarginBytes` (§1.5) |
 | serial console silent on a live Tier-1 boot | guest `serial-getty@ttyS0` not enabled / wrong `CIDATA` label | re-check the seed `user-data` + that the ISO volume label is exactly `CIDATA` (see the guest-image recipe) |

@@ -31,3 +31,9 @@ places where a check is an argument rather than a measurement.
   first with the legacy exFAT OUTPUT disk (2026-06-25) and then with the current user-space outbox
   transport (2026-07-21). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see
   `docs/live-smoke-test.md`). Tier 2 and Tier 3 are scaffold-only and have had no live run.
+- Guest sizing and a host free-RAM gate: a workload profile may set `Memory` and `Cpu` (bounded to
+  512MB..64GB and 1..32 at load, for tiers and workloads alike) plus optional `CpuMaximumPercent` and
+  `CpuRelativeWeight` caps that reach `Set-VMProcessor`. `New-SandboxVM` refuses, before it creates
+  anything, when the host's free RAM is below the guest's memory plus `-HostMemoryMarginBytes` (default
+  2GB) or cannot be read. Backend additions: `SetProcessor` `Maximum`/`RelativeWeight` and
+  `GetHostMemory`.
