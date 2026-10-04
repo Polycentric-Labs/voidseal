@@ -34,7 +34,10 @@
         "NewVM":         { "err": ...; "cap": { Name; GenerationGiven; Generation; MemoryGiven; MemoryStartupBytes; SwitchName; NoVHD } },
         "NewSwitch_Ext": { "err": ...; "cap": { Name; SwitchType; NetAdapterGiven; NetAdapterName } },
         "NewSwitch_Int": { ... },
-        "SetProcessor":  { "err": ...; "cap": { VMName; CountGiven; Count; ExposeGiven; Expose } }
+        "SetProcessor":  { "err": ...; "cap": { VMName; CountGiven; Count; ExposeGiven; Expose; MaximumGiven; Maximum; RelativeWeightGiven; RelativeWeight } },
+        "SetProcessor_Caps" / "SetProcessor_MaxOnly": the same shape, with the caps supplied,
+        "GetHostMemory" / "GetHostMemory_Big":   { "err": ...; "cap": { ClassName }; "result": { FreeBytes; TotalBytes } },
+        "GetHostMemory_Null" / "GetHostMemory_Empty": { "err": ... }   # the fail-closed shapes
       }
     Each 'err' is $null on success or the thrown message; 'cap' is what the shadowed cmdlet recorded.
 #>
@@ -101,13 +104,37 @@ function New-VMSwitch {
 
 function Set-VMProcessor {
     [CmdletBinding()]
-    param([string] $VMName, [int] $Count, [bool] $ExposeVirtualizationExtensions)
+    # Real parameter types: -Maximum is UInt64 (percent, 0..100) and -RelativeWeight is Int32 (1..10000).
+    param([string] $VMName, [int] $Count, [bool] $ExposeVirtualizationExtensions,
+          [uint64] $Maximum, [int] $RelativeWeight)
     $script:capSetProc = [ordered]@{
-        VMName      = $VMName
-        CountGiven  = $PSBoundParameters.ContainsKey('Count')
-        Count       = $Count
-        ExposeGiven = $PSBoundParameters.ContainsKey('ExposeVirtualizationExtensions')
-        Expose      = [bool]$ExposeVirtualizationExtensions
+        VMName              = $VMName
+        CountGiven          = $PSBoundParameters.ContainsKey('Count')
+        Count               = $Count
+        ExposeGiven         = $PSBoundParameters.ContainsKey('ExposeVirtualizationExtensions')
+        Expose              = [bool]$ExposeVirtualizationExtensions
+        MaximumGiven        = $PSBoundParameters.ContainsKey('Maximum')
+        Maximum             = [long]$Maximum
+        RelativeWeightGiven = $PSBoundParameters.ContainsKey('RelativeWeight')
+        RelativeWeight      = $RelativeWeight
+    }
+}
+
+# Get-CimInstance shadow. The real Win32_OperatingSystem instance exposes FreePhysicalMemory and
+# TotalVisibleMemorySize as UInt64 values in KiB; the stub returns exactly that shape. $script:cimMode
+# selects the figures or one of the two fail-closed shapes (no instance at all, or an instance with no
+# memory properties).
+$script:capCim  = $null
+$script:cimMode = 'normal'
+function Get-CimInstance {
+    [CmdletBinding()]
+    param([string] $ClassName, [string] $Namespace)
+    $script:capCim = [ordered]@{ ClassName = $ClassName }
+    switch ($script:cimMode) {
+        'normal' { return [pscustomobject]@{ FreePhysicalMemory = [uint64]8388608;  TotalVisibleMemorySize = [uint64]16777216 } }
+        'big'    { return [pscustomobject]@{ FreePhysicalMemory = [uint64]4294967296; TotalVisibleMemorySize = [uint64]8589934592 } }
+        'empty'  { return [pscustomobject]@{ Caption = 'no memory figures here' } }
+        default  { return $null }
     }
 }
 
@@ -127,6 +154,16 @@ function Invoke-Capture {
     return @{ err = $err; cap = (Get-Variable -Name $CapVarName -Scope script -ValueOnly) }
 }
 
+# GetHostMemory returns a plain hashtable; capture it next to the stub's recorded parameters.
+function Invoke-CaptureResult {
+    param([scriptblock] $Call, [string] $CimMode)
+    $script:cimMode = $CimMode
+    $script:capCim  = $null
+    $err = $null; $res = $null
+    try { $res = & $Call } catch { $err = $_.Exception.Message }
+    return @{ err = $err; cap = $script:capCim; result = $res }
+}
+
 $out = [ordered]@{
     NewVHD_Diff   = Invoke-Capture { & $b.NewVHD @{ Path = 'C:\sandbox\child.vhdx'; Differencing = $true; ParentPath = 'C:\sandbox\golden\debian-12-cloud.vhdx' } } 'capNewVHD'
     NewVHD_Fresh  = Invoke-Capture { & $b.NewVHD @{ Path = 'C:\sandbox\fresh.vhdx'; SizeBytes = 42949672960; Dynamic = $true } } 'capNewVHD'
@@ -135,6 +172,12 @@ $out = [ordered]@{
     NewSwitch_Ext = Invoke-Capture { & $b.NewSwitch @{ Name = 'extsw'; SwitchType = 'External'; NetAdapterName = 'Ethernet0' } } 'capNewSwitch'
     NewSwitch_Int = Invoke-Capture { & $b.NewSwitch @{ Name = 'intsw'; SwitchType = 'Internal' } } 'capNewSwitch'
     SetProcessor  = Invoke-Capture { & $b.SetProcessor @{ VMName = 'vm1'; Count = 2; ExposeVirtualizationExtensions = $true } } 'capSetProc'
+    SetProcessor_Caps    = Invoke-Capture { & $b.SetProcessor @{ VMName = 'vm1'; Count = 2; Maximum = 60; RelativeWeight = 500 } } 'capSetProc'
+    SetProcessor_MaxOnly = Invoke-Capture { & $b.SetProcessor @{ VMName = 'vm1'; Maximum = 25 } } 'capSetProc'
+    GetHostMemory        = Invoke-CaptureResult { & $b.GetHostMemory @{} } 'normal'
+    GetHostMemory_Big    = Invoke-CaptureResult { & $b.GetHostMemory @{} } 'big'
+    GetHostMemory_Null   = Invoke-CaptureResult { & $b.GetHostMemory @{} } 'null'
+    GetHostMemory_Empty  = Invoke-CaptureResult { & $b.GetHostMemory @{} } 'empty'
 }
 
 $out | ConvertTo-Json -Depth 6 -Compress
