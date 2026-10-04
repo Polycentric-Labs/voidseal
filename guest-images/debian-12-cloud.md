@@ -407,7 +407,9 @@ raw cmdlet). For reference, the equivalent raw Hyper-V calls are:
 # Gen2 VM (UEFI), Linux Secure Boot template, COM1 over a host named pipe.
 Set-VMFirmware -VMName $vm -SecureBootTemplate MicrosoftUEFICertificateAuthority
 Set-VMComPort  -VMName $vm -Number 1 -Path "\\.\pipe\$vm-com1"   # the serial command seam
-# (Tier 1: Internal vSwitch, NIC kept. For a Serial-mode InGuestSquid profile, Invoke-Voidseal
+# (Tier 1: Internal vSwitch, NIC kept. Under the shipped EgressMode='HostProxy' the host enforces
+#  egress (mock-green, never run live) and the seed adds only an in-guest default-DROP as defense
+#  in depth. For a Serial-mode InGuestSquid profile, Invoke-Voidseal
 #  renders an in-guest iptables + Squid allowlist into the seed it builds; that layer is
 #  defense-in-depth rather than a boundary, has never run live, and is enabled at first boot
 #  without being started, so its activation during a run is a Phase-6 question. Tier 2/3: NO NIC.)

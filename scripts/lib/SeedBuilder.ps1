@@ -655,8 +655,9 @@ runcmd:
 # __SQUID_ALLOWLIST_ACL__ is substituted (space-joined merged EgressAllowlist).
 #
 # THIS IS DEFENSE-IN-DEPTH, NOT A BOUNDARY (Pass A / Pass 5): a compromised/root guest can disable its
-# own iptables or kill its own Squid. The host-verified boundary is Phase-6 (host-side Internal
-# vSwitch + NAT + host default-DROP + host Squid SNI-splice, docs/phase-6-live-runbook.md). The mock
+# own iptables or kill its own Squid. This is the in-guest fallback mode; the tier1 default is
+# EgressMode='HostProxy', where the host enforces egress (host CONNECT proxy, host firewall rules and port
+# ACL, gate-verified, mock-green, never run live; docs/phase-6-live-runbook.md section 2). The mock
 # asserts SHAPE only (Squid ACL contains each allowlist domain; http_access deny all; iptables
 # default-DROP; IPv6 disabled) — real packet-drop is a Phase-6 live-validation item, same posture the
 # builder's own egress fragment already carries.
@@ -668,8 +669,8 @@ $script:CidataSerialEgressTemplate = @'
 # client does NOT authenticate) PLUS an in-guest iptables default-DROP + transparent Squid domain-ACL
 # over the profile's merged EgressAllowlist, ported from the builder's SquidSniProxy mechanism.
 #
-# DEFENSE-IN-DEPTH, NOT A BOUNDARY: a compromised/root guest can disable this. The host-verified
-# boundary is Phase-6 (host-side NAT/Squid/default-DROP). See docs/tier-reference.md.
+# DEFENSE-IN-DEPTH, NOT A BOUNDARY: a compromised/root guest can disable this. This is the InGuestSquid
+# fallback; the tier1 default, EgressMode='HostProxy', is host-enforced. See docs/tier-reference.md.
 
 users:
   - name: sandbox

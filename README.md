@@ -26,10 +26,13 @@ rather than duplicating it.
 >   untrusted-plugin detonation yet.**
 > - **Windows + Hyper-V only**, today. The "Tier-0 container" substrate is design-intent; v1 provisions
 >   Tier 0 as a Hyper-V VM whose seal removes its only network adapter, host-verified by the gate.
-> - **Tier-1 ships an in-guest egress control (iptables default-DROP + Squid allowlist) as
->   defense-in-depth**; it is mock-shape-asserted only, not yet exercised live, and NOT a boundary — a
->   compromised/root guest can disable it. The host-verified boundary is Phase-6. Don't rely on the
->   in-guest layer against a hostile guest (see the Egress note in
+> - **Tier-1 egress is host-enforced by design (`EgressMode='HostProxy'`, what `tier1.psd1` ships) and
+>   gate-verified, but mock-green only: it has never run live.** The guest has no route, NAT or
+>   resolver; a host CONNECT allowlist proxy on the VM's own /30 is the only way out, behind host
+>   firewall rules and a port ACL that the seal gate reads back. Do not run a hostile workload at
+>   Tier 1 until the live checks in [`docs/phase-6-live-runbook.md`](docs/phase-6-live-runbook.md)
+>   section 2 pass. A profile set to `InGuestSquid` instead gets only the in-guest iptables and Squid
+>   layer, which a root guest can disable (see the Egress note in
 >   [`docs/tier-reference.md`](docs/tier-reference.md)).
 > - **A profile's `Mounts` block does not deliver anything into the guest, and neither does
 >   `StageAssets`.** Nothing in the Provisioner or Runner attaches a host-guest bind mount; the backend
@@ -62,7 +65,7 @@ insider, and make the blast radius structurally small.
 | Tier | Boundary | Network | Credentials | Use |
 |---|---|---|---|---|
 | **0** | lightweight / offline (no-NIC VM in v1) | default-offline (host-proxy allowlist declared, not yet implemented) | none | trusted local workloads, file organizers |
-| **1** | net-restricted Hyper-V VM | Internal-switch isolation (seal-verified); in-guest egress allowlist ships as defense-in-depth (iptables + Squid, mock-shape-asserted, not a boundary) | scoped, on-demand | autonomous agent loops against a target repo |
+| **1** | net-restricted Hyper-V VM | Internal-switch isolation (seal-verified); host-enforced egress allowlist (`HostProxy`: host CONNECT proxy, host firewall rules and port ACL, gate-verified; mock-green, never run live) | scoped, on-demand | autonomous agent loops against a target repo |
 | **2** | disposable, **no NIC** | none (structurally starved) | none (refused at load) | untrusted code *(scaffold-only in v1)* |
 | **3** | air-gapped + sinkhole | none | none | malware detonation *(scaffold-only in v1)* |
 

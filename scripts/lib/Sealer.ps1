@@ -566,8 +566,9 @@ function Lock-Sandbox {
 
     # --- 3. remove every NIC unless the policy is exactly IsolatedInternalSwitch ---
     # Get-SealNicPolicy (SealPolicy.ps1) is the single predicate shared with the Provisioner and
-    # Assert-Sealed. Only a Tier-1 non-processor keeps its NIC: it is net-RESTRICTED, not no-net (egress
-    # control today is in-guest defense-in-depth, not the seal; host-side enforcement is Phase-6-live).
+    # Assert-Sealed. Only a Tier-1 non-processor keeps its NIC: it is net-RESTRICTED, not no-net (under
+    # EgressMode='HostProxy' the host enforces egress and the seal installs and verifies it; mock-green,
+    # never run live).
     # Every other VM is NoAdapter, and real New-VM always creates one adapter, so the seal removes it
     # (remove, not disconnect) for Assert-Sealed's zero-adapter check to pass. A descriptor with no
     # Network label lands on NoAdapter here and is then refused by the gate.
@@ -778,8 +779,10 @@ function Assert-Sealed {
     # seal now verifies BOTH: (a) the NIC's switch is SwitchType='Internal' (fail closed on External/Private/
     # unresolvable), AND (b) that switch is NOT the built-in Default Switch, refused explicitly BY NAME below
     # (Phase-6 §Track item 1 — now shipped; see the dedicated throw for the LIVE-only GUID-hardening note).
-    # Egress FILTERING via host Squid/NAT/default-DROP remains Phase-6-live; this asserts switch ISOLATION
-    # only — the VM can reach only the host gateway of whatever (non-Default) Internal switch it's on.
+    # This block asserts switch ISOLATION: the VM can reach only the host gateway of whatever (non-Default)
+    # Internal switch it's on. For EgressMode='HostProxy' the gateway address, firewall rules and port ACL
+    # that restrict what the guest can reach there are read back and verified further down; that
+    # enforcement is host-side and gate-verified, mock-green only, and has never run live.
     if ($nicPolicy -eq 'IsolatedInternalSwitch') {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
         # Without this guard a $null read meant the foreach below ran zero times and the VM CERTIFIED:

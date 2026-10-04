@@ -329,11 +329,11 @@ Remove-Sandbox -Name '<the VM name from $report.Name, e.g. sbx-0-xxxxxxxx>' -Del
 > untrusted or hostile agent workloads at Tier 1 until those checks pass.** A profile set to
 > `InGuestSquid` has only the in-guest layer, which a root guest can disable.
 
-**Proves milestone 5 — net-reachable, with an in-guest allowlist exercised live for the first
-time.** A Gen2 VM that keeps its NIC (not no-net) and runs a **bounded** Ralph loop reaching
-`api.anthropic.com` — the seed's in-guest Squid allowlist is intended to block any *other*
-destination, but whether it actually activates in time and holds under a live guest is exactly
-what this milestone is the first live test of (see §5.2).
+**Proves milestone 5: net-reachable, with the host-enforced allowlist exercised live for the
+first time.** A Gen2 VM that keeps its NIC (not no-net) and runs a **bounded** Ralph loop reaching
+`api.anthropic.com`, and the host CONNECT proxy is intended to refuse any *other* destination, but
+whether the host objects and the proxy actually hold under a live guest is exactly what this
+milestone is the first live test of (see §5.2).
 
 ### 4.1 Pin the upstream SHA (placeholder in `ralph.psd1`)
 
@@ -387,19 +387,17 @@ $report.RunResult.ExitCode   # the Ralph loop's exit status over the serial seam
 $report.ExtractedArtifact    # the extracted workspace diff/output dir, copied to the host
 ```
 
-- The VM (**net-reachable, defense-in-depth-restricted**) keeps its NIC (a Tier-1 non-processor is
-  the only VM that does; every other VM has its NIC removed). **In-guest egress control now ships, unproven live:** the
-  ralph/Serial CIDATA seed's `CidataSerialEgressTemplate` installs **iptables default-DROP
-  OUTPUT** plus a **transparent Squid `dstdomain` allowlist** over `EgressAllowlist`, so a
-  working activation should filter `api.anthropic.com` from any other destination — but this
-  run is the first live exercise of whether the control actually activates (and in time
-  relative to the guest's own pre-seal package install) and whether the packet-drop holds.
-  `Lock-Sandbox` does **not** install egress rules either way — that was never its job; it
-  removes host↔guest channels + detaches import media, same as every tier. This in-guest
-  **Squid-based redirect** (the approach the separate builder profile pioneered — static
-  nftables/ipset allowlists don't survive CDN IP rotation) is **defense-in-depth
-  only**: a compromised/root guest can disable it. The **host-verified boundary is Phase-6**
-  (see [`phase-6-live-runbook.md`](phase-6-live-runbook.md)).
+- The VM (**net-reachable, host-restricted**) keeps its NIC (a Tier-1 non-processor is the only
+  VM that does; every other VM has its NIC removed). **Host-enforced egress ships, mock-green and
+  never run live:** for `EgressMode='HostProxy'` (what `tier1.psd1` and so `ralph` use),
+  `Lock-Sandbox` installs the host side of egress in addition to removing host↔guest channels and
+  detaching import media: the gateway address on the VM's own Internal switch, the seven
+  `Voidseal-egress-<vm>-*` firewall rules and the port ACL entries. `Assert-Sealed` then reads
+  them back and refuses to certify on any mismatch; the CONNECT allowlist proxy starts after the
+  gate. The guest has no route, NAT or resolver, and the seed's in-guest default-DROP is defense
+  in depth only. A profile set to `InGuestSquid` instead relies on the in-guest iptables and Squid
+  layer, which a compromised/root guest can disable. The full live check list is
+  [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2.
 - The Ralph loop is **bounded**: rate/iteration caps (`MAX_CALLS_PER_HOUR`,
   `CLAUDE_TIMEOUT_MINUTES`, etc.) are env settings in the **guest**, not profile fields. The
   engine-built seed does not set them, so put a small cap on the command itself for the smoke test
@@ -653,8 +651,8 @@ Remove-Sandbox -Name '<sbx-0-... from $report.Name>' -DeleteDisks
 
 The seal gate (`Assert-Sealed`) runs **inside** `Invoke-Voidseal` as a hard gate before
 RUNNING. You verify it certified by reading the report; for Tier 1 you also spot-check the
-in-guest egress control (defense-in-depth, unproven live) — see §5.2, the first live exercise
-of it, not a pass/fail config check.
+host-enforced egress control (host-enforced and gate-verified, unproven live); see §5.2, the
+first live exercise of it, not a pass/fail config check.
 
 ### 5.1 Eyeball that the gate certified
 
@@ -669,14 +667,13 @@ $report.SealVerdict    # MUST be $true for BOTH milestones — the workload only
   operator-runbook troubleshooting table.
 - `States` should include `SEALED` on success; a seal-gate abort stops **before** `RUNNING`.
 
-### 5.2 Tier-1 egress: first live exercise of the in-guest control (not a boundary)
+### 5.2 Tier-1 egress: first live exercise of the host-enforced control
 
-The seal does **not** enforce egress (§4.4) — egress is the in-guest iptables+Squid control's
-job, and this is the **first live exercise** of it. The mock suite only asserts the seed's
-SHAPE (the rendered Squid config text, the iptables rule text, the ACL substitution) — it has
-never proven real packet-drop or the activation-timing ordering against the guest's own
-pre-seal package install. Run this to see what the live guest actually does, not to confirm a
-known gap.
+Under `EgressMode='HostProxy'` the seal installs the host side of egress and the gate reads it
+back (§4.4), and this is the **first live exercise** of it. The mock suite runs the host bodies
+against stub cmdlets and the proxy on loopback sockets; no real packet has crossed any of it.
+Run this to see what the live guest actually does, not to confirm a known gap. (For a profile
+set to `InGuestSquid`, the same commands exercise only the in-guest iptables and Squid layer.)
 
 ```text
 # In the guest serial console (the host drives \\.\pipe\<vm>-com1):
@@ -684,16 +681,15 @@ curl -sS -m 8 https://api.anthropic.com/ -o /dev/null ; echo "anthropic rc=$?"
 curl -sS -m 8 https://example.com/ -o /dev/null ; echo "example rc=$?"
 ```
 
-**If the control is active and working:** `anthropic rc=0`, `example rc≠0` (the Squid
-`dstdomain` ACL denies it and default-DROP blocks anything Squid doesn't redirect) — the
-in-guest control now restricts a benign agent to the allowlist, as designed. **If BOTH
-succeed:** the control did not activate in time (check the activation-timing ordering vs the
-guest's own pre-seal package install — `deb.debian.org` is intentionally not in the
-allowlist) — record this as a live-validation finding, not something to silently patch around.
-**Either way, this control is defense-in-depth only** — it is guest-disableable (a
-compromised/root guest can flush its own iptables or kill Squid) — so do **not** treat a
-passing check here as clearing Tier-1 for a hostile/untrusted workload. The **host-verified
-boundary is Phase-6** (see [`phase-6-live-runbook.md`](phase-6-live-runbook.md)).
+**If the control is working:** `anthropic rc=0`, `example rc≠0` (the host proxy refuses a
+name that is not on the allowlist, and the host firewall rules and port ACL drop anything that
+is not a CONNECT to the proxy), so the host now restricts a benign agent to the allowlist, as
+designed. **If BOTH succeed:** the host enforcement did not take effect; stop and record it as a
+live-validation finding, not something to silently patch around. **Do not treat one passing
+spot check as clearing Tier-1 for a hostile workload:** that needs the whole check list in
+[`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2, including the readback of all
+seven firewall rules. For an `InGuestSquid` profile, whatever the result, the control is
+defense in depth only (a compromised/root guest can flush its own iptables or kill Squid).
 
 ---
 
@@ -741,8 +737,8 @@ Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows 
   the seal gate certifying, a one-way host-read extraction, and a clean teardown — the core
   engine end-to-end.
 - Tier-1 Ralph: the same lifecycle on a **net-reachable** Gen2 VM (Internal-switch isolated,
-  NIC kept), with a **bounded** agent loop and the in-guest defense-in-depth egress control
-  (iptables default-DROP + Squid allowlist) exercised live for the first time, the diff
+  NIC kept), with a **bounded** agent loop and the host-enforced egress control
+  (`HostProxy`: host CONNECT proxy, firewall rules and port ACL) exercised live for the first time, the diff
   extracted for **human cherry-pick** (no auto-push), and a clean teardown.
 - The **host-verified seal gate** is a real gate on a real backend (the workload only runs on
   `SealVerdict=$true`).
@@ -762,11 +758,12 @@ Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows 
 - **Does not harden the serial transport (Gap 4).** The COM1 client is best-effort v1 with no
   per-command nonce; the smoke test exercises it live for the first time but does not certify
   it against an adversarial guest.
-- **Does not prove the in-guest egress control holds against a hostile guest.** The
-  iptables+Squid layer is **defense-in-depth**, not a boundary — a compromised/root guest can
-  disable it. This run is the first live check of activation + packet-drop (§5.2), not a
-  certification of that layer as trustworthy against adversarial code. The **host-verified
-  boundary is Phase-6**.
+- **Does not prove the egress control holds against a hostile guest.** The host-enforced
+  `HostProxy` control is gate-verified in the mock suite and this run is its first live check
+  (§5.2); one run is not a certification against adversarial code, which needs the full
+  [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2 list. The in-guest layers
+  (the seed's default-DROP, and the iptables+Squid of an `InGuestSquid` profile) are defense
+  in depth, not a boundary: a compromised/root guest can disable them.
 
 ---
 
