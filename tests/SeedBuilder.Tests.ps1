@@ -814,3 +814,146 @@ Describe 'Write-Iso9660Image — REAL IMAPI2 round-trip (gated on IMAPI availabi
         ([System.Text.Encoding]::ASCII.GetString($bytes)) | Should -BeLike "*$marker*" -Because 'the user-data content must round-trip into the image'
     }
 }
+
+# ===========================================================================
+#  Serial templates carry the same structural [voidseal-diag] markers as the disk runners (E7)
+# ===========================================================================
+Describe 'New-CidataUserData - the serial baseline and serial egress seeds narrate structure on the serial console (E7)' {
+
+    BeforeAll {
+        $script:DiagLineShape = 'diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }'
+        $script:SerialUd = New-CidataUserData -Profile $script:SerialProfile
+        $egress = $script:SerialProfile.Clone()
+        $egress['EgressMode']      = 'InGuestSquid'
+        $egress['EgressAllowlist'] = @('api.example.com', '.example.org')
+        $script:SerialEgressUd = New-CidataUserData -Profile $egress
+
+        # The content block of one write_files entry, dedented (same extraction the data-disk tests use).
+        function script:Get-SeedFile {
+            param([string] $UserData, [string] $Path)
+            $lines = $UserData -split "`n"
+            $start = [array]::IndexOf($lines, "  - path: $Path")
+            $start | Should -BeGreaterOrEqual 0 -Because "the seed must write $Path"
+            $body = [System.Collections.Generic.List[string]]::new()
+            for ($i = $start + 3; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - path: ' -or $lines[$i] -match '^  #' -or $lines[$i] -match '^\S') { break }
+                $body.Add(($lines[$i] -replace '^      ', ''))
+            }
+            return ($body -join "`n")
+        }
+        # The runcmd entries after the 'runcmd:' key.
+        function script:Get-RunCmd {
+            param([string] $UserData)
+            $lines = $UserData -split "`n"
+            $at = [array]::IndexOf($lines, 'runcmd:')
+            $at | Should -BeGreaterOrEqual 0
+            $out = [System.Collections.Generic.List[string]]::new()
+            for ($i = $at + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - ') { $out.Add($lines[$i].Trim()) } elseif ($lines[$i] -match '^\S') { break }
+            }
+            return @($out)
+        }
+        $script:Diag = @{
+            Serial = (script:Get-SeedFile $script:SerialUd '/usr/local/sbin/voidseal-serial-diag')
+            Egress = (script:Get-SeedFile $script:SerialEgressUd '/usr/local/sbin/voidseal-serial-diag')
+            Lock   = (script:Get-SeedFile $script:SerialEgressUd '/usr/local/sbin/voidseal-egress-lockdown')
+        }
+
+        $script:PosixSh2 = $null
+        if ($IsWindows) {
+            foreach ($git in @(Get-Command git -CommandType Application -All -ErrorAction SilentlyContinue)) {
+                $dir = Split-Path -Parent $git.Source
+                for ($up = 0; $up -lt 3 -and -not $script:PosixSh2 -and $dir; $up++) {
+                    $dir = Split-Path -Parent $dir
+                    foreach ($c in 'usr\bin\dash.exe', 'usr\bin\sh.exe') {
+                        $cand = Join-Path $dir $c
+                        if (Test-Path -LiteralPath $cand) { $script:PosixSh2 = $cand; break }
+                    }
+                }
+                if ($script:PosixSh2) { break }
+            }
+        }
+        else {
+            $sh = Get-Command dash, sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sh) { $script:PosixSh2 = $sh.Source }
+        }
+    }
+
+    It 'both seeds write the diag script and run it as the last runcmd entry' -ForEach @(
+        @{ Seed = 'baseline'; Var = 'SerialUd' }, @{ Seed = 'egress'; Var = 'SerialEgressUd' }
+    ) {
+        $ud = Get-Variable -Scope Script -Name $Var -ValueOnly
+        $ud | Should -BeLike '*- path: /usr/local/sbin/voidseal-serial-diag*'
+        $cmds = @(script:Get-RunCmd $ud)
+        $cmds[-1] | Should -Be '- [ /usr/local/sbin/voidseal-serial-diag ]' -Because 'it runs after the installs, so it reports what they left'
+    }
+
+    It 'uses the same diag helper shape as the outbox and builder runners, and the same marker prefix' {
+        $builder = New-CidataUserData -Profile (Import-WorkloadProfile -Path (Join-Path $script:SkillRoot 'profiles/builder.psd1') -TierProfileDir (Join-Path $script:SkillRoot 'tier-profiles'))
+        $builder.Contains($script:DiagLineShape)             | Should -BeTrue -Because 'the builder runner is the reference shape'
+        $script:Diag.Serial.Contains($script:DiagLineShape) | Should -BeTrue
+        $script:Diag.Egress.Contains($script:DiagLineShape) | Should -BeTrue
+        $script:Diag.Lock.Contains($script:DiagLineShape)   | Should -BeTrue
+    }
+
+    It 'the baseline script narrates device, mount, user, serial-getty and package facts' {
+        foreach ($marker in 'serial-seed start', 'block_devices=', 'device_mounts=', 'cidata_labeled=', 'sandbox_user=',
+                            'serial_getty_active=', 'autologin_dropin=', 'grub_ttyS0_lines=', 'cmdline_ttyS0=', 'bwrap_present=',
+                            'ca_certificates=', 'failed_units=', 'serial-seed done') {
+            $script:Diag.Serial | Should -BeLike "*diag `"*$marker*" -Because "the baseline must narrate $marker"
+        }
+    }
+
+    It 'the egress seed adds the squid, unit, IPv6 and OUTPUT-policy facts, and its lockdown script narrates its own run' {
+        foreach ($marker in 'squid_present=', 'squid_active=', 'egress_unit_enabled=', 'ipv6_disabled=', 'output_policy=') {
+            $script:Diag.Egress | Should -BeLike "*diag `"*$marker*" -Because "the egress seed must narrate $marker"
+        }
+        $script:Diag.Lock | Should -Match 'diag "squid_active='
+        $script:Diag.Lock | Should -Match 'diag "egress_lockdown=v4-applied redirect80_rc=\$r80 redirect443_rc=\$r443"'
+        $script:Diag.Lock | Should -Match 'diag "ip6_lockdown=applied"'
+        $script:Diag.Lock | Should -Match 'diag "ip6_lockdown=skipped'
+        $script:Diag.Lock | Should -Match 'r80=\$\?' -Because 'each REDIRECT rc is captured right after its rule'
+    }
+
+    It 'the markers are structural only: no content tools, and only fixed system paths are read' -ForEach @(
+        @{ Which = 'Serial' }, @{ Which = 'Egress' }, @{ Which = 'Lock' }
+    ) {
+        $diagLines = @(($script:Diag[$Which] -split "`n") | Where-Object { $_ -match '^\s*diag "' })
+        $diagLines.Count | Should -BeGreaterThan 1
+        foreach ($l in $diagLines) {
+            $l | Should -Not -Match '\b(ls|find|head|tail|od|xxd|hexdump|strings|dd|journalctl|dmesg|tee)\b' -Because "'$l' would put names or bytes on the console"
+            $l | Should -Not -Match '/mnt|/run/staging|/home|/workspace|/tmp|/var'
+            # cat may only read the one kernel flag; any other absolute path must be a known fixed one.
+            foreach ($m in [regex]::Matches($l, '\bcat\s+(\S+)')) { $m.Groups[1].Value | Should -Be '/proc/sys/net/ipv6/conf/all/disable_ipv6' }
+            $allowed = @('/proc/mounts', '/proc/cmdline', '/boot/grub/grub.cfg', '/proc/sys/net/ipv6/conf/all/disable_ipv6',
+                         '/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf', '/dev/null', '/dev/console', '/dev/')
+            foreach ($m in [regex]::Matches($l, "(?<![\w<])/[A-Za-z][\w@./-]*")) {
+                $path = $m.Value.TrimEnd('"', ')', '.')
+                ($allowed | Where-Object { $path -eq $_ -or ($_ -eq '/dev/' -and $path -eq '/dev/') }) | Should -Not -BeNullOrEmpty -Because "'$path' in '$l' is not a fixed system path"
+            }
+        }
+    }
+
+    It 'the diag scripts and the lockdown script parse as POSIX sh (sh -n)' -ForEach @(
+        @{ Which = 'Serial' }, @{ Which = 'Egress' }, @{ Which = 'Lock' }
+    ) {
+        if (-not $script:PosixSh2) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $f = Join-Path $TestDrive "diag-$Which.sh"
+        [System.IO.File]::WriteAllText($f, $script:Diag[$Which], [System.Text.UTF8Encoding]::new($false))
+        $out = & $script:PosixSh2 -n $f 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because "sh -n reported: $out"
+    }
+
+    It 'a diag failure cannot change control flow: set +e, output to /dev/console, errors swallowed' {
+        foreach ($w in 'Serial', 'Egress') {
+            $script:Diag[$w] | Should -Match '(?m)^set \+e$'
+            $script:Diag[$w] | Should -Not -Match '(?m)^\s*(exit|poweroff|reboot|shutdown)\b'
+        }
+    }
+
+    It 'the bare baseline still carries no egress content, and the egress seed still carries the lockdown' {
+        $script:SerialUd | Should -Not -BeLike '*squid_active*'
+        $script:SerialUd | Should -Not -BeLike '*egress_lockdown*'
+        $script:SerialEgressUd | Should -BeLike '*iptables -P OUTPUT DROP*'
+    }
+}

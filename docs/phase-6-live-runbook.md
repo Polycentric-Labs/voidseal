@@ -213,6 +213,20 @@ Read the live verdict off `Status` and `ExitCode` first, and cross-check it agai
 Markers are structural only (liveness/rc/counts/presence); dependency payload bytes never ride the
 console.
 
+The Serial baseline and Serial egress seeds (ralph) emit the same kind of markers, from
+`/usr/local/sbin/voidseal-serial-diag` (run last in `runcmd`) and, for egress, from the lockdown script
+itself:
+
+| Marker | What it attributes |
+|---|---|
+| `block_devices= device_mounts= cidata_labeled=` | whether the guest saw the CIDATA disk and how many disks and device mounts it has |
+| `sandbox_user=` | the non-root run user exists |
+| `serial_getty_active= autologin_dropin= grub_ttyS0_lines= cmdline_ttyS0=` | the COM1 command channel: getty up, autologin drop-in written, console arguments in GRUB and on the running kernel |
+| `bwrap_present= ca_certificates=` | the installs that follow `apt-get update` |
+| `squid_present= squid_active= egress_unit_enabled= ipv6_disabled= output_policy=` | egress seed only: Squid, the lockdown unit, IPv6 and the OUTPUT chain policy |
+| `egress_lockdown=v4-applied redirect80_rc= redirect443_rc=` and `ip6_lockdown=` | egress seed, written when the lockdown unit runs (the next boot), same fields as the builder |
+| `failed_units=` | count of failed systemd units |
+
 ## 6. Builder output: what a good run leaves
 
 A run that ends `Status='Success'` leaves `deps-<Name>.vhdx` under `-DepsOutputDir` (default

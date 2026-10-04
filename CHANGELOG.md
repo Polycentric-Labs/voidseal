@@ -116,3 +116,8 @@ places where a check is an argument rather than a measurement.
   working copy of it. `-DepsDiskPath` still names an exact file. A destination inside the storage root,
   a relative or UNC path, a non-`.vhdx` name, or an existing file is refused before the build starts.
   New `-ArtifactRoot` parameter; `WholeImageHash` stays in the result as an alias of `DepsImageHash`.
+- Serial seed diagnostics: the Serial baseline and Serial egress seeds now emit the same structural
+  `[voidseal-diag]` markers the outbox and builder runners do (device and mount counts, serial-getty
+  and package presence, Squid and IPv6 state, the lockdown's REDIRECT return codes), through the same
+  `diag()` helper, so a misbehaving ralph seed can be told apart from the serial capture alone. Counts
+  and yes/no facts only, never file content or workload names.
