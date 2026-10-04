@@ -109,7 +109,7 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `ScreenConfig` | no — **PROCESSOR-only** | `mode` (default `'aggressive'`) + `categories` (default `@()`) that route the post-detach Sensitivity Gate | a "processor" profile is specifically `Network='None'` **plus** a declared `ScreenConfig`; it is never paired with `OutboxOutput=$true` (transport-only profiles are never screened, by design) |
 | `DepsDiskPath` | no | host path to a pre-built `deps.vhdx` a processor run attaches | in practice supplied via a `-Workload` runtime override rather than baked into the `.psd1`, since it's produced by a separate builder run |
 | `OutboxOutput` | no | opts a non-processor Disk-mode workload into the shared user-space outbox transport (Raw OUTPUT disk; the host reads it via `ReadVhdxRawRegion`, **never** `Mount-VHD`) | transport-only — never paired with `ScreenConfig` (see `firefox.psd1`) |
-| `DataDisks` | no (Disk-mode only) | pre-built, hash-verified data disks the guest mounts **read-only** at `/mnt/data/<name>`: bulk input of any size and tree shape, wheels, or model weights. Each entry is `@{ Name; Path; ImageHash }`, printed by `scripts/New-VoidsealDataDisk.ps1`. `-Workload.DataDisks` replaces the profile's list entirely | `Name` matches `^[a-z0-9]{1,8}$`, unique, at most 8 disks; `Path` a local `.vhdx` outside the sandbox storage root, not secret-shaped, never the DEPS disk or the golden parent; `ImageHash` 64 hex characters. A mismatched hash refuses the run before any data disk is attached. Full rules: `tier-profiles/SCHEMA.md` |
+| `DataDisks` | no (Disk-mode only) | pre-built, hash-verified data disks the guest mounts **read-only** at `/mnt/data/<name>`: bulk input of any size and tree shape, wheels, or model weights. Each entry is `@{ Name; Path; ImageHash }`, printed by `scripts/New-VoidsealDataDisk.ps1`. `-Workload.DataDisks` replaces the profile's list entirely | `Name` matches `^[a-z0-9]{1,8}$`, unique, at most 8 disks; `Path` a local `.vhdx` outside the sandbox storage root, not secret-shaped, never the DEPS disk or the golden parent; `ImageHash` 64 hex characters. Each run attaches a per-run working copy, never your file, and a copy that does not match the hash refuses the run before any data disk is attached. Budget the space and copy time of one copy per disk per run. Full rules: `tier-profiles/SCHEMA.md` |
 
 > **Fields marked "not yet in SCHEMA.md"** (`WorkloadMode`, `Inputs`, `InputFiles`, `FileSystem`,
 > `InputLabel`/`OutputLabel`, `DepsSpec`, `ScreenConfig`, `DepsDiskPath`, `OutboxOutput`) are real,
@@ -165,7 +165,7 @@ takes effect:
 | `RUNNING` | your `Entrypoint` runs in the sealed guest, bounded by the effective deadline (`-WorkloadTimeoutSeconds` if passed, else `WorkloadTimeoutSeconds`, else 600 s). **Serial mode**: `Start-SandboxWorkload` boots the guest and sends the command over the COM1 seam, and the command's stdout and stderr come back the same way into the host-side run capture (there are no data disks, and `Mounts` is not wired); **Disk mode**: the guest boots straight into the seed-injected runner, mounts `INPUT` read-only / `OUTPUT` read-write, runs your `Entrypoint`, writes the result + an exit-code sentinel, and self-powers-off | `Entrypoint` (Serial) or `WorkloadMode`/`Inputs`/`FileSystem`/`InputLabel`/`OutputLabel` (Disk); `WorkloadTimeoutSeconds` for either |
 | `CAPTURED` | the run result + host-side capture artifact are recorded | `Capture` |
 | `EXTRACTED` | `Export-SandboxArtifact` reads the result out, **one-way OUT** — `HostReadResultDir` (Tier 0/1) just reads what your workload wrote; `ColdVHDX-Quarantine-CDR` (Tier ≥ 2) routes to the quarantine sink (throws — not implemented in v1) | `Extraction` |
-| `DESTROYED` | `Remove-Sandbox` tears down per the teardown model — **always runs**, in a `finally`, so a mid-flow failure never leaves an orphaned VM/disk/switch. Data disks are never deleted; once the VM is gone each one is re-hashed, and a change sets the report's `DataDiskChanged` | `Lifecycle`, `DataDisks` |
+| `DESTROYED` | `Remove-Sandbox` tears down per the teardown model — **always runs**, in a `finally`, so a mid-flow failure never leaves an orphaned VM/disk/switch. Teardown deletes the data disks' working copies (and the DEPS disk's) with the run's other disks; the originals are kept, and once the VM is gone each original is re-hashed, so a change on the host during the run sets the report's `DataDiskChanged` | `Lifecycle`, `DataDisks` |
 
 ## 4. Worked walkthrough — authoring a synthetic Tier-0 profile
 
@@ -217,13 +217,17 @@ carry data today:
   ```
 
   Here `sample-corpus` is a folder of synthetic sample text files. The script refuses a tree that
-  holds a secret-shaped file or any junction or symbolic link. At run time the engine re-hashes the
-  disk and refuses the run on a mismatch, the guest mounts it read-only at `/mnt/data/corpus`, and
-  your `Entrypoint` reads it there (for example `--corpus /mnt/data/corpus`). If a declared disk
-  does not mount read-only, the guest powers off without running the workload. After the run the
-  disk is re-hashed; `DataDiskChanged` on the report says whether the guest altered it. Pass the
-  list as `-Workload @{ DataDisks = @(...) }` to keep host paths out of the `.psd1`. The real
-  copy needs an elevated session (it mounts the new disk on the host).
+  holds a secret-shaped file or any junction or symbolic link. At run time the engine copies the
+  disk into the run's sandbox folder, refuses the run if the copy does not match the hash, and
+  attaches the copy; your file is never attached, so it keeps its hash for the next run. That costs
+  one copy's worth of free space and copy time per disk on every run, and teardown deletes the copy.
+  The guest mounts it read-only at `/mnt/data/corpus`, and your `Entrypoint` reads it there (for
+  example `--corpus /mnt/data/corpus`). If a declared disk does not mount read-only, the guest powers
+  off without running the workload. After the run your original is re-hashed; `DataDiskChanged` on
+  the report says whether something on the host changed it meanwhile, and `DataDisks` on the report
+  lists each disk's original, verified hash and working copy. Pass the list as
+  `-Workload @{ DataDisks = @(...) }` to keep host paths out of the `.psd1`. Building the disk needs
+  an elevated session (the script mounts the new disk on the host).
 - **Serial mode** attaches no data disks, so the engine copies no host file into the guest. The
   `Entrypoint` string arrives over COM1, and the command's stdout and stderr come back in the
   host-side run capture (`run-<timestamp>.json` under the artifact root). On this offline tier,

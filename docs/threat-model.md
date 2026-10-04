@@ -61,7 +61,7 @@ Legend: 🟢 **IN SCOPE** (a bug here is a Voidseal defect — see the gate name
 | **Host↔guest channel left ON** (clipboard / shares / guest-services / enhanced-session) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Residual / import / secret-shaped disk left attached** | 🟢 best-effort backstop | 🟢 best-effort backstop | 🟢 structural, authoritative | 🟢 structural, authoritative |
 | **Malicious/malformed profile bypassing load-time invariants** | 🟢 | 🟢 | 🟢 | 🟢 |
-| **Pre-built data disk** substituted before attach, aliasing a run disk, or written by the guest | 🟢 verified before attach; a guest write is reported, not prevented | 🟢 same | 🟢 same | 🟢 same |
+| **Pre-built data disk** substituted before attach, aliasing a run disk, or written by the guest | 🟢 a verified per-run working copy is attached; the guest can write only to that copy, which teardown deletes | 🟢 same | 🟢 same | 🟢 same |
 | **Hostile-output extraction / quarantine** | ➖ not a presumed-hostile tier | ➖ not a presumed-hostile tier | 🟡 designed in scope; sink is a scaffold | 🟡 designed in scope; sink is a scaffold |
 | **Host operator error** (unpatched host, wrong parent disk, elevation misuse, etc.) | ⚪ | ⚪ | ⚪ | ⚪ |
 
@@ -154,21 +154,29 @@ be a Voidseal defect.
   or equal to the DEPS disk or the golden parent, compared both lexically and after following junctions
   and symbolic links. A data disk file with a second hard link is refused, since the other name could be
   any of those.
-- **Before attach**, every declared disk passes the same check as the DEPS disk
-  (`Assert-DiskImageVerified`): readable, not differencing, and its whole-image SHA-256 (user space,
-  never `Mount-VHD`) equal to the operator-recorded hash. All disks are verified before the first is
-  attached, so one bad disk leaves none attached and the run never seals. This is tamper evidence for
-  the hand-off from `New-VoidsealDataDisk.ps1` to the run, not a statement about where the content came
-  from. A swap in the instant between the hash and the attach is not covered.
+- **Before attach**, every declared disk goes through the same `New-VerifiedDiskCopy` as the DEPS disk:
+  the original must be readable and not differencing; it is copied into the run's own sandbox folder
+  (`CopyVhdxFile`, a plain file copy); and the COPY must pass the same structure check and have a
+  whole-image SHA-256 (user space, never `Mount-VHD`) equal to the recorded hash. The copy is what gets
+  attached, so the bytes the guest sees are the bytes that were hashed, and nothing outside the run
+  folder holds them. All copies are verified before the first is attached, so one bad disk leaves none
+  attached and the run never seals. This is tamper evidence for the hand-off from
+  `New-VoidsealDataDisk.ps1` (or the builder) to the run, not a statement about where the content came
+  from.
 - **In the guest**, the runner mounts each disk read-only and refuses to run the workload if one is
-  missing or mounted writable. That `ro` mount is not a boundary: the host attach is **read-write**
-  (Hyper-V cannot attach a VHDX read-only, D3), and the in-guest user has passwordless sudo, so a hostile
-  guest can remount or write raw blocks.
-- **After the run**, once teardown has removed the VM, every data disk is re-hashed. A change, or a disk
-  that cannot be re-hashed, sets `DataDiskChanged` on the report and warns. It does not fail the run and
-  does not undo the write: the operator must rebuild or restore the disk before relying on it again.
-  Teardown never deletes a data disk (it is not on `CreatedDisks`), and `Assert-Sealed` accepts only
-  recorded data disks.
+  missing or mounted writable. That `ro` mount is not a boundary: the host attach of the copy is
+  **read-write** (Hyper-V cannot attach a VHDX read-only, D3), and the in-guest user has passwordless
+  sudo, so a hostile guest can remount or write raw blocks. Whatever it writes lands on the working
+  copy, which is on `CreatedDisks` and deleted at teardown; it cannot reach the original or a later run.
+  The same holds for any metadata Hyper-V itself writes when it opens the file.
+- **After the run**, once teardown has removed the VM, every ORIGINAL is re-hashed. This catches a change
+  made on the host while the run was going, not anything the guest did. A change, or an original that
+  cannot be re-hashed, sets `DataDiskChanged` on the report and warns; it does not fail the run.
+  Originals are never attached or deleted, and `Assert-Sealed` accepts only the recorded working copies.
+- **Cost and residual:** each run needs one copy's worth of free space per disk under the storage root
+  (budgeted in the free-space preflight) and the time to copy it. A change to the original in the window
+  between its structure check and the copy is caught by the copy's hash; a change after the copy does
+  not affect this run and shows up in `DataDiskChanged`.
 
 **Hostile-output extraction / quarantine.**
 - **T0/T1 — not applicable in the adversarial sense.** `Extraction='HostReadResultDir'` is a **trusting**
