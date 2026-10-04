@@ -57,8 +57,8 @@
         Teardown uses it as well: Remove-Sandbox removes the switches the descriptor records in
         CreatedSwitches, so a COMPLETED run leaves no per-VM switch behind either.
     NIC POLICY (2026-10-03):
-      * Get-SealNicPolicy is the single predicate for whether a VM keeps a NIC, shared with Lock-Sandbox
-        and Assert-Sealed. New-SandboxVM records the profile's Network label on the descriptor so all
+      * Get-SealNicPolicy (SealPolicy.ps1, dot-sourced below) is the single predicate for whether a VM
+        keeps a NIC, shared with Lock-Sandbox and Assert-Sealed. New-SandboxVM records the profile's Network label on the descriptor so all
         three compute the same answer. Only a Tier-1 non-processor gets a switch and a connected NIC.
     AUTOMATIC CHECKPOINTS (RC7 — gap CLOSED 2026-06-25):
       * Hyper-V defaults `AutomaticCheckpointsEnabled=ON`, which pins a differencing AVHDX per disk at
@@ -71,6 +71,9 @@
 #>
 
 Set-StrictMode -Version Latest
+
+# The NIC policy predicate shared with Lock-Sandbox and Assert-Sealed (see SealPolicy.ps1).
+. (Join-Path $PSScriptRoot 'SealPolicy.ps1')
 
 # --------------------------------------------------------------------------
 # Internal helpers
@@ -313,38 +316,7 @@ function New-SandboxDescriptor {
     }
 }
 
-<#
-.SYNOPSIS
-    The ONE predicate for a sandbox VM's network-adapter posture: 'IsolatedInternalSwitch' or 'NoAdapter'.
-.DESCRIPTION
-    Three call sites used to answer "does this VM keep a NIC?" on their own: the Provisioner keyed on
-    Substrate, Lock-Sandbox on Tier, and Assert-Sealed on Tier plus a Network field that production
-    never recorded. They drifted, so a processor kept its default adapter through the seal and a Tier-1
-    processor was certified with a CONNECTED adapter. All three now ask this function.
-
-    The rule is an allow-list with one entry. A VM keeps a NIC (on an isolated Internal vSwitch) only
-    when its Tier is exactly 1 AND its Network label is present and is not 'None'. Every other input
-    returns 'NoAdapter': Tier 0, Tier >= 2, a processor (Network='None') at any tier, a blank label,
-    and an out-of-range tier. Unexpected input therefore lands on the strict side. The 'None' match is
-    case-insensitive, like the loader's processor rule, and it also trims surrounding whitespace, which
-    the loader does not, so this predicate is the stricter of the two.
-.PARAMETER Tier
-    The VM's risk tier (descriptor or profile Tier).
-.PARAMETER Network
-    The VM's Network posture label (descriptor or profile Network). Blank or $null means NoAdapter.
-#>
-function Get-SealNicPolicy {
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory)] [int] $Tier,
-        [Parameter(Mandatory)] [AllowNull()] [AllowEmptyString()] [string] $Network
-    )
-    if ($Tier -eq 1 -and -not [string]::IsNullOrWhiteSpace($Network) -and $Network.Trim() -ne 'None') {
-        return 'IsolatedInternalSwitch'
-    }
-    return 'NoAdapter'
-}
+# Get-SealNicPolicy lives in SealPolicy.ps1 (dot-sourced at the top of this file).
 
 # --------------------------------------------------------------------------
 # Public: New-SandboxVM  (the Provisioner)

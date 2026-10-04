@@ -1622,3 +1622,39 @@ Describe 'Seal coverage: Assert-Sealed refuses automatic checkpoints and any exi
             Should -Throw -ExpectedMessage '*could not list its checkpoints (the read returned no collection)*'
     }
 }
+
+# ===========================================================================
+#  The NIC policy predicate travels with the Sealer
+# ===========================================================================
+#  Lock-Sandbox and Assert-Sealed call Get-SealNicPolicy. It used to live in Provisioner.ps1, so a session
+#  that dot-sourced Sealer.ps1 alone could not seal. It now lives in SealPolicy.ps1, which both the Sealer
+#  and the Provisioner dot-source, and each file is checked here in a fresh runspace.
+Describe 'Get-SealNicPolicy loads with Sealer.ps1 and with Provisioner.ps1, each dot-sourced alone' {
+
+    It 'a fresh runspace that dot-sources only <File> can call Get-SealNicPolicy' -ForEach @(
+        @{ File = 'Sealer.ps1' }, @{ File = 'Provisioner.ps1' }
+    ) {
+        $path = Join-Path $script:SkillRoot "scripts/lib/$File"
+        $ps = [powershell]::Create()
+        try {
+            $null = $ps.AddScript({
+                param($p)
+                . $p
+                Get-SealNicPolicy -Tier 1 -Network 'Internal+Allowlist'
+            }).AddArgument($path)
+            $out = $ps.Invoke()
+            @($ps.Streams.Error).Count | Should -Be 0 -Because "dot-sourcing $File alone must not error: $(@($ps.Streams.Error) -join '; ')"
+            @($out)[0] | Should -Be 'IsolatedInternalSwitch'
+        }
+        finally { $ps.Dispose() }
+    }
+
+    It 'the predicate is defined in exactly one file, SealPolicy.ps1' {
+        $defs = @(Get-ChildItem -LiteralPath (Join-Path $script:SkillRoot 'scripts/lib') -Filter '*.ps1' | Where-Object {
+            $t = $null; $e = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$t, [ref]$e)
+            @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-SealNicPolicy' }, $true)).Count -gt 0
+        } | ForEach-Object { $_.Name })
+        $defs | Should -Be @('SealPolicy.ps1')
+    }
+}

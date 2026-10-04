@@ -18,7 +18,7 @@ attached, that no secret-shaped or unrecorded volume remains, that the host chan
 off, and that no passthrough device is assigned: no GPU partition adapter and no device handed over by
 Discrete Device Assignment, which could be a physical NIC that the virtual-adapter read never sees.
 **Every VM except a Tier-1 non-processor must seal with zero network adapters.** One predicate,
-`Get-SealNicPolicy` in `scripts/lib/Provisioner.ps1`, makes that call for the Provisioner, `Lock-Sandbox`
+`Get-SealNicPolicy` in `scripts/lib/SealPolicy.ps1`, makes that call for the Provisioner, `Lock-Sandbox`
 and `Assert-Sealed` alike: Tier 0, Tier >= 2, and any profile that declares `Network='None'` (a
 "processor") at any tier get no adapter. Real `New-VM` always creates one, so the seal removes it and the
 gate requires the host to report none; a descriptor that records no `Network`, or a policy value the

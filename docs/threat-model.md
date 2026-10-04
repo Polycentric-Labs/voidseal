@@ -73,7 +73,7 @@ bubblewrap draws for the Linux kernel primitives it wraps. Keeping the host patc
 itself is patched.
 
 **Live NIC / egress route present at seal time.**
-- **T0, T2, T3, and every processor: IN SCOPE.** `Get-SealNicPolicy` (`scripts/lib/Provisioner.ps1`)
+- **T0, T2, T3, and every processor: IN SCOPE.** `Get-SealNicPolicy` (`scripts/lib/SealPolicy.ps1`)
   returns `NoAdapter` for all of them, and the Provisioner, `Lock-Sandbox` and `Assert-Sealed` all ask it.
   The Provisioner builds no switch, `Lock-Sandbox` removes the one adapter real `New-VM` always creates,
   and `Assert-Sealed` requires the backend's `GetNetworkAdapter` call to return zero adapters, naming the

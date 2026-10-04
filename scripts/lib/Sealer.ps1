@@ -33,7 +33,7 @@
       Lock-Sandbox handles VM-CONFIG isolation:
         1. detach every import-only medium (ISO DVD + transfer VHDs recorded on the descriptor),
         2. for a NoAdapter VM (Tier 0, Tier >= 2, any processor; see Get-SealNicPolicy in
-           Provisioner.ps1) `RemoveNetworkAdapter` (remove, not disconnect),
+           SealPolicy.ps1) `RemoveNetworkAdapter` (remove, not disconnect),
         3. turn OFF every host<->guest channel (clipboard / shares / guest-services /
            enhanced-session, plus the Time Synchronization, Key-Value Pair Exchange, Backup and
            Heartbeat integration services) via the backend's SetHostChannel,
@@ -109,13 +109,19 @@
 
 Set-StrictMode -Version Latest
 
+# Get-SealNicPolicy, the NIC predicate Lock-Sandbox and Assert-Sealed share with the Provisioner.
+. (Join-Path $PSScriptRoot 'SealPolicy.ps1')
+
 # --------------------------------------------------------------------------
 # Shared constants
 # --------------------------------------------------------------------------
 
 # The host<->guest channels the seal turns OFF and the gate host-verifies. Mirrors
 # $script:HostChannelNames in HyperVBackend.ps1 and the tier-profile HostChannels keys
-# (SCHEMA.md). Re-declared here so this file is usable when dot-sourced standalone.
+# (SCHEMA.md). Re-declared here so the set does not depend on HyperVBackend.ps1 being loaded first.
+# What this file needs from elsewhere: Get-SealNicPolicy comes from SealPolicy.ps1, which this file
+# dot-sources itself; Get-VMField (Provisioner.ps1) and Test-IsSecretPath (ProfileLoader.ps1) still come
+# from the load order in the header, and Assert-Sealed refuses when Test-IsSecretPath is missing.
 #
 # Since 2026-10-03 (design E6) the set also closes four Hyper-V integration services the engine never
 # uses: TimeSync (Time Synchronization), KeyValueExchange (Key-Value Pair Exchange), Backup (VSS) and
@@ -531,7 +537,7 @@ function Lock-Sandbox {
     }
 
     # --- 3. remove every NIC unless the policy is exactly IsolatedInternalSwitch ---
-    # Get-SealNicPolicy (Provisioner.ps1) is the single predicate shared with the Provisioner and
+    # Get-SealNicPolicy (SealPolicy.ps1) is the single predicate shared with the Provisioner and
     # Assert-Sealed. Only a Tier-1 non-processor keeps its NIC: it is net-RESTRICTED, not no-net (egress
     # control today is in-guest defense-in-depth, not the seal; host-side enforcement is Phase-6-live).
     # Every other VM is NoAdapter, and real New-VM always creates one adapter, so the seal removes it
@@ -634,7 +640,7 @@ function Assert-Sealed {
         throw "Assert-Sealed: descriptor has no VM Name; cannot verify a seal."
     }
     $tier = [int](Get-DescriptorField -Descriptor $Descriptor -Name 'Tier' -Default 0)
-    # The NIC policy comes from ONE predicate, Get-SealNicPolicy (Provisioner.ps1), shared with the
+    # The NIC policy comes from ONE predicate, Get-SealNicPolicy (SealPolicy.ps1), shared with the
     # Provisioner and Lock-Sandbox and computed from the Tier plus the Network label New-SandboxVM
     # records on the descriptor. Until 2026-10-03 production never recorded Network, so the processor
     # branch below could fire only in tests that injected the field by hand.
