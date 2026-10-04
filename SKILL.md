@@ -31,7 +31,7 @@ assume the agent/code inside is a prompt-injectable insider; make the blast radi
 structurally small. Isolation strength is matched to the task's risk via the **tier axis**.
 
 > **Status (v1):** core engine + the Tier 0/1 Hyper-V provisioning paths built + tested. The whole
-> module is **mock-backed green (907 Pester tests passed, 0 failed, 2 skipped; plus 56 pytest tests)**, AND the **Tier-0 `firefox` disk-mode round-trip is now
+> module is **mock-backed green (1517 Pester tests passed, 0 failed, 2 skipped; plus 185 pytest tests)**, AND the **Tier-0 `firefox` disk-mode round-trip is now
 > LIVE-PROVEN on real Hyper-V**: provision, host-verified seal gate, disk-passing workload, host-read
 > result, clean teardown, end to end. Milestone 3 (2026-06-25) proved it with the legacy exFAT OUTPUT
 > disk and drove out 7 real `fake≠real` host/Hyper-V gaps, all since fixed; the current user-space
@@ -215,7 +215,7 @@ From the skill root (no elevation needed — the backend is mocked):
 Invoke-Pester -Path tests/
 ```
 
-As of the last local run: 907 passed, 0 failed, 2 skipped (unit, e2e, invariant refusals, and the
-shipped profiles), plus 56 pytest tests for the guest and host helpers. The profile-loader refusals
+As of the last local run: 1517 passed, 0 failed, 2 skipped (unit, e2e, invariant refusals, and the
+shipped profiles), plus 185 pytest tests for the guest and host helpers. The profile-loader refusals
 (secret-shaped `Mounts` and `StageAssets` sources, Tier >= 2 starvation, the pre-seal gate) and the
 seal-gate abort are **must-pass** tests.

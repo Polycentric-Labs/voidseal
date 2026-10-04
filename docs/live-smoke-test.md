@@ -7,7 +7,7 @@
 >
 > **What it proves:** milestones **4** (Tier-0 Firefox proof) and **5** (Tier-1
 > Ralph proof) — the Tier 0/1 lifecycle end-to-end, on a **live** Hyper-V backend, after a
-> mock-backed green suite (907 passed, 0 failed, 2 skipped as of the last local run). It does **NOT** exercise Tier 2/3 (harness-only this
+> mock-backed green suite (1517 passed, 0 failed, 2 skipped as of the last local run). It does **NOT** exercise Tier 2/3 (harness-only this
 > round) and does **NOT** touch your real personal data (synthetic-by-default).
 >
 > **Safe by default:** synthetic Firefox data; a bounded Ralph loop; no auto-push; manual
@@ -157,10 +157,10 @@ Prove the logic is green and watch the state machine before any real VM exists.
 
 ```powershell
 Invoke-Pester -Path tests/
-# Expect: Failed: 0, Errors: 0. The passed count is 907 as of the last local run
+# Expect: Failed: 0, Errors: 0. The passed count is 1517 as of the last local run
 # (2 skipped); it grows as features land, so gate on Failed: 0, never on an exact total.
 python -m pytest tests/guest tests/host -q
-# Expect: 56 passed, 0 failed.
+# Expect: 185 passed, 0 failed.
 ```
 
 If **any** test is red — especially the profile-loader invariant refusals (secret-mount,
@@ -435,7 +435,7 @@ never assumes "Off == success".
 
 > **Why this exists:** Milestone 1 reached `INIT…DESTROYED` + `SealVerdict=True` but its
 > `bookmarks.html` was a stand-in because the serial command channel raced the boot. The
-> disk-passing model replaces that fragile handshake. The engine is **mock-proven (907 passed, 0 failed, 2 skipped)**;
+> disk-passing model replaces that fragile handshake. The engine is **mock-proven (1517 passed, 0 failed, 2 skipped)**;
 > this milestone is its first *live* exercise.
 
 > **Note — this section describes the CURRENT contract, not Milestone 3's original one.** Milestone 3
@@ -624,7 +624,7 @@ Whatever the outcome, **teardown still runs** (the `finally`), so you won't accu
 
 ### 4A.6 The live-only-unproven list (what this milestone is actually testing for the first time)
 
-The 907 passing mock tests prove the *host orchestration* + *classification* logic. These pieces run for
+The 1517 passing mock tests prove the *host orchestration* + *classification* logic. These pieces run for
 the **first time** on real hardware here — if something snags, it's most likely one of these,
 **not** a containment failure:
 
@@ -814,8 +814,8 @@ any gap-related friction observed).
 - [ ] Debian-12 golden `.vhdx` built; `$GoldenVhdx` resolves; `grub-efi-amd64-signed` present — §1
 
 **Dry run**
-- [ ] `Invoke-Pester -Path tests/` → **0 failed** (907 passed / 2 skipped as of the last local run; gate on Failed: 0, not on a total), see §2.1
-- [ ] `python -m pytest tests/guest tests/host -q` → **56 passed, 0 failed** — §2.1
+- [ ] `Invoke-Pester -Path tests/` → **0 failed** (1517 passed / 2 skipped as of the last local run; gate on Failed: 0, not on a total), see §2.1
+- [ ] `python -m pytest tests/guest tests/host -q` → **185 passed, 0 failed** — §2.1
 - [ ] Fake-backend `Invoke-Voidseal` shows `INIT..DESTROYED`, `SealVerdict=$true`, clean teardown — §2.2
 
 **Milestone 1 — Firefox (Tier 0), synthetic (containment proof, stand-in output)**
