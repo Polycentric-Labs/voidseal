@@ -450,9 +450,10 @@ write_files:
       # SERIAL DIAGNOSTICS (Phase-6 live-debug observability — the same discipline whose markers
       # pinned BOTH Tier-0 live root causes in the OutboxOutput runner). Phase 6 is the FIRST live
       # egress: a failed fetch must be attributable to squid-down vs REDIRECT-not-applied vs
-      # mount-failure vs the fetch itself. Invoke-BuilderVM's Status=Success is clean-POWEROFF-only
-      # (the exitcode read deferred to Phase 4 and never landed for the builder) and teardown deletes
-      # the OUTPUT disk, so this console narration is the ONLY live signal of fetch outcome.
+      # mount-failure vs the fetch itself. Invoke-BuilderVM reads result.exitcode and deps-manifest.json
+      # off the OUTPUT disk and reports Success only for an exit code of exactly 0 with the manifest
+      # present, else FetchFailed with the reason; teardown then deletes the OUTPUT disk, so this console
+      # narration is the second source and the only one that says WHERE the guest stopped.
       # STRUCTURAL ONLY: liveness, rc values, file COUNTS, manifest presence — NEVER fetched-artifact
       # bytes (contract-consistency with the shared outbox runner; serial stays a control-flow record,
       # not a payload mirror). Never alters control flow: runs under `set +e`, writes to /dev/console
@@ -525,9 +526,9 @@ write_files:
       if mount -o uid=$SBX_UID,gid=$SBX_GID LABEL=OUTPUT /mnt/out 2>/dev/null; then OUT_SANDBOX_OWNED=1; fi
       mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out 2>/dev/null
       # Both fail-closed branches below were SILENT `poweroff` guards — the exact silent-runner class
-      # that hid the Tier-0 root causes. Each now names its branch first. The no-INPUT branch writes
-      # the rc70 sentinel to OUTPUT, but the host never reads it (no host-mount by design), so serial
-      # is the only place that sentinel's meaning surfaces.
+      # that hid the Tier-0 root causes. Each now names its branch first. The no-OUTPUT branch writes
+      # nothing, so the host sees no exit-code file (FetchFailed); the no-INPUT branch writes the rc70
+      # sentinel, which the host reads as a non-zero exit code (FetchFailed). Serial names which branch.
       if ! mountpoint -q /mnt/out; then diag "ABORT output-not-mounted (LABEL=OUTPUT did not mount at /mnt/out - exfat module missing on this kernel? label mismatch?)"; poweroff; exit 0; fi
       diag "output_mounted=yes owner_sandbox=$OUT_SANDBOX_OWNED"
       if ! mountpoint -q /mnt/in; then diag "ABORT input-not-mounted (LABEL=INPUT did not mount at /mnt/in; rc70 sentinel written to OUTPUT)"; printf '%s' 70 > /mnt/out/result.exitcode; sync; umount /mnt/out 2>/dev/null; poweroff; exit 0; fi
@@ -543,7 +544,7 @@ write_files:
       rc=$?
       printf '%s' "$rc" > /mnt/out/result.exitcode
       # fetch_deps.py exits 2 on the FIRST failed fetcher; that rc reaches result.exitcode on the
-      # OUTPUT disk (which teardown deletes) and nowhere else — narrate it, plus the per-fetcher
+      # OUTPUT disk, which the host reads as the verdict. Narrate it too, plus the per-fetcher
       # artifact COUNTS (never names/bytes) and the manifest verdict. write_manifest runs only after
       # ALL fetchers succeed, so manifest_present=yes is the single yes/no of a fully-green fetch.
       diag "entrypoint_rc=$rc"

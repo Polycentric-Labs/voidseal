@@ -190,6 +190,15 @@ function Get-HyperVBackendMethodManifest {
         # destination and removes the partial file on failure. FAKE = clones the VHD record. The real
         # body runs no Hyper-V cmdlet, so tests drive it in-process on temp files.
         CopyVhdxFile         = @('Path', 'Destination')
+        # MOVE a whole DETACHED .vhdx file to a new path (the builder's finished deps.vhdx leaves the
+        # sandbox folder this way, so teardown, which deletes only what the run created, never sees it).
+        # A plain file move: no mount, no Hyper-V cmdlet. REAL = the same volume: a rename (Move-Item,
+        # through the RC8 lock-retry); another volume: copy to '<dest>.partial-<guid>', rename into place,
+        # then delete the source (a failed delete is a warning, the destination is already complete).
+        # Refuses a missing source and an existing destination, removes a partial copy on failure, clears
+        # ReadOnly on the result. FAKE = re-keys the VHD record. The real body runs no Hyper-V cmdlet, so
+        # tests drive it in-process on temp files.
+        MoveVhdxFile         = @('Path', 'Destination')
         ReadVhdxFile         = @('Path', 'InnerPath')              # host reads one file from a VHDX (ro) -> string or $null
         # Byte-clean siblings of WriteVhdxFile/ReadVhdxFile (I2a). WriteVhdxFile/ReadVhdxFile go through
         # Set-Content/Get-Content -Encoding utf8, which silently corrupts binary content (0x00, 0x80-0xFF,
@@ -1369,6 +1378,51 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
+    # Move a detached .vhdx file (the builder's finished deps disk, out of the sandbox folder). A plain
+    # file move: no mount, no Hyper-V cmdlet. Refuses a missing source and an existing destination
+    # (never overwrite). Same volume: one Move-Item (an atomic rename, so a failure leaves the source
+    # where it was and nothing at the destination), through $LockRetry because the source's first open
+    # can hit the RC8 settle-lag sharing violation. Another volume: Copy-Item to
+    # '<dest>.partial-<guid>', rename into place, then delete the source; the partial is removed on a
+    # failed copy or rename, and a source that cannot be deleted afterwards is a warning, not an error
+    # (the destination is complete by then, and the caller's teardown removes the source it recorded).
+    # ReadOnly is cleared on the result, for the same reason as CopyVhdxFile.
+    $b.MoveVhdxFile = {
+        param([System.Collections.IDictionary] $P)
+        $src = & $AssertArg $P 'Path'        'MoveVhdxFile'
+        $dst = & $AssertArg $P 'Destination' 'MoveVhdxFile'
+        & $InvokeOp {
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+                throw "MoveVhdxFile: source VHDX '$src' does not exist. Failing closed."
+            }
+            if (Test-Path -LiteralPath $dst) {
+                throw "MoveVhdxFile: destination '$dst' already exists; refusing to overwrite it. Failing closed."
+            }
+            $dir = Split-Path -Parent $dst
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) { $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop }
+            $srcRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($src))
+            $dstRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($dst))
+            if ($srcRoot.Equals($dstRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                & $LockRetry -Context 'MoveVhdxFile' -Operation { Move-Item -LiteralPath $src -Destination $dst -ErrorAction Stop }
+            }
+            else {
+                $tmp = "{0}.partial-{1}" -f $dst, ([guid]::NewGuid().ToString('N'))
+                try {
+                    & $LockRetry -Context 'MoveVhdxFile' -Operation { Copy-Item -LiteralPath $src -Destination $tmp -ErrorAction Stop }
+                    Move-Item -LiteralPath $tmp -Destination $dst -ErrorAction Stop
+                }
+                catch {
+                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                    throw
+                }
+                try { Remove-Item -LiteralPath $src -Force -ErrorAction Stop }
+                catch { Write-Warning "MoveVhdxFile: '$dst' is complete, but the source '$src' could not be deleted ($($_.Exception.Message)); the caller's teardown removes it." }
+            }
+            $item = Get-Item -LiteralPath $dst -Force -ErrorAction Stop
+            if ($item.IsReadOnly) { $item.IsReadOnly = $false }
+        }
+    }.GetNewClosure()
+
     # Mount READ-WRITE (not -ReadOnly), deliberately mirroring WriteVhdxFile. A read-only mount on
     # Windows frequently does NOT auto-assign a drive letter, and `Add-PartitionAccessPath
     # -AssignDriveLetter` against a write-protected volume can throw — which would make the FIRST
@@ -2532,6 +2586,28 @@ function New-FakeHyperVBackend {
         $copy['Path'] = $dst
         $state.VHDs[$dst] = $copy
         $state.CallLog.Add(@{ Op = 'CopyVhdxFile'; Path = $src; Destination = $dst })
+    }.GetNewClosure()
+
+    # Move a detached .vhdx file (fake): re-key the VHD record under the new path, so the file keeps its
+    # structure, label, image bytes (and therefore its hash) and its per-file settle-lag counters, and the
+    # old path no longer exists. Mirrors the real refusals: a missing source, an existing destination, and
+    # a source attached to a live VM (locked).
+    $b.MoveVhdxFile = {
+        param([System.Collections.IDictionary] $P)
+        $src = & $AssertArg $P 'Path'        'MoveVhdxFile'
+        $dst = & $AssertArg $P 'Destination' 'MoveVhdxFile'
+        if (-not $state.VHDs.ContainsKey($src)) { throw "MoveVhdxFile: source VHDX '$src' does not exist. Failing closed." }
+        if ($state.VHDs.ContainsKey($dst)) { throw "MoveVhdxFile: destination '$dst' already exists; refusing to overwrite it. Failing closed." }
+        foreach ($vmRec in $state.VMs.Values) {
+            if ((@($vmRec.HardDrives) -contains $src) -and ([string]$vmRec.State -in @('Running','Saved','Paused'))) {
+                throw "MoveVhdxFile: the VHDX '$src' is still locked (attached to a live VM '$($vmRec.Name)'). Failing closed."
+            }
+        }
+        $rec = $state.VHDs[$src]
+        $rec['Path'] = $dst
+        $state.VHDs[$dst] = $rec
+        $state.VHDs.Remove($src) | Out-Null
+        $state.CallLog.Add(@{ Op = 'MoveVhdxFile'; Path = $src; Destination = $dst })
     }.GetNewClosure()
 
     # Copy a host directory tree onto a formatted data VHDX (fake). Mirrors the real failure shape:

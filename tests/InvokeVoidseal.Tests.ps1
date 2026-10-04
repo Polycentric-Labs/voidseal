@@ -1183,7 +1183,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
     It 'D (no builder exemption): a builder-shaped profile (EgressMode=SquidSniProxy) MISROUTED directly into Invoke-Voidseal is REFUSED with the same host-mount message (its real entry point is Invoke-BuilderVM, which never reaches this code at all)' {
         # A future caller could mistakenly pass the builder profile straight to Invoke-Voidseal instead
-        # of Invoke-BuilderVM (its real, hash-verified, never-mount entry point). The builder is a
+        # of Invoke-BuilderVM (its real, hash-verified entry point). The builder is a
         # Disk-mode profile that is neither a processor nor OutboxOutput, so it gets NO special
         # exemption from the structural validator — it is refused exactly like any other non-outbox,
         # non-processor Disk profile would be. (The builder's LEGITIMATE path, Invoke-BuilderVM, has its

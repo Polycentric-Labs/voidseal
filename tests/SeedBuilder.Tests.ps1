@@ -743,9 +743,9 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
     # The builder runner had ZERO serial markers, while the OutboxOutput runner's diag lines are what
     # pinned BOTH Tier-0 live root causes (D4-D). Phase 6 is the project's FIRST live egress: a failed
     # fetch must be attributable to squid-down vs REDIRECT-not-applied vs mount-failure vs the fetch
-    # itself. And Invoke-BuilderVM's Status=Success is clean-POWEROFF-only today (the exitcode read
-    # deferred to Phase 4 and never landed for the builder) while teardown DELETES the OUTPUT disk —
-    # so the serial console is the ONLY live signal of whether the fetch actually worked. Same
+    # itself. Invoke-BuilderVM now reads the exit-code file and manifest off the OUTPUT disk for its
+    # verdict (Success or FetchFailed), but teardown then DELETES that disk, so the serial console is
+    # the second source and the only one that says where the guest stopped. Same
     # discipline as the outbox runner: STRUCTURAL ONLY — liveness, rc values, file COUNTS, manifest
     # presence; never fetched-artifact bytes.
     It 'emits structural [voidseal-diag] serial markers (the silent-runner class already cost two live debug rounds)' {
@@ -762,11 +762,11 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
         $ud | Should -Match 'diag "ip6_lockdown'    -Because 'the IPv6 belt-and-braces outcome (applied vs no-binary skip) must be visible live'
     }
 
-    It 'narrates mounts, entrypoint rc, per-fetcher artifact counts, and manifest presence (Success is poweroff-only today — serial is the live fetch-outcome signal)' {
+    It 'narrates mounts, entrypoint rc, per-fetcher artifact counts, and manifest presence (the host verdict is the exit code and manifest; serial says where the guest stopped)' {
         $ud = New-CidataUserData -Profile $script:builderProfile
         $ud | Should -Match 'diag "input_mounted='  -Because 'a failed INPUT mount means the runner + DepsSpec never reached the guest'
         $ud | Should -Match 'diag "output_mounted=' -Because 'a failed OUTPUT mount means nothing can be staged — and which owner it mounted under decides who may write'
-        $ud | Should -Match 'diag "entrypoint_rc='  -Because 'fetch_deps.py exits 2 on any failed fetcher; that rc never reaches the host Status (clean-poweroff-only), so it must ride serial'
+        $ud | Should -Match 'diag "entrypoint_rc='  -Because 'fetch_deps.py exits 2 on any failed fetcher; the host reads that rc as the verdict, and serial says where it came from'
         $ud | Should -Match 'fetched pip='          -Because 'a per-fetcher artifact COUNT attributes an empty deps disk to the fetcher that produced nothing'
         $ud | Should -Match 'apt='                  -Because 'apt artifacts land under /mnt/out/apt — its count must be narrated separately'
         $ud | Should -Match 'hf='                   -Because 'HF artifacts land under /mnt/out/hf — its count must be narrated separately'
@@ -776,7 +776,7 @@ Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
     It 'echoes a DISTINCT ABORT reason before each of the two fail-closed poweroffs (no-OUTPUT vs no-INPUT+rc70)' {
         $ud = New-CidataUserData -Profile $script:builderProfile
         $ud | Should -Match 'diag "ABORT output-not-mounted' -Because 'the no-OUTPUT branch powers off with NOTHING written anywhere; only serial can say why'
-        $ud | Should -Match 'diag "ABORT input-not-mounted'  -Because 'the no-INPUT branch writes the rc70 sentinel the host never reads (no host-mount by design); serial must name the branch'
+        $ud | Should -Match 'diag "ABORT input-not-mounted'  -Because 'the no-INPUT branch writes the rc70 sentinel, which the host reads as a failed verdict; serial must name the branch'
     }
 
     It 'builder diag markers are STRUCTURAL only — no fetched-artifact bytes on the serial console (same contract as the outbox runner)' {

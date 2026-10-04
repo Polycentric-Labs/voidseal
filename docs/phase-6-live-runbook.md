@@ -188,11 +188,14 @@ correctness, not proof of live behavior.
 ### Serial capture is mandatory for the live run
 
 Attach the COM1 serial capture **before starting the VM** — it is the project's default live-debug
-tool (it pinned both Tier-0 live root causes) and, for the builder, it is the **only** live signal of
-fetch outcome: `Invoke-BuilderVM`'s `Status='Success'` means *clean power-off* only (the in-guest
-`result.exitcode` is written to the OUTPUT disk, which teardown deletes, and the host never reads it —
-by design, no host-mount). The builder runner narrates structural `[voidseal-diag]` markers to the
-serial console (mirroring the OutboxOutput runner's discipline; asserted by `SeedBuilder.Tests.ps1`):
+tool (it pinned both Tier-0 live root causes). For the builder it is the **second** source of fetch
+outcome, and the only one that says where the guest stopped. `Invoke-BuilderVM`'s `Status` now carries
+the exit code: the runner writes `result.exitcode` to the OUTPUT disk, the host reads it (and
+`deps-manifest.json`) after the detach, and `Status='Success'` needs the file to read exactly `0` with
+the manifest present. A missing, unparsable or non-zero exit code, or a missing manifest, is
+`Status='FetchFailed'` with the reason in `Error` and the code in `ExitCode`; a timeout is `Failed`.
+The builder runner narrates structural `[voidseal-diag]` markers to the serial console (mirroring the
+OutboxOutput runner's discipline; asserted by `SeedBuilder.Tests.ps1`):
 
 | Marker | What it attributes |
 |---|---|
@@ -204,6 +207,19 @@ serial console (mirroring the OutboxOutput runner's discipline; asserted by `See
 | `entrypoint_rc=` | `fetch_deps.py` rc (2 = first failed fetcher; fail-closed) |
 | `fetched pip= apt= hf= manifest_present=` | per-fetcher artifact **counts** + the single yes/no of a fully-green fetch (`write_manifest` runs only after all fetchers succeed) |
 
-Read the live verdict off `entrypoint_rc=0` **and** `manifest_present=yes` — never off `Status`
-alone. Markers are structural only (liveness/rc/counts/presence); dependency payload bytes never
-ride the console.
+Read the live verdict off `Status` and `ExitCode` first, and cross-check it against `entrypoint_rc=0`
+**and** `manifest_present=yes` on the serial capture: the two sources must agree, and when they do not
+(for example `Status='FetchFailed'` with `entrypoint_rc=0`), the capture says which side is wrong.
+Markers are structural only (liveness/rc/counts/presence); dependency payload bytes never ride the
+console.
+
+## 6. Builder output: what a good run leaves
+
+A run that ends `Status='Success'` leaves `deps-<Name>.vhdx` under `-DepsOutputDir` (default
+`<ArtifactRoot>\deps`, where `ArtifactRoot` defaults to `<temp>\Voidseal\artifacts\<Name>`), outside
+the sandbox folder, so teardown does not delete it. The result carries `DepsDiskPath` and `DepsImageHash`
+(taken on that file after the move); pass them as `-Workload.DepsDiskPath` and `-Workload.DepsImageHash`
+of the processor run, which attaches a verified working copy and leaves the file in place. The
+destination is checked before the build: inside the storage root, relative, UNC, not `.vhdx`, or already
+present is refused, so choose a fresh folder per build. After a `FetchFailed` or `Failed` run nothing is
+left behind except what the serial capture recorded.
