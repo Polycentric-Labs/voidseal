@@ -41,17 +41,17 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 > provisions Tier 0 via the Hyper-V path; the Docker / `docker sbx` / sandbox-runtime substrate is a
 > planned future addition). Tier 2/3 are **scaffolded code paths validated with benign inputs only** —
 > no untrusted plugin or malware is run until you explicitly green-light verified isolation.
-> Credential-injecting host-Envoy is **deferred to Phase-1B** (v1 Tier-1/ralph egress now ships
-> an **in-guest** iptables default-DROP + Squid `dstdomain` allowlist — `EgressMode='InGuestSquid'`,
-> ported from the separate builder profile's mechanism — as **defense-in-depth, mock-shape-asserted
-> only**, NOT a boundary; the host-verified boundary remains Phase-6).
+> Credential-injecting host-Envoy is **deferred to Phase-1B**. v1 Tier-1/ralph egress is
+> **host-enforced** (`EgressMode='HostProxy'`): no route, NAT or resolver in the guest, a host CONNECT
+> allowlist proxy on the VM's own /30, and host firewall rules plus a port ACL that `Assert-Sealed`
+> verifies. It is mock-green only; the first elevated run is Phase 6.
 
 ## The tier model
 
 | Tier | Substrate | Network / egress | Credentials | Extraction | Lifecycle | v1 status |
 |---|---|---|---|---|---|---|
 | **0** | **Hyper-V path / lightweight guest** today (a container runtime, whether Docker, devcontainer, `docker sbx` or sandbox-runtime, is **PLANNED, not yet built**) | host-proxy allowlist (default offline) | none | host reads result dir | `--rm` ephemeral (container tier, when built) | **mock-backed, and LIVE-PROVEN** (the `firefox` disk round-trip on real Hyper-V: the legacy exFAT path on 2026-06-25, the current outbox transport on 2026-07-21). The proof runs the Hyper-V path, not a container |
-| **1** | Hyper-V Gen2 VM | Internal switch (NIC kept); in-guest egress **defense-in-depth ships** — `EgressMode='InGuestSquid'`: iptables default-DROP + Squid `dstdomain` allowlist, mock-shape-asserted only, NOT a boundary | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal validated (mock-backed; live run = the live smoke test, operator-run, elevated); in-guest egress defense-in-depth ships (mock-shape-asserted), NOT yet live-exercised — the boundary is Phase-6** — `ralph` proof |
+| **1** | Hyper-V Gen2 VM | Internal switch (NIC kept); **host-enforced** egress, `EgressMode='HostProxy'`: host CONNECT allowlist proxy, host firewall rules and port ACL verified by the seal gate, no route/NAT/resolver in the guest; mock-green only | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal validated (mock-backed; live run = the live smoke test, operator-run, elevated); host-enforced egress built and gate-verified in the mock suite, NOT yet live-exercised (Phase 6)**; `ralph` proof |
 | **2** | Hyper-V VM, disposable | **no NIC** (structurally starved) | **none** (enforced) | **cold output-VHDX → quarantine VM → CDR → inert promote** | create → destroy | **scaffold / benign dry-run only** |
 | **3** | Hyper-V Gen2, **no NIC** + sinkhole VM | **structurally no egress** | **none** (enforced) | same as Tier 2, mandatory | detonate → wipe | **scaffold / benign dry-run only** |
 

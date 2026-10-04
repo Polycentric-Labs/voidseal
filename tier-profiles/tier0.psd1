@@ -3,8 +3,8 @@
     # network adapter: Get-SealNicPolicy returns NoAdapter for Tier 0, so the provisioner builds no
     # switch, Lock-Sandbox removes the default adapter Hyper-V creates, and Assert-Sealed host-verifies
     # that none remains. It is NOT a container: the Substrate='Container' value below is aspirational
-    # and changes nothing at runtime. The EgressMode='HostProxy' allowlist has no implementation and is
-    # moot while the VM has no adapter. See docs/live-smoke-test.md Gap 1.
+    # and changes nothing at runtime. EgressMode='HostProxy' is implemented for Tier 1 (a VM that keeps a
+    # NIC); here it is moot, because the VM has no adapter. See docs/live-smoke-test.md Gap 1.
     # For trusted productivity workloads (e.g. the Firefox organizer proof on a profile COPY).
     Tier            = 0
     Description     = 'Lightweight offline sandbox. v1 runs it as a Hyper-V VM sealed with no network adapter; the container substrate and the host-proxy network mode are declared, not built. Trusted dev + productivity. Operates on copies, never live host data without explicit per-task authorization.'

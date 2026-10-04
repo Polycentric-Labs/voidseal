@@ -57,7 +57,7 @@ Legend: 🟢 **IN SCOPE** (a bug here is a Voidseal defect — see the gate name
 | **VM-escape** (guest breaks the Hyper-V hypervisor boundary itself) | ⚪ | ⚪ | ⚪ | ⚪ |
 | **Live NIC / egress route present at seal time** | 🟢 zero NICs required | 🟢 exactly one NIC, on the VM's own recorded Internal switch (zero NICs for a processor) | 🟢 zero NICs required | 🟢 zero NICs required |
 | **Passthrough device present at seal time** (GPU partition adapter, device assigned by DDA) | 🟢 | 🟢 | 🟢 | 🟢 |
-| **Egress filtering** (which destinations are reachable through whatever route exists) | ➖ no route exists | 🟡 in-guest defense-in-depth only, GuestRoot-disableable | ➖ no route exists | ➖ no route exists |
+| **Egress filtering** (which destinations are reachable through whatever route exists) | ➖ no route exists | 🟢 HostProxy: host-enforced allowlist proxy, gate-verified host objects, mock-green only; residual: CDN-hosted allowed names (🟡 for an `InGuestSquid` profile: in-guest only, GuestRoot-disableable) | ➖ no route exists | ➖ no route exists |
 | **Host↔guest channel left ON** (clipboard / shares / guest-services / enhanced-session) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Integration service left ON** (Time Synchronization, Key-Value Pair Exchange, Backup, Heartbeat) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Host time reaching the guest** (reference TSC page, after Time Synchronization is off) | 🟡 | 🟡 | 🟡 | 🟡 |
@@ -109,16 +109,41 @@ check sits beside the NIC check. Only the count is read, and a read that fails r
 
 **Egress filtering (which destinations are reachable through an existing route).**
 - **T0: N/A.** A sealed Tier-0 VM has no network adapter (see the row above), so no route exists to
-  filter. `tier0.psd1` still declares `EgressMode='HostProxy'`; per `tier-reference.md`'s P2 row that
-  host-proxy allowlist is not implemented, and it stays moot unless a future Tier-0 design keeps an adapter.
-- **T1 — KNOWN LIMITATION, TRACKED (the worked example this document exists to fold in honestly).**
-  `tier1.psd1`'s `EgressMode='InGuestSquid'` ships a real, mock-shape-asserted **in-guest** mechanism: the
-  seed's iptables default-DROP OUTPUT plus a transparent Squid `dstdomain` allowlist. This is
-  **defense-in-depth, not a boundary** — it runs *inside* the guest, so a GuestRoot attacker can flush its
-  own iptables rules or kill its own Squid process; the untrusted principal cannot be trusted to police
-  itself, by construction. The host-verified boundary — a host-run Squid SNI-splice, `New-NetNat`, and a
-  host default-DROP policy on the Internal switch's gateway — is **Phase-6-live, not yet built**
-  (`phase-6-live-runbook.md` §2).
+  filter. `tier0.psd1` still declares `EgressMode='HostProxy'`; the host-proxy machinery runs only for a
+  VM that keeps a NIC, so for Tier 0 the setting stays moot unless a future Tier-0 design keeps an adapter.
+- **T1: IN SCOPE for the host enforcement, KNOWN LIMITATION for what an allowed name can carry.**
+  `tier1.psd1` ships `EgressMode='HostProxy'` (since 2026-10-03). The guest has one static address in a /30
+  of its own switch and no route, NAT or resolver. The host puts the gateway address on that switch's
+  vEthernet adapter, scopes host firewall rules to the interface and a port ACL to the VM's NIC so that
+  the only open path is TCP from the guest's address to the proxy port, and runs
+  `scripts/egress/voidseal_egress_proxy.py` there. The proxy accepts only `CONNECT <name>:443` for names on
+  the merged `EgressAllowlist`, resolves the name on the host and refuses any answer holding a private,
+  loopback, link-local, multicast, reserved or non-global address, then dials the address it chose.
+  `Assert-Sealed` refuses unless the gateway address, every firewall rule and every ACL entry are on the
+  host exactly as recorded, the record is complete for the VM's address plan, and no NAT covers the
+  subnet. A GuestRoot attacker controls only the guest, so none of that is in its reach; a VM certified
+  with a missing, disabled or edited rule, an extra ACL entry, or a NAT over its subnet is a Voidseal
+  defect. ECH and SNI tricks do not matter here, because the decision is made on the CONNECT name and the
+  host-resolved address, not on a ClientHello.
+
+  **The residual (KNOWN LIMITATION):** an allowlist admits names, not parties. A name that fronts a shared
+  CDN or a public storage service can carry traffic for parties other than the intended one: ralph's
+  `storage.googleapis.com` admits any public bucket, so a guest can read from, or write to, a bucket an
+  attacker controls through an allowed name, and the proxy cannot see inside the TLS tunnel to tell. The
+  same holds for any name that serves many tenants behind one hostname. The mitigation is a narrow
+  allowlist; there is no technical control for it in v1. Byte counts per connection land in the proxy
+  log, which helps after the fact but does not prevent anything.
+
+  **Also residual:** Windows Firewall applies a Block over any Allow, so the host rules are one Allow plus
+  Blocks shaped around it, not a blanket block. A protocol other than TCP, UDP or ICMP sent to the gateway
+  address itself is covered only by the default inbound Block and the port ACL's deny-all, not by a named
+  rule. Everything here is mock-green; the first elevated run is the first time any of it meets a real
+  host (`phase-6-live-runbook.md` §2 lists the checks).
+
+  A Tier-1 profile set to `EgressMode='InGuestSquid'`, and the builder (`SquidSniProxy`), still rely on an
+  **in-guest** mechanism (iptables default-DROP plus a transparent Squid `dstdomain` allowlist). That is
+  **defense in depth, not a boundary**: a GuestRoot attacker can flush its own iptables rules or kill its
+  own Squid process, so the untrusted principal is policing itself.
 - **T2/T3 — N/A.** No NIC exists once sealed (see the row above), so there is no route for a filtering
   question to apply to.
 
@@ -279,9 +304,13 @@ blend them: something can be correctly scoped as IN SCOPE and still be unproven 
   (`Get-VMIntegrationService` matched by component GUID, `Get-VMComPort -Number 2`, `Get-VM`'s
   `AutomaticCheckpointsEnabled`, `Get-VMSnapshot`) run here only against stub cmdlets. A live failure
   refuses the seal.
-- **Tier-1 in-guest egress:** shape-asserted only. The mock suite proves the rendered Squid config text,
-  the iptables rule text, and the ACL substitution are correct — it does not prove a real Squid/iptables
-  process has ever actually spliced or dropped a real packet (`phase-6-live-runbook.md` §5).
+- **Tier-1 HostProxy egress:** mock-proven only. The proxy is tested on loopback sockets with a stub
+  resolver; the host bodies (gateway address, firewall rules, port ACL, NAT read, proxy start and stop) run
+  against stub cmdlets and a stub child process; the seed is checked as text, with `sh -n` and a YAML
+  parse. No real packet has crossed any of it (`phase-6-live-runbook.md` §2).
+- **Tier-1 in-guest egress (InGuestSquid, the builder):** shape-asserted only. The mock suite proves the
+  rendered Squid config text, the iptables rule text, and the ACL substitution are correct; it does not
+  prove a real Squid/iptables process has ever spliced or dropped a real packet (`phase-6-live-runbook.md` §5).
 - **Tier 2/3: scaffold-only.** There is **no shipped `tier-profiles/tier2.psd1` or `tier3.psd1`** — only
   `tier0.psd1` and `tier1.psd1` exist in the repo. The Tier ≥ 2 invariants above are enforced generically
   and unit-tested against inline fixture hashtables (`tests/ProfileLoader.Tests.ps1`), but an operator

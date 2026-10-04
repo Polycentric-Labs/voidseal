@@ -20,66 +20,154 @@
 
 ## 1. Scope + safety gate
 
-- **ELEVATED session only** (Hyper-V Administrators group membership required for the host-side
-  `New-VMSwitch` / `New-NetNat` / `New-NetFirewallRule` operations this runbook prescribes).
+- **ELEVATED session only** (Hyper-V Administrators group membership plus local administrator for the
+  host-side `New-VMSwitch`, `New-NetIPAddress`, `New-NetFirewallRule` and
+  `Add-VMNetworkAdapterExtendedAcl` operations HostProxy performs).
 - **Allen-run only. NEVER unattended.** This is the first live egress in the project — the host stops
   being a passive test harness and starts making real outbound network decisions on real hardware.
 - **Scope: the first LIVE Tier-1 builder round-trip only.** Tier 2 (disposable no-net) and Tier 3
   (airgapped detonation) stay gated behind an explicit, separate verified-isolation green-light — this
   runbook does not arm them (`docs/operator-runbook.md` §3, "Tier 2/3, not armed in v1," is
   unaffected by this doc).
-- Nothing in §§2–4 below is implemented as live-enforced code today. §2 (host egress) and §3 (qemu-img
-  confinement) are host-side / native-shim mechanisms that sit outside the mock-green PowerShell+Pester
-  engine by design (`progress.md`: "host egress enforcement is live-only... qemu confinement REAL shim is
-  NOT mock-green"). §4 lists which seal-time assertions are shipped today vs. remain a live-only add.
+- §2 (host egress) is now built as engine code (2026-10-03, `EgressMode='HostProxy'`) and is mock-green:
+  every host call goes through the backend seam and runs in the suite against the fake and against stub
+  cmdlets, but none of it has touched a real interface. §3 (qemu-img confinement) is still a native-shim
+  mechanism outside the mock-green engine. §4 lists which seal-time assertions are shipped vs. still a
+  live-only add.
 
 ---
 
-## 2. Host egress enforcement sequence
+## 2. Host egress enforcement (B': host CONNECT proxy, no NAT)
 
-*Source: Pass A §Q2. Every cmdlet below is marked CONFIRMED in Pass A for Windows 11 client Hyper-V — none
-of the fabrication-watch items in Pass A's kill-list (`New-VMSwitch -SwitchType NAT`, `Set-VMFirewall`)
-appear here.*
+*Decision of 2026-10-03 (private memo): the earlier plan in this section (a host Squid SNI splice plus
+`New-NetNat` plus a host default-DROP) is replaced by B'. B' keeps the property that the host enforces,
+drops the NAT and the guest's internet route entirely, and does not depend on SNI, so ECH and SNI spoofing
+stop mattering. Implemented in `scripts/lib/HostEgress.ps1`, `scripts/egress/voidseal_egress_proxy.py`,
+the HostProxy backend methods in `scripts/lib/HyperVBackend.ps1`, and the HostProxy seed in
+`scripts/lib/SeedBuilder.ps1`. Mock-green; not yet run on a live host.*
 
-The goal: move egress enforcement to the **host**, so the untrusted Tier-1 guest is no longer the thing
-policing its own network access. In sequence:
+### 2.1 What the engine does, in order
 
-1. **`New-VMSwitch -SwitchType Internal`** — a dedicated Internal switch, NOT the built-in Default Switch
-   (Pass A: `-SwitchType` accepts only `Internal`/`Private`; External is implicit via `-NetAdapterName`).
-   Real Tier-1 provisioning already names its switch `"<vm>-int"` (`scripts/lib/Provisioner.ps1`), never
-   "Default Switch" — this sequence must preserve that.
-2. **Static host-gateway IP** on the switch's `vEthernet (X)` vNIC via `New-NetIPAddress -InterfaceIndex`.
-   The builder VM gets exactly one vNIC and one default route: the host gateway IP.
-3. **`New-NetNat -InternalIPInterfaceAddressPrefix`** for the builder subnet. NAT is client-supported on
-   Win10/11 (not Server-only, Pass A CONFIRMED) and gives reachability only — it is not the filter. There
-   is a one-NAT-network-per-host hard limit (Docker Desktop / WSL contend for the slot); detect an
-   existing NAT first via **`Get-NetNat`** before creating a new one.
-4. **Host default-DROP** on the gateway vNIC via **`New-NetFirewallRule`**: allow ONLY TCP to the Squid
-   IP:port; drop UDP/443 (QUIC), UDP/53 (DNS), TCP/853 (DoT), and everything else. This is SEC-2's
-   default-DROP moved from the guest to the host (the builder seed's in-guest default-DROP is already
-   mock-shipped — `1e6f594` et seq. per `progress.md` — but an in-guest rule is not a containment
-   boundary; see the callout below).
-5. **Host-run transparent Squid SNI-splice** as the domain-ACL enforcement point, outside the guest trust
-   domain: `ssl_bump` peek/splice + `ssl::server_name` (Squid 3.5+, CONFIRMED) for a domain allowlist
-   without decryption, plus an explicit-deny `on_unsupported_protocol` terminal rule (Pass A: the real
-   actions are `tunnel`/`respond`, not the loose "=terminate" phrasing some models used — the terminal
-   rule must be an explicit deny/respond, not a bare "terminate"). Prefer explicit-proxy config in the
-   guest + host ACLs blocking all non-proxy 80/443 over transparent TPROXY/NAT redirection (Pass A: TPROXY
-   /NAT redirection is fragile on Windows). Pass A §Q3 additionally flags that the splice never validates
-   the origin cert, and that ECH (RFC 9849, Proposed Standard) blinds passive SNI inspection for
-   ECH-capable clients — so the Squid config must actively strip/deny ECH-bearing ClientHellos, not just
-   passively read SNI, to keep the ACL meaningful.
-6. **Defense-in-depth**: also set **`Add-VMNetworkAdapterExtendedAcl`** deny-all-except-proxy-IP on the VM
-   NIC. This runs at the vSwitch **port** regardless of switch type (L3/L4 5-tuple only, no SNI) — so
-   evasion now requires breaking both the vSwitch port ACL and the host firewall, two independent
-   controls.
+1. **Plan (New-SandboxVM, before anything is created).** The VM's /30 is taken from a SHA-256 of its name
+   inside `10.231.0.0/16`: gateway `.1`, guest `.2`, proxy port `13128`. `Get-NetIPAddress -AddressFamily
+   IPv4` and `Get-NetNat` are read; an overlap with any host address or NAT network, or a read that fails,
+   refuses the provision. The plan is recorded on the descriptor (`EgressMode`, `Egress`).
+2. **Switch.** `New-VMSwitch -SwitchType Internal` named `<vm>-int`, as before (never the Default Switch).
+3. **Seed.** The CIDATA disk carries a `network-config` (eth0, the guest address, DHCP off, no route, no
+   nameservers), `HTTPS_PROXY`/`https_proxy` with `NO_PROXY` empty, apt's proxy setting with https
+   sources, and an in-guest default-DROP (nftables, iptables fallback) that allows only TCP to the proxy
+   port and is applied before networking on the guest's only boot.
+4. **Seal (Lock-Sandbox).** `New-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -PolicyStore
+   ActiveStore` for the gateway; seven `New-NetFirewallRule` rules in the group `Voidseal egress`, named
+   `Voidseal-egress-<vm>-*`, all inbound and scoped to that interface (one Allow for TCP from the guest to
+   gateway:13128; Blocks for every other TCP port, the proxy port from any other address, UDP, ICMPv4,
+   ICMPv6, and every protocol to any local address but the gateway, IPv6 included; Windows lets a Block
+   beat any Allow, so the Blocks are shaped around the allowed tuple); three
+   `Add-VMNetworkAdapterExtendedAcl` entries (deny inbound and outbound at weight 1, allow stateful
+   outbound TCP from the guest to gateway:13128 at weight 100). Each is recorded the moment it exists;
+   a failure rolls back what was created.
+5. **Gate (Assert-Sealed).** On top of the one-NIC-on-own-switch rule: the gateway address is on the
+   interface with prefix 30, no other host address overlaps the /30, no NAT covers it, every recorded rule
+   exists, is enabled and matches its record, the adapter carries exactly the recorded ACL entries, and
+   the record is the full set the plan requires. Any failed read refuses.
+6. **Proxy (Invoke-Voidseal, after the gate, before StartVM).** `python voidseal_egress_proxy.py
+   --listen-host <gateway> --listen-port 13128 --allow ...` as a plain child process; the engine waits for
+   its ready file. It exits on its stop file, at the run deadline plus 15 minutes, or when the PowerShell
+   process that started it exits. Log: `<ArtifactRoot>\egress-proxy.log`.
+7. **Teardown (Remove-Sandbox).** Stop the proxy, stop the VM, remove the ACL entries, the rules and the
+   address, remove the VM and the switch. Anything that cannot be removed stays recorded and is named in
+   `TeardownStatus`.
 
-**State plainly (Pass A, direct):** this moves enforcement to the **host** — the guest no longer polices
-itself. The in-guest iptables default-DROP and in-guest Squid SNI proxy that the builder seed already
-ships (mock-shape today) are belt-and-braces, not the boundary: a compromised guest with code-execution
-can flush its own `iptables` rules or kill its own Squid process, so the untrusted principal cannot be
-trusted to police itself, by construction (`SECURITY.md` makes the identical point today about the
-in-guest layer).
+**State plainly:** the guest does not police itself in this mode. Its in-guest default-DROP is belt and
+braces. What the guest can reach is decided by host objects the gate has read back, and by a proxy that
+resolves names itself. The residual is the allowlist itself: an allowed name that fronts a shared CDN or a
+public storage service can carry traffic for other parties (`docs/threat-model.md`).
+
+### 2.2 Live checks for the first elevated run
+
+Run the steps by hand in an elevated PowerShell first (`New-SandboxVM`, `New-WorkloadSeedDisk`,
+`Lock-Sandbox`, `Assert-Sealed`, then `Start-SandboxEgressProxy` and `Start-SandboxWorkload`), so each
+host object can be inspected before the next step. Use a throwaway profile with a short synthetic
+allowlist. Every item below is something the mock suite cannot prove.
+
+**Before provisioning**
+
+1. `Get-NetNat` returns without an error (nothing, or a list). An error here refuses every HostProxy
+   provision, by design.
+2. `Get-NetIPAddress -AddressFamily IPv4` shows nothing inside `10.231.0.0/16`, and no interface prefix
+   that covers it (a VPN with a `10.0.0.0/8` interface prefix would refuse every run).
+3. `Get-NetFirewallProfile` shows the firewall enabled on every profile, with default inbound action
+   Block. HostProxy's leftover-protocol coverage relies on that default.
+4. `Resolve-PythonExe` returns a real interpreter, and it runs
+   `scripts/egress/voidseal_egress_proxy.py --help`.
+
+**After New-SandboxVM (switch exists)**
+
+5. `Get-NetAdapter -Name 'vEthernet (<vm>-int)'` exists. If it appears only after a delay, the address
+   step needs a settle wait; note how long.
+
+**After Lock-Sandbox**
+
+6. `Get-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -AddressFamily IPv4` shows the gateway with
+   `PrefixLength 30`, `PolicyStore ActiveStore`, and `AddressState Preferred` (not Tentative or
+   Duplicate). Note whether the APIPA `169.254.x.x` address is still there; the gate ignores it, but
+   record it.
+7. `Get-NetFirewallRule -Group 'Voidseal egress'` lists seven rules, all `Enabled True`. For each, compare
+   `Get-NetFirewallPortFilter`, `Get-NetFirewallAddressFilter` and `Get-NetFirewallInterfaceFilter` with
+   the record: how an address range renders (`0.0.0.0-10.231.a.b`), whether the IPv6 range
+   `::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff` was accepted, how `ICMPv4`/`ICMPv6`/`Any` render as
+   `Protocol`, and whether `InterfaceAlias` reads back as the alias. This is the most likely fake versus
+   real gap: if `Assert-Sealed` refuses with "differs from its record", capture these outputs, because
+   the normalization in the real `GetHostFirewallRule` must change, not the gate.
+8. `Get-VMNetworkAdapterExtendedAcl -VMName <vm>` lists three entries. Record how an unset field renders
+   (empty, `ANY`, `*`), whether `Protocol` reads `TCP` or `6`, and `Stateful`.
+9. `Assert-Sealed` returns `$true`.
+
+**After Start-SandboxEgressProxy**
+
+10. `Get-NetTCPConnection -LocalAddress <gateway> -LocalPort 13128 -State Listen` shows the Python pid,
+    and nothing listens on `0.0.0.0:13128`. If the bind failed while the address was still tentative, the
+    proxy retries for 15 seconds; note whether it needed to.
+
+**After the guest boots (serial capture attached first, as always)**
+
+11. Serial markers: `egress_lockdown=hostproxy-applied tool=nft rc=0` (or `tool=iptables`),
+    `egress_mode=hostproxy guest_addr=1 default_routes=0 nameservers=0 proxy_env=1`, and
+    `proxy_reachable=yes`. `guest_addr=1` also proves the NIC is `eth0`; if it is 0, the network-config
+    key must change.
+12. From the guest (a test entrypoint, run as the sandbox user):
+    - `curl -sS -o /dev/null -w '%{http_code}' https://<an allowlisted name>/` succeeds through the proxy.
+    - `curl https://<a name not on the list>/` fails with the proxy's 403; the log shows
+      `"reason": "not-allowlisted"`.
+    - `curl --noproxy '*' https://<any public IP>/` fails at once (no route).
+    - `getent hosts <an allowlisted name>` fails (no resolver).
+    - `curl -x http://<gateway>:13128 http://<allowlisted name>/` gets 405 (no plain HTTP).
+13. With the in-guest layer removed (`sudo nft delete table inet voidseal`, or `sudo iptables -P OUTPUT
+    ACCEPT`), so only the host layers stand:
+    - TCP to the gateway on other ports (`bash -c 'exec 3<>/dev/tcp/<gateway>/445'`, 135, 3389, 5985)
+      fails.
+    - `ping <gateway>` gets no reply; UDP to `<gateway>:53` gets no answer.
+    - `sudo ip addr add <another address in the /30>/30 dev eth0`, then a connection to the proxy from that
+      source address fails (port ACL `LocalIPAddress` and the firewall's guest-only rule).
+    - With IPv6 re-enabled in the guest, nothing on the host answers on its link-local address.
+14. Optional rebinding probe: temporarily allowlist a public name that resolves to `127.0.0.1` and confirm
+    the proxy answers 403 with `"reason": "forbidden-address", "address_class": "loopback"`.
+15. `egress-proxy.log` has one JSON line per attempt with name, decision, reason and byte counts, and no
+    payload.
+
+**After teardown**
+
+16. `Get-NetFirewallRule -Group 'Voidseal egress'` is empty, the gateway address is gone, the proxy pid is
+    gone, the switch is gone, and `TeardownStatus` starts with `OK`.
+17. Crash path: start a run, kill the PowerShell process mid-run, and confirm the proxy exits on its own
+    (parent watch). Then clean up by hand: `Get-NetFirewallRule -Group 'Voidseal egress' |
+    Remove-NetFirewallRule`, `Remove-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -IPAddress
+    <gateway>`, and the usual VM and switch removal. The address is in the active store only, so a host
+    reboot also clears it.
+
+The builder (`SquidSniProxy`) is unchanged by B': it still uses its in-guest Squid and has no host
+enforcement. Moving it to the host proxy is a follow-up (its Disk-mode runner would need the same proxy
+settings and network-config).
 
 ---
 
@@ -136,18 +224,20 @@ but nothing yet confines the child process.*
 | NIC's switch `SwitchType == Internal` | **SHIPPED, mock-green** — `Assert-Sealed`'s `SwitchType -ne 'Internal'` refusal in `scripts/lib/Sealer.ps1`'s Tier-1 block — locate by predicate |
 | By-name refusal of the built-in "Default Switch" | **SHIPPED, mock-green, this slice** — `Assert-Sealed`'s `$switchName.Trim() -ieq 'Default Switch'` refusal in `scripts/lib/Sealer.ps1`'s Tier-1 block — locate by predicate (commit `3c3a944`) |
 | No-uplink (`NetAdapterInterfaceDescription == null`) | live-only addition (not yet asserted) |
-| Host-gateway-IP pin | live-only addition (not yet asserted) |
-| Firewall-baseline export/diff | live-only addition (not yet asserted) |
+| Host-gateway-IP pin | **SHIPPED, mock-green (2026-10-03), HostProxy VMs**: the recorded gateway address must be on `vEthernet (<vm>-int)` with prefix 30, and no other host address may overlap the VM's /30 |
+| Recorded host firewall rules and port ACL, exactly as recorded | **SHIPPED, mock-green (2026-10-03), HostProxy VMs**: every recorded rule exists, is enabled and matches; the adapter carries exactly the recorded ACL entries; the record is the full set the address plan requires |
+| No NAT covers the VM subnet | **SHIPPED, mock-green (2026-10-03), HostProxy VMs**: `Get-NetNat` read; an overlap or a failed read refuses |
+| Whole-host firewall-baseline export/diff | live-only addition (not yet asserted); the per-VM rules above are checked, other rules on the host are not |
 | Refuse the Default-Switch by its immutable GUID `c08cb7b8-9b3c-408e-8e30-5e16a3aeb444` | **LIVE Phase-6 addition, tracked, not shipped** — the fake backend does not model a switch `.Id`, so this cannot be mock-verified; the name-based refusal above is the mock-verifiable control this project ships today. The friendly name "Default Switch" can be localized on non-English Windows — the GUID is stable and is the correct control for a non-English host. |
 
 The by-name Default-Switch refusal is real, host-verified, seal-time code today (see `SECURITY.md` and
 `docs/operator-runbook.md` for the full writeup of what it does and does not guarantee). It is a
-switch-**isolation** control, not egress **filtering** — §2 above is the filtering layer, and it remains
-entirely live-only. The GUID-by-Id hardening is the one remaining live addition to the switch-identity
+switch-**isolation** control, not egress **filtering**; §2 above is the filtering layer, built and
+gate-verified in the mock suite and not yet run live. The GUID-by-Id hardening is the one remaining live addition to the switch-identity
 check itself (the switch binding above already refuses a NIC on a localized Default Switch, because that
-is not the VM's recorded switch, so the GUID check is now defense in depth). The rest of this table
-(no-uplink, gateway-IP pin, firewall-baseline diff) are net-new live-only assertions, none of which exist
-in the mock-green engine today.
+is not the VM's recorded switch, so the GUID check is now defense in depth). Of the rest of this table, the gateway-IP pin, the recorded rules and ACL,
+and the NAT check now ship for HostProxy VMs (mock-green); no-uplink and the whole-host firewall-baseline
+diff are still live-only additions.
 
 ---
 
@@ -178,7 +268,9 @@ proves them.*
   Before that run, in an elevated PowerShell, run `Get-VMGpuPartitionAdapter -VMName <an existing VM>` and
   `Get-VMAssignableDevice -VMName <an existing VM>`. Each should return nothing, not an error. If either
   errors on the host, `Assert-Sealed` refuses every seal (fail closed) until that is resolved.
-- **Real Squid domain-ACL packet behavior.** The builder seed's Squid egress config (SEC-2, mock-shipped
+- **HostProxy, end to end.** Every check in §2.2. Until they pass, the host enforcement is proven in the
+  mock suite only.
+- **Real Squid domain-ACL packet behavior (builder and InGuestSquid only).** The builder seed's Squid egress config (SEC-2, mock-shipped
   per `progress.md`: default-DROP + minimal allow-list, `BlockProtocols` enforced by construction,
   DoH/DoT/QUIC dropped) is asserted at the level of seed **shape** only — the seed template is correct,
   but no test has observed a real Squid process actually splicing/dropping real packets. The first live

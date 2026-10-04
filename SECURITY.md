@@ -46,9 +46,11 @@ Default-Switch-connected NIC is refused, not certified. Real Tier-1 provisioning
 Internal switch, never the Default Switch. **This by-name match is the switch's ENGLISH friendly name**
 ("Default Switch"); on a non-English/localized Windows host the friendly name differs, so the by-name
 refusal does not fire there — the locale-independent guarantee is the immutable-GUID refusal
-(`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`), which is Phase-6-live, not yet shipped. Host egress **filtering**
-(Squid SNI-splice / `New-NetNat` / default-DROP) remains Phase-6-live (see "Tier-1 egress" below) — switch
-isolation and by-name refusal are reachability controls, not a claim that egress is filtered. Higher tiers
+(`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`), which is Phase-6-live, not yet shipped. Switch isolation and the
+by-name refusal are reachability controls. Egress **filtering** for a Tier-1 VM is a separate layer:
+since 2026-10-03 a Tier-1 profile runs with `EgressMode='HostProxy'`, where the host enforces an allowlist
+and the seal gate verifies the host objects that enforce it. That layer is mock-green and has not run on a
+live host yet (see "Tier-1 egress" below). Higher tiers
 additionally **starve** the guest of network and credentials at load time (refused if a Tier ≥ 2 profile
 declares any), and route hostile output through a one-way cold-disk quarantine boundary rather than a
 trusting host read.
@@ -225,12 +227,29 @@ full privileges of whoever invokes it — here, the host operator.
 - **Tier 2/3 (disposable no-net / air-gapped detonation) and the cold-VHDX→quarantine extraction are
   scaffold-only** in v1 (the quarantine sink throws `NotImplemented`). No live malware or untrusted-plugin
   detonation should be run until verified isolation is in place.
-- **Tier-1 egress filtering is in-guest today, and an in-guest control is not a containment boundary.**
-  The builder seed's iptables default-DROP-plus-allowlist and the in-guest Squid SNI proxy run *inside*
-  the VM whose workload they're supposed to constrain. A guest with code-execution can flush its own
-  `iptables` rules or kill its own Squid process — the untrusted principal cannot be trusted to police
-  itself, by construction. Treat these in-guest rules as defense-in-depth (they raise the bar for an
-  unsophisticated or non-adversarial workload) — not as the security boundary.
+- **Tier-1 egress: host-enforced under HostProxy, in-guest only under InGuestSquid and the builder.**
+  With `EgressMode='HostProxy'` (what `tier-profiles/tier1.psd1` ships since 2026-10-03, so ralph uses it)
+  the guest has one static address in a /30 of its own switch and no route, NAT or resolver. The host
+  holds the gateway address, runs `scripts/egress/voidseal_egress_proxy.py` on it, and closes everything
+  else twice: host firewall rules on that interface and a port ACL on the VM's NIC both admit only TCP from
+  the guest's address to the proxy port. The proxy tunnels only `CONNECT <name>:443` for names on the
+  run's merged `EgressAllowlist`, resolves each name itself, and refuses an answer that contains a private,
+  loopback, link-local, multicast, reserved or otherwise non-global address, so the guest picks a name and
+  the host picks the address. Nothing in the guest takes part in the decision. The in-guest default-DROP
+  the seed still installs is defense in depth. The builder (`SquidSniProxy`) and any profile set to
+  `InGuestSquid` still rely on rules *inside* the VM: a guest with code execution can flush its own
+  `iptables` rules or kill its own Squid, so for those modes the untrusted principal is policing itself.
+  Treat in-guest rules as raising the bar for a non-adversarial workload, not as the boundary.
+- **A domain allowlist is only as narrow as the names on it.** The HostProxy allowlist admits names, not
+  parties: an allowed name that fronts a shared CDN or a public storage service (ralph's
+  `storage.googleapis.com` admits any public bucket) can carry traffic to or from someone other than the
+  intended service, and the proxy cannot see inside the TLS tunnel. Keep allowlists narrow; see
+  `docs/threat-model.md`.
+- **The HostProxy host objects are mock-proven only.** The gateway address, the seven firewall rules, the
+  three port ACL entries, the NAT read and the proxy process start have run only against stub cmdlets and
+  the fake backend (`tests/fixtures/Invoke-RealEgressCapture.ps1`, `tests/HostEgress.Tests.ps1`). Every
+  read fails closed, so a live surprise is a refused seal or a failed provision, not an open path. The
+  checks the first elevated run must make are in `docs/phase-6-live-runbook.md` section 2.
 - **Three of the eight host channels are reported off by construction, not measured.** `Assert-Sealed`
   iterates all eight (clipboard, shares, guest-services, enhanced-session, and since 2026-10-03 the Time
   Synchronization, Key-Value Pair Exchange, Backup and Heartbeat integration services), but the real
@@ -266,13 +285,13 @@ full privileges of whoever invokes it — here, the host operator.
   builds a disk from. It never opens or inspects a file, so it cannot tell a real credential
   from a file that merely looks like one, and it does not fire on a credential the caller renamed. It
   reduces accidents. It is not a cryptographic or content-based boundary.
-  - **What IS host-verified today: switch isolation, not egress filtering.** `Assert-Sealed` verifies
+  - **What is host-verified: switch isolation for every Tier-1 VM, and the egress objects under HostProxy.** `Assert-Sealed` verifies
     (from the host, never the guest's self-report) that a Tier-1 VM has exactly one NIC and that it sits
     on the VM's own recorded **Internal** switch (the descriptor's `SwitchName`), not on an External or
     Private switch and not on any other Internal switch. That is a genuine host-enforced guarantee that the
     guest's only possible network path leaves through the host-controlled gateway on that Internal
     switch — an unfiltered External/Private switch is refused, fail-closed. It says nothing about *which*
-    destinations are reachable through that gateway; today, nothing on the host filters what crosses it.
+    destinations are reachable through that gateway; for a HostProxy VM that is the next bullet's job.
     **Caveat:** the built-in "Default Switch" is itself `SwitchType=Internal` (Hyper-V's ICS/internet-
     connected switch), so the SwitchType check alone cannot distinguish it from a purpose-built isolated
     Internal switch — but the seal now ALSO refuses it explicitly **by name** (host-verified, mock-tested),
@@ -281,15 +300,19 @@ full privileges of whoever invokes it — here, the host operator.
     name**; on a non-English/localized Windows host the friendly name differs, so the by-name refusal does
     not fire there — the locale-independent guarantee is the immutable-GUID refusal
     (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`), which is Phase-6-live, not yet shipped. This is still a
-    reachability/isolation control, not egress filtering — see the next bullet.
-  - **Egress filtering at the host is the Phase-6-live layer, not yet built.** The planned control is a
-    host-run transparent Squid SNI-splice proxy plus a host-side NAT (`New-NetNat`) and a host default-DROP
-    policy on the Internal switch's gateway interface — i.e. the same allow-only-what's-needed filtering
-    the in-guest layer attempts today, but enforced from a position the guest cannot reach or disable.
-    Until that lands, **do not read "the seal is host-verified" as "Tier-1 egress is filtered."** The seal
-    verifies isolation (the guest can only reach the host gateway); it does not yet verify filtering (what
-    the host gateway then permits through). See `docs/phase-6-live-runbook.md` for the full prescribed live
-    sequence (host egress enforcement, qemu-img confinement, seal-time assertions to add live).
+    reachability/isolation control, not egress filtering; see the next bullet.
+  - **Egress filtering at the host (HostProxy) is built and gate-verified, mock-green only.** For a VM that
+    records `EgressMode='HostProxy'`, `Lock-Sandbox` installs the gateway address on `vEthernet (<vm>-int)`,
+    the host firewall rules scoped to that interface and the port ACL, recording each one, and
+    `Assert-Sealed` refuses unless every one is on the host exactly as recorded, the record is the full
+    set the VM's address plan requires, no other host address overlaps the VM's /30, and no NAT network
+    covers it. Any read that fails refuses. The proxy starts only after the gate certifies and before the
+    guest boots, and teardown removes exactly what was recorded. There is no NAT at all in this design, so
+    the one-NAT-per-host contention with Docker and WSL does not arise. What remains unproven is live
+    behavior (rule matching on a real interface, ACL evaluation at the vSwitch port, the proxy under a
+    real client); **until the first elevated run, read "host-enforced" as "host-enforced by design and in
+    the mock suite."** `InGuestSquid` and the builder's `SquidSniProxy` have no host filtering. See
+    `docs/phase-6-live-runbook.md` for the live sequence and checks.
 
 Do not rely on Voidseal as your sole boundary for genuinely hostile code until the higher tiers are
 completed and you have independently verified the isolation on your host.

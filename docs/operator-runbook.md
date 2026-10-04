@@ -257,8 +257,8 @@ $report.RunResult.ExitCode
 > `SwitchType=Internal`. An External or Private switch, any other Internal switch, or a second NIC is
 > refused. That's a real, host-verified guarantee that the guest's only
 > possible route off-box is the host-controlled gateway on that Internal switch — **for a purpose-built
-> Internal switch.** It is **not** a guarantee that egress is filtered — nothing today inspects or
-> restricts what crosses that gateway once traffic is on it. **It DOES, now, refuse the built-in
+> Internal switch.** On its own it says nothing about which destinations are reachable; for that, see
+> the HostProxy paragraph below. **It DOES, now, refuse the built-in
 > "Default Switch" by name:** the Default Switch is itself `SwitchType=Internal` (Hyper-V's
 > ICS/internet-connected switch), so the SwitchType check alone could not distinguish it from a
 > purpose-built isolated Internal switch — the seal now ALSO verifies the switch is not the Default
@@ -267,18 +267,32 @@ $report.RunResult.ExitCode
 > non-English/localized Windows host the friendly name differs, so the by-name refusal does not fire
 > there — the locale-independent guarantee is the immutable-GUID refusal
 > (`c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`), which is Phase-6-live, not yet shipped. This by-name refusal
-> is a reachability/isolation control, not egress filtering — see below.
+> is a reachability/isolation control, not egress filtering; see below.
 >
-> The in-guest controls (the builder profile's iptables default-DROP-plus-allowlist, the in-guest Squid
-> SNI proxy) are **not** a containment boundary: a compromised or adversarial guest with code-execution
-> can flush its own `iptables` rules or kill its own Squid — you cannot have the untrusted principal police
-> itself. Treat them as defense-in-depth, not as what stands between an exfiltrating workload and the
-> internet. The layer that WOULD make that guarantee — a host-run transparent Squid SNI-splice proxy plus
-> host-side NAT (`New-NetNat`) and a host default-DROP policy on the gateway interface, so filtering
-> happens from a position the guest cannot reach — is the **Phase-6-live** work, not yet built. Until then,
-> a "sealed" Tier-1 VM is isolation-verified, not egress-filtered; see `SECURITY.md` for the full writeup.
-> The full prescribed live-run sequence — host egress enforcement, qemu-img confinement, seal-time
-> assertions to add live — is `docs/phase-6-live-runbook.md`.
+> **HostProxy (what `tier1.psd1` ships).** For a VM with `EgressMode='HostProxy'`, `SealVerdict = $true`
+> also means the gate read back, from the host, the gateway address on `vEthernet (<vm>-int)`, the seven
+> host firewall rules on that interface and the three port ACL entries on the VM's NIC, each exactly as
+> recorded, and found no NAT over the VM's /30. Those leave one path open: TCP from the guest's address to
+> the host proxy on the gateway, which tunnels only `CONNECT <name>:443` for names on the merged
+> `EgressAllowlist`. The guest has no route, NAT or resolver. The proxy starts after the gate and before the
+> VM; its per-connection log is `report.EgressProxyLog` (`egress-proxy.log` in the artifact folder), one
+> JSON line per connection with the requested name, decision, reason code and byte counts, never payload.
+> Read it after a run to see what the workload tried to reach. Running this mode needs the elevated
+> session the rest of a live run needs (it creates a host address, firewall rules and port ACL entries),
+> and teardown removes exactly what the run created; a removal that fails shows up as
+> `TeardownStatus = 'FAILED: ...'` naming the object, which you then remove by hand (rules are named
+> `Voidseal-egress-<vm>-*`, in the group "Voidseal egress"). It is mock-green only until the first elevated
+> run; `docs/phase-6-live-runbook.md` section 2 lists the checks. Keep allowlists narrow: an allowed name
+> that fronts a shared CDN or a public storage service can carry traffic for parties other than the
+> intended one.
+>
+> The in-guest controls (the in-guest default-DROP the HostProxy seed still installs, and, for a profile
+> set to `InGuestSquid` or the builder, the in-guest iptables and Squid) are **not** a containment
+> boundary: a compromised or adversarial guest with code execution can flush its own rules or kill its own
+> Squid. Under `InGuestSquid` and the builder they are the only egress control, so a "sealed" VM in those
+> modes is isolation-verified, not egress-filtered; see `SECURITY.md` for the full writeup. The full live
+> sequence (host egress enforcement, qemu-img confinement, seal-time assertions) is
+> `docs/phase-6-live-runbook.md`.
 
 ### 1.3 Reading the report
 

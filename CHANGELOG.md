@@ -135,3 +135,19 @@ places where a check is an argument rather than a measurement.
   and package presence, Squid and IPv6 state, the lockdown's REDIRECT return codes), through the same
   `diag()` helper, so a misbehaving ralph seed can be told apart from the serial capture alone. Counts
   and yes/no facts only, never file content or workload names.
+- Host-enforced Tier-1 egress (`EgressMode='HostProxy'`, now what `tier1.psd1` and so `ralph` use): the
+  guest gets one static address in a per-VM /30 (`10.231.0.0/16`, chosen from the VM name; an overlap
+  with a host address or NAT network refuses the provision) and no route, NAT or resolver. The host puts
+  the gateway address on the VM switch's vEthernet adapter, adds firewall rules on that interface and a
+  port ACL on the VM's NIC that leave only TCP from the guest to the proxy port open, and runs
+  `scripts/egress/voidseal_egress_proxy.py` there: a standard-library CONNECT proxy that tunnels only
+  `<name>:443` for names on the merged `EgressAllowlist`, resolves names itself, refuses answers with
+  private or otherwise non-global addresses, and logs one JSON line per connection (never payload) to
+  `egress-proxy.log` in the run folder (`report.EgressProxyLog`). `Assert-Sealed` refuses unless the
+  gateway address, rules and ACL entries are on the host exactly as recorded and no NAT covers the
+  subnet; the proxy starts after the gate and before the guest boots; teardown removes exactly what was
+  recorded and reports what it could not. Twelve new backend methods (manifest, real, fake), with the
+  real bodies pinned by an out-of-process capture harness. The seed writes a `network-config`, the proxy
+  settings, and an in-guest default-DROP that allows only the proxy port. `InGuestSquid` still works for
+  a tier that sets it; the builder keeps `SquidSniProxy`. Mock-green only: the first elevated run follows
+  `docs/phase-6-live-runbook.md` section 2, which this replaces (no host Squid, no NAT).

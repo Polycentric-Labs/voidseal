@@ -11,8 +11,8 @@
 | `Description` | string | human summary |
 | `Substrate` | `'Container'` \| `'HyperV-Gen2'` | what hosts the workload |
 | `Network` | string | network posture label |
-| `EgressMode` | `'HostProxy'`\|`'InGuestSquid'`\|`'HostEnvoy'`(Phase-1B)\|`'SquidSniProxy'`(builder)\|`'None'` | egress enforcement mechanism |
-| `EgressAllowlist` | string[] | FQDNs permitted (empty = none) |
+| `EgressMode` | `'HostProxy'`\|`'InGuestSquid'`\|`'HostEnvoy'`(Phase-1B)\|`'SquidSniProxy'`(builder)\|`'None'` | egress enforcement mechanism. `'HostProxy'` (tier1's value) is host-enforced and acts only on a VM that keeps a NIC (Tier 1, `Network='Internal+Allowlist'`): `New-SandboxVM` gives it a /30 in `10.231.0.0/16` from its name and refuses a host address or NAT that overlaps it; `Lock-Sandbox` installs the gateway address, host firewall rules and a port ACL; `Assert-Sealed` reads them back (see invariant 6); `Invoke-Voidseal` starts the host CONNECT proxy (`scripts/egress/voidseal_egress_proxy.py`) after the gate; teardown removes what was recorded. Serial mode only (a Disk-mode HostProxy seed is refused). On a VM sealed with no adapter (Tier 0) it is moot. `'InGuestSquid'` is an in-guest layer only (defense in depth) |
+| `EgressAllowlist` | string[] | FQDNs permitted (empty = none). A leading dot (`.example.org`) means the domain and its subdomains; under `HostProxy` it becomes the proxy rules `example.org` and `*.example.org`. The merged list (tier plus workload `ExtraAllowlist`) is what the proxy enforces |
 | `BlockProtocols` | string[] | (opt) protocols force-blocked (QUIC/DoH/DoT) |
 | `Credentials` | `'None'`\|`'ScopedOnDemand'` | credential posture. **MUST be `'None'` for Tier ≥ 2** |
 | `GuestImage` | string | base image id |
@@ -42,7 +42,7 @@
 | `WorkloadTimeoutSeconds` | int 60–86400 | (opt) the overall deadline for the workload run, after which the guest is force-stopped and the run reports Failed. `Invoke-Voidseal -WorkloadTimeoutSeconds` wins only when it is explicitly passed; otherwise this key; otherwise 600. The same precedence applies to `Invoke-BuilderVM`. The bounds are checked at load |
 | `ExtraAllowlist` | string[] | (opt) additional FQDNs unioned onto the tier allowlist |
 | `StageAssets` | hashtable | (opt) host source path → a free-text pin note (for example a commit SHA; no hash is checked on this path). `Invoke-Voidseal` attaches each key as a read-only ISO before the seal (`Import-SandboxAsset -As Iso`, which fails closed on a missing file), and the seal ejects it before the guest's only boot, so nothing in it reaches a running workload; use Disk-mode `Inputs` for that. Its source keys are still screened by invariant 1 below |
-| `SeedIso` | string | (opt) **not read by `Invoke-Voidseal`.** Only `New-CidataSeed` uses it, as the default output path for a `CIDATA` seed ISO built by hand. The engine builds the cloud-init seed itself from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (`New-WorkloadSeedDisk`), for every run that boots a guest: in Serial mode serial-getty autologin on ttyS0 (the Runner's command channel), the run-user and the seed's packages, plus the in-guest egress layer for an `InGuestSquid` profile; in Disk mode the disk-mode runner. A seed DVD would be ejected by the seal before the guest's only boot. |
+| `SeedIso` | string | (opt) **not read by `Invoke-Voidseal`.** Only `New-CidataSeed` uses it, as the default output path for a `CIDATA` seed ISO built by hand. The engine builds the cloud-init seed itself from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (`New-WorkloadSeedDisk`), for every run that boots a guest: in Serial mode serial-getty autologin on ttyS0 (the Runner's command channel), the run-user and the seed's packages, plus the in-guest egress layer for an `InGuestSquid` profile, or for a networked `HostProxy` VM the proxy settings, an in-guest default-DROP allowing only the proxy port, and a `network-config` with one static address and no route or resolver; in Disk mode the disk-mode runner. A seed DVD would be ejected by the seal before the guest's only boot. |
 
 ## Provision-time resource gate (not a loader rule)
 Before it creates anything, `New-SandboxVM` reads the host's free physical memory (backend method
@@ -78,6 +78,9 @@ at run time, not on the profile alone.
    is set and is not `'None'` may keep a NIC (on an isolated Internal vSwitch, never the Default Switch);
    Tier 0, Tier >= 2 and every `Network='None'` profile must seal with zero adapters, and a descriptor
    that records no `Network` is refused. The unrecorded-residual-disk refusal is authoritative at
-   Tier >= 2 and best-effort below it.
+   Tier >= 2 and best-effort below it. A Tier-1 VM whose descriptor records `EgressMode='HostProxy'` is
+   also refused unless its gateway address, host firewall rules and port ACL entries are on the host
+   exactly as recorded, the record is the complete set its address plan requires, no other host address
+   overlaps its /30, and no NAT network covers it; a read that fails refuses.
 
 Validation = a Pester test per invariant; a deliberately-violating fixture profile MUST fail closed.

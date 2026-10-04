@@ -319,17 +319,15 @@ Remove-Sandbox -Name '<the VM name from $report.Name, e.g. sbx-0-xxxxxxxx>' -Del
 
 ## 4. Milestone 2 — Ralph proof (Tier 1), LIVE
 
-> **⚠️ WARNING — in-guest egress is defense-in-depth, NOT a boundary, and still unproven
-> live.** Tier-1's Serial seed now ships an in-guest **iptables default-DROP OUTPUT +
-> transparent Squid `dstdomain` allowlist** over `EgressAllowlist` (`EgressMode='InGuestSquid'`
-> in `tier-profiles/tier1.psd1`, rendered by `CidataSerialEgressTemplate` in
-> `SeedBuilder.ps1`) — but the mock suite only asserts the seed's SHAPE (the rendered Squid
-> config / iptables rule text), never real packet-drop or the activation-timing ordering
-> against the guest's own pre-seal package install (see [`tier-reference.md`](tier-reference.md)'s
-> Egress note for the full picture and the finding that ruled out a static nftables
-> allowlist). A compromised/root guest can disable this layer (flush iptables, kill Squid).
-> **Do NOT run untrusted/hostile agent workloads at Tier-1 live relying on the in-guest layer
-> alone — the host-verified boundary is Phase-6.**
+> **⚠️ WARNING: Tier-1 egress is host-enforced by design but unproven live.** `tier1.psd1` ships
+> `EgressMode='HostProxy'`: no route, NAT or resolver in the guest, a host CONNECT allowlist proxy
+> on the VM's own /30, and host firewall rules plus a port ACL that `Assert-Sealed` reads back (see
+> [`tier-reference.md`](tier-reference.md)'s Egress note). None of it has run on a real host. The
+> first Tier-1 live run must walk the checks in
+> [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2 before trusting it, and it needs an
+> elevated session that may create a host address, firewall rules and port ACL entries. **Do NOT run
+> untrusted or hostile agent workloads at Tier 1 until those checks pass.** A profile set to
+> `InGuestSquid` has only the in-guest layer, which a root guest can disable.
 
 **Proves milestone 5 — net-reachable, with an in-guest allowlist exercised live for the first
 time.** A Gen2 VM that keeps its NIC (not no-net) and runs a **bounded** Ralph loop reaching
