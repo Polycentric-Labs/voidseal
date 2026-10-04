@@ -27,6 +27,12 @@ places where a check is an argument rather than a measurement.
 - Release Governor: a per-profile per-day release rate cap backed by an append-only ledger.
 - Tier-1 builder VM and the `builder` profile; `Get-VoidsealGoldenImage.ps1` and
   `Test-VoidsealPrereqs.ps1`; the user-space outbox transport for Raw OUTPUT disks.
+- Seal network-adapter policy: one predicate (`Get-SealNicPolicy`) now drives the Provisioner,
+  `Lock-Sandbox` and `Assert-Sealed`. Tier 0, Tier >= 2 and every `Network='None'` processor seal with
+  zero adapters, host-verified. The processor check previously read a descriptor field production never
+  wrote, so it could not fire, and a Tier-1 processor was certified with a connected NIC. The gate also
+  refuses any GPU partition adapter or Discrete Device Assignment device at every tier, and the fake
+  backend now models the default adapter real `New-VM` creates. Not yet exercised live.
 - Live acceptance status: the **Tier-0 `firefox` disk round-trip ran end-to-end on real Hyper-V**,
   first with the legacy exFAT OUTPUT disk (2026-06-25) and then with the current user-space outbox
   transport (2026-07-21). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see

@@ -225,7 +225,7 @@ $report.RunResult.ExitCode
 
 > **Operator note — what `SealVerdict = $true` guarantees for Tier-1, and what it doesn't.** A Tier-1
 > VM legitimately keeps its NIC (net-restricted, not no-net), so the seal can't certify "no network" the
-> way it does at Tier ≥ 2. What it certifies instead: `Assert-Sealed` reads the NIC's vSwitch from the
+> way it does for a Tier-0, Tier ≥ 2 or processor VM. What it certifies instead: `Assert-Sealed` reads the NIC's vSwitch from the
 > **host** and refuses to certify unless that switch is an isolated **Internal** vSwitch — never an
 > unfiltered External or Private switch. That's a real, host-verified guarantee that the guest's only
 > possible route off-box is the host-controlled gateway on that Internal switch — **for a purpose-built

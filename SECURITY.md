@@ -14,11 +14,16 @@ The core control is the **host-verified, fail-closed seal gate** (`Assert-Sealed
 cut, the **host** (never the guest's self-report) certifies the VM against its tier's contract, and the
 workload is structurally unreachable unless that certification returns true. What gets certified is
 tier-scoped, and the scope matters. At every tier the host verifies that no import DVD or ISO is still
-attached, that no secret-shaped or unrecorded volume remains, and that the host channels it can read
-report off. **The no-network-adapter certification applies only at Tier >= 2, plus any profile that
-declares `Network='None'` (a "processor") at any tier**: the check is gated on
-`if ($tier -ge 2 -or $isProcessor)` in `scripts/lib/Sealer.ps1`. A Tier-0 or Tier-1 VM never has its
-adapter count certified. For a Tier-1 VM, which legitimately keeps a NIC
+attached, that no secret-shaped or unrecorded volume remains, that the host channels it can read report
+off, and that no passthrough device is assigned: no GPU partition adapter and no device handed over by
+Discrete Device Assignment, which could be a physical NIC that the virtual-adapter read never sees.
+**Every VM except a Tier-1 non-processor must seal with zero network adapters.** One predicate,
+`Get-SealNicPolicy` in `scripts/lib/Provisioner.ps1`, makes that call for the Provisioner, `Lock-Sandbox`
+and `Assert-Sealed` alike: Tier 0, Tier >= 2, and any profile that declares `Network='None'` (a
+"processor") at any tier get no adapter. Real `New-VM` always creates one, so the seal removes it and the
+gate requires the host to report none; a descriptor that records no `Network`, or a policy value the
+predicate does not recognize, is refused outright. For a
+Tier-1 VM, which legitimately keeps a NIC
 (net-restricted, not no-net), the seal instead certifies that NIC's vSwitch is an isolated **Internal**
 switch — never an unfiltered External or Private switch — so the guest's only possible route off-box is
 the host-controlled gateway on that Internal switch. That is a host-verified **switch-isolation**
@@ -202,6 +207,11 @@ full privileges of whoever invokes it — here, the host operator.
   Hyper-V**: with the legacy exFAT OUTPUT disk on 2026-06-25, and with the current user-space outbox
   transport on 2026-07-21. Changes made after that run are mock-tested only. No other tier has had a
   live acceptance run; Tier 1 remains the operator's elevated step.
+- **The zero-adapter seal and the passthrough refusal are mock-proven only.** Since 2026-10-03 every
+  Tier-0 seal runs the real `RemoveNetworkAdapter`, and every gate reads `Get-VMGpuPartitionAdapter` and
+  `Get-VMAssignableDevice`. None of the three has run on a live host; the next Tier-0 `firefox` re-run is
+  their first live exercise. A failure there refuses the seal and tears down, so the failure mode is a
+  refused run, not an unsealed one.
 - **Tier 2/3 (disposable no-net / air-gapped detonation) and the cold-VHDX→quarantine extraction are
   scaffold-only** in v1 (the quarantine sink throws `NotImplemented`). No live malware or untrusted-plugin
   detonation should be run until verified isolation is in place.

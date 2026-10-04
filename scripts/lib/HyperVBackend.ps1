@@ -231,6 +231,17 @@ function Get-HyperVBackendMethodManifest {
         RemoveNetworkAdapter = @('VMName')                         # the SEAL operation
         GetNetworkAdapter    = @('VMName')                         # -> @() of NIC records
 
+        # ---- passthrough devices (SEAL/GATE surface) ----
+        # Host-TRUTH reads of devices that bypass the virtual NIC entirely: GPU partition adapters
+        # (Get-VMGpuPartitionAdapter) and devices handed to the guest by Discrete Device Assignment
+        # (Get-VMAssignableDevice; a passed-through physical NIC never shows up in GetNetworkAdapter).
+        # Voidseal never assigns either, so Assert-Sealed refuses any present, at every tier. Read-only:
+        # there are deliberately no Add/Remove methods, because detection is the whole job. Added per the
+        # GetDvdDrives addendum precedent (manifest + both factories + parity/drift tests). Both return a
+        # unary-comma-wrapped @() so a single device keeps .Count = 1.
+        GetGpuPartitionAdapters = @('VMName')                      # -> @() of GPU partition adapter records
+        GetAssignableDevices    = @('VMName')                      # -> @() of assigned-device records
+
         # ---- checkpoint ----
         Checkpoint           = @('VMName', 'SnapshotName')
         RestoreCheckpoint    = @('VMName', 'SnapshotName')
@@ -1598,12 +1609,18 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
+    # The SEAL operation: strip ALL NICs so Assert-Sealed (host-side) sees none. Lock-Sandbox calls it
+    # for every NoAdapter VM (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy in Provisioner.ps1).
+    # It enumerates the adapters and pipes the objects to the removal cmdlet (its documented
+    # ResourceObject parameter set) instead of naming the VM and omitting -Name, which leans on
+    # behavior the docs never state. The count guard makes it idempotent, matching the fake: a VM with
+    # no adapters is a no-op. Never yet exercised live; the next Tier-0 run is its first live use.
     $b.RemoveNetworkAdapter = {
         param([System.Collections.IDictionary] $P)
-        # The SEAL operation: strip ALL NICs so Assert-Sealed (host-side) sees none.
         $vm = & $AssertArg $P 'VMName' 'RemoveNetworkAdapter'
         & $InvokeOp {
-            Remove-VMNetworkAdapter -VMName $vm -ErrorAction Stop
+            $nics = @(Get-VMNetworkAdapter -VMName $vm -ErrorAction Stop)
+            if ($nics.Count -gt 0) { $nics | Remove-VMNetworkAdapter -ErrorAction Stop }
         }
     }.GetNewClosure()
 
@@ -1615,6 +1632,24 @@ function New-RealHyperVBackend {
         # MUST be here, not inside the op: $InvokeOp's `return (& $op)` re-enumerates and
         # would strip an inner comma, re-unrolling a single element to a bare object.
         return ,@(& $InvokeOp { Get-VMNetworkAdapter -VMName $vm -ErrorAction Stop })
+    }.GetNewClosure()
+
+    # ---- passthrough devices (SEAL/GATE surface) -------------------------
+    # Host-truth reads for Assert-Sealed's passthrough refusal. Unary-comma wrap at the OUTERMOST return
+    # (see GetNetworkAdapter) so a single device keeps .Count = 1. The gate reads ONLY .Count, never the
+    # device objects' properties, whose real shape cannot be verified without elevation. Both cmdlets
+    # are present in the Hyper-V module on the v1 Windows 11 host; on a host without them the call
+    # throws and the gate refuses rather than skipping the check. Never yet exercised live.
+    $b.GetGpuPartitionAdapters = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $AssertArg $P 'VMName' 'GetGpuPartitionAdapters'
+        return ,@(& $InvokeOp { Get-VMGpuPartitionAdapter -VMName $vm -ErrorAction Stop })
+    }.GetNewClosure()
+
+    $b.GetAssignableDevices = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $AssertArg $P 'VMName' 'GetAssignableDevices'
+        return ,@(& $InvokeOp { Get-VMAssignableDevice -VMName $vm -ErrorAction Stop })
     }.GetNewClosure()
 
     # ---- checkpoint ------------------------------------------------------
@@ -1928,14 +1963,22 @@ function New-FakeHyperVBackend {
             HardDrives                     = [System.Collections.Generic.List[object]]::new()
             DvdDrive                       = $null
             NetworkAdapters                = [System.Collections.Generic.List[object]]::new()
+            # Passthrough devices (GPU partition adapters, DDA-assigned devices): empty, because
+            # Voidseal never assigns either. Tests seed one by adding to these lists.
+            GpuPartitionAdapters           = [System.Collections.Generic.List[object]]::new()
+            AssignableDevices              = [System.Collections.Generic.List[object]]::new()
             Checkpoints                    = [System.Collections.Generic.List[object]]::new()  # @{ Name; Snapshot=<vm copy> }
             # Host<->guest channels seeded to the UNSEALED default (all $true) — Hyper-V enables
             # Guest Services / Enhanced Session by default, so a freshly-provisioned VM is NOT
             # sealed until the Sealer turns them off. Assert-Sealed host-verifies these are off.
             HostChannels                   = @{ Clipboard = $true; Shares = $true; GuestServices = $true; EnhancedSession = $true }
         }
+        # Real New-VM ALWAYS creates exactly one virtual network adapter; -SwitchName only decides whether
+        # it starts connected (Microsoft Learn's New-VM reference, -SwitchName). The fake once created no
+        # adapter without a SwitchName, so a Tier-0 VM had zero NICs here and one on real Hyper-V, and every
+        # no-NIC seal check passed on the fake alone.
         $sw = & $GetArg $P 'SwitchName'
-        if ($null -ne $sw) { $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' }) }
+        $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
         $state.VMs[$name] = $vm
     }.GetNewClosure()
 
@@ -2613,10 +2656,22 @@ function New-FakeHyperVBackend {
         # Real Connect-VMNetworkAdapter errors when the named switch does not exist; mirror
         # that by demanding the switch was created via NewSwitch first. Without this the fake
         # would bind a NIC to a phantom switch and network-isolation checks go false-green.
+        # The check runs before any adapter is touched, so a failed connect changes nothing.
         if (-not $state.Switches.ContainsKey($sw)) {
             throw "HyperVBackend(fake).ConnectNetworkAdapter: switch '$sw' does not exist (create it with NewSwitch first); real Connect-VMNetworkAdapter errors on an unknown switch."
         }
-        $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
+        # Mirror the REAL method's branch: it reads the VM's first adapter and calls
+        # Connect-VMNetworkAdapter when one exists, adding an adapter only when the VM has none. Real
+        # New-VM always leaves one, so a provisioned VM ends with exactly ONE adapter, on the switch.
+        # The real call passes no -Name filter and the docs do not spell out the multi-adapter case, so
+        # the fake connects every existing adapter; that is identical for the one-adapter case
+        # production always has.
+        if ($vm.NetworkAdapters.Count -gt 0) {
+            foreach ($nic in $vm.NetworkAdapters) { $nic['SwitchName'] = $sw }
+        }
+        else {
+            $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
+        }
     }.GetNewClosure()
 
     $b.RemoveNetworkAdapter = {
@@ -2639,6 +2694,23 @@ function New-FakeHyperVBackend {
         # VM has exactly one NIC (and to $null when empty), so an unwrapped caller's `.Count`
         # would read the hashtable's key-count (or fail on $null). `,@(...)` keeps it an array.
         return ,@($vm.NetworkAdapters)
+    }.GetNewClosure()
+
+    # ---- passthrough devices (SEAL/GATE surface) ----
+    # Per-VM lists, empty by default (Voidseal never assigns either device kind). A test seeds one by
+    # adding to the VM record, e.g. (& $b.GetVM @{ Name = 'vm1' }).GpuPartitionAdapters.Add(@{ Id = 'g0' }).
+    # Unary-comma wrap (see GetNetworkAdapter) so a single entry keeps .Count = 1. The checkpoint
+    # deep-copy (SbCopyFakeVM) already clones any list of hashtables, so these need no extra handling.
+    $b.GetGpuPartitionAdapters = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $requireVM (& $GetArg $P 'VMName') 'GetGpuPartitionAdapters'
+        return ,@($vm.GpuPartitionAdapters)
+    }.GetNewClosure()
+
+    $b.GetAssignableDevices = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $requireVM (& $GetArg $P 'VMName') 'GetAssignableDevices'
+        return ,@($vm.AssignableDevices)
     }.GetNewClosure()
 
     # ---- checkpoint ----

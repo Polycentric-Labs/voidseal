@@ -94,6 +94,27 @@ BeforeAll {
         }.GetNewClosure()
         return $snap
     }
+
+    # Spy on a backend's GetNetworkAdapter so a test can see what Assert-Sealed read at certify time.
+    # Invoke-Voidseal tears the VM down before it returns, so the adapters cannot be read afterward.
+    # Returns the list the wrapper appends to: one @{ VMName; Adapters; Switches } entry per read. The
+    # wrapper hands back exactly what the wrapped method returned (comma-wrapped to keep array semantics).
+    $script:SpyNicReads = {
+        param([hashtable] $Backend)
+        $inner = $Backend.GetNetworkAdapter
+        $reads = [System.Collections.Generic.List[object]]::new()
+        $Backend.GetNetworkAdapter = {
+            param([System.Collections.IDictionary] $P)
+            $nics = & $inner $P
+            $reads.Add(@{
+                VMName   = [string]$P['VMName']
+                Adapters = $nics.Count
+                Switches = @($nics | ForEach-Object { [string]$_.SwitchName })
+            })
+            return ,$nics
+        }.GetNewClosure()
+        return ,$reads
+    }
 }
 
 AfterAll {
@@ -830,8 +851,8 @@ Describe 'StageAssets: attached before the seal, gone when the guest first boots
 Describe 'Invoke-Voidseal — processor (gate) wiring' {
 
     BeforeEach {
-        # A Tier-0 PROCESSOR profile: Network='None' (structurally no-NIC; Tier-0 Container substrate
-        # wires no NIC, so it seals clean) + a ScreenConfig (mode='aggressive') that routes the post-
+        # A Tier-0 PROCESSOR profile: Network='None' (NoAdapter: the provisioner builds no switch and
+        # Lock-Sandbox removes the default adapter, so it seals clean) + a ScreenConfig (mode='aggressive') that routes the post-
         # detach gate, + WorkloadMode='Disk' (a processor IS a Disk-mode workload) + an Entrypoint (so
         # the disk-mode CIDATA seed disk is built, exactly like the RC6 path). EgressMode/EgressAllowlist
         # MUST be 'None'/@() for a Network='None' profile (the loader's processor rule).
@@ -1660,6 +1681,30 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
         $mountOps.Count | Should -Be 0 -Because 'the host must NEVER Mount-VHD / ReadVhdxFile a Raw OUTPUT with no filesystem'
     }
 
+    It 'seals the Tier-0 VM with ZERO network adapters (the seal strips the default one) and still extracts the artifact' {
+        # Tier 0 is NoAdapter (Get-SealNicPolicy): real New-VM creates one adapter, Lock-Sandbox removes
+        # it, and the gate requires the host to report none. Removing an adapter this offline workload
+        # never used must not break the disk round-trip.
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+        $reads = & $script:SpyNicReads $b
+        $art  = Join-Path $script:TmpRoot ("art-fx-nonic-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $dest = Join-Path $script:TmpRoot ("dest-fx-nonic-{0}" -f ([guid]::NewGuid().ToString('N')))
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx `
+            -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-fx-nonic' -ArtifactRoot $art -Destination $dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+
+        $report.SealVerdict | Should -BeTrue
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' -and $_.VMName -eq 'sbx-fx-nonic' }).Count |
+            Should -Be 1 -Because 'Lock-Sandbox must remove the default adapter of a Tier-0 VM'
+        $gateRead = @($reads | Where-Object { $_.VMName -eq 'sbx-fx-nonic' })
+        $gateRead.Count       | Should -Be 1 -Because 'Assert-Sealed reads the adapters once for a NoAdapter VM'
+        $gateRead[0].Adapters | Should -Be 0 -Because 'the gate certified a Tier-0 VM whose host reports zero adapters'
+        $report.ExtractedArtifact | Should -Not -BeNullOrEmpty
+        [System.IO.File]::ReadAllBytes(@($report.ExtractedArtifact)[0]) | Should -Be $script:FxResultBytes
+    }
+
     It 'DENY-on-no-outbox: a clean power-off with NO outbox written -> header-magic probe fails closed, no artifact' {
         $b = New-FakeHyperVBackend -SimulateSelfPowerOff       # NOTE: no -SimulateOutboxBlob
 
@@ -1913,5 +1958,138 @@ Describe 'Invoke-Voidseal — input validation' {
         $b = New-FakeHyperVBackend
         { Invoke-Voidseal -Tier 1 -Profile (Join-Path $script:TmpRoot 'no-such-profile.psd1') -Backend $b } |
             Should -Throw -Because 'a profile path that does not exist must fail closed'
+    }
+}
+
+# ===========================================================================
+#  The NIC policy reaches the seal gate through the REAL orchestrator path
+# ===========================================================================
+#  Until 2026-10-03 the processor no-NIC check read a descriptor field production never wrote, so it
+#  fired only in tests that injected the field by hand. These tests drive Invoke-Voidseal end to end on
+#  the fake (which, like real New-VM, gives every VM one default adapter): Network must reach the
+#  descriptor, Lock-Sandbox must strip the adapter of every NoAdapter VM, and Assert-Sealed must refuse
+#  an adapter that survives. $script:SpyNicReads records what the gate read, since the VM is torn down
+#  before the report returns.
+Describe 'Invoke-Voidseal: the NIC policy reaches the seal gate (processors at Tier 0 and 1; Tier-1 non-processor)' {
+
+    BeforeAll {
+        # A processor profile (Network='None' plus a ScreenConfig) on the given base tier. EgressMode and
+        # EgressAllowlist must be 'None' and empty for a Network='None' profile (the loader's processor rule).
+        $script:NewProcessorProfile = {
+            param([int] $BaseTier)
+            $p = Import-TierProfile -Path (Join-Path $script:TierDir ("tier{0}.psd1" -f $BaseTier))
+            $p = @{} + $p
+            $p['Name']            = "nicpolicy-proc-t$BaseTier"
+            $p['WorkloadMode']    = 'Disk'
+            # The processor preflight refuses a run whose Inputs lack the in-guest helpers, so load them
+            # the way the $script:Proc fixture does.
+            $p['Inputs']          = @{}
+            foreach ($helper in @('run_disk_workload.py', 'outbox.py', 'screener.py')) {
+                $p['Inputs'][$helper] = Get-Content -LiteralPath (Join-Path $script:SkillRoot "guest/$helper") -Raw
+            }
+            $p['FileSystem']      = 'exFAT'
+            $p['Network']         = 'None'
+            $p['EgressMode']      = 'None'
+            $p['EgressAllowlist'] = @()
+            $p['ScreenConfig']    = @{ mode = 'aggressive' }
+            $p['Entrypoint']      = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
+            Assert-TierProfileValid -Profile $p -Context "TEST Tier-$BaseTier processor fixture"
+            return $p
+        }
+        # Fresh, GUID-named artifact, destination and rate-ledger paths for one run.
+        $script:NewRunPaths = {
+            param([string] $Tag)
+            return @{
+                Art    = Join-Path $script:TmpRoot ("art-$Tag-{0}"  -f ([guid]::NewGuid().ToString('N')))
+                Dest   = Join-Path $script:TmpRoot ("dest-$Tag-{0}" -f ([guid]::NewGuid().ToString('N')))
+                Ledger = Join-Path $script:TmpRoot ("ledger-$Tag-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+            }
+        }
+    }
+
+    It 'Tier-0 processor: Network reaches the descriptor, the seal strips the default adapter, the gate certifies' {
+        $proc  = & $script:NewProcessorProfile -BaseTier 0
+        $paths = & $script:NewRunPaths -Tag 'nic-proc0'
+        $b     = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $reads = & $script:SpyNicReads $b
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $proc -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-nic-proc0' -ArtifactRoot $paths.Art -Destination $paths.Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -RateLedgerPath $paths.Ledger `
+            -Backend $b -WarningAction SilentlyContinue
+
+        $report.Descriptor.Network | Should -Be 'None' -Because 'New-SandboxVM must record the profile Network on the descriptor'
+        $report.SealVerdict | Should -BeTrue
+        @($report.States) | Should -Contain 'SEALED'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' -and $_.VMName -eq 'sbx-nic-proc0' }).Count |
+            Should -Be 1 -Because 'Lock-Sandbox must remove the default adapter of a NoAdapter VM'
+        $gateRead = @($reads | Where-Object { $_.VMName -eq 'sbx-nic-proc0' })
+        $gateRead.Count       | Should -Be 1 -Because 'Assert-Sealed reads the adapters once for a NoAdapter VM'
+        $gateRead[0].Adapters | Should -Be 0 -Because 'the gate certified a processor whose host reports zero adapters'
+    }
+
+    It 'Tier-0 processor: an adapter that SURVIVES the seal is refused by the gate through Invoke-Voidseal itself' {
+        # The proof that the processor check fires through the real orchestrator path, not only in tests
+        # that inject Network onto a descriptor. RemoveNetworkAdapter becomes a no-op (the one-method
+        # failure injection Provisioner.Tests.ps1 uses for SetFirmware), so the default adapter survives
+        # Lock-Sandbox and only Assert-Sealed stands between it and RUNNING.
+        $proc  = & $script:NewProcessorProfile -BaseTier 0
+        $paths = & $script:NewRunPaths -Tag 'nic-proc0-stuck'
+        $b     = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $b.RemoveNetworkAdapter = { param($P) }.GetNewClosure()
+
+        $report = Invoke-Voidseal -Tier 0 -Profile $proc -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-nic-proc0-stuck' -ArtifactRoot $paths.Art -Destination $paths.Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -RateLedgerPath $paths.Ledger `
+            -Backend $b -WarningAction SilentlyContinue
+
+        $report.SealVerdict | Should -BeFalse -Because 'a processor with a live adapter must never be certified'
+        @($report.States) | Should -Not -Contain 'SEALED'
+        @($report.States) | Should -Not -Contain 'RUNNING'
+        $report.Error | Should -Match 'certify processor VM' -Because 'the refusal must name the processor reason'
+        $report.Error | Should -Match 'network adapter'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0 -Because 'the VM never started'
+        (& $b.GetVM @{ Name = 'sbx-nic-proc0-stuck' }) | Should -BeNullOrEmpty -Because 'teardown still runs after a seal refusal'
+    }
+
+    It 'Tier-1 processor: no switch is ever built, the default adapter is removed, the gate certifies zero adapters' {
+        $proc  = & $script:NewProcessorProfile -BaseTier 1
+        $paths = & $script:NewRunPaths -Tag 'nic-proc1'
+        $b     = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $reads = & $script:SpyNicReads $b
+
+        $report = Invoke-Voidseal -Tier 1 -Profile $proc -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-nic-proc1' -ArtifactRoot $paths.Art -Destination $paths.Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -RateLedgerPath $paths.Ledger `
+            -Backend $b -WarningAction SilentlyContinue
+
+        $report.SealVerdict | Should -BeTrue
+        $report.Descriptor.Network    | Should -Be 'None'
+        $report.Descriptor.SwitchName | Should -BeNullOrEmpty -Because 'a processor is never wired to a switch, not even before the seal'
+        (& $b.GetSwitch @{ Name = 'sbx-nic-proc1-int' }) | Should -BeNullOrEmpty -Because 'no Internal switch is created for a NoAdapter VM'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' -and $_.VMName -eq 'sbx-nic-proc1' }).Count | Should -Be 1
+        $gateRead = @($reads | Where-Object { $_.VMName -eq 'sbx-nic-proc1' })
+        $gateRead.Count       | Should -Be 1
+        $gateRead[0].Adapters | Should -Be 0 -Because 'a Tier-1 processor must seal with zero adapters, not one on a switch'
+    }
+
+    It 'Tier-1 non-processor (ralph shape): keeps exactly one NIC, on its own sbx-nic-t1-int switch, and nothing is removed' {
+        $paths = & $script:NewRunPaths -Tag 'nic-t1'
+        $b     = New-FakeHyperVBackend
+        $reads = & $script:SpyNicReads $b
+        $wl    = & $script:NewWorkload -Tag 'nic-t1'
+
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $wl `
+            -Name 'sbx-nic-t1' -ArtifactRoot $paths.Art -Destination $paths.Dest -Backend $b
+
+        $report.SealVerdict | Should -BeTrue
+        $report.Descriptor.Network    | Should -Be 'Internal+Allowlist'
+        $report.Descriptor.SwitchName | Should -Be 'sbx-nic-t1-int'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' }).Count |
+            Should -Be 0 -Because 'a Tier-1 non-processor keeps its NIC; the seal must not remove it'
+        $gateRead = @($reads | Where-Object { $_.VMName -eq 'sbx-nic-t1' })
+        $gateRead.Count          | Should -Be 1
+        $gateRead[0].Adapters    | Should -Be 1 -Because 'one adapter: real New-VM creates it and the provisioner connects it'
+        $gateRead[0].Switches[0] | Should -Be 'sbx-nic-t1-int'
     }
 }

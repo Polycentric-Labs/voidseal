@@ -128,12 +128,16 @@ function New-VMSwitch {
 
 function Get-VMNetworkAdapter {
     [CmdletBinding()] param([string] $VMName)
-    # ConnectNetworkAdapter probes for an existing NIC first; report none so the Add branch runs.
-    return $null
+    # Real New-VM always leaves one default adapter, so ConnectNetworkAdapter takes its Connect branch
+    # (the production path). Report that adapter here.
+    return [pscustomobject]@{ __Stub = 'VMNetworkAdapter'; VMName = $VMName; Name = 'Network Adapter'; SwitchName = $null }
 }
 
 function Add-VMNetworkAdapter {
     [CmdletBinding()] param([string] $VMName, [string] $SwitchName)
+    # Kept on purpose although the Get-VMNetworkAdapter stub above reports an adapter, so the Connect
+    # branch runs and the Add branch is unreachable here. If a future change makes ConnectNetworkAdapter
+    # add an adapter, the call must still resolve to this stub rather than a live cmdlet.
     # Real Add-VMNetworkAdapter emits a Microsoft.HyperV.PowerShell.VMNetworkAdapter object.
     [pscustomobject]@{ __Stub = 'VMNetworkAdapter'; VMName = $VMName }
 }

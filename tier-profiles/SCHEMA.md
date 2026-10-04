@@ -57,9 +57,12 @@
 4. **VM-tier channels:** `Substrate -eq 'HyperV-Gen2'` ⇒ all `HostChannels` values `$false`.
 5. **Linux management:** a Linux `GuestImage` ⇒ `ManagementChannel -eq 'Com1Serial'` (not `PSDirect`).
 6. **Pre-seal gate (`Assert-Sealed`, runtime):** refuse to certify a VM SEALED if it detects an
-   attached secret-shaped volume or a still-attached import DVD, at **any** tier. The **live-NIC**
-   refusal is narrower: it fires at Tier >= 2, or for any profile declaring `Network='None'`, and is
-   the reason Tier 0 and Tier 1 get no adapter-count guarantee. The unrecorded-residual-disk refusal
-   is authoritative at Tier >= 2 and best-effort below it.
+   attached secret-shaped volume, a still-attached import DVD, or any passthrough device (a GPU
+   partition adapter or a device assigned by Discrete Device Assignment), at **any** tier. The
+   **network-adapter** rule follows one predicate, `Get-SealNicPolicy`: only a Tier-1 VM whose `Network`
+   is set and is not `'None'` may keep a NIC (on an isolated Internal vSwitch, never the Default Switch);
+   Tier 0, Tier >= 2 and every `Network='None'` profile must seal with zero adapters, and a descriptor
+   that records no `Network` is refused. The unrecorded-residual-disk refusal is authoritative at
+   Tier >= 2 and best-effort below it.
 
 Validation = a Pester test per invariant; a deliberately-violating fixture profile MUST fail closed.
