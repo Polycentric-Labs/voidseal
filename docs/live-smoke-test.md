@@ -479,7 +479,7 @@ never assumes "Off == success".
   comes up in a sealed guest, until its own 120 s timeout expires. The seed's `bootcmd` mask cannot
   prevent it (it runs in a stage ordered *after* that unit, and a sandbox boots only once). The real
   fix is to mask the unit in the **golden image** at image-prep — **not done yet**. Nothing is broken
-  either way: the host `-WorkloadTimeoutSeconds` (default 600) bounds it comfortably.
+  either way: the host `-WorkloadTimeoutSeconds` (default 600, or the profile's `WorkloadTimeoutSeconds`) bounds it comfortably.
 - **`ds=nocloud`** on the guest kernel cmdline is a *marginal* speed tunable here, not the fix above —
   discovery is already ~2 s. See `guest-images/debian-12-cloud.md` for delivery paths.
 

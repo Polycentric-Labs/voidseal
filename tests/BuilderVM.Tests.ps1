@@ -318,3 +318,40 @@ Describe 'Invoke-BuilderVM - honors -StorageRoot (E2)' {
         (& $b.GetVM @{ Name = 'bld-root-bad' }) | Should -BeNullOrEmpty
     }
 }
+
+# ===========================================================================
+#  WorkloadTimeoutSeconds: explicit parameter > profile key > 600 (E3)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - the deadline comes from -WorkloadTimeoutSeconds, then the profile, then 600 (E3)' {
+
+    BeforeAll {
+        function script:New-BuilderProfileWithTimeout {
+            param($Timeout)
+            $p = @{} + (Import-WorkloadProfile -Path "$script:SkillRoot/profiles/builder.psd1" -TierProfileDir "$script:SkillRoot/tier-profiles")
+            if ($null -ne $Timeout) { $p['WorkloadTimeoutSeconds'] = $Timeout }
+            return $p
+        }
+    }
+    BeforeEach { Mock Wait-WorkloadComplete { @{ State = 'Off'; TimedOut = $false } } }
+
+    It 'uses the profile key when the parameter is not given' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout 3600) -Name 'bld-to-prof' -Backend $b `
+            -DepsDiskPath (Join-Path $TestDrive 'to-prof.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 3600 }
+    }
+
+    It 'an explicit parameter beats the profile key' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout 3600) -Name 'bld-to-exp' -Backend $b `
+            -WorkloadTimeoutSeconds 0 -DepsDiskPath (Join-Path $TestDrive 'to-exp.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 0 }
+    }
+
+    It 'falls back to 600 when neither is given' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+        $null = Invoke-BuilderVM -Profile (script:New-BuilderProfileWithTimeout -Timeout $null) -Name 'bld-to-def' -Backend $b `
+            -DepsDiskPath (Join-Path $TestDrive 'to-def.vhdx')
+        Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+    }
+}

@@ -1998,3 +1998,87 @@ Describe 'Invoke-Voidseal - the storage root covers the system, seed and data di
         (& $b.GetVM @{ Name = 'sbx-orch-bad' }) | Should -BeNullOrEmpty
     }
 }
+
+# ===========================================================================
+#  WorkloadTimeoutSeconds: explicit parameter > profile key > 600 (E3)
+# ===========================================================================
+Describe 'Invoke-Voidseal - the workload deadline comes from -WorkloadTimeoutSeconds, then the profile, then 600 (E3)' {
+
+    BeforeAll {
+        # A Disk-mode (outbox) Tier-0 profile, like the fixture above, with room to add the timeout key.
+        function script:New-TimeoutDiskProfile {
+            param($Timeout)
+            $p = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+            $p = @{} + $p
+            $p['Name'] = 'timeout-test'; $p['WorkloadMode'] = 'Disk'; $p['Inputs'] = @{}
+            $p['FileSystem'] = 'exFAT'; $p['OutboxOutput'] = $true
+            if ($null -ne $Timeout) { $p['WorkloadTimeoutSeconds'] = $Timeout }
+            return $p
+        }
+    }
+
+    BeforeEach {
+        # The wait is mocked so the test can read the deadline it was handed without sleeping. A guest that
+        # is already Off is the same observable outcome as the fake's self-power-off.
+        Mock Wait-WorkloadComplete { @{ State = 'Off'; TimedOut = $false } }
+        Mock Start-SandboxWorkload { @{ Status = 'Success'; ExitCode = 0; ArtifactPath = $null; TimedOut = $false } }
+    }
+
+    Context 'Disk mode (Wait-WorkloadComplete)' {
+        It 'uses the profile key when -WorkloadTimeoutSeconds is not given' {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+            $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout 7200) -Name 'sbx-to-prof' `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-prof') -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 7200 }
+        }
+
+        It 'an explicit -WorkloadTimeoutSeconds beats the profile key, including an explicit 0' {
+            foreach ($explicit in @(120, 0)) {
+                $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+                $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout 7200) -Name "sbx-to-exp$explicit" `
+                    -WorkloadTimeoutSeconds $explicit -ArtifactRoot (Join-Path $script:TmpRoot "art-to-exp$explicit") `
+                    -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+                Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq $explicit }
+            }
+        }
+
+        It 'falls back to 600 when neither is given' {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+            $null = Invoke-Voidseal -Tier 0 -Profile (script:New-TimeoutDiskProfile -Timeout $null) -Name 'sbx-to-def' `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-def') -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Wait-WorkloadComplete -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+        }
+    }
+
+    Context 'Serial mode (Start-SandboxWorkload)' {
+        It 'passes the profile key as the serial command deadline when the parameter is not given' {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = 1800
+            $b = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-ser' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser') -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 1800 }
+        }
+
+        It 'an explicit parameter wins, and 600 applies when nothing is set' {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = 1800
+            $b = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-ser2' -Workload @{ Entrypoint = 'true' } `
+                -WorkloadTimeoutSeconds 90 -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser2') -Backend $b -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 90 }
+
+            $b2 = New-FakeHyperVBackend
+            $null = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-to-ser3' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-ser3') -Backend $b2 -WarningAction SilentlyContinue
+            Should -Invoke Start-SandboxWorkload -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 600 }
+        }
+    }
+
+    It 'an out-of-range profile key is a load error (the loader bounds are 60..86400)' {
+        foreach ($bad in @(30, 86401)) {
+            $p = $script:Tier1.Clone(); $p['WorkloadTimeoutSeconds'] = $bad
+            { Invoke-Voidseal -Tier 1 -Profile $p -Name 'sbx-to-bad' -Workload @{ Entrypoint = 'true' } `
+                -ArtifactRoot (Join-Path $script:TmpRoot 'art-to-bad') -Backend (New-FakeHyperVBackend) } |
+                Should -Throw -ExpectedMessage '*WorkloadTimeoutSeconds*'
+        }
+    }
+}

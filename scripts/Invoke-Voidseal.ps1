@@ -365,7 +365,9 @@ function Get-WorkloadField {
     deadline — so it bounds the ACTUAL delivered command, not a pre-dispatch clock check. When that
     guest command reports TimedOut=$true (the guest hung and never completed in time — a REPORTED
     outcome from InvokeGuestCommand, not a thrown error), Invoke-Voidseal force-stops the VM and
-    records a Failed RunResult, mirroring the Disk-mode timeout shape. Default 600. Tests use the fake
+    records a Failed RunResult, mirroring the Disk-mode timeout shape. Where the value comes from (E3):
+    this parameter wins only when it is explicitly bound (an explicit 0 counts); otherwise the profile's
+    WorkloadTimeoutSeconds key (60..86400, validated by the loader); otherwise 600. Tests use the fake
     backend's -SimulateGuestCommandTimeout switch (not a 0 value) to exercise this deterministically,
     since a real elapsed-time trip cannot be forced instantaneously through a mock without a live
     blocking primitive. NOTE (LIVE-ONLY-UNPROVEN, Phase 6): the real InvokeGuestCommand's timeout
@@ -456,6 +458,18 @@ function Invoke-Voidseal {
     # leakage backstop. See the .PARAMETER RateLedgerPath doc above for the full rationale.
     if ([string]::IsNullOrWhiteSpace($RateLedgerPath)) {
         $RateLedgerPath = Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\state\release-ledger.json'
+    }
+
+    # E3: the overall workload deadline. An explicitly bound -WorkloadTimeoutSeconds wins (so a caller, or a
+    # test passing 0, always gets exactly what it asked for), then the profile's WorkloadTimeoutSeconds
+    # (bounds already enforced by the loader), then the 600 default. $PSBoundParameters is what separates
+    # "the caller said 600" from "nobody said anything".
+    $effectiveTimeoutSeconds = if ($PSBoundParameters.ContainsKey('WorkloadTimeoutSeconds')) {
+        $WorkloadTimeoutSeconds
+    } elseif ($resolved.ContainsKey('WorkloadTimeoutSeconds') -and $null -ne $resolved['WorkloadTimeoutSeconds']) {
+        [int]$resolved['WorkloadTimeoutSeconds']
+    } else {
+        600
     }
 
     # The entrypoint: prefer the workload spec, fall back to a workload profile's Entrypoint.
@@ -745,13 +759,13 @@ function Invoke-Voidseal {
             # DISK MODE: the guest runs its boot workload off the SEED, writes its result + an
             # exit-code sentinel onto the OUTPUT data disk, then powers ITSELF off. There is NO live
             # control channel (the Sealer severed them), so the host learns completion by POLLING VM
-            # State until Off (Wait-WorkloadComplete) — or until WorkloadTimeoutSeconds force-stops a
+            # State until Off (Wait-WorkloadComplete), or until the effective deadline force-stops a
             # hung guest. Then the host DETACHES the data disks (VM is Off) and reads + classifies the
             # result off the OUTPUT volume.
             $null = & $Backend.StartVM @{ Name = $Name }
             $states.Add('RUNNING')
             $wait = Wait-WorkloadComplete -Descriptor $descriptor -Backend $Backend `
-                        -TimeoutSeconds $WorkloadTimeoutSeconds -PollDelaySeconds $BootPollDelaySeconds
+                        -TimeoutSeconds $effectiveTimeoutSeconds -PollDelaySeconds $BootPollDelaySeconds
             $states.Add('CAPTURED')
             # Detach the data disks BEFORE the host reads the output (VM is Off, or force-stopped on
             # timeout). The host must not read a disk still attached to a (potentially live) guest.
@@ -885,7 +899,7 @@ function Invoke-Voidseal {
             if (-not [string]::IsNullOrWhiteSpace($entrypoint)) {
                 # I6a: the OVERALL wall-clock DENY (Disk-mode parity). Disk mode already force-stops a
                 # hung guest on an overall deadline (Wait-WorkloadComplete -TimeoutSeconds
-                # $WorkloadTimeoutSeconds, above). Serial mode's real mechanism: $WorkloadTimeoutSeconds
+                # $effectiveTimeoutSeconds, above). Serial mode's real mechanism: $effectiveTimeoutSeconds
                 # is passed as the OUTER bound (-TimeoutSeconds) of the single serial guest-command run
                 # (Start-SandboxWorkload -> InvokeGuestCommand). When that guest command reports
                 # TimedOut=$true (the guest hung and never completed before the deadline — a REPORTED
@@ -898,7 +912,7 @@ function Invoke-Voidseal {
                 # command's reported timeout, not a pre-dispatch clock comparison.
                 $runResult = Start-SandboxWorkload -Descriptor $descriptor -Entrypoint $entrypoint `
                     -ArtifactRoot $ArtifactRoot -BootWaitSeconds $BootWaitSeconds `
-                    -BootPollDelaySeconds $BootPollDelaySeconds -TimeoutSeconds $WorkloadTimeoutSeconds `
+                    -BootPollDelaySeconds $BootPollDelaySeconds -TimeoutSeconds $effectiveTimeoutSeconds `
                     -Backend $Backend
                 $report.RunResult = $runResult
                 $states.Add('RUNNING')

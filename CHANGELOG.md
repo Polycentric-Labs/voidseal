@@ -41,3 +41,6 @@ places where a check is an argument rather than a measurement.
   `New-SandboxVM`, then the `VOIDSEAL_STORAGE_ROOT` environment variable, then the existing
   `%ProgramData%\Voidseal\sandboxes` default. The root must be an absolute local path (relative, UNC and
   device paths are refused before anything is created), and every disk of a run lands under it.
+- Workload deadline from a profile: a workload may set `WorkloadTimeoutSeconds` (60 to 86400).
+  `-WorkloadTimeoutSeconds` on `Invoke-Voidseal` and `Invoke-BuilderVM` wins only when explicitly passed,
+  then the profile key, then 600.

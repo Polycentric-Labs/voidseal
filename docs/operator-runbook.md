@@ -289,7 +289,7 @@ Remove-Sandbox -Name '<vm-name>' -DeleteDisks
 Remove-VMSwitch -Name '<vm-name>-int' -Force        # only if Get-VMSwitch still shows it
 ```
 
-### 1.5 Sizing a run: Memory, Cpu, CPU caps and the host free-RAM gate
+### 1.5 Sizing a run: Memory, Cpu, CPU caps, the deadline and the host free-RAM gate
 
 A workload profile may size its own guest instead of taking the tier's numbers:
 
@@ -307,6 +307,11 @@ A workload profile may size its own guest instead of taking the tier's numbers:
 
 The caps are optional. Leave them out and Hyper-V's defaults apply. When set they reach
 `Set-VMProcessor -Maximum` / `-RelativeWeight`.
+
+A workload that needs more (or less) than the default ten minutes sets its own deadline with
+`WorkloadTimeoutSeconds = 3600` (60 to 86400). `-WorkloadTimeoutSeconds` on `Invoke-Voidseal` or
+`Invoke-BuilderVM` still wins, but only when you pass it explicitly; with neither the deadline is 600
+seconds. Past the deadline the guest is force-stopped and the run reports `Failed`.
 
 Before it creates anything, `New-SandboxVM` compares the host's free physical memory with the guest's
 `Memory` plus a margin. The margin defaults to 2GB and is the `-HostMemoryMarginBytes` parameter on
