@@ -153,6 +153,25 @@ allowlist. Every item below is something the mock suite cannot prove.
     `egress_mode=hostproxy guest_addr=1 default_routes=0 nameservers=0 proxy_env=1`, and
     `proxy_reachable=yes`. `guest_addr=1` also proves the NIC is `eth0`; if it is 0, the network-config
     key must change.
+11a. First boot with four integration services off. `Lock-Sandbox` turns off Time Synchronization,
+    Key-Value Pair Exchange, Backup and Heartbeat, and `Assert-Sealed` refuses a VM with any of them on.
+    Neither the mock suite nor any earlier live run has booted a guest that way. Check both effects:
+    - **cloud-init NoCloud still completes without KVP.** In the guest, `cloud-init status --long` reads
+      `done` and `cloud-id` reads `nocloud` (the CIDATA data disk is the datasource). The journal shows no
+      wait on the Azure datasource, which uses Hyper-V KVP: `journalctl -b | grep -i -E
+      'azure|kvp|hyperv'`. Note how long first boot took. If it hangs or picks another datasource, pin
+      `datasource_list: [ NoCloud ]` in a drop-in under `/etc/cloud/cloud.cfg.d/` of the golden image and
+      rebuild it; do not turn KVP back on (the gate would refuse the VM).
+    - **The guest clock is sane enough for TLS.** HostProxy tunnels CONNECT to port 443 only, so no NTP
+      leaves the guest, and with Time Synchronization off the clock comes from the RTC the VM starts with.
+      Compare `date -u` in the guest with `(Get-Date).ToUniversalTime()` on the host (within a few
+      seconds), expect `timedatectl` to say `System clock synchronized: no` and `RTC in local TZ: no`, and
+      confirm item 12's first `curl` to an allowlisted name verifies its certificate. If the offset equals
+      the host's UTC offset, the RTC is being read as local time: fix it in the golden image
+      (`timedatectl set-local-rtc 0`, `/etc/adjtime` saying UTC). Record any drift over a long run and
+      bound such runs with `-WorkloadTimeoutSeconds`. Do not re-enable Time Synchronization or open UDP
+      123 to fix it: the seal verifies the first and the firewall rules block the second, so either would
+      be a deliberate design change to record, not a workaround.
 12. From the guest (a test entrypoint, run as the sandbox user):
     - `curl -sS -o /dev/null -w '%{http_code}' https://<an allowlisted name>/` succeeds through the proxy.
     - `curl https://<a name not on the list>/` fails with the proxy's 403; the log shows

@@ -303,6 +303,9 @@ $report.TeardownStatus      # 'OK (VM removed, created disks deleted)'
 - If the serial seam can't reach the guest (Gap 4), `RunResult.ExitCode` will be `-1` or the
   run reports a timeout in `Error` — that's a **serial-transport issue**, not a containment failure;
   the VM is still torn down.
+- First boot with the integration services off (section 5.3): cloud-init still reaches `done` and the
+  guest clock is sane. The seal turns off Time Synchronization, Key-Value Pair Exchange, Backup and
+  Heartbeat, and no live run has booted a guest that way yet.
 
 ### 3.5 Manual cleanup if it fails mid-flow
 
@@ -690,6 +693,33 @@ spot check as clearing Tier-1 for a hostile workload:** that needs the whole che
 [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2, including the readback of all
 seven firewall rules. For an `InGuestSquid` profile, whatever the result, the control is
 defense in depth only (a compromised/root guest can flush its own iptables or kill Squid).
+
+### 5.3 First boot with Time Synchronization and Key-Value Pair Exchange off
+
+`Lock-Sandbox` turns off four integration services (Time Synchronization, Key-Value Pair Exchange,
+Backup and Heartbeat) at every tier, and the gate refuses a VM with any of them on. No live run has
+booted a guest in that state, so on the first run of each milestone check two things from the serial
+console (or the run's capture):
+
+```text
+cloud-init status --long ; cloud-id
+journalctl -b | grep -i -E 'azure|kvp|hyperv'
+date -u ; timedatectl
+```
+
+- **cloud-init NoCloud completes without KVP.** Expect `status: done` and `nocloud`. The Azure datasource
+  uses Hyper-V KVP, so a long wait or an Azure datasource in the journal means the datasource search was
+  not pinned: add `datasource_list: [ NoCloud ]` under `/etc/cloud/cloud.cfg.d/` in the golden image
+  (a golden-image change, then rebuild). Do not turn KVP back on; the gate would refuse the VM.
+- **The guest clock is sane enough for TLS.** Nothing re-syncs the clock: a Tier-0 or Tier-2/3 VM has no
+  NIC, and a Tier-1 VM under HostProxy reaches only port 443 through the proxy, so no NTP leaves the
+  guest. The clock is the RTC value the VM started with. `date -u` should match the host's
+  `(Get-Date).ToUniversalTime()` within seconds, and `timedatectl` will say the clock is not
+  synchronized (expected). On Tier 1, the first HTTPS request to an allowlisted name must verify its
+  certificate. If the clock is off by exactly the host's UTC offset, the RTC is being read as local time:
+  fix it in the golden image (`timedatectl set-local-rtc 0`, `/etc/adjtime` saying UTC). For long runs,
+  record the drift and bound the run with `-WorkloadTimeoutSeconds`. Do not re-enable Time
+  Synchronization to fix a clock problem; that is a design change, not a workaround.
 
 ---
 
