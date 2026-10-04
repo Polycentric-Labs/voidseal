@@ -13,7 +13,7 @@
 Set-StrictMode -Version Latest
 
 # --------------------------------------------------------------------------
-# Resolve-PythonExe: robust host python3/python resolution.
+# Resolve-PythonExe: deterministic host python3/python resolution.
 #
 # A hard `& python3` BREAKS the Windows host: the Windows Python installer provides
 # `python`, not `python3`. The in-guest binary is `python3` (Debian), but the HOST
