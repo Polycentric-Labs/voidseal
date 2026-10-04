@@ -426,28 +426,40 @@ function Invoke-Voidseal {
                "(Invoke-BuilderVM) and must never be passed to Invoke-Voidseal directly. Fail closed.")
     }
 
-    # --- PROCESSOR preflight: the in-guest producer, outbox module and screener must ride INPUT ---
-    # A processor's seed runs `python3 /mnt/in/run_disk_workload.py --mode <mode>`, which imports
-    # outbox.py and runs screener.py from its own directory. If any of the three is missing, the guest
-    # producer exits non-zero and writes no outbox, and all the host can report is "outbox header
-    # missing", which reads like a transport fault. Refuse here instead, before anything is
-    # provisioned. The effective Inputs follow the same rule the Disk branch applies when it folds the
-    # override in: a non-empty -Workload.Inputs wins, otherwise the profile's own Inputs count.
-    # (Transport-only profiles such as firefox are not checked: the mock suite runs them with empty
-    # Inputs by design, and their helper delivery is the documented live-run step.)
-    if ($workloadMode -eq 'Disk' -and (Test-IsProcessorProfile -Profile $resolved)) {
+    # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT ---
+    # Every outbox-transport Disk run (a processor, or a transport-only OutboxOutput profile such as
+    # firefox) executes `python3 /mnt/in/run_disk_workload.py` from the INPUT disk, and that script
+    # imports outbox.py from its own directory. A processor also runs screener.py beside them. If any
+    # required file is missing, the guest producer exits non-zero and writes no outbox, and all the
+    # host can report is "outbox header missing", which reads like a transport fault. Refuse here
+    # instead, before anything is provisioned. The effective Inputs follow the same rule the Disk
+    # branch applies when it folds the override in: a non-empty -Workload.Inputs wins, otherwise the
+    # profile's own Inputs count. The shipped firefox profile declares empty Inputs on purpose (a
+    # .psd1 cannot inline a Python file), so a live run supplies the helpers through
+    # -Workload.Inputs, as docs/live-smoke-test.md section 4A shows. Both profile kinds come from the
+    # shared predicates in ProfileLoader.ps1 (Test-UsesOutboxTransport / Test-IsProcessorProfile).
+    if ($workloadMode -eq 'Disk' -and (Test-UsesOutboxTransport -Profile $resolved)) {
+        $isProcessorShape = Test-IsProcessorProfile -Profile $resolved
+        $requiredHelpers  = if ($isProcessorShape) { @('run_disk_workload.py', 'outbox.py', 'screener.py') }
+                            else                   { @('run_disk_workload.py', 'outbox.py') }
         $effectiveInputs = Get-WorkloadField -Workload $Workload -Name 'Inputs'
         if (-not ($effectiveInputs -is [System.Collections.IDictionary] -and $effectiveInputs.Count -gt 0)) {
             $effectiveInputs = if ($resolved.ContainsKey('Inputs')) { $resolved['Inputs'] } else { $null }
         }
-        $missingHelpers = @(@('run_disk_workload.py', 'outbox.py', 'screener.py') | Where-Object {
+        $missingHelpers = @($requiredHelpers | Where-Object {
             -not ($effectiveInputs -is [System.Collections.IDictionary] -and $effectiveInputs.Contains($_))
         })
         if ($missingHelpers.Count -gt 0) {
-            throw ("Invoke-Voidseal: REFUSING processor '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
-                   "processor's in-guest runner executes run_disk_workload.py from the INPUT disk, and that script " +
-                   "imports outbox.py and runs screener.py beside it. Stage all three from the repo's guest/ " +
-                   "directory in Inputs (or -Workload.Inputs). Fail closed.")
+            if ($isProcessorShape) {
+                throw ("Invoke-Voidseal: REFUSING processor '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
+                       "processor's in-guest runner executes run_disk_workload.py from the INPUT disk, and that script " +
+                       "imports outbox.py and runs screener.py beside it. Stage all three from the repo's guest/ " +
+                       "directory in Inputs (or -Workload.Inputs). Fail closed.")
+            }
+            throw ("Invoke-Voidseal: REFUSING outbox profile '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
+                   "in-guest runner executes run_disk_workload.py from the INPUT disk, and that script imports " +
+                   "outbox.py beside it. Stage both from the repo's guest/ directory in Inputs (or " +
+                   "-Workload.Inputs). Fail closed.")
         }
     }
 

@@ -38,6 +38,19 @@ BeforeAll {
     $script:BackendPath = Join-Path $script:SkillRoot 'scripts/lib/HyperVBackend.ps1'
     $script:TierDir     = Join-Path $script:SkillRoot 'tier-profiles'
 
+    # The files every outbox-transport Disk run must find on its INPUT disk: the in-guest producer and
+    # the outbox module it imports. The orchestrator's outbox preflight refuses a run without them, so
+    # every transport-only fixture below starts from a copy of this map (a processor also needs
+    # screener.py, which its own fixture adds). A function returns a fresh hashtable per call so a test
+    # that adds entries never leaks them into another.
+    function script:New-OutboxHelperInputs {
+        $h = @{}
+        foreach ($helper in @('run_disk_workload.py', 'outbox.py')) {
+            $h[$helper] = Get-Content -LiteralPath (Join-Path $script:SkillRoot "guest/$helper") -Raw
+        }
+        $h
+    }
+
     Test-Path $script:OrchPath    | Should -BeTrue -Because 'the orchestrator script must exist to be tested'
     Test-Path $script:BackendPath | Should -BeTrue -Because 'the backend must exist'
 
@@ -326,7 +339,7 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         $script:Tier0Disk = @{} + $script:Tier0Disk          # mutable copy
         $script:Tier0Disk['Name']         = 'firefox-test'
         $script:Tier0Disk['WorkloadMode'] = 'Disk'
-        $script:Tier0Disk['Inputs']       = @{}              # empty inputs -> input disk created with no files
+        $script:Tier0Disk['Inputs']       = script:New-OutboxHelperInputs   # the helpers the outbox preflight requires
         $script:Tier0Disk['FileSystem']   = 'exFAT'
         $script:Tier0Disk['OutboxOutput'] = $true
         Assert-TierProfileValid -Profile $script:Tier0Disk -Context 'TEST Tier-0 Disk-mode fixture'
@@ -435,7 +448,7 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
     }
 
     It 'Invoke-Voidseal Disk mode folds -Workload.Inputs onto the INPUT disk' {
-        # CONTRACT GAP: the profile's Inputs is empty (the .psd1 keeps it empty; live runs populate
+        # CONTRACT GAP: the shipped profile's Inputs is empty (the .psd1 keeps it empty; live runs populate
         # it at deploy time). The documented live-acceptance path passes the inputs through -Workload.Inputs.
         # Without the orchestrator folding -Workload.Inputs into the resolved profile BEFORE New-WorkloadDisks,
         # the override is silently dropped -> the INPUT disk is created with no files -> no organizer script in
@@ -443,9 +456,14 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         # volume through the orchestrator. We assert via the fake's WriteVhdxFile call log (which captures the
         # Content and survives teardown — the disk itself is deleted by the Reaper's -DeleteDisks pass at the
         # end of the lifecycle, so it can't be read back post-run).
-        $script:Tier0Disk['Inputs'] | Should -BeNullOrEmpty -Because 'the fixture profile carries an EMPTY Inputs — the override must be what populates the disk'
-        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
-            -Workload @{ WorkloadMode = 'Disk'; Inputs = @{ 'organize_bookmarks.py' = 'print(1)'; 'sample.json' = '{}' } } `
+        $emptyInputsProfile = @{} + $script:Tier0Disk
+        $emptyInputsProfile['Inputs'] = @{}
+        $emptyInputsProfile['Inputs'] | Should -BeNullOrEmpty -Because 'this profile copy carries an EMPTY Inputs, like the shipped firefox profile; the override must be what populates the disk'
+        $overrideInputs = script:New-OutboxHelperInputs      # the outbox preflight needs the helpers in the effective Inputs
+        $overrideInputs['organize_bookmarks.py'] = 'print(1)'
+        $overrideInputs['sample.json']           = '{}'
+        $report = Invoke-Voidseal -Tier 0 -Profile $emptyInputsProfile `
+            -Workload @{ WorkloadMode = 'Disk'; Inputs = $overrideInputs } `
             -Name 'sbx-inputs' -ArtifactRoot $script:Art -Destination $script:Dest `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:DiskB
         $inPath = $report.Descriptor.InputDiskPath
@@ -551,7 +569,7 @@ Describe 'Invoke-Voidseal — Disk mode delivers the seed on a CIDATA data disk 
         $script:Tier0Seed = @{} + $script:Tier0Seed
         $script:Tier0Seed['Name']         = 'firefox-seed-test'
         $script:Tier0Seed['WorkloadMode'] = 'Disk'
-        $script:Tier0Seed['Inputs']       = @{}
+        $script:Tier0Seed['Inputs']       = script:New-OutboxHelperInputs
         $script:Tier0Seed['FileSystem']   = 'exFAT'
         $script:Tier0Seed['OutboxOutput'] = $true   # D: a non-processor Disk-mode fixture MUST be outbox/processor/builder-shaped now (structural C1 no-mount)
         $script:Tier0Seed['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
@@ -795,7 +813,7 @@ Describe 'StageAssets: attached before the seal, gone when the guest first boots
         $p['Name']         = 'stage-disk-test'
         $p['WorkloadMode'] = 'Disk'
         $p['OutboxOutput'] = $true
-        $p['Inputs']       = @{}
+        $p['Inputs']       = script:New-OutboxHelperInputs
         $p['Entrypoint']   = 'python3 /mnt/in/task.py --out /run/staging/result.html'
         $p['StageAssets']  = @{ $script:StageIso = 'synthetic test payload' }
         # No outbox blob is simulated, so the run fails its result read after StartVM; only the media
@@ -1605,7 +1623,7 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
         $script:Fx = @{} + $script:Fx                    # mutable copy
         $script:Fx['Name']         = 'firefox-outbox-test'
         $script:Fx['WorkloadMode'] = 'Disk'
-        $script:Fx['Inputs']       = @{}
+        $script:Fx['Inputs']       = script:New-OutboxHelperInputs   # the helpers the outbox preflight requires
         $script:Fx['FileSystem']   = 'exFAT'
         $script:Fx['OutboxOutput'] = $true                # C1.1: Raw OUTPUT, no ScreenConfig -> transport-only
         $script:Fx['Entrypoint']   = 'python3 /mnt/in/organize_bookmarks.py --profile /mnt/in --out /run/staging/result.html'
@@ -1658,6 +1676,45 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
         $mountOps = @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxFile' -and $_.Path -eq $outputPath })
         $rawOps.Count   | Should -BeGreaterThan 0 -Because 'the result must be read user-space via ReadVhdxRawRegion'
         $mountOps.Count | Should -Be 0 -Because 'the host must NEVER Mount-VHD / ReadVhdxFile a Raw OUTPUT with no filesystem'
+    }
+
+    # The outbox preflight covers transport-only profiles too: without run_disk_workload.py and
+    # outbox.py on INPUT the guest producer exits non-zero and writes no outbox, which the host can
+    # only report as "outbox header missing". Refuse up front instead, before anything is provisioned.
+    It 'REFUSES a transport-only OutboxOutput profile whose Inputs lack both guest helpers, naming them, before anything is provisioned' {
+        $bare = @{} + $script:Fx
+        $bare['Inputs'] = @{ 'organize_bookmarks.py' = 'print(1)' }   # the workload alone, no guest helpers
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $err = { Invoke-Voidseal -Tier 0 -Profile $bare -Name 'sbx-fx-nohelpers' -ArtifactRoot $script:FxArt `
+                    -Destination $script:FxDest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+                Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike '*run_disk_workload.py*outbox.py*' -Because 'the operator needs to see which helpers are missing'
+        $err.Exception.Message | Should -Not -BeLike '*screener.py*' -Because 'a transport-only profile is not screened, so it does not need the screener'
+        (& $b.GetVM @{ Name = 'sbx-fx-nohelpers' }) | Should -BeNullOrEmpty -Because 'the refusal comes before provisioning, so no VM is created'
+    }
+
+    It 'REFUSES a transport-only profile missing only outbox.py, naming just that helper' {
+        $partial = @{} + $script:Fx
+        $partial['Inputs'] = script:New-OutboxHelperInputs
+        $partial['Inputs'].Remove('outbox.py')
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $err = { Invoke-Voidseal -Tier 0 -Profile $partial -Name 'sbx-fx-partial' -ArtifactRoot $script:FxArt `
+                    -Destination $script:FxDest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+                Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike '*lack outbox.py.*'
+        $err.Exception.Message | Should -Not -BeLike '*run_disk_workload.py,*' -Because 'the helper that is present must not be reported missing'
+    }
+
+    It 'the transport-only preflight honors -Workload.Inputs (a shipped-firefox-shaped profile with empty Inputs runs once the helpers arrive that way)' {
+        $emptyInputs = @{} + $script:Fx
+        $emptyInputs['Inputs'] = @{}
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+        $report = Invoke-Voidseal -Tier 0 -Profile $emptyInputs `
+            -Workload @{ WorkloadMode = 'Disk'; Inputs = (script:New-OutboxHelperInputs) } `
+            -Name 'sbx-fx-wlhelpers' -ArtifactRoot $script:FxArt -Destination $script:FxDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        $report.Error             | Should -BeNullOrEmpty
+        $report.ExtractedArtifact | Should -Not -BeNullOrEmpty -Because 'exactly the two helpers pass the transport-only preflight, with no screener.py'
     }
 
     It 'DENY-on-no-outbox: a clean power-off with NO outbox written -> header-magic probe fails closed, no artifact' {
