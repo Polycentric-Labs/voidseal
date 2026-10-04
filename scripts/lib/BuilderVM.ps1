@@ -52,8 +52,8 @@
 
 Set-StrictMode -Version Latest
 
-# NOTE: Resolve-PythonExe is defined in Invoke-Voidseal.ps1 (fold-in #1).
-# Always dot-source Invoke-Voidseal.ps1 BEFORE this file. The test BeforeAll
+# NOTE: Resolve-PythonExe is defined in scripts/lib/PythonResolver.ps1, which
+# Invoke-Voidseal.ps1 dot-sources. Always dot-source Invoke-Voidseal.ps1 BEFORE this file. The test BeforeAll
 # does this; the function is available without re-defining it here.
 
 # --------------------------------------------------------------------------

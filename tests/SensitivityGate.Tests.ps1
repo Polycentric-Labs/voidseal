@@ -139,6 +139,62 @@ pathlib.Path(a.out).write_text(json.dumps([{"name": "a.txt", "verdict": "SAFE", 
   }
 }
 
+Describe 'Invoke-SensitivityGate Run mode interpreter (-PythonExe / Resolve-PythonExe)' {
+  BeforeAll {
+    . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"
+    $script:fakePyCalls = [System.Collections.Generic.List[object]]::new()
+    # A stand-in interpreter: a function resolved by name through `& $PythonExe`. It records its
+    # arguments and writes a one-file verdicts.json where the gate told it to (--out), so the gate
+    # runs end to end without launching any real process.
+    function script:Invoke-FakeScreenerPython {
+      $script:fakePyCalls.Add(@($args))
+      $a = @($args)
+      $out = $a[[array]::IndexOf($a, '--out') + 1]
+      $in  = $a[[array]::IndexOf($a, '--in') + 1]
+      $sha = (Get-FileHash -LiteralPath (Join-Path $in 'a.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
+      @([pscustomobject]@{ name = 'a.txt'; sha256 = $sha; verdict = 'SAFE'; error_code = 'NONE'; flags = @() }) |
+        ConvertTo-Json -Depth 4 -AsArray | Set-Content -LiteralPath $out -Encoding utf8
+      $global:LASTEXITCODE = 0
+    }
+    function script:New-RunModeStaging([string] $Tag) {
+      $st = Join-Path $TestDrive "runmode-staging-$Tag"; New-Item -ItemType Directory -Path $st -Force | Out-Null
+      Set-Content -LiteralPath (Join-Path $st 'a.txt') -Value 'alpha'
+      $o = Join-Path $TestDrive "runmode-out-$Tag"; New-Item -ItemType Directory -Path $o -Force | Out-Null
+      @{ Staging = $st; Out = $o }
+    }
+  }
+  BeforeEach { $script:fakePyCalls.Clear() }
+
+  It 'runs the screener with the injected -PythonExe and never consults Resolve-PythonExe' {
+    Mock Resolve-PythonExe { throw 'Resolve-PythonExe must not be called when -PythonExe is supplied' }
+    $d = New-RunModeStaging 'inject'
+    $r = Invoke-SensitivityGate -StagingDir $d.Staging -OutputDir $d.Out -Mode moderate `
+           -ScreenerPath 'C:\fake\screener.py' -PythonExe 'Invoke-FakeScreenerPython'
+    $script:fakePyCalls.Count | Should -Be 1
+    $call = @($script:fakePyCalls[0])
+    $call[0] | Should -Be 'C:\fake\screener.py'
+    $call[[array]::IndexOf($call, '--mode') + 1] | Should -Be 'moderate'
+    @($r.Released).Count | Should -Be 1
+    Should -Invoke Resolve-PythonExe -Times 0 -Exactly
+  }
+
+  It 'defaults to the interpreter Resolve-PythonExe returns when -PythonExe is omitted' {
+    Mock Resolve-PythonExe { 'Invoke-FakeScreenerPython' }
+    $d = New-RunModeStaging 'default'
+    $null = Invoke-SensitivityGate -StagingDir $d.Staging -OutputDir $d.Out -ScreenerPath 'C:\fake\screener.py'
+    Should -Invoke Resolve-PythonExe -Times 1 -Exactly
+    $script:fakePyCalls.Count | Should -Be 1
+  }
+
+  It 'fails closed, releasing nothing, when no real interpreter resolves' {
+    Mock Resolve-PythonExe { throw 'Resolve-PythonExe: neither python3 nor python was found. Failing closed.' }
+    $d = New-RunModeStaging 'nopython'
+    { Invoke-SensitivityGate -StagingDir $d.Staging -OutputDir $d.Out -ScreenerPath 'C:\fake\screener.py' } |
+      Should -Throw -ExpectedMessage '*Failing closed*'
+    @(Get-ChildItem (Join-Path $d.Out 'released') -ErrorAction SilentlyContinue).Count | Should -Be 0
+  }
+}
+
 Describe 'Invoke-SensitivityGate -VerdictsPath (consume mode)' {
   BeforeAll {
     . "$PSScriptRoot/../scripts/lib/SensitivityGate.ps1"
