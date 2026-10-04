@@ -56,6 +56,55 @@ BeforeAll {
                       $n.Left.Extent.Text -eq ('$b.' + $Method)
         }, $true) | Select-Object -First 1
     }
+
+    # AST pin helpers: each returns the matching NODES under an AST, so a pin built on one is satisfied
+    # only by real code, never by a comment or a string that names the call. 'AST pin helpers' below
+    # proves each one rejects a commented-out or quoted call.
+    #   PinFindCommand     <ast> <command> [<param>]  CommandAst invoking <command>, with -<param> when given
+    #   PinFindPipedInto   <ast> <command>            CommandAst for <command> fed by an upstream pipeline element
+    #   PinFindCountGuard  <ast>                      BinaryExpressionAst `<x>.Count -gt 0`
+    #   PinFindCommaReturn <ast>                      ReturnStatementAst returning `,@(...)`
+    $script:PinFindCommand = {
+        param($Ast, [string] $Command, [string] $Param)
+        @($Ast.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq $Command
+        }, $true) | Where-Object {
+            [string]::IsNullOrEmpty($Param) -or @($_.CommandElements | Where-Object {
+                $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq $Param }).Count -gt 0
+        })
+    }
+    $script:PinFindPipedInto = {
+        param($Ast, [string] $Command)
+        @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.PipelineAst] }, $true) | ForEach-Object {
+            $els = @($_.PipelineElements)
+            for ($i = 1; $i -lt $els.Count; $i++) {
+                if ($els[$i] -is [System.Management.Automation.Language.CommandAst] -and $els[$i].GetCommandName() -eq $Command) { $els[$i] }
+            }
+        })
+    }
+    $script:PinFindCountGuard = {
+        param($Ast)
+        @($Ast.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                      $n.Operator -eq [System.Management.Automation.Language.TokenKind]::Igt -and
+                      $n.Left -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                      $n.Left.Member.Extent.Text -eq 'Count' -and
+                      $n.Right -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+                      $n.Right.Value -eq 0
+        }, $true))
+    }
+    $script:PinFindCommaReturn = {
+        param($Ast)
+        @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and $null -ne $n.Pipeline }, $true) |
+            Where-Object {
+                # `,@(...)` parses as a one-element ArrayLiteralAst wrapping an ArrayExpressionAst.
+                $null -ne $_.Pipeline.Find({
+                    param($m) $m -is [System.Management.Automation.Language.ArrayLiteralAst] -and
+                              @($m.Elements).Count -eq 1 -and
+                              $m.Elements[0] -is [System.Management.Automation.Language.ArrayExpressionAst]
+                }, $true)
+            })
+    }
 }
 
 # ===========================================================================
@@ -1835,21 +1884,68 @@ Describe 'RemoveNetworkAdapter: the REAL method uses only documented parameter s
         $script:RealRemoveNicAssign = & $script:GetRealBackendAssign 'RemoveNetworkAdapter'
     }
 
-    It 'enumerates the adapters with Get-VMNetworkAdapter (the harness below proves the removal only receives what was enumerated)' {
+    # These pins walk AST nodes (CommandAst, PipelineAst, BinaryExpressionAst), not the method's source
+    # text. A text regex also matched a comment, so deleting the call but leaving a comment that named it
+    # still passed; the 'pin helpers' Describe below proves each helper rejects exactly that.
+    It 'enumerates the adapters with Get-VMNetworkAdapter -VMName (the harness below proves the removal only receives what was enumerated)' {
         $script:RealRemoveNicAssign | Should -Not -BeNullOrEmpty -Because 'the real factory must define RemoveNetworkAdapter'
-        $script:RealRemoveNicAssign.Right.Extent.Text |
-            Should -Match 'Get-VMNetworkAdapter\s+-VMName' -Because 'the adapters to remove are read from host truth first'
+        @(& $script:PinFindCommand $script:RealRemoveNicAssign 'Get-VMNetworkAdapter' 'VMName').Count |
+            Should -BeGreaterThan 0 -Because 'the adapters to remove are read from host truth first'
     }
 
     It 'removes by piping the adapter objects, never with Remove-VMNetworkAdapter -VMName' {
-        $body = $script:RealRemoveNicAssign.Right.Extent.Text
-        $body | Should -Match '\|\s*Remove-VMNetworkAdapter' -Because 'piping adapter objects uses the documented ResourceObject parameter set'
-        $body | Should -Not -Match 'Remove-VMNetworkAdapter\s+-VMName' -Because 'omitting -Name in the VMName set relies on undocumented remove-everything behavior'
+        @(& $script:PinFindPipedInto $script:RealRemoveNicAssign 'Remove-VMNetworkAdapter').Count |
+            Should -BeGreaterThan 0 -Because 'piping adapter objects uses the documented ResourceObject parameter set'
+        @(& $script:PinFindCommand $script:RealRemoveNicAssign 'Remove-VMNetworkAdapter' 'VMName').Count |
+            Should -Be 0 -Because 'omitting -Name in the VMName set relies on undocumented remove-everything behavior'
     }
 
     It 'guards the removal on a non-zero adapter count (idempotent, like the fake)' {
-        $script:RealRemoveNicAssign.Right.Extent.Text |
-            Should -Match '\.Count\s+-gt\s+0' -Because 'a VM with no adapters must be a no-op, as the fake already is'
+        @(& $script:PinFindCountGuard $script:RealRemoveNicAssign).Count |
+            Should -BeGreaterThan 0 -Because 'a VM with no adapters must be a no-op, as the fake already is'
+    }
+}
+
+# ===========================================================================
+#  The AST pin helpers fail when the pinned code is gone
+# ===========================================================================
+#  Each helper is run against a synthetic scriptblock where the call survives only in a comment or a string
+#  (it must find nothing) and against one where the call is real (it must find it). This is the evidence
+#  that a pin built on the helper fails when the pinned call is removed.
+Describe 'AST pin helpers: comments and strings do not satisfy a pin' {
+
+    It 'PinFindCommand: a commented-out or quoted call is not a call; a real one is' {
+        $gone = { # Get-VMGpuPartitionAdapter -VMName $vm
+                  $note = 'Get-VMGpuPartitionAdapter -VMName $vm'
+                  return ,@() }.Ast
+        $here = { return ,@(Get-VMGpuPartitionAdapter -VMName $vm -ErrorAction Stop) }.Ast
+        @(& $script:PinFindCommand $gone 'Get-VMGpuPartitionAdapter' 'VMName').Count | Should -Be 0
+        @(& $script:PinFindCommand $here 'Get-VMGpuPartitionAdapter' 'VMName').Count | Should -Be 1
+        @(& $script:PinFindCommand $here 'Get-VMGpuPartitionAdapter' 'Name').Count   | Should -Be 0 -Because 'the parameter filter is exact'
+    }
+
+    It 'PinFindPipedInto: only a real pipeline into the command counts' {
+        $gone = { # $nics | Remove-VMNetworkAdapter
+                  Remove-VMNetworkAdapter -VMName $vm }.Ast
+        $here = { $nics | Remove-VMNetworkAdapter -ErrorAction Stop }.Ast
+        @(& $script:PinFindPipedInto $gone 'Remove-VMNetworkAdapter').Count | Should -Be 0
+        @(& $script:PinFindPipedInto $here 'Remove-VMNetworkAdapter').Count | Should -Be 1
+    }
+
+    It 'PinFindCountGuard: only a real `.Count -gt 0` comparison counts' {
+        $gone = { # if ($nics.Count -gt 0) { }
+                  if ($nics) { } }.Ast
+        $here = { if ($nics.Count -gt 0) { } }.Ast
+        @(& $script:PinFindCountGuard $gone).Count | Should -Be 0
+        @(& $script:PinFindCountGuard $here).Count | Should -Be 1
+    }
+
+    It 'PinFindCommaReturn: only a real `return ,@(...)` counts' {
+        $gone = { # return ,@(Get-Thing)
+                  return @(Get-Thing) }.Ast
+        $here = { return ,@(Get-Thing) }.Ast
+        @(& $script:PinFindCommaReturn $gone).Count | Should -Be 0
+        @(& $script:PinFindCommaReturn $here).Count | Should -Be 1
     }
 }
 
@@ -1862,16 +1958,6 @@ Describe 'RemoveNetworkAdapter: the REAL method uses only documented parameter s
 #  pinned via the AST; the fake carries the behavioral checks.
 Describe 'Passthrough-device reads: GetGpuPartitionAdapters + GetAssignableDevices (real/fake parity; AST-pinned real)' {
 
-    BeforeAll {
-        # The text of `$b.<Method> = { ... }` inside the real factory, or $null when absent.
-        $script:RealPtBody = {
-            param([string] $Method)
-            $assign = & $script:GetRealBackendAssign $Method
-            if ($null -eq $assign) { return $null }
-            return $assign.Right.Extent.Text
-        }
-    }
-
     It 'the manifest documents both reads taking exactly VMName' {
         foreach ($m in 'GetGpuPartitionAdapters', 'GetAssignableDevices') {
             $script:ExpectedMethods.Keys | Should -Contain $m
@@ -1879,18 +1965,14 @@ Describe 'Passthrough-device reads: GetGpuPartitionAdapters + GetAssignableDevic
         }
     }
 
-    It 'the REAL GetGpuPartitionAdapters reads Get-VMGpuPartitionAdapter and returns a ,@(...) collection' {
-        $body = & $script:RealPtBody 'GetGpuPartitionAdapters'
-        $body | Should -Not -BeNullOrEmpty -Because 'the real factory must define GetGpuPartitionAdapters'
-        $body | Should -Match 'Get-VMGpuPartitionAdapter\s+-VMName'
-        $body | Should -Match 'return\s*,@\(' -Because 'a single adapter must keep .Count = 1 for an unwrapped caller'
-    }
-
-    It 'the REAL GetAssignableDevices reads Get-VMAssignableDevice and returns a ,@(...) collection' {
-        $body = & $script:RealPtBody 'GetAssignableDevices'
-        $body | Should -Not -BeNullOrEmpty -Because 'the real factory must define GetAssignableDevices'
-        $body | Should -Match 'Get-VMAssignableDevice\s+-VMName'
-        $body | Should -Match 'return\s*,@\(' -Because 'a single device must keep .Count = 1 for an unwrapped caller'
+    It 'the REAL <Method> calls <Cmdlet> -VMName and returns a ,@(...) collection (AST nodes, not text)' -ForEach @(
+        @{ Method = 'GetGpuPartitionAdapters'; Cmdlet = 'Get-VMGpuPartitionAdapter' },
+        @{ Method = 'GetAssignableDevices';    Cmdlet = 'Get-VMAssignableDevice' }
+    ) {
+        $assign = & $script:GetRealBackendAssign $Method
+        $assign | Should -Not -BeNullOrEmpty -Because "the real factory must define $Method"
+        @(& $script:PinFindCommand $assign $Cmdlet 'VMName').Count | Should -BeGreaterThan 0 -Because "the read must invoke $Cmdlet for the VM it was given"
+        @(& $script:PinFindCommaReturn $assign).Count | Should -BeGreaterThan 0 -Because 'a single item must keep .Count = 1 for an unwrapped caller'
     }
 
     It 'the FAKE reports none by default, as arrays (no caller @() wrap needed)' {
