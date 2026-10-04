@@ -183,6 +183,13 @@ function Get-HyperVBackendMethodManifest {
         # LIVE-ONLY-UNPROVEN: the real copy never runs in the mock suite (its body is pinned by
         # tests/fixtures/Invoke-RealCopyDirectoryCapture.ps1).
         CopyDirectoryToVhdx  = @('Path', 'SourceDir')
+        # Copy a whole DETACHED .vhdx file to a new path, byte for byte (a plain file copy, never a
+        # mount). Invoke-Voidseal makes each run's WORKING COPY of the DEPS disk and of every data disk
+        # with it, so the original is never attached. REAL = Copy-Item to '<dest>.partial-<guid>' (through
+        # the RC8 lock-retry), rename into place, clear ReadOnly; refuses a missing source or an existing
+        # destination and removes the partial file on failure. FAKE = clones the VHD record. The real
+        # body runs no Hyper-V cmdlet, so tests drive it in-process on temp files.
+        CopyVhdxFile         = @('Path', 'Destination')
         ReadVhdxFile         = @('Path', 'InnerPath')              # host reads one file from a VHDX (ro) -> string or $null
         # Byte-clean siblings of WriteVhdxFile/ReadVhdxFile (I2a). WriteVhdxFile/ReadVhdxFile go through
         # Set-Content/Get-Content -Encoding utf8, which silently corrupts binary content (0x00, 0x80-0xFF,
@@ -1326,6 +1333,42 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
+    # Copy a detached .vhdx file (the per-run working copy). A plain file copy: no mount, no Hyper-V
+    # cmdlet, so the host never parses the disk's contents. Refuses a missing source and an existing
+    # destination (never overwrite: teardown deletes what this run created, and only that). The copy
+    # lands under a '.partial-<guid>' name first and is renamed into place only when complete, so a
+    # failed or interrupted copy never leaves a file at the destination; the partial is removed. The
+    # source's first open can hit the RC8 settle-lag sharing violation, so the copy rides $LockRetry.
+    # ReadOnly is cleared on the copy: an operator may mark the original read-only to protect it, and
+    # Hyper-V cannot attach a read-only file. Copy-Item does not carry the source's ACL, so the copy
+    # inherits the run folder's; Add-VMHardDiskDrive grants the VM's access at attach.
+    $b.CopyVhdxFile = {
+        param([System.Collections.IDictionary] $P)
+        $src = & $AssertArg $P 'Path'        'CopyVhdxFile'
+        $dst = & $AssertArg $P 'Destination' 'CopyVhdxFile'
+        & $InvokeOp {
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+                throw "CopyVhdxFile: source VHDX '$src' does not exist. Failing closed."
+            }
+            if (Test-Path -LiteralPath $dst) {
+                throw "CopyVhdxFile: destination '$dst' already exists; refusing to overwrite it. Failing closed."
+            }
+            $dir = Split-Path -Parent $dst
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) { $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop }
+            $tmp = "{0}.partial-{1}" -f $dst, ([guid]::NewGuid().ToString('N'))
+            try {
+                & $LockRetry -Context 'CopyVhdxFile' -Operation { Copy-Item -LiteralPath $src -Destination $tmp -ErrorAction Stop }
+                Move-Item -LiteralPath $tmp -Destination $dst -ErrorAction Stop
+                $item = Get-Item -LiteralPath $dst -Force -ErrorAction Stop
+                if ($item.IsReadOnly) { $item.IsReadOnly = $false }
+            }
+            catch {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                throw
+            }
+        }
+    }.GetNewClosure()
+
     # Mount READ-WRITE (not -ReadOnly), deliberately mirroring WriteVhdxFile. A read-only mount on
     # Windows frequently does NOT auto-assign a drive letter, and `Add-PartitionAccessPath
     # -AssignDriveLetter` against a write-protected volume can throw — which would make the FIRST
@@ -1910,8 +1953,9 @@ $script:SbCopyFakeVM = {
     must refuse in that case rather than assume there is enough memory.
 .PARAMETER SimulateGuestDiskWrite
     Disk paths a hostile guest writes raw blocks to while it runs (at StartVM, only for a path attached
-    to that VM). Models a guest with root writing to a data disk it mounted read-only: Hyper-V cannot
-    attach a VHDX read-only (D3), so the host's post-run re-hash is what notices. The bytes are appended
+    to that VM). Models a guest with root writing to a disk it mounted read-only: Hyper-V cannot
+    attach a VHDX read-only (D3). The engine attaches per-run working copies, so such a write must
+    land on the copy and never on the operator's original. The bytes are appended
     to the image-byte stand-in the fake GetVhdxImageHash reads. A fake-only simulation switch on an
     existing method, NOT a new backend method (no manifest change).
 .PARAMETER SimulateCreateEnospc
@@ -1945,7 +1989,8 @@ function New-FakeHyperVBackend {
         [long] $SimulateFreeSpaceBytes = 500GB,
         [long] $SimulateHostFreeMemoryBytes = 64GB,
         [long] $SimulateHostTotalMemoryBytes = 128GB,
-        [switch] $SimulateHostMemoryReadError,
+        [switch] $SimulateHostMemoryReadError
+,
         [string[]] $SimulateGuestDiskWrite = @()
     )
 
@@ -2459,6 +2504,34 @@ function New-FakeHyperVBackend {
             return $state.VHDs[$path]['Files'][$inner]
         }
         return $null
+    }.GetNewClosure()
+
+    # Copy a detached .vhdx file (fake): clone the VHD record under the new path, so the copy has the
+    # same structure, label and image bytes (and therefore the same hash). Mirrors the real refusals: a
+    # missing source, an existing destination, and a source attached to a live VM (locked).
+    $b.CopyVhdxFile = {
+        param([System.Collections.IDictionary] $P)
+        $src = & $AssertArg $P 'Path'        'CopyVhdxFile'
+        $dst = & $AssertArg $P 'Destination' 'CopyVhdxFile'
+        if (-not $state.VHDs.ContainsKey($src)) { throw "CopyVhdxFile: source VHDX '$src' does not exist. Failing closed." }
+        if ($state.VHDs.ContainsKey($dst)) { throw "CopyVhdxFile: destination '$dst' already exists; refusing to overwrite it. Failing closed." }
+        foreach ($vmRec in $state.VMs.Values) {
+            if ((@($vmRec.HardDrives) -contains $src) -and ([string]$vmRec.State -in @('Running','Saved','Paused'))) {
+                throw "CopyVhdxFile: the VHDX '$src' is still locked (attached to a live VM '$($vmRec.Name)'). Failing closed."
+            }
+        }
+        $from = $state.VHDs[$src]
+        $copy = @{}
+        foreach ($k in @($from.Keys)) {
+            if ([string]$k -like '_*') { continue }   # per-file settle-lag counters belong to the original
+            $v = $from[$k]
+            if ($v -is [byte[]]) { $nb = [byte[]]::new($v.Length); [System.Array]::Copy($v, $nb, $v.Length); $copy[$k] = $nb }
+            elseif ($v -is [System.Collections.IDictionary]) { $h = @{}; foreach ($ik in $v.Keys) { $h[$ik] = $v[$ik] }; $copy[$k] = $h }
+            else { $copy[$k] = $v }
+        }
+        $copy['Path'] = $dst
+        $state.VHDs[$dst] = $copy
+        $state.CallLog.Add(@{ Op = 'CopyVhdxFile'; Path = $src; Destination = $dst })
     }.GetNewClosure()
 
     # Copy a host directory tree onto a formatted data VHDX (fake). Mirrors the real failure shape:

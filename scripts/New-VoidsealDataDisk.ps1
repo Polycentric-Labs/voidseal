@@ -7,7 +7,8 @@
     A data disk carries bulk read-only input into a sealed guest: a corpus of sample text files,
     Python wheels for `pip install --no-index --find-links /mnt/data/<name>`, or model weights. The
     guest mounts it read-only at /mnt/data/<name> by its volume label (VSD + the upper-cased name).
-    Invoke-Voidseal attaches it only after re-hashing it and matching the hash printed here.
+    Each run copies it into the run's own folder, checks that the COPY matches the hash printed here,
+    and attaches the copy; this file is never attached, so it keeps its hash across runs.
 
     Steps (all fail-closed, in this order, before anything is created):
       1. The name must match ^[a-z0-9]{1,8}$ (it becomes a guest directory and a volume label).

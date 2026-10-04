@@ -105,14 +105,150 @@ Describe 'Assert-DiskImageVerified (the shared verify-before-attach helper)' {
         $a = & $script:VerifyArgs $b $p $h
         $null = Assert-DiskImageVerified @a
         @($b.FakeCallLog | Where-Object { $_.Op -eq 'GetVhdxImageHash' }).Count | Should -Be 2 -Because 'one hash in the test setup, one in the helper'
-        # Structurally: the only backend members the helper touches are the two read-only probes.
-        $ast = (Get-Command Assert-DiskImageVerified).ScriptBlock.Ast
-        $members = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] -and
-                                    $n.Expression.Extent.Text -eq '$Backend' }, $true) |
-                     ForEach-Object { $_.Member.Extent.Text } | Sort-Object -Unique)
-        $members | Should -Be @('GetVHDInfo', 'GetVhdxImageHash') -Because 'verification must never attach or mount'
-        @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
-                         $n.GetCommandName() -match 'Mount-VHD|Add-VMHardDiskDrive' }, $true)).Count | Should -Be 0
+        # Structurally: across the three helpers the only backend members touched are the two
+        # read-only probes and the file copy. None of them attaches or mounts.
+        $members = foreach ($fn in 'Assert-DiskStructure', 'Assert-DiskImageVerified', 'New-VerifiedDiskCopy') {
+            $ast = (Get-Command $fn).ScriptBlock.Ast
+            $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                           $n.Expression.Extent.Text -eq '$Backend' }, $true) | ForEach-Object { $_.Member.Extent.Text }
+            @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                             $n.GetCommandName() -match 'Mount-VHD|Add-VMHardDiskDrive' }, $true)).Count | Should -Be 0
+        }
+        @($members | Sort-Object -Unique) | Should -Be @('CopyVhdxFile', 'GetVHDInfo', 'GetVhdxImageHash')
+    }
+}
+
+Describe 'New-VerifiedDiskCopy (the per-run working copy both DEPS and data disks use)' {
+
+    BeforeAll {
+        $script:CopyArgs = {
+            param($Backend, $Desc, $Path, $Copy, $Hash)
+            @{
+                VMName = 'vm-copy'; Path = $Path; CopyPath = $Copy; ExpectedHash = $Hash
+                DiskLabel = "data disk 'corpus'"; DiskKind = 'data disk'; HashOrigin = 'operator-recorded'
+                MissingHashMessage = 'no hash was supplied for this disk'; Descriptor = $Desc; Backend = $Backend
+            }
+        }
+        $script:NewOriginal = {
+            param($Backend, [string] $Path)
+            & $Backend.NewOutputVhdx @{ Path = $Path; Label = 'VSDCORPUS'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+            [string](& $Backend.GetVhdxImageHash @{ Path = $Path })
+        }
+    }
+
+    It 'copies the original, records only the copy on CreatedDisks, and verifies the COPY' {
+        $b = New-FakeHyperVBackend
+        $desc = [pscustomobject]@{ Name = 'vm-copy'; CreatedDisks = @('C:\sb\vm-copy\vm-copy-system.vhdx') }
+        $orig = 'C:\data\corpus.vhdx'; $copy = 'C:\sb\vm-copy\vm-copy-data-corpus.vhdx'
+        $h = & $script:NewOriginal $b $orig
+        $a = & $script:CopyArgs $b $desc $orig $copy $h
+        New-VerifiedDiskCopy @a | Should -Be $h
+        @($desc.CreatedDisks) | Should -Contain $copy
+        @($desc.CreatedDisks) | Should -Not -Contain $orig
+        (& $b.GetVHDInfo @{ Path = $copy }).Label | Should -Be 'VSDCORPUS'
+        $log = @($b.FakeCallLog)
+        @($log | Where-Object { $_.Op -eq 'GetVhdxImageHash' -and $_.Path -eq $copy }).Count | Should -Be 1 -Because 'the copy is what gets hashed'
+        @($log | Where-Object { $_.Op -eq 'GetVhdxImageHash' -and $_.Path -eq $orig }).Count | Should -Be 1 -Because 'only the test setup hashed the original'
+    }
+
+    It 'refuses when the COPY does not match, even though the original would (and still records the copy for teardown)' {
+        $b = New-FakeHyperVBackend
+        $desc = [pscustomobject]@{ Name = 'vm-copy'; CreatedDisks = @() }
+        $orig = 'C:\data\corpus.vhdx'; $copy = 'C:\sb\vm-copy\bad-copy.vhdx'
+        $h = & $script:NewOriginal $b $orig
+        # A copy that lands different from its source (a flaky copy, or a swap mid-copy).
+        $driftDir = Join-Path $TestDrive 'drift'
+        New-Item -ItemType Directory -Path $driftDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $driftDir 'drift.txt') -Value 'x'
+        $realCopy = $b.CopyVhdxFile
+        $b.CopyVhdxFile = { param($P) & $realCopy $P; & $b.CopyDirectoryToVhdx @{ Path = $P.Destination; SourceDir = $driftDir } }.GetNewClosure()
+        $a = & $script:CopyArgs $b $desc $orig $copy $h
+        { New-VerifiedDiskCopy @a } | Should -Throw -ExpectedMessage "*working copy of '$orig'*"
+        @($desc.CreatedDisks) | Should -Contain $copy -Because 'a copy that exists must be deleted at teardown'
+    }
+
+    It 'makes no copy when the original is unreadable, differencing, or has no expected hash' {
+        $b = New-FakeHyperVBackend
+        $desc = [pscustomobject]@{ Name = 'vm-copy'; CreatedDisks = @() }
+        $a = & $script:CopyArgs $b $desc 'C:\data\absent.vhdx' 'C:\sb\c1.vhdx' ('a' * 64)
+        { New-VerifiedDiskCopy @a } | Should -Throw -ExpectedMessage '*unreadable via GetVHDInfo*'
+        & $b.NewVHD @{ Path = 'C:\data\diff.vhdx'; Differencing = $true; ParentPath = 'C:\x\p.vhdx' }
+        $a = & $script:CopyArgs $b $desc 'C:\data\diff.vhdx' 'C:\sb\c2.vhdx' ('a' * 64)
+        { New-VerifiedDiskCopy @a } | Should -Throw -ExpectedMessage '*DIFFERENCING*'
+        $null = & $script:NewOriginal $b 'C:\data\ok.vhdx'
+        $a = & $script:CopyArgs $b $desc 'C:\data\ok.vhdx' 'C:\sb\c3.vhdx' ''
+        { New-VerifiedDiskCopy @a } | Should -Throw -ExpectedMessage 'no hash was supplied for this disk'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'CopyVhdxFile' }).Count | Should -Be 0
+        @($desc.CreatedDisks).Count | Should -Be 0
+    }
+
+    It 'never overwrites an existing destination, and never records a file it did not create' {
+        $b = New-FakeHyperVBackend
+        $desc = [pscustomobject]@{ Name = 'vm-copy'; CreatedDisks = @() }
+        $h = & $script:NewOriginal $b 'C:\data\corpus.vhdx'
+        $null = & $script:NewOriginal $b 'C:\sb\taken.vhdx'
+        $a = & $script:CopyArgs $b $desc 'C:\data\corpus.vhdx' 'C:\sb\taken.vhdx' $h
+        { New-VerifiedDiskCopy @a } | Should -Throw -ExpectedMessage '*already exists*'
+        @($desc.CreatedDisks) | Should -Not -Contain 'C:\sb\taken.vhdx'
+    }
+}
+
+Describe 'CopyVhdxFile backend method' {
+
+    It 'is in the manifest with Path and Destination, and both factories implement it' {
+        (Get-HyperVBackendMethodManifest)['CopyVhdxFile'] | Should -Be @('Path', 'Destination')
+        (New-FakeHyperVBackend).CopyVhdxFile | Should -BeOfType [scriptblock]
+        (New-RealHyperVBackend).CopyVhdxFile | Should -BeOfType [scriptblock]
+    }
+
+    It 'fake: refuses a source attached to a running VM' {
+        $b = New-FakeHyperVBackend
+        & $b.NewVM @{ Name = 'vm-busy' }
+        & $b.NewVHD @{ Path = 'C:\data\busy.vhdx'; SizeBytes = 64MB; Dynamic = $true }
+        & $b.AddHardDiskDrive @{ VMName = 'vm-busy'; Path = 'C:\data\busy.vhdx' }
+        & $b.StartVM @{ Name = 'vm-busy' }
+        { & $b.CopyVhdxFile @{ Path = 'C:\data\busy.vhdx'; Destination = 'C:\sb\x.vhdx' } } | Should -Throw -ExpectedMessage '*locked*'
+    }
+
+    Context 'real body, in-process on temp files (it runs no Hyper-V cmdlet)' {
+        BeforeAll {
+            $script:RealB = New-RealHyperVBackend
+            $script:CopyDir = Join-Path $TestDrive 'realcopy'
+            New-Item -ItemType Directory -Path $script:CopyDir -Force | Out-Null
+            $script:SrcFile = Join-Path $script:CopyDir 'orig.vhdx'
+            $bytes = [byte[]](0..255 + 0..255)
+            [System.IO.File]::WriteAllBytes($script:SrcFile, $bytes)
+            (Get-Item -LiteralPath $script:SrcFile).IsReadOnly = $true
+        }
+
+        It 'copies byte for byte into a new folder, clears ReadOnly, and leaves no partial file' {
+            $dst = Join-Path $script:CopyDir 'run\copy.vhdx'
+            & $script:RealB.CopyVhdxFile @{ Path = $script:SrcFile; Destination = $dst }
+            [System.IO.File]::ReadAllBytes($dst) | Should -Be ([System.IO.File]::ReadAllBytes($script:SrcFile))
+            (Get-Item -LiteralPath $dst).IsReadOnly | Should -BeFalse
+            (Get-Item -LiteralPath $script:SrcFile).IsReadOnly | Should -BeTrue -Because 'the original is untouched'
+            @(Get-ChildItem -LiteralPath (Split-Path -Parent $dst) -Filter '*.partial-*').Count | Should -Be 0
+        }
+
+        It 'refuses an existing destination and a missing source' {
+            $dst = Join-Path $script:CopyDir 'exists.vhdx'
+            Set-Content -LiteralPath $dst -Value 'keep me'
+            { & $script:RealB.CopyVhdxFile @{ Path = $script:SrcFile; Destination = $dst } } | Should -Throw -ExpectedMessage '*already exists*'
+            (Get-Content -LiteralPath $dst -Raw).Trim() | Should -Be 'keep me'
+            { & $script:RealB.CopyVhdxFile @{ Path = (Join-Path $script:CopyDir 'nope.vhdx'); Destination = (Join-Path $script:CopyDir 'n2.vhdx') } } |
+                Should -Throw -ExpectedMessage '*does not exist*'
+        }
+
+        It 'removes the partial file when the copy fails (source held open exclusively)' {
+            $dst = Join-Path $script:CopyDir 'locked-copy.vhdx'
+            $fs = [System.IO.File]::Open($script:SrcFile, 'Open', 'Read', 'None')
+            try {
+                { & $script:RealB.CopyVhdxFile @{ Path = $script:SrcFile; Destination = $dst } } | Should -Throw
+            }
+            finally { $fs.Dispose() }
+            Test-Path -LiteralPath $dst | Should -BeFalse
+            @(Get-ChildItem -LiteralPath $script:CopyDir -Filter 'locked-copy.vhdx.partial-*').Count | Should -Be 0
+        }
     }
 }
 
@@ -373,7 +509,7 @@ Describe 'Invoke-Voidseal data-disk preflight (refused before anything is provis
     }
 }
 
-Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
+Describe 'Invoke-Voidseal copies, verifies, attaches and seals data disks' {
 
     BeforeAll {
         # A transport-only outbox carrying result.html, so a run can reach Success end to end.
@@ -396,7 +532,7 @@ Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
             if ($NeverOff) { $fakeArgs = @{ SimulateNeverOff = $true } }
             elseif (-not $NoBlob) { $fakeArgs.SimulateOutboxBlob = $script:DdBlob }
             if ($GuestWrites.Count -gt 0) {
-                $fakeArgs.SimulateGuestDiskWrite = @($GuestWrites | ForEach-Object { Join-Path $script:DataRoot "$_.vhdx" })
+                $fakeArgs.SimulateGuestDiskWrite = @($GuestWrites)
             }
             $b = New-FakeHyperVBackend @fakeArgs
             $attached = [System.Collections.Generic.List[string]]::new()
@@ -416,9 +552,11 @@ Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
                 -Name $VmName -ArtifactRoot (Join-Path $TestDrive "art-$VmName") -Destination (Join-Path $TestDrive "dest-$VmName") `
                 -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $Run.Backend -WarningAction SilentlyContinue
         }
+        # Where a run puts its working copy of a data disk (the default storage root in these tests).
+        $script:CopyOf = { param([string] $Vm, [string] $DiskName) Join-Path (Get-SandboxStorageRoot -Name $Vm) ("{0}-data-{1}.vhdx" -f $Vm, $DiskName) }
     }
 
-    It 'verifies, attaches and records each data disk; the seal certifies; the run succeeds' {
+    It 'copies, verifies, attaches and records each data disk; the seal certifies; the run succeeds' {
         $run = & $script:NewDataRun -Names @('corpus', 'wheels')
         $report = & $script:RunWith $run 'sbx-dd-ok'
         $report.Error | Should -BeNullOrEmpty
@@ -430,26 +568,47 @@ Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
         $rec[0].Name | Should -Be 'corpus'
         $rec[0].Label | Should -BeExactly 'VSDCORPUS'
         $rec[0].ImageHash | Should -Be $run.Decl[0].ImageHash
-        $rec[1].Path | Should -Be $run.Decl[1].Path
-        foreach ($d in $run.Decl) { $run.Attached | Should -Contain $d.Path }
+        $rec[1].SourcePath | Should -Be $run.Decl[1].Path
+        $rec[1].Path | Should -Be (& $script:CopyOf 'sbx-dd-ok' 'wheels')
+        foreach ($r in $rec) { $run.Attached | Should -Contain $r.Path }
+        foreach ($d in $run.Decl) { $run.Attached | Should -Not -Contain $d.Path -Because 'the original is never attached' }
     }
 
-    It 'never adds a data disk to CreatedDisks, so teardown leaves the file in place' {
+    It 'reports a per-disk summary: name, original, verified hash, working copy, changed' {
+        $run = & $script:NewDataRun -Names @('corpus')
+        $report = & $script:RunWith $run 'sbx-dd-summary'
+        $s = @($report.DataDisks)
+        $s.Count | Should -Be 1
+        $s[0].Name | Should -Be 'corpus'
+        $s[0].SourcePath | Should -Be $run.Decl[0].Path
+        $s[0].ImageHash | Should -Be $run.Decl[0].ImageHash
+        $s[0].CopyPath | Should -Be (& $script:CopyOf 'sbx-dd-summary' 'corpus')
+        $s[0].Changed | Should -BeFalse
+    }
+
+    It 'puts only the working copy on CreatedDisks: teardown deletes the copy and keeps the original' {
         $run = & $script:NewDataRun -Names @('corpus')
         $report = & $script:RunWith $run 'sbx-dd-gc'
+        $copy = & $script:CopyOf 'sbx-dd-gc' 'corpus'
+        @($report.Descriptor.CreatedDisks) | Should -Contain $copy
         @($report.Descriptor.CreatedDisks) | Should -Not -Contain $run.Decl[0].Path
+        (& $run.Backend.GetVHDInfo @{ Path = $copy }) | Should -BeNullOrEmpty -Because 'the working copy is deleted at teardown'
         (& $run.Backend.GetVHDInfo @{ Path = $run.Decl[0].Path }) | Should -Not -BeNullOrEmpty -Because 'the operator data disk survives teardown'
         (& $run.Backend.GetVM @{ Name = 'sbx-dd-gc' }) | Should -BeNullOrEmpty -Because 'the VM itself is gone'
     }
 
-    It 'a hash mismatch on ANY disk attaches NO data disk and never seals' {
+    It 'a hash mismatch on ANY disk attaches NO data disk, never seals, and the copies made are deleted' {
         $run = & $script:NewDataRun -Names @('corpus', 'wheels')
         $second = @{} + $run.Decl[1]
         $second.ImageHash = 'f' * 64
         $report = & $script:RunWith $run 'sbx-dd-mismatch' @($run.Decl[0], $second)
         $report.Error | Should -Match "data disk 'wheels' integrity check FAILED"
         @($report.States) | Should -Not -Contain 'SEALED'
-        foreach ($d in $run.Decl) { $run.Attached | Should -Not -Contain $d.Path -Because 'all disks are verified before the first attach' }
+        foreach ($n in 'corpus', 'wheels') {
+            $c = & $script:CopyOf 'sbx-dd-mismatch' $n
+            $run.Attached | Should -Not -Contain $c -Because 'all disks are verified before the first attach'
+            (& $run.Backend.GetVHDInfo @{ Path = $c }) | Should -BeNullOrEmpty -Because 'teardown deletes every copy made'
+        }
         @($run.Backend.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0
     }
 
@@ -458,19 +617,20 @@ Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
         $decl = @($run.Decl[0], @{ Name = 'ghost'; Path = (Join-Path $script:DataRoot 'ghost.vhdx'); ImageHash = ('a' * 64) })
         $report = & $script:RunWith $run 'sbx-dd-ghost' $decl
         $report.Error | Should -Match 'unreadable via GetVHDInfo'
-        $run.Attached | Should -Not -Contain $run.Decl[0].Path
+        $run.Attached | Should -Not -Contain (& $script:CopyOf 'sbx-dd-ghost' 'corpus')
     }
 
-    It 'refuses a differencing data disk' {
+    It 'refuses a differencing data disk, without copying it' {
         $run = & $script:NewDataRun -Names @()
         $p = Join-Path $script:DataRoot 'diff.vhdx'
         & $run.Backend.NewVHD @{ Path = $p; Differencing = $true; ParentPath = 'C:\elsewhere\base.vhdx' }
         $report = & $script:RunWith $run 'sbx-dd-diff' @(@{ Name = 'diff'; Path = $p; ImageHash = ('a' * 64) })
         $report.Error | Should -Match 'DIFFERENCING'
         @($report.States) | Should -Not -Contain 'SEALED'
+        @($run.Backend.FakeCallLog | Where-Object { $_.Op -eq 'CopyVhdxFile' }).Count | Should -Be 0
     }
 
-    It 'reports DataDiskChanged = $false when every data disk re-hashes to its recorded value' {
+    It 'reports DataDiskChanged = $false when every original re-hashes to its recorded value' {
         $run = & $script:NewDataRun -Names @('corpus', 'wheels')
         $report = & $script:RunWith $run 'sbx-dd-same'
         $report.DataDiskChanged | Should -BeFalse
@@ -480,61 +640,110 @@ Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
         }
     }
 
-    It 'a guest write to a data disk sets DataDiskChanged and warns, without failing a good run' {
-        $run = & $script:NewDataRun -Names @('corpus', 'wheels') -GuestWrites @('wheels')
-        $report = & $script:RunWith $run 'sbx-dd-tamper'
-        $report.RunResult.Status | Should -Be 'Success' -Because 'the data disk is an input; a change is reported, not a run failure'
-        $report.Error | Should -BeNullOrEmpty
+    It 'a guest write lands on the working copy only: the original stays verified and a second run reuses it' {
+        $vm = 'sbx-dd-guestwrite'
+        $run = & $script:NewDataRun -Names @('corpus', 'wheels') -GuestWrites @((& $script:CopyOf $vm 'wheels'))
+        $report = & $script:RunWith $run $vm
+        $report.RunResult.Status | Should -Be 'Success'
+        $report.DataDiskChanged | Should -BeFalse -Because 'the guest only ever had the copy, which teardown deleted'
+        [string](& $run.Backend.GetVhdxImageHash @{ Path = $run.Decl[1].Path }) | Should -Be $run.Decl[1].ImageHash
+        # The same originals, the same recorded hashes, a fresh run: still accepted.
+        $again = & $script:RunWith $run "$vm-2"
+        $again.Error | Should -BeNullOrEmpty
+        $again.RunResult.Status | Should -Be 'Success'
+    }
+
+    It 'a change to the ORIGINAL on the host during the run sets DataDiskChanged and warns, without failing the run' {
+        $run = & $script:NewDataRun -Names @('corpus')
+        $orig = $run.Decl[0].Path
+        $drift = Join-Path $TestDrive 'host-drift'
+        New-Item -ItemType Directory -Path $drift -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $drift 'swapped.txt') -Value 'changed on the host'
+        $b = $run.Backend
+        $realStart = $b.StartVM
+        $b.StartVM = {
+            param($P)
+            & $realStart $P
+            # Something on the host rewrites the original while the guest runs.
+            & $b.RemoveVHD @{ Path = $orig }
+            & $b.NewOutputVhdx @{ Path = $orig; Label = 'VSDCORPUS'; FileSystem = 'exFAT'; SizeBytes = 64MB }
+            & $b.CopyDirectoryToVhdx @{ Path = $orig; SourceDir = $drift }
+        }.GetNewClosure()
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = $run.Decl } `
+            -Name 'sbx-dd-hostdrift' -ArtifactRoot (Join-Path $TestDrive 'art-hd') -Destination (Join-Path $TestDrive 'dest-hd') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -WarningVariable wv -WarningAction SilentlyContinue
+        $report.RunResult.Status | Should -Be 'Success'
         $report.DataDiskChanged | Should -BeTrue
-        $byName = @{}; foreach ($d in @($report.Descriptor.DataDisks)) { $byName[$d.Name] = $d }
-        $byName['wheels'].Changed | Should -BeTrue
-        $byName['wheels'].PostRunImageHash | Should -Not -Be $byName['wheels'].ImageHash
-        $byName['corpus'].Changed | Should -BeFalse
+        @($report.DataDisks)[0].Changed | Should -BeTrue
+        (@($wv) -join "`n") | Should -Match "data disk 'corpus' original .*not the recorded"
     }
 
-    It 'the warning names the changed disk' {
-        $run = & $script:NewDataRun -Names @('corpus') -GuestWrites @('corpus')
-        $null = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = $run.Decl } `
-            -Name 'sbx-dd-warn' -ArtifactRoot (Join-Path $TestDrive 'art-warn') -Destination (Join-Path $TestDrive 'dest-warn') `
-            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $run.Backend -WarningVariable wv -WarningAction SilentlyContinue
-        (@($wv) -join "`n") | Should -Match "data disk 'corpus'.*not the recorded"
-    }
-
-    It 'the re-hash runs after teardown (the VM is gone, so every data disk is detached)' {
+    It 'the re-hash of the original runs after teardown; the pre-attach hash is of the copy' {
         $run = & $script:NewDataRun -Names @('corpus')
         $null = & $script:RunWith $run 'sbx-dd-order'
         $log = @($run.Backend.FakeCallLog)
-        $hashes = @(for ($i = 0; $i -lt $log.Count; $i++) { if ($log[$i].Op -eq 'GetVhdxImageHash' -and $log[$i].Path -eq $run.Decl[0].Path) { $i } })
-        $hashes.Count | Should -Be 3 -Because 'one in the test setup, one before attach, one after the run'
+        $origHashes = @(for ($i = 0; $i -lt $log.Count; $i++) { if ($log[$i].Op -eq 'GetVhdxImageHash' -and $log[$i].Path -eq $run.Decl[0].Path) { $i } })
+        $origHashes.Count | Should -Be 2 -Because 'one in the test setup, one after the run'
+        $copyHashes = @($log | Where-Object { $_.Op -eq 'GetVhdxImageHash' -and $_.Path -eq (& $script:CopyOf 'sbx-dd-order' 'corpus') })
+        $copyHashes.Count | Should -Be 1 -Because 'the copy is verified once, before attach'
         $startIdx = @(for ($i = 0; $i -lt $log.Count; $i++) { if ($log[$i].Op -eq 'StartVM') { $i } })[0]
-        $hashes[2] | Should -BeGreaterThan $startIdx
+        $origHashes[1] | Should -BeGreaterThan $startIdx
         (& $run.Backend.GetVM @{ Name = 'sbx-dd-order' }) | Should -BeNullOrEmpty
     }
 
-    It 'a data disk that cannot be re-hashed counts as changed (fail closed on the report)' {
+    It 'an original that cannot be re-hashed counts as changed (fail closed on the report)' {
         $run = & $script:NewDataRun -Names @('corpus')
+        $orig = $run.Decl[0].Path
         $calls = @(0)
-        $orig = $run.Backend.GetVhdxImageHash
-        $run.Backend.GetVhdxImageHash = { param($P) $calls[0]++; if ($calls[0] -ge 2) { throw 'simulated: file vanished' }; & $orig $P }.GetNewClosure()
+        $realHash = $run.Backend.GetVhdxImageHash
+        $run.Backend.GetVhdxImageHash = {
+            param($P)
+            if ($P.Path -eq $orig) { $calls[0]++; throw 'simulated: file vanished' }
+            & $realHash $P
+        }.GetNewClosure()
         $report = & $script:RunWith $run 'sbx-dd-gone'
         $report.DataDiskChanged | Should -BeTrue
         @($report.Descriptor.DataDisks)[0].PostRunImageHash | Should -BeNullOrEmpty
     }
 
-    It 'a guest write also counts when the guest hangs and is force-stopped' {
-        $run = & $script:NewDataRun -Names @('corpus') -NeverOff -GuestWrites @('corpus')
-        $report = & $script:RunWith $run 'sbx-dd-hang'
+    It 'a hung guest that wrote to its copy leaves the original unchanged' {
+        $vm = 'sbx-dd-hang'
+        $run = & $script:NewDataRun -Names @('corpus') -NeverOff -GuestWrites @((& $script:CopyOf $vm 'corpus'))
+        $report = & $script:RunWith $run $vm
         $report.RunResult.Status | Should -Be 'Failed'
-        $report.DataDiskChanged | Should -BeTrue
+        $report.DataDiskChanged | Should -BeFalse
     }
 
-    It 'leaves DataDiskChanged $null when no data disk was attached' {
+    It 'counts every working copy in the host free-space preflight' {
+        # INPUT + OUTPUT are 1GB each and the preflight adds 1GB of headroom: 3GB fits in 3.5GB free.
+        # A 1GB data disk's working copy (budgeted at its virtual size + 64MB) does not. A tiny golden
+        # parent keeps the provisioner's own system-disk check (parent size + 1GB) inside the same figure.
+        $gold = Join-Path $TestDrive 'tiny-golden.vhdx'
+        [System.IO.File]::WriteAllBytes($gold, [byte[]]::new(4096))
+        $fit = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:DdBlob -SimulateFreeSpaceBytes 3.5GB
+        $ok = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk' } -Name 'sbx-dd-space-ok' -ParentDiskPath $gold `
+            -ArtifactRoot (Join-Path $TestDrive 'art-sp1') -Destination (Join-Path $TestDrive 'dest-sp1') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $fit -WarningAction SilentlyContinue
+        $ok.Error | Should -BeNullOrEmpty -Because 'without a data disk the run fits'
+        $tight = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:DdBlob -SimulateFreeSpaceBytes 3.5GB
+        $p = Join-Path $script:DataRoot 'big.vhdx'
+        & $tight.NewVHD @{ Path = $p; SizeBytes = 1GB; Dynamic = $true }
+        $h = [string](& $tight.GetVhdxImageHash @{ Path = $p })
+        $no = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = @(@{ Name = 'big'; Path = $p; ImageHash = $h }) } `
+            -Name 'sbx-dd-space-no' -ParentDiskPath $gold -ArtifactRoot (Join-Path $TestDrive 'art-sp2') -Destination (Join-Path $TestDrive 'dest-sp2') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $tight -WarningAction SilentlyContinue
+        $no.Error | Should -Match 'insufficient host free space'
+        @($tight.FakeCallLog | Where-Object { $_.Op -eq 'CopyVhdxFile' }).Count | Should -Be 0 -Because 'the refusal comes before any copy'
+    }
+
+    It 'leaves DataDiskChanged and DataDisks $null when no data disk was attached' {
         $run = & $script:NewDataRun -Names @()
         $report = Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk' } `
             -Name 'sbx-dd-none' -ArtifactRoot (Join-Path $TestDrive 'art-none') -Destination (Join-Path $TestDrive 'dest-none') `
             -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $run.Backend -WarningAction SilentlyContinue
         $report.PSObject.Properties.Name | Should -Contain 'DataDiskChanged'
         $report.DataDiskChanged | Should -BeNullOrEmpty
+        $report.DataDisks | Should -BeNullOrEmpty
     }
 
     It 'refuses data disks when there is no Entrypoint (no seed would mount them read-only)' {
@@ -543,6 +752,35 @@ Describe 'Invoke-Voidseal attaches, records and seals verified data disks' {
         $noEp.Remove('Entrypoint')
         { Invoke-Voidseal -Tier 0 -Profile $noEp -Workload @{ WorkloadMode = 'Disk'; DataDisks = $run.Decl } `
             -Name 'sbx-dd-noep' -Backend $run.Backend } | Should -Throw -ExpectedMessage '*no Entrypoint*'
+    }
+
+    It 'DEPS disk: a processor attaches a verified working copy and never the builder''s original' {
+        $proc = @{} + $script:Fx
+        $proc.Remove('OutboxOutput')
+        $proc['Network'] = 'None'; $proc['EgressMode'] = 'None'; $proc['EgressAllowlist'] = @()
+        $proc['ScreenConfig'] = @{ mode = 'aggressive' }
+        $proc['Inputs'] = @{} + $script:Fx['Inputs']
+        $proc['Inputs']['screener.py'] = Get-Content -LiteralPath (Join-Path $script:SkillRoot 'guest/screener.py') -Raw
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $attached = [System.Collections.Generic.List[string]]::new()
+        $realAdd = $b.AddHardDiskDrive
+        $b.AddHardDiskDrive = { param($P) $attached.Add([string]$P.Path); & $realAdd $P }.GetNewClosure()
+        $deps = Join-Path $script:DataRoot 'deps.vhdx'
+        & $b.NewVHD @{ Path = $deps; SizeBytes = 1GB; Dynamic = $true }
+        $h = [string](& $b.GetVhdxImageHash @{ Path = $deps })
+        $report = Invoke-Voidseal -Tier 0 -Profile $proc -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $deps; DepsImageHash = $h } `
+            -Name 'sbx-dd-deps' -ArtifactRoot (Join-Path $TestDrive 'art-deps') -Destination (Join-Path $TestDrive 'dest-deps') `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath (Join-Path $TestDrive 'ledger.json') -WarningAction SilentlyContinue
+        @($report.States) | Should -Contain 'SEALED'
+        $copy = Join-Path (Get-SandboxStorageRoot -Name 'sbx-dd-deps') 'sbx-dd-deps-deps.vhdx'
+        $report.Descriptor.DepsDiskPath | Should -Be $copy
+        $report.Descriptor.DepsSourcePath | Should -Be $deps
+        $report.Descriptor.DepsImageHash | Should -Be $h
+        $attached | Should -Contain $copy
+        $attached | Should -Not -Contain $deps
+        @($report.Descriptor.CreatedDisks) | Should -Contain $copy
+        (& $b.GetVHDInfo @{ Path = $copy }) | Should -BeNullOrEmpty -Because 'teardown deletes the working copy'
+        (& $b.GetVHDInfo @{ Path = $deps }) | Should -Not -BeNullOrEmpty -Because 'the builder original stays reusable'
     }
 }
 

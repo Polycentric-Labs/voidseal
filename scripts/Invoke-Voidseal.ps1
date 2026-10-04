@@ -548,10 +548,12 @@ function Invoke-Voidseal {
         Held              = $null
         SensitivityReport = $null
         # Pre-built data disks (DataDisks.ps1): $null when none were attached; otherwise $true when any
-        # recorded data disk no longer matches its recorded hash after the run (or could not be
-        # re-hashed), else $false. Reported, never a run failure; per-disk detail is on
-        # Descriptor.DataDisks (PostRunImageHash, Changed).
+        # data disk's ORIGINAL no longer matches its recorded hash after the run (or could not be
+        # re-hashed), else $false. Reported, never a run failure. DataDisks is the per-disk summary:
+        # Name, SourcePath (the original), ImageHash (verified), CopyPath (the working copy the guest
+        # got, deleted at teardown) and Changed.
         DataDiskChanged   = $null
+        DataDisks         = $null
     }
 
     $descriptor = $null
@@ -620,6 +622,25 @@ function Invoke-Voidseal {
             }
 
             $diskStorageRoot = $vmStorageDir
+
+            # The DEPS disk an attach would use (processor runs only) and the per-run WORKING COPY budget.
+            # Every pre-built disk is copied into this run's folder before it is verified and attached
+            # (New-VerifiedDiskCopy), so the free-space preflight in New-WorkloadDisks must count each copy.
+            # The budget is each original's VIRTUAL size from GetVHDInfo: an upper bound for a dynamic
+            # VHDX's file size (give or take a few MB of metadata), conservative for a sparse one. An
+            # unreadable original contributes nothing here and is refused, with its own message, below.
+            $depsDiskPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
+            if ([string]::IsNullOrWhiteSpace($depsDiskPath) -and $resolved.ContainsKey('DepsDiskPath')) { $depsDiskPath = [string]$resolved['DepsDiskPath'] }
+            $attachDeps = ($resolved['Network'] -eq 'None' -and -not [string]::IsNullOrWhiteSpace($depsDiskPath))
+            $copySources = @()
+            if ($attachDeps) { $copySources += $depsDiskPath }
+            foreach ($dd in $dataDisks) { $copySources += [string]$dd['Path'] }
+            $copyBudget = [long]0
+            foreach ($cs in $copySources) {
+                $csInfo = & $Backend.GetVHDInfo @{ Path = $cs }
+                if ($null -ne $csInfo -and $null -ne $csInfo.SizeBytes) { $copyBudget += [long]$csInfo.SizeBytes + 64MB }
+            }
+
             # New-WorkloadDisks now RECORDS each data disk on the descriptor INCREMENTALLY (its path
             # field AND a deduped append to CreatedDisks) right after it is created — so the INPUT/
             # OUTPUT VHDX files are on CreatedDisks for the Reaper's -DeleteDisks pass, and a mid-
@@ -628,7 +649,7 @@ function Invoke-Voidseal {
             # here — that fold moved into New-WorkloadDisks (which dedupes against the provisioner's
             # system disk). Just refresh $report.Descriptor with the mutated descriptor.
             $descriptor = New-WorkloadDisks -Descriptor $descriptor -Profile $resolved `
-                -StorageRoot $diskStorageRoot -Backend $Backend
+                -StorageRoot $diskStorageRoot -ExtraBudgetBytes $copyBudget -Backend $Backend
             $report.Descriptor = $descriptor
             # I2b ENOSPC (FAIL-CLOSED): on a classified HOST-side ENOSPC writing an Input, New-WorkloadDisks
             # stamps $descriptor.WorkloadDiskStatus='DiskFull' (diagnostic) then RE-THROWS a classified error
@@ -667,58 +688,64 @@ function Invoke-Voidseal {
             # ATTACHED and RECORDED (DepsDiskPath) on the descriptor BEFORE Lock-Sandbox so Assert-Sealed's
             # host-truth scan ACCEPTS it as an expected disk — an UNRECORDED extra attached disk fails the
             # seal gate as a residual. We attach via the existing AddHardDiskDrive (no read-only attach:
-            # Hyper-V cannot host-enforce a read-only VHDX — D3). The DEPS disk is the BUILDER's pre-
-            # existing file, so it is NOT added to CreatedDisks (we did not create it; teardown's
-            # Remove-Sandbox detaches it by removing the VM, but the deps.vhdx FILE is left on disk).
-            $depsDiskPath = [string](Get-WorkloadField -Workload $Workload -Name 'DepsDiskPath')
-            if ([string]::IsNullOrWhiteSpace($depsDiskPath) -and $resolved.ContainsKey('DepsDiskPath')) { $depsDiskPath = [string]$resolved['DepsDiskPath'] }
-            if ($resolved['Network'] -eq 'None' -and -not [string]::IsNullOrWhiteSpace($depsDiskPath)) {
+            # Hyper-V cannot host-enforce a read-only VHDX, D3). What is attached is a per-run WORKING
+            # COPY made in this run's folder; the builder's deps.vhdx itself is never attached, so a
+            # Hyper-V metadata update or a guest write can never change it, and it stays reusable. The
+            # copy is on CreatedDisks (teardown deletes it); the original is not, so it is left on disk.
+            if ($attachDeps) {
                 # I1 (structure before hash) and PHASE 3 (verify before attach) live in the shared
-                # Assert-DiskImageVerified (DataDisks.ps1), which data disks use too. It refuses an
-                # unreadable or differencing deps disk, a missing DepsImageHash, and a mismatched
-                # whole-image hash (GetVhdxImageHash: user space, never Mount-VHD, taken while the disk
-                # is still detached). This proves deps.vhdx is byte-identical to what the builder
+                # New-VerifiedDiskCopy (DataDisks.ps1), which data disks use too. It refuses an unreadable
+                # or differencing deps disk and a missing DepsImageHash, copies it, then checks the COPY's
+                # structure and refuses a mismatched whole-image hash (GetVhdxImageHash: user space, never
+                # Mount-VHD, taken while the copy is still detached). This proves the copy is byte-identical
+                # to what the builder
                 # emitted (host to processor hand-off integrity); it says nothing about whether the
                 # packages or models INSIDE are what upstream published (see guest/fetch_deps.py and
                 # docs/operator-runbook.md for the per-fetcher provenance story). The expected hash
                 # comes from the TRUSTED caller via -Workload.DepsImageHash (fallback: the profile).
                 $expectedHash = [string](Get-WorkloadField -Workload $Workload -Name 'DepsImageHash')
                 if ([string]::IsNullOrWhiteSpace($expectedHash) -and $resolved.ContainsKey('DepsImageHash')) { $expectedHash = [string]$resolved['DepsImageHash'] }
-                $actualHash = Assert-DiskImageVerified -VMName $Name -Path $depsDiskPath -ExpectedHash $expectedHash `
-                    -DiskLabel 'DEPS disk' -DiskKind 'dependency disk' -HashOrigin 'builder-recorded' -Backend $Backend `
+                $depsCopy = Join-Path $vmStorageDir ("{0}-deps.vhdx" -f $Name)
+                $actualHash = New-VerifiedDiskCopy -VMName $Name -Path $depsDiskPath -CopyPath $depsCopy -ExpectedHash $expectedHash `
+                    -DiskLabel 'DEPS disk' -DiskKind 'dependency disk' -HashOrigin 'builder-recorded' `
+                    -Descriptor $descriptor -Backend $Backend `
                     -MissingHashMessage ("Invoke-Voidseal: '$Name' attaches a DEPS disk ('$depsDiskPath') but no DepsImageHash " +
                         "was supplied. A deps disk MUST carry the builder's recorded whole-image hash (pass " +
                         "-Workload.DepsImageHash): refusing to attach an UNVERIFIED dependency disk. Failing closed.")
-                # Verified -> attach + RECORD (DepsDiskPath + the verified DepsImageHash) BEFORE Lock-Sandbox so
-                # Assert-Sealed accepts it as an expected disk. NOT added to CreatedDisks (builder-owned, reusable
-                # across runs — D3-D; teardown's Remove-Sandbox leaves the deps.vhdx FILE on disk). No read-only
-                # attach (Hyper-V can't host-enforce guest-RO — D3).
-                $null = & $Backend.AddHardDiskDrive @{ VMName = $Name; Path = $depsDiskPath }
-                Set-DescriptorField -Descriptor $descriptor -Name 'DepsDiskPath'  -Value $depsDiskPath
-                Set-DescriptorField -Descriptor $descriptor -Name 'DepsImageHash' -Value $actualHash
+                # Verified -> attach the COPY + RECORD (DepsDiskPath = the attached copy, DepsSourcePath = the
+                # builder's original, plus the verified DepsImageHash) BEFORE Lock-Sandbox so Assert-Sealed
+                # accepts it as an expected disk. The original stays builder-owned and reusable (D3-D).
+                $null = & $Backend.AddHardDiskDrive @{ VMName = $Name; Path = $depsCopy }
+                Set-DescriptorField -Descriptor $descriptor -Name 'DepsDiskPath'   -Value $depsCopy
+                Set-DescriptorField -Descriptor $descriptor -Name 'DepsSourcePath' -Value $depsDiskPath
+                Set-DescriptorField -Descriptor $descriptor -Name 'DepsImageHash'  -Value $actualHash
                 $report.Descriptor = $descriptor
             }
 
-            # --- DATA DISKS: verify ALL, then attach + RECORD each, BEFORE the seal -----------------
-            # Every declared data disk passes the same Assert-DiskImageVerified the DEPS disk uses
-            # (readable, not differencing, operator-recorded hash present and equal) BEFORE the first
-            # one is attached, so a refusal leaves no data disk attached. Each verified disk is then
-            # attached and recorded on the descriptor's DataDisks list (Name, Path, verified hash) right
-            # away, which is what lets Assert-Sealed accept it. Like the DEPS disk, a data disk is the
-            # operator's file: it is NEVER added to CreatedDisks, so teardown never deletes it. The host
-            # attach is read-write (Hyper-V has no read-only attach, D3); the guest mounts it read-only
-            # and the post-run re-hash (in the finally below) reports any change.
+            # --- DATA DISKS: copy + verify ALL, then attach + RECORD each, BEFORE the seal ----------
+            # Every declared data disk goes through the same New-VerifiedDiskCopy the DEPS disk uses: the
+            # original must be readable and not differencing, it is copied into this run's folder, and the
+            # COPY must match the operator-recorded hash. All copies are verified before the first is
+            # attached, so a refusal leaves no data disk attached (copies made so far are on CreatedDisks
+            # and teardown deletes them). Each verified copy is then attached and recorded on the
+            # descriptor's DataDisks list (Name, SourcePath = the original, Path = the attached copy,
+            # Label, verified hash), which is what lets Assert-Sealed accept it. The operator's original is
+            # never attached and never deleted. The host attach of the copy is read-write (D3); the guest
+            # mounts it read-only, and whatever it does to the copy is discarded at teardown.
             if ($dataDisks.Count -gt 0) {
                 $verifiedData = [System.Collections.Generic.List[object]]::new()
                 foreach ($dd in $dataDisks) {
                     $ddName = [string]$dd['Name']
                     $ddPath = [string]$dd['Path']
-                    $ddHash = Assert-DiskImageVerified -VMName $Name -Path $ddPath -ExpectedHash ([string]$dd['ImageHash']) `
-                        -DiskLabel "data disk '$ddName'" -DiskKind 'data disk' -HashOrigin 'operator-recorded' -Backend $Backend `
+                    $ddCopy = Join-Path $vmStorageDir ("{0}-data-{1}.vhdx" -f $Name, $ddName)
+                    $ddHash = New-VerifiedDiskCopy -VMName $Name -Path $ddPath -CopyPath $ddCopy -ExpectedHash ([string]$dd['ImageHash']) `
+                        -DiskLabel "data disk '$ddName'" -DiskKind 'data disk' -HashOrigin 'operator-recorded' `
+                        -Descriptor $descriptor -Backend $Backend `
                         -MissingHashMessage ("Invoke-Voidseal: '$Name' data disk '$ddName' ('$ddPath') has no ImageHash: refusing " +
                             "to attach an UNVERIFIED data disk. Failing closed.")
+                    $report.Descriptor = $descriptor
                     $verifiedData.Add([pscustomobject]@{
-                        Name = $ddName; Path = $ddPath; Label = (Get-DataDiskLabel -Name $ddName); ImageHash = $ddHash
+                        Name = $ddName; SourcePath = $ddPath; Path = $ddCopy; Label = (Get-DataDiskLabel -Name $ddName); ImageHash = $ddHash
                     })
                 }
                 $recorded = [System.Collections.Generic.List[object]]::new()
@@ -972,15 +999,25 @@ function Invoke-Voidseal {
             $report.TeardownStatus = "FAILED: $($_.Exception.Message)"
             Write-Warning "Invoke-Voidseal: teardown of '$Name' failed: $($_.Exception.Message)"
         }
-        # --- data disks: re-hash AFTER teardown, when the VM is gone and every data disk is detached ---
-        # A data disk is attached read-write at the Hyper-V level; the guest mounts it read-only, but a
-        # guest with root can write raw blocks. A change is reported (DataDiskChanged + a warning), not
-        # turned into a failed run: the disk is an input. Teardown never deletes data disks (they are
-        # not on CreatedDisks), so the file is still there to hash. Never throws out of the finally.
+        # --- data disks: re-hash each ORIGINAL after teardown ----------------------------------------
+        # The guest only had a working copy, and teardown has just deleted it, so nothing the guest did
+        # can reach the original. Re-hashing the original catches a change made on the HOST during the
+        # run (or an original that vanished). A change is reported (DataDiskChanged + a warning), never
+        # turned into a failed run. Never throws out of the finally.
         try { $report.DataDiskChanged = Test-DataDiskChanged -Descriptor $descriptor -VMName $Name -Backend $Backend }
         catch {
             $report.DataDiskChanged = $true
             Write-Warning "Invoke-Voidseal: '$Name' data disk re-check failed: $($_.Exception.Message)"
+        }
+        $ddRecorded = @(Get-DescriptorField -Descriptor $descriptor -Name 'DataDisks' -Default @())
+        if ($ddRecorded.Count -gt 0) {
+            $report.DataDisks = @($ddRecorded | ForEach-Object {
+                $chg = if ($null -ne $_.PSObject.Properties['Changed']) { [bool]$_.Changed } else { $true }
+                [pscustomobject]@{
+                    Name = [string]$_.Name; SourcePath = [string]$_.SourcePath; ImageHash = [string]$_.ImageHash
+                    CopyPath = [string]$_.Path; Changed = $chg
+                }
+            })
         }
         $report.States = $states.ToArray()
     }

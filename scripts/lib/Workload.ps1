@@ -97,6 +97,10 @@ function New-WorkloadDisks {
         [Parameter(Mandatory)] $Descriptor,
         [Parameter(Mandatory)] [hashtable] $Profile,
         [Parameter(Mandatory)] [string] $StorageRoot,
+        # Bytes the run will add to the same root after these disks: the per-run working copies of the
+        # DEPS disk and any data disks (Invoke-Voidseal sums their sizes). Counted in the one preflight
+        # below so a run that cannot fit them is refused before anything is written.
+        [long] $ExtraBudgetBytes = 0,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
     $name     = [string]$Descriptor.Name
@@ -161,7 +165,7 @@ function New-WorkloadDisks {
     # exhaustion risk I6b closed for the system disk. Reuse the SAME helper with the SUMMED INPUT+
     # OUTPUT budget, measured against the volume hosting $StorageRoot (the same root both data disks
     # land on), before either NewOutputVhdx call — so a refusal here leaves NEITHER disk created.
-    $null = Test-HostFreeSpace -Path $StorageRoot -RequiredBytes ($inSizeBytes + $outSizeBytes) -Backend $Backend
+    $null = Test-HostFreeSpace -Path $StorageRoot -RequiredBytes ($inSizeBytes + $outSizeBytes + $ExtraBudgetBytes) -Backend $Backend
 
     # INCREMENTAL-RECORD INVARIANT (orphan-window fix): each data disk is recorded on the descriptor
     # — its path field AND a deduped append to CreatedDisks — IMMEDIATELY after it is CREATED, before

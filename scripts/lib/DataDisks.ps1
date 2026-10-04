@@ -1,20 +1,25 @@
 <#
 .SYNOPSIS
-    Voidseal: verify-before-attach for pre-built disks (the DEPS disk and operator data disks).
+    Voidseal: verified per-run working copies of pre-built disks (the DEPS disk and operator data disks).
 
 .DESCRIPTION
     A pre-built disk is a VHDX the host did not create for this run: the builder's deps.vhdx, or a
-    data disk the operator built from a directory with scripts/New-VoidsealDataDisk.ps1. Before the
-    orchestrator attaches one, it has to prove the file is the one whose whole-image SHA-256 was
-    recorded when it was built. Assert-DiskImageVerified is that proof, shared by both callers so the
-    checks cannot drift apart:
+    data disk the operator built from a directory with scripts/New-VoidsealDataDisk.ps1. The run never
+    attaches that ORIGINAL. Hyper-V attaches every VHDX read-write and may update the file's metadata
+    even when the guest only reads, which would change its whole-image hash and make the next run
+    refuse it; a guest with root could also write to it. So each run attaches a WORKING COPY instead,
+    made in the run's own sandbox folder and deleted at teardown with the run's other disks.
 
-      1. GetVHDInfo must read the disk (an unreadable or missing VHDX is refused).
-      2. The disk must not be differencing and must carry no parent path (a differencing child takes
-         blocks from a parent the host never hashed).
-      3. An expected hash must be supplied (an unverified disk is never attached).
-      4. GetVhdxImageHash (user space, never Mount-VHD) must equal the expected hash, compared as
-         case-insensitive hex.
+    New-VerifiedDiskCopy is the one path both callers use, so the checks cannot drift apart:
+
+      1. GetVHDInfo must read the ORIGINAL, and it must not be differencing or carry a parent path
+         (a differencing child takes blocks from a parent the host never hashed).
+      2. An expected hash must be supplied (an unverified disk is never attached).
+      3. CopyVhdxFile copies the original into the run folder (it refuses to overwrite a file that
+         already exists there), and the copy joins CreatedDisks so teardown deletes it.
+      4. The COPY passes the same structure check, and its GetVhdxImageHash (user space, never
+         Mount-VHD) must equal the expected hash, compared as case-insensitive hex. Hashing the copy
+         rather than the original means the bytes the guest gets are the bytes that were verified.
 
     The function returns the verified hash in lowercase. Attaching and recording stay with the
     caller, because the DEPS disk and the data disks record different descriptor fields, and data
@@ -27,11 +32,45 @@ Set-StrictMode -Version Latest
 
 <#
 .SYNOPSIS
-    Verify a pre-built VHDX before it is attached: readable, not differencing, hash present and equal.
+    Refuse a VHDX the host cannot read, or one that is differencing or names a parent.
+.OUTPUTS
+    The GetVHDInfo record.
+#>
+function Assert-DiskStructure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $VMName,
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $DiskLabel,
+        [Parameter(Mandatory)] [string] $DiskKind,
+        [Parameter(Mandatory)] [hashtable] $Backend
+    )
+    # I1, STRUCTURE BEFORE HASH: a container swap can rewrite a fixed disk's footer and parent
+    # locator so it becomes a DIFFERENCING disk pointing at a parent the attacker controls (which
+    # supplies the real blocks at attach time). Refuse any differencing or parent-bearing disk before
+    # trusting it. The whole-image hash alone does not model an attacker who controls child and parent.
+    $info = & $Backend.GetVHDInfo @{ Path = $Path }
+    if ($null -eq $info) {
+        throw ("Invoke-Voidseal: '$VMName' $DiskLabel ('$Path') is unreadable via GetVHDInfo (missing, or not " +
+               "a VHDX the host can read): refusing to attach an unverifiable $DiskKind. Failing closed.")
+    }
+    if ([bool]$info.Differencing -or -not [string]::IsNullOrWhiteSpace([string]$info.ParentPath)) {
+        throw ("Invoke-Voidseal: '$VMName' $DiskLabel ('$Path') is a DIFFERENCING disk (Differencing=$($info.Differencing), " +
+               "ParentPath='$($info.ParentPath)'). A $DiskKind MUST be a self-contained fixed/dynamic VHDX: a " +
+               "differencing child pulls blocks from an external parent the host cannot verify. Refusing to attach; failing closed.")
+    }
+    return $info
+}
+
+<#
+.SYNOPSIS
+    Verify a VHDX before it is attached: readable, not differencing, hash present and equal.
 .PARAMETER VMName
     The run's VM name (used in messages only).
 .PARAMETER Path
-    The host path of the VHDX to verify.
+    The host path of the VHDX to verify (the working copy, when called by New-VerifiedDiskCopy).
+.PARAMETER SourcePath
+    Optional: the original this file was copied from, named in the mismatch message.
 .PARAMETER ExpectedHash
     The whole-image SHA-256 recorded when the disk was built. Blank or null is refused.
 .PARAMETER DiskLabel
@@ -54,6 +93,7 @@ function Assert-DiskImageVerified {
     param(
         [Parameter(Mandatory)] [string] $VMName,
         [Parameter(Mandatory)] [string] $Path,
+        [string] $SourcePath,
         [AllowNull()] [AllowEmptyString()] [string] $ExpectedHash,
         [Parameter(Mandatory)] [string] $DiskLabel,
         [Parameter(Mandatory)] [string] $DiskKind,
@@ -62,20 +102,7 @@ function Assert-DiskImageVerified {
         [Parameter(Mandatory)] [hashtable] $Backend
     )
 
-    # I1, STRUCTURE BEFORE HASH: a container swap can rewrite a fixed disk's footer and parent
-    # locator so it becomes a DIFFERENCING disk pointing at a parent the attacker controls (which
-    # supplies the real blocks at attach time). Refuse any differencing or parent-bearing disk before
-    # trusting it. The whole-image hash alone does not model an attacker who controls child and parent.
-    $info = & $Backend.GetVHDInfo @{ Path = $Path }
-    if ($null -eq $info) {
-        throw ("Invoke-Voidseal: '$VMName' $DiskLabel ('$Path') is unreadable via GetVHDInfo (missing, or not " +
-               "a VHDX the host can read): refusing to attach an unverifiable $DiskKind. Failing closed.")
-    }
-    if ([bool]$info.Differencing -or -not [string]::IsNullOrWhiteSpace([string]$info.ParentPath)) {
-        throw ("Invoke-Voidseal: '$VMName' $DiskLabel ('$Path') is a DIFFERENCING disk (Differencing=$($info.Differencing), " +
-               "ParentPath='$($info.ParentPath)'). A $DiskKind MUST be a self-contained fixed/dynamic VHDX: a " +
-               "differencing child pulls blocks from an external parent the host cannot verify. Refusing to attach; failing closed.")
-    }
+    $null = Assert-DiskStructure -VMName $VMName -Path $Path -DiskLabel $DiskLabel -DiskKind $DiskKind -Backend $Backend
 
     # VERIFY BEFORE ATTACH: tamper evidence for the hand-off (the disk is byte-identical to what was
     # built), not a claim about where its contents came from. The hash is taken in user space while
@@ -86,11 +113,59 @@ function Assert-DiskImageVerified {
     $expected = $ExpectedHash.Trim().ToLowerInvariant()
     $actual   = ([string](& $Backend.GetVhdxImageHash @{ Path = $Path })).Trim().ToLowerInvariant()
     if ($actual -ne $expected) {
-        throw ("Invoke-Voidseal: '$VMName' $DiskLabel integrity check FAILED: '$Path' hashes to '$actual' but the " +
+        $what = if ([string]::IsNullOrWhiteSpace($SourcePath)) { "'$Path'" } else { "'$Path' (the working copy of '$SourcePath')" }
+        throw ("Invoke-Voidseal: '$VMName' $DiskLabel integrity check FAILED: $what hashes to '$actual' but the " +
                "expected ($HashOrigin) hash is '$expected'. The $DiskKind was tampered with or substituted; " +
                "refusing to attach. Failing closed.")
     }
     return $actual
+}
+
+<#
+.SYNOPSIS
+    Make and verify this run's working copy of a pre-built disk. See the file header for the steps.
+.PARAMETER Path
+    The ORIGINAL pre-built VHDX (never attached).
+.PARAMETER CopyPath
+    Where the working copy goes: inside the run's own sandbox folder.
+.PARAMETER Descriptor
+    The run descriptor; the copy is appended to its CreatedDisks once it exists, so teardown deletes it.
+.OUTPUTS
+    [string] the verified lowercase hex SHA-256 of the copy (equal to the expected hash).
+#>
+function New-VerifiedDiskCopy {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string] $VMName,
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $CopyPath,
+        [AllowNull()] [AllowEmptyString()] [string] $ExpectedHash,
+        [Parameter(Mandatory)] [string] $DiskLabel,
+        [Parameter(Mandatory)] [string] $DiskKind,
+        [Parameter(Mandatory)] [string] $MissingHashMessage,
+        [string] $HashOrigin = 'builder-recorded',
+        [Parameter(Mandatory)] $Descriptor,
+        [Parameter(Mandatory)] [hashtable] $Backend
+    )
+
+    # 1-2: the original's structure and the presence of a hash, before spending time on a copy.
+    $null = Assert-DiskStructure -VMName $VMName -Path $Path -DiskLabel $DiskLabel -DiskKind $DiskKind -Backend $Backend
+    if ([string]::IsNullOrWhiteSpace($ExpectedHash)) {
+        throw $MissingHashMessage
+    }
+
+    # 3: copy, then record. Recording only after the copy exists keeps teardown from ever deleting a
+    # file this run did not create (CopyVhdxFile refuses to overwrite an existing destination).
+    $null = & $Backend.CopyVhdxFile @{ Path = $Path; Destination = $CopyPath }
+    $created = @(@($Descriptor.CreatedDisks) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($created -notcontains $CopyPath) { $created = @($created) + @($CopyPath) }
+    $Descriptor.CreatedDisks = @($created)
+
+    # 4: the copy is what the guest gets, so the copy is what gets verified.
+    return (Assert-DiskImageVerified -VMName $VMName -Path $CopyPath -SourcePath $Path -ExpectedHash $ExpectedHash `
+                -DiskLabel $DiskLabel -DiskKind $DiskKind -MissingHashMessage $MissingHashMessage `
+                -HashOrigin $HashOrigin -Backend $Backend)
 }
 
 <#
@@ -253,14 +328,16 @@ function Assert-DataDiskPathsIsolated {
 
 <#
 .SYNOPSIS
-    Re-hash every recorded data disk after the run and report whether any of them changed.
+    Re-hash every recorded data disk's ORIGINAL after the run and report whether any of them changed.
 .DESCRIPTION
-    Called once the VM is gone (after teardown), so every data disk is detached and no guest can be
-    writing to it. Each recorded entry gets PostRunImageHash (the new hash, or $null when it could not
-    be read) and Changed. A mismatch, or a hash that cannot be taken at all, counts as changed and
-    writes a warning naming the disk: the data disk is an input, so this never fails a run that
-    otherwise succeeded, but the report must say the operator's file is no longer the one recorded.
-    Returns $null when no data disk was recorded (nothing to check), else $true or $false.
+    Called after teardown. The guest only ever saw a working copy, which teardown deletes, so a guest
+    write cannot reach the original or the next run; it is not tracked. What this catches is the
+    original changing on the HOST while the run was going (or being unreadable afterwards), so the
+    operator knows the file on disk is no longer the one that was verified for this run. Each recorded
+    entry gets PostRunImageHash (the original's new hash, or $null when it could not be read) and
+    Changed. A mismatch, or a hash that cannot be taken at all, counts as changed and writes a warning
+    naming the disk; it never fails a run that otherwise succeeded. Returns $null when no data disk was
+    recorded (nothing to check), else $true or $false.
 .PARAMETER Descriptor
     The run descriptor (its DataDisks list, as recorded at attach time).
 .PARAMETER VMName
@@ -278,7 +355,8 @@ function Test-DataDiskChanged {
     foreach ($e in $entries) {
         $post = $null
         $why  = $null
-        try   { $post = ([string](& $Backend.GetVhdxImageHash @{ Path = [string]$e.Path })).Trim().ToLowerInvariant() }
+        $original = [string]$e.SourcePath
+        try   { $post = ([string](& $Backend.GetVhdxImageHash @{ Path = $original })).Trim().ToLowerInvariant() }
         catch { $why = $_.Exception.Message }
         $same = (-not [string]::IsNullOrWhiteSpace($post)) -and ($post -eq ([string]$e.ImageHash).ToLowerInvariant())
         Add-Member -InputObject $e -MemberType NoteProperty -Name 'PostRunImageHash' -Value $post -Force
@@ -286,8 +364,9 @@ function Test-DataDiskChanged {
         if (-not $same) {
             $anyChanged = $true
             $detail = if ($null -ne $why) { "could not be re-hashed ($why)" } else { "now hashes to '$post', not the recorded '$($e.ImageHash)'" }
-            Write-Warning ("Invoke-Voidseal: '$VMName' data disk '$($e.Name)' ('$($e.Path)') $detail. Treat it as changed: " +
-                           "rebuild it with New-VoidsealDataDisk.ps1 (or restore it) before another run relies on it.")
+            Write-Warning ("Invoke-Voidseal: '$VMName' data disk '$($e.Name)' original ('$original') $detail. Something on " +
+                           "the host changed it during the run; treat it as changed and rebuild it with " +
+                           "New-VoidsealDataDisk.ps1 (or restore it) before another run relies on it.")
         }
     }
     return $anyChanged
