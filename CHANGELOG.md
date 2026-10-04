@@ -31,3 +31,14 @@ places where a check is an argument rather than a measurement.
   first with the legacy exFAT OUTPUT disk (2026-06-25) and then with the current user-space outbox
   transport (2026-07-21). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see
   `docs/live-smoke-test.md`). Tier 2 and Tier 3 are scaffold-only and have had no live run.
+- Pre-built data disks (`DataDisks`, Disk mode only): carry a directory tree, wheels or model weights
+  into a sealed guest. `scripts/New-VoidsealDataDisk.ps1` builds an exFAT VHDX from a directory
+  (refusing secret-shaped paths and links in the tree) through the new `CopyDirectoryToVhdx` backend
+  method and prints its whole-image SHA-256. `Invoke-Voidseal` refuses bad names, paths that alias the
+  storage root, the DEPS disk or the golden parent, and Serial-mode runs before provisioning; verifies
+  every disk's hash before attaching any (the DEPS disk now shares that check); records them so
+  `Assert-Sealed` accepts them; never deletes them at teardown; and re-hashes them afterwards, setting
+  the new `DataDiskChanged` report field on any change. Both Disk-mode runners mount each disk
+  read-only at `/mnt/data/<name>` and power off without running the workload if one is missing or
+  writable. `Mounts` and `Packages` docs now point here. Mock-tested only; the real disk build, attach
+  and re-hash have not run live.

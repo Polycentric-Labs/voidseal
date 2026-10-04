@@ -55,8 +55,10 @@
     # ~/.docker/config.json, .npmrc, .pypirc, *-service-account.json, anything under a
     # .secrets/ dir), and because they record the intended shape. Point a source at a
     # COPY, never a live secret store or live personal data. To get files in and out,
-    # use Disk mode; StageAssets and the cloud-init seed do not carry your files to a
-    # running workload either (Step 4 of the authoring guide's walkthrough covers each).
+    # use Disk mode: small files via Inputs, a whole directory via DataDisks (a disk
+    # built with scripts/New-VoidsealDataDisk.ps1, mounted read-only). StageAssets and
+    # the cloud-init seed do not carry your files to a running workload either (Step 4
+    # of the authoring guide's walkthrough covers each).
     Mounts = @{
         'C:\sandbox\example-input'  = '/mnt/task/in:ro'   # declared only: nothing attaches it
         'C:\sandbox\example-output' = '/mnt/task/out'     # declared only: nothing attaches it

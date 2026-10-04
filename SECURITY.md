@@ -220,9 +220,16 @@ full privileges of whoever invokes it — here, the host operator.
   that the ESM facets are structurally absent on a stock Linux guest. Treat the host-channel gate as
   one host-verified channel plus three asserted-absent ones. The fake backend models all four as
   readable, so the mock suite exercises a check the real host cannot perform.
+- **A pre-built data disk is attached read-write; read-only is the guest's mount, not the host's.**
+  `DataDisks` are hash-verified before attach and re-hashed after teardown, and the guest runner mounts
+  each one `ro`. Hyper-V cannot attach a VHDX read-only, and the in-guest user has passwordless sudo, so
+  a hostile guest can write to a data disk. The engine detects that afterwards (`DataDiskChanged` on the
+  run report, plus a warning); it does not prevent it, and it does not fail the run. Rebuild a changed
+  disk before reusing it. The real disk build, attach and re-hash are mock-tested only (no live run).
 - **The secret-path denylist is a lint, not a control.** `Test-IsSecretPath`
   (`scripts/lib/ProfileLoader.ps1`) matches filename globs and directory segments against the `Mounts`
-  and `StageAssets` source keys. It never opens or inspects a file, so it cannot tell a real credential
+  and `StageAssets` source keys, `DataDisks` paths, and every path in a tree `New-VoidsealDataDisk.ps1`
+  builds a disk from. It never opens or inspects a file, so it cannot tell a real credential
   from a file that merely looks like one, and it does not fire on a credential the caller renamed. It
   reduces accidents. It is not a cryptographic or content-based boundary.
   - **What IS host-verified today: switch isolation, not egress filtering.** `Assert-Sealed` verifies

@@ -60,6 +60,7 @@ Legend: 🟢 **IN SCOPE** (a bug here is a Voidseal defect — see the gate name
 | **Host↔guest channel left ON** (clipboard / shares / guest-services / enhanced-session) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Residual / import / secret-shaped disk left attached** | 🟢 best-effort backstop | 🟢 best-effort backstop | 🟢 structural, authoritative | 🟢 structural, authoritative |
 | **Malicious/malformed profile bypassing load-time invariants** | 🟢 | 🟢 | 🟢 | 🟢 |
+| **Pre-built data disk** substituted before attach, aliasing a run disk, or written by the guest | 🟢 verified before attach; a guest write is reported, not prevented | 🟢 same | 🟢 same | 🟢 same |
 | **Hostile-output extraction / quarantine** | ➖ not a presumed-hostile tier | ➖ not a presumed-hostile tier | 🟡 designed in scope; sink is a scaffold | 🟡 designed in scope; sink is a scaffold |
 | **Host operator error** (unpatched host, wrong parent disk, elevation misuse, etc.) | ⚪ | ⚪ | ⚪ | ⚪ |
 
@@ -136,8 +137,33 @@ Tier ≥ 2 profile that doesn't set `Credentials='None'` / `EgressMode='None'` /
 `Network='None'` processor that still declares egress; a builder (`EgressMode='SquidSniProxy'`) profile
 with no `DepsSpec`, or an allowlist that doesn't cover its fetchers' required hosts; and an
 `EgressAllowlist` entry containing a character outside the safe hostname charset (the guard against
-injecting directives into the Squid `dstdomain` ACL). A profile that got any of these past the loader would
+injecting directives into the Squid `dstdomain` ACL); and a malformed or secret-shaped `DataDisks`
+declaration. A profile that got any of these past the loader would
 be a Voidseal defect.
+
+**Pre-built data disk.** IN SCOPE, every tier where a Disk-mode run declares `DataDisks`
+(`scripts/lib/DataDisks.ps1`). What is enforced, and where it stops:
+- **Before anything is provisioned**, `Invoke-Voidseal` refuses a malformed declaration (name outside
+  `^[a-z0-9]{1,8}$`, duplicate, more than 8, non-local or secret-shaped path, `ImageHash` not 64 hex
+  characters), a Serial-mode run, a run with no `Entrypoint`, and any path under the sandbox storage root
+  or equal to the DEPS disk or the golden parent, compared both lexically and after following junctions
+  and symbolic links. A data disk file with a second hard link is refused, since the other name could be
+  any of those.
+- **Before attach**, every declared disk passes the same check as the DEPS disk
+  (`Assert-DiskImageVerified`): readable, not differencing, and its whole-image SHA-256 (user space,
+  never `Mount-VHD`) equal to the operator-recorded hash. All disks are verified before the first is
+  attached, so one bad disk leaves none attached and the run never seals. This is tamper evidence for
+  the hand-off from `New-VoidsealDataDisk.ps1` to the run, not a statement about where the content came
+  from. A swap in the instant between the hash and the attach is not covered.
+- **In the guest**, the runner mounts each disk read-only and refuses to run the workload if one is
+  missing or mounted writable. That `ro` mount is not a boundary: the host attach is **read-write**
+  (Hyper-V cannot attach a VHDX read-only, D3), and the in-guest user has passwordless sudo, so a hostile
+  guest can remount or write raw blocks.
+- **After the run**, once teardown has removed the VM, every data disk is re-hashed. A change, or a disk
+  that cannot be re-hashed, sets `DataDiskChanged` on the report and warns. It does not fail the run and
+  does not undo the write: the operator must rebuild or restore the disk before relying on it again.
+  Teardown never deletes a data disk (it is not on `CreatedDisks`), and `Assert-Sealed` accepts only
+  recorded data disks.
 
 **Hostile-output extraction / quarantine.**
 - **T0/T1 — not applicable in the adversarial sense.** `Extraction='HostReadResultDir'` is a **trusting**
