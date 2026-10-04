@@ -83,3 +83,18 @@ places where a check is an argument rather than a measurement.
 - Workload deadline from a profile: a workload may set `WorkloadTimeoutSeconds` (60 to 86400).
   `-WorkloadTimeoutSeconds` on `Invoke-Voidseal` and `Invoke-BuilderVM` wins only when explicitly passed,
   then the profile key, then 600.
+- Pre-built data disks (`DataDisks`, Disk mode only): carry a directory tree, wheels or model weights
+  into a sealed guest. `scripts/New-VoidsealDataDisk.ps1` builds an exFAT VHDX from a directory
+  (refusing secret-shaped paths and links in the tree) through the new `CopyDirectoryToVhdx` backend
+  method and prints its whole-image SHA-256. `Invoke-Voidseal` refuses bad names, paths that alias the
+  run's storage root (from `-StorageRoot`, `VOIDSEAL_STORAGE_ROOT` or the default), the DEPS disk or
+  the golden parent, and Serial-mode runs before provisioning. It never attaches the original: each run
+  copies every data disk, and the processor's DEPS disk, into its own sandbox folder through the new
+  `CopyVhdxFile` backend method, verifies each copy's hash before attaching any, and deletes the copies
+  at teardown, so Hyper-V metadata updates and guest writes cannot change the original. The cost is one
+  copy's worth of free space (counted in the free-space preflight) and copy time per disk per run.
+  After teardown each original is re-hashed; a host-side change sets the new `DataDiskChanged` report
+  field, and the new `DataDisks` report field lists each disk's name, original, verified hash, working
+  copy and changed flag. Both Disk-mode runners mount each disk read-only at `/mnt/data/<name>` and
+  power off without running the workload if one is missing or writable. `Mounts` and `Packages` docs
+  now point here. Mock-tested only; the real disk build, copy, attach and re-hash have not run live.

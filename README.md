@@ -36,8 +36,9 @@ rather than duplicating it.
 >   has no 9p, virtiofs or SMB method, so `Mounts` is validated (its source keys are
 >   secret-path-screened) and otherwise inert. A `StageAssets` ISO is attached before the seal and
 >   ejected by it before the guest's only boot. Files reach a running workload only through Disk-mode
->   `Inputs` (the INPUT data disk); the cloud-init seed is built from the profile and carries none of
->   yours. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
+>   `Inputs` (the INPUT data disk) or `DataDisks` (pre-built, hash-verified disks the guest mounts
+>   read-only; build one with `scripts/New-VoidsealDataDisk.ps1`); the cloud-init seed is built from
+>   the profile and carries none of yours. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
 > - **On the `Invoke-Voidseal` path, `BlockProtocols` is declarative and `EgressAllowlist` reaches only
 >   the Serial seed.** No code reads `BlockProtocols`. `EgressAllowlist` is validated, merged and deduped;
 >   for a Serial-mode profile whose `EgressMode` is `InGuestSquid` (Tier 1, as in `ralph`),

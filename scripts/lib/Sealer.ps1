@@ -217,6 +217,25 @@ function Get-CanonicalDiskPath {
 
 <#
 .SYNOPSIS
+    The host paths of the pre-built data disks recorded on a descriptor's DataDisks list.
+.DESCRIPTION
+    Invoke-Voidseal records each verified, attached data disk as an entry carrying Name, Path and
+    ImageHash (hashtable or pscustomobject). Returns the non-blank Path values as a [string[]];
+    empty when nothing is recorded, so an absent field never widens the seal's expected set.
+#>
+function Get-DescriptorDataDiskPath {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([AllowNull()] $Descriptor)
+    $entries = @(Get-DescriptorField -Descriptor $Descriptor -Name 'DataDisks' -Default @())
+    return @($entries | ForEach-Object {
+        if ($_ -is [System.Collections.IDictionary]) { if ($_.Contains('Path')) { [string]$_['Path'] } }
+        elseif ($null -ne $_ -and $null -ne $_.PSObject.Properties['Path']) { [string]$_.Path }
+    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
+<#
+.SYNOPSIS
     Normalize the backend's VM HardDrives field to a flat [string[]] of disk paths.
 .DESCRIPTION
     The FAKE records HardDrives as path STRINGS; the REAL backend as HardDiskDrive objects
@@ -573,8 +592,8 @@ function Lock-Sandbox {
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.
       * Tier >= 2 STRUCTURAL invariant-6 check: the only hard disks that may be attached are the
         recorded system disk and the descriptor's RECORDED workload data disks (InputDiskPath/
-        OutputDiskPath, plus the RC6 CIDATA SeedDiskPath — all attached before the seal, expected to
-        remain); ANY other attached volume is treated as a residual secret/transfer volume and refused
+        OutputDiskPath, plus the RC6 CIDATA SeedDiskPath, the DEPS disk and the hash-verified DataDisks
+        entries; all attached before the seal, expected to remain); ANY other attached volume is treated as a residual secret/transfer volume and refused
         (catches an attached secret volume even if its path isn't secret-shaped). An UNRECORDED data disk is still refused, so this is
         the AUTHORITATIVE no-net guarantee (Tier-3 scope per SCHEMA invariant-6).
       * ANY tier BEST-EFFORT backstop: an attached disk that is NOT an EXPECTED disk (recorded
@@ -813,6 +832,11 @@ function Assert-Sealed {
     # The DEPS disk is attached normally; the recorded DepsDiskPath is simply ACCEPTED (not refused
     # as a residual), exactly like INPUT/OUTPUT. (D3 correction — 2026-06-28.)
     $depsDisk   = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'DepsDiskPath')
+    # Pre-built DATA DISKS (DataDisks.ps1) are accepted exactly like the DEPS disk: verified against
+    # their recorded whole-image hash, attached before the seal and RECORDED on the descriptor's
+    # DataDisks list. Only the recorded paths join the expected sets; an unrecorded disk is still
+    # refused, and the secret check (b) still runs first on every attached path.
+    $dataDiskPaths = @(Get-DescriptorDataDiskPath -Descriptor $Descriptor)
     # Path canonicalization: the set-membership compares below (the structural rule (c)
     # and the all-tier backstop (d)) test a host-truth attached path against these recorded sets with
     # an exact OrdinalIgnoreCase string compare. A recorded path and the attached path that differ
@@ -824,7 +848,7 @@ function Assert-Sealed {
     # This does NOT weaken the gate: an UNRECORDED disk's canonical form is still absent from the set,
     # so it is still refused (a genuinely-different path canonicalizes to a genuinely-different string).
     $expectedDisks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($e in (@($systemDisk) + $createdDisks + $diskPaths + @($inputDisk) + @($outputDisk) + @($seedDisk) + @($depsDisk))) {
+    foreach ($e in (@($systemDisk) + $createdDisks + $diskPaths + @($inputDisk) + @($outputDisk) + @($seedDisk) + @($depsDisk) + $dataDiskPaths)) {
         if (-not [string]::IsNullOrWhiteSpace([string]$e)) { [void]$expectedDisks.Add((Get-CanonicalDiskPath ([string]$e))) }
     }
     # The recorded data disks, as a set, used by the Tier>=2 STRUCTURAL rule (c) to allow them too
@@ -834,7 +858,7 @@ function Assert-Sealed {
     # Task 1.3: the DEPS disk (DepsDiskPath) joins the same recorded-data-disk set for the structural
     # rule, mirroring the SeedDiskPath addition (an UNRECORDED disk is still refused by rule (c)).
     $recordedDataDisks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($e in (@($inputDisk) + @($outputDisk) + @($seedDisk) + @($depsDisk))) {
+    foreach ($e in (@($inputDisk) + @($outputDisk) + @($seedDisk) + @($depsDisk) + $dataDiskPaths)) {
         if (-not [string]::IsNullOrWhiteSpace([string]$e)) { [void]$recordedDataDisks.Add((Get-CanonicalDiskPath ([string]$e))) }
     }
     # The system disk in canonical form, for the structural rule (c)'s system-disk compare.
