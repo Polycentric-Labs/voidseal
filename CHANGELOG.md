@@ -176,3 +176,8 @@ places where a check is an argument rather than a measurement.
   settings, and an in-guest default-DROP that allows only the proxy port. `InGuestSquid` still works for
   a tier that sets it; the builder keeps `SquidSniProxy`. Mock-green only: the first elevated run follows
   `docs/phase-6-live-runbook.md` section 2, which this replaces (no host Squid, no NAT).
+- Profile schema: `InputDiskSizeBytes` and `OutputDiskSizeBytes` (data-disk sizes, integers from 64MB to
+  2TB, default 1GB each) and `DepsImageHash` (64 hex characters, either case) are now schema keys that
+  layer from a workload profile. The engine already read all three from the resolved profile, but the
+  unknown-key refusal rejected them at load, so a profile could not set them. Out-of-range sizes and
+  malformed hashes are refused at load. Documented in `tier-profiles/SCHEMA.md`.

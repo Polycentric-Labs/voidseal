@@ -115,7 +115,10 @@ $script:WorkloadRequiredKeys = @('BaseTier', 'Name', 'Entrypoint')
 # Disk-mode workload (firefox) that still wants the Raw-OUTPUT / user-space-outbox-read path without
 # a ScreenConfig. DataDisks declares pre-built, hash-verified data disks (a -Workload.DataDisks value
 # replaces this one entirely at run time). ResultInnerName names the staged file a transport-only run
-# releases (a -Workload.ResultInnerName value wins over it).
+# releases (a -Workload.ResultInnerName value wins over it). InputDiskSizeBytes / OutputDiskSizeBytes
+# size the INPUT / OUTPUT data disks (New-WorkloadDisks, default 1GB each) and DepsImageHash is the
+# whole-image SHA-256 a processor run checks its deps disk against when -Workload supplies none
+# (Invoke-Voidseal); the engine reads all three from the resolved profile, so the loader owns them.
 #
 # This is also the SCHEMA KEY LIST for the unknown-key refusal (Assert-KnownProfileKeys): a key that
 # is in no list in this file is refused at load rather than silently ignored.
@@ -124,7 +127,7 @@ $script:WorkloadLayeredKeys = @(
     'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
     'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput',
     'Memory', 'Cpu', 'CpuMaximumPercent', 'CpuRelativeWeight', 'WorkloadTimeoutSeconds',
-    'DataDisks', 'ResultInnerName'
+    'DataDisks', 'ResultInnerName', 'InputDiskSizeBytes', 'OutputDiskSizeBytes', 'DepsImageHash'
 )
 
 # Workload keys that are legitimate but never layered onto the merged profile: ExtraAllowlist is
@@ -145,6 +148,16 @@ $script:ProfileCpuRelativeWeightMin  = 1
 $script:ProfileCpuRelativeWeightMax  = 10000
 $script:ProfileWorkloadTimeoutMin    = 60
 $script:ProfileWorkloadTimeoutMax    = 86400
+
+# Data-disk sizes (InputDiskSizeBytes / OutputDiskSizeBytes), in bytes, inclusive. 64MB is the size of
+# the engine's own FAT32 CIDATA seed disk, the smallest volume the engine creates; 2TB bounds a profile
+# well inside what a fixed-size OUTPUT VHDX and the host free-space preflight can sensibly be asked for.
+$script:ProfileDiskSizeMinBytes      = 64MB
+$script:ProfileDiskSizeMaxBytes      = 2TB
+
+# DepsImageHash: a whole-image SHA-256, exactly 64 hex characters in either case. \z, not $, so a
+# trailing newline is not accepted.
+$script:DepsImageHashPattern         = '^[0-9A-Fa-f]{64}\z'
 
 # A ResultInnerName names one file in the outbox container (guest/outbox.py's name rule: 1 to 40 of
 # A-Z a-z 0-9 . _ -), and the host joins it onto a destination directory, so it must be a plain file
@@ -691,6 +704,24 @@ function Assert-TierProfileValid {
     Assert-OptionalIntInRange -Profile $Profile -Key 'CpuMaximumPercent' -Min $script:ProfileCpuMaximumPercentMin -Max $script:ProfileCpuMaximumPercentMax -Context $Context
     Assert-OptionalIntInRange -Profile $Profile -Key 'CpuRelativeWeight' -Min $script:ProfileCpuRelativeWeightMin -Max $script:ProfileCpuRelativeWeightMax -Context $Context
     Assert-OptionalIntInRange -Profile $Profile -Key 'WorkloadTimeoutSeconds' -Min $script:ProfileWorkloadTimeoutMin -Max $script:ProfileWorkloadTimeoutMax -Context $Context
+
+    # Data-disk sizes (optional, bytes): a true integer in 64MB..2TB. Checked here so New-WorkloadDisks
+    # never sees a size the host could not create, and so the loader and the engine agree on the bounds.
+    foreach ($sizeKey in @('InputDiskSizeBytes', 'OutputDiskSizeBytes')) {
+        if (-not $Profile.ContainsKey($sizeKey) -or $null -eq $Profile[$sizeKey]) { continue }
+        $sv = $Profile[$sizeKey]
+        if (-not (($sv -is [int]) -or ($sv -is [long])) -or $sv -lt $script:ProfileDiskSizeMinBytes -or $sv -gt $script:ProfileDiskSizeMaxBytes) {
+            throw "Schema validation: '$Context' field '$sizeKey' must be an integer in 64MB..2TB ($($script:ProfileDiskSizeMinBytes)..$($script:ProfileDiskSizeMaxBytes) bytes) (got '$sv')."
+        }
+    }
+
+    # DepsImageHash (optional): the whole-image SHA-256 of the deps disk, exactly 64 hex characters.
+    if ($Profile.ContainsKey('DepsImageHash') -and $null -ne $Profile['DepsImageHash']) {
+        $dh = $Profile['DepsImageHash']
+        if (-not ($dh -is [string]) -or $dh -cnotmatch $script:DepsImageHashPattern) {
+            throw "Schema validation: '$Context' field 'DepsImageHash' must be exactly 64 hex characters (a whole-image SHA-256, either case) (got '$dh')."
+        }
+    }
 
     # ResultInnerName (optional): the one staged file a transport-only run releases. It is joined onto a
     # host directory and matched against the outbox's entry names, so it must be a plain file name.
