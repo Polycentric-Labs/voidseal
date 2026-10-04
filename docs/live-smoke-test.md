@@ -815,7 +815,7 @@ any gap-related friction observed).
 
 **Dry run**
 - [ ] `Invoke-Pester -Path tests/` → **0 failed** (1517 passed / 2 skipped as of the last local run; gate on Failed: 0, not on a total), see §2.1
-- [ ] `python -m pytest tests/guest tests/host -q` → **185 passed, 0 failed** — §2.1
+- [ ] `python -m pytest tests/guest tests/host -q` → **185 passed, 0 failed**, see §2.1
 - [ ] Fake-backend `Invoke-Voidseal` shows `INIT..DESTROYED`, `SealVerdict=$true`, clean teardown — §2.2
 
 **Milestone 1 — Firefox (Tier 0), synthetic (containment proof, stand-in output)**
