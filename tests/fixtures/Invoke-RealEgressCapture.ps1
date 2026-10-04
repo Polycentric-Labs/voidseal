@@ -9,7 +9,7 @@
     session state captured when New-RealHyperVBackend ran, so a Pester Mock cannot intercept them
     (Invoke-RealBackendCapture.ps1 carries the full note). This script defines the stubs and dot-sources
     the lib in the SAME top-level scope, so the REAL bodies run against the stubs with no live host
-    network change, no Hyper-V and no elevation. The parent Pester test (tests/HostEgress.Tests.ps1)
+    network change, no Hyper-V and no elevation. The parent Pester test (tests/EgressBackend.Tests.ps1)
     runs it in a child pwsh and asserts on the single JSON line it prints.
 
     The stubs model the real objects' awkward parts on purpose: the firewall rule's Enabled, Action and

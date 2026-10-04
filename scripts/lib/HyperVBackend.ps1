@@ -3789,6 +3789,9 @@ function New-FakeHyperVBackend {
     # TEST-ONLY, same rule: the proxy processes the fake "started" (id -> @{ Running; Arguments; ... }), so a
     # test can prove teardown stopped exactly the one it started.
     $b.FakeEgressProcesses = $state.EgressProcs
+    # TEST-ONLY, same rule: the host firewall rules by Name, so a seal-gate test can model a rule that was
+    # disabled or edited outside the tool (no backend method changes a rule in place).
+    $b.FakeFirewallRules = $state.FirewallRules
 
     return $b
 }

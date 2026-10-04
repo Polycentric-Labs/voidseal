@@ -38,10 +38,11 @@
            enhanced-session, plus the Time Synchronization, Key-Value Pair Exchange, Backup and
            Heartbeat integration services) via the backend's SetHostChannel,
         4. mark the descriptor State='Sealed'.
-      It does NOT power the VM on (the seal runs before first boot) and it does NOT itself filter
-      egress: Tier-1 net-restriction relies on in-guest controls (Squid SNI proxy + allowlist) as
-      defense-in-depth today; host-side egress enforcement (Squid/NAT/default-DROP) is Phase-6-live,
-      not this function's job. A Tier-1 non-processor keeps its NIC; every other VM has it removed.
+      It does NOT power the VM on (the seal runs before first boot). For a Tier-1 non-processor with
+      EgressMode='HostProxy' it installs the host side of egress (gateway address, host firewall rules,
+      port ACL; HostEgress.ps1), which the gate then reads back; the proxy itself starts after the gate.
+      For EgressMode='InGuestSquid' the only egress control is the in-guest layer (defense in depth, not
+      a boundary). A Tier-1 non-processor keeps its NIC; every other VM has it removed.
 
     THE GATE (Assert-Sealed; SCHEMA.md invariant 6 — the runtime pre-seal gate):
       Verifies the seal FROM THE HOST via backend Get* calls — the guest's own view is NEVER
@@ -56,6 +57,9 @@
           MUST be empty (no NIC, no live egress route). A Tier-1 non-processor keeps exactly one NIC,
           which must sit on the VM's own recorded Internal switch (descriptor SwitchName), not the
           Default Switch and not any other switch. A $null adapter read refuses in both branches.
+          With EgressMode='HostProxy' the gate also requires the recorded gateway address, firewall
+          rules and port ACL entries on the host exactly as recorded, the record to be the full set the
+          VM's address plan requires, and no NAT covering its subnet (Assert-SandboxEgressSealed).
         * ANY tier: no GPU partition adapter and no device assigned by Discrete Device Assignment
           (GetGpuPartitionAdapters / GetAssignableDevices; a read that fails refuses).
         * ANY tier: no path on COM2 (GetComPort Number=2; Voidseal wires only COM1).
@@ -112,6 +116,8 @@ Set-StrictMode -Version Latest
 
 # Get-SealNicPolicy, the NIC predicate Lock-Sandbox and Assert-Sealed share with the Provisioner.
 . (Join-Path $PSScriptRoot 'SealPolicy.ps1')
+# HostProxy egress: Lock-Sandbox installs the host side, Assert-Sealed reads it back (HostEgress.ps1).
+. (Join-Path $PSScriptRoot 'HostEgress.ps1')
 
 # --------------------------------------------------------------------------
 # Shared constants
@@ -489,10 +495,12 @@ function Dismount-SandboxAsset {
       4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session /
          time sync / key-value exchange / backup / heartbeat),
       5. set the descriptor State = 'Sealed'.
-    It does NOT power the VM on, and does NOT itself filter egress: Tier-1 net-restriction today
-    relies on in-guest controls (Squid SNI proxy + allowlist) as defense-in-depth, not this
-    function's job; host-side egress enforcement is Phase-6-live. A Tier-1 non-processor KEEPS its
-    NIC; Tier 0, Tier >= 2 and every processor are no-NIC.
+    Between 3 and 4, a Tier-1 non-processor whose descriptor records EgressMode='HostProxy' gets the
+    host side of its egress installed (gateway address, host firewall rules, port ACL; HostEgress.ps1
+    Install-SandboxEgressNetwork). That is host-enforced filtering, and Assert-Sealed reads it back. The
+    proxy process itself starts later, after the gate. For EgressMode='InGuestSquid' the only egress
+    control is the in-guest layer, which is defense in depth and not a boundary. It does NOT power the
+    VM on. A Tier-1 non-processor KEEPS its NIC; Tier 0, Tier >= 2 and every processor are no-NIC.
 .PARAMETER Descriptor
     The New-SandboxVM descriptor (consumed + updated; its Tier and Network drive the NIC decision).
 .PARAMETER Backend
@@ -567,8 +575,22 @@ function Lock-Sandbox {
     # removes the NIC for any other value, including one this code does not recognize. An unrecognized
     # policy can never keep a NIC.
     $network = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'Network')
-    if ((Get-SealNicPolicy -Tier $tier -Network $network) -ne 'IsolatedInternalSwitch') {
+    $lockNicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
+    if ($lockNicPolicy -ne 'IsolatedInternalSwitch') {
         $null = & $Backend.RemoveNetworkAdapter @{ VMName = $vmName }
+    }
+
+    # --- 3b. HostProxy: install the host side of egress before the gate reads it ---
+    # A VM that keeps its NIC and records EgressMode='HostProxy' gets its gateway address, host firewall
+    # rules and port ACL now (Install-SandboxEgressNetwork, HostEgress.ps1), each recorded on the
+    # descriptor as it is created and rolled back if a later step fails. Assert-Sealed then reads every
+    # one back from the host. The proxy process is NOT started here: the orchestrator starts it only
+    # after the gate certifies. A descriptor that already records the gateway address was installed by
+    # an earlier Lock-Sandbox and is left as it is (the gate still checks it).
+    if ($lockNicPolicy -eq 'IsolatedInternalSwitch' -and
+        [string](Get-DescriptorField -Descriptor $Descriptor -Name 'EgressMode') -eq 'HostProxy' -and
+        [string]::IsNullOrWhiteSpace([string](Get-DescriptorField -Descriptor $Descriptor -Name 'EgressGatewayAddress'))) {
+        Install-SandboxEgressNetwork -Descriptor $Descriptor -Backend $Backend
     }
 
     # --- 4. turn OFF every host<->guest channel ---------------------------
@@ -821,6 +843,13 @@ function Assert-Sealed {
                        "'$switchName', not this VM's own recorded switch '$recordedSwitch'. An Internal switch built " +
                        "for another sandbox, or one the host routes or NATs, is not this VM's isolated switch. Fail closed.")
             }
+        }
+
+        # HostProxy (EgressMode recorded by New-SandboxVM): the host side of egress must be on the host
+        # exactly as recorded, the record must be the full set the address plan requires, and no NAT may
+        # cover the VM's subnet (Assert-SandboxEgressSealed, HostEgress.ps1). Every unreadable read refuses.
+        if ([string](Get-DescriptorField -Descriptor $Descriptor -Name 'EgressMode') -eq 'HostProxy') {
+            Assert-SandboxEgressSealed -Descriptor $Descriptor -Backend $Backend
         }
     }
 

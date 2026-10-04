@@ -303,7 +303,9 @@ function New-WorkloadDisks {
 .PARAMETER Profile
     The resolved profile. New-CidataUserData picks the user-data from it: in Disk mode the runner with
     the Entrypoint substituted (so a non-blank Entrypoint is required); in Serial mode the serial-getty
-    autologin baseline, plus the in-guest egress layer for EgressMode='InGuestSquid'. A Serial
+    autologin baseline, plus the in-guest egress layer for EgressMode='InGuestSquid', or, when the
+    descriptor records EgressMode='HostProxy' with an address plan, the host-proxy settings plus a
+    third document, `network-config` (one static address, no route, no resolver). A Serial
     Entrypoint is not part of the seed; the Runner delivers it over COM1. (Serial mode joined RC6 on
     2026-10-03: its DVD seed had been ejected by the seal before the guest's only boot, too.)
 .PARAMETER StorageRoot
@@ -328,8 +330,20 @@ function New-WorkloadSeedDisk {
     # no seed disk. Both documents are LF-normalized (the user-data embeds a #!/bin/sh runner; a CRLF
     # there is a guest bad-interpreter failure). Belt-and-braces re-normalize so the on-disk seed is
     # LF-only regardless of the content source.
-    $userData = ConvertTo-LfText -Text ([string](New-CidataUserData -Profile $Profile))
+    # A HostProxy VM (EgressMode recorded on the descriptor, with the address plan New-SandboxVM checked)
+    # also gets a network-config: one static address in its /30, no route, no resolver. The plan is
+    # passed to New-CidataUserData so the seed's proxy settings name the same gateway. A HostProxy
+    # descriptor WITHOUT a plan reaches New-CidataUserData with none, which refuses (fail closed).
+    $egressPlan = $null
+    $descEgressMode = $null
+    if ($null -ne $Descriptor.PSObject.Properties['EgressMode']) { $descEgressMode = [string]$Descriptor.EgressMode }
+    if ($descEgressMode -eq 'HostProxy' -and $null -ne $Descriptor.PSObject.Properties['Egress']) { $egressPlan = $Descriptor.Egress }
+    $udArgs = @{ Profile = $Profile }
+    if ($null -ne $egressPlan) { $udArgs.Egress = $egressPlan }
+    $userData = ConvertTo-LfText -Text ([string](New-CidataUserData @udArgs))
     $metaData = ConvertTo-LfText -Text ([string](New-CidataMetaData))
+    $netConfig = $null
+    if ($null -ne $egressPlan) { $netConfig = ConvertTo-LfText -Text ([string](New-CidataNetworkConfig -Egress $egressPlan)) }
 
     # CIDATA disk: create -> RECORD (field + CreatedDisks) -> populate -> attach. The record happens
     # right after CREATE (before populate/attach) so even a populate/attach throw leaves the disk
@@ -354,6 +368,9 @@ function New-WorkloadSeedDisk {
     # at the volume root). WriteVhdxFile writes the content verbatim (LF preserved, no BOM).
     $null = & $Backend.WriteVhdxFile @{ Path = $seedPath; InnerPath = 'user-data'; Content = $userData }
     $null = & $Backend.WriteVhdxFile @{ Path = $seedPath; InnerPath = 'meta-data'; Content = $metaData }
+    if ($null -ne $netConfig) {
+        $null = & $Backend.WriteVhdxFile @{ Path = $seedPath; InnerPath = 'network-config'; Content = $netConfig }
+    }
 
     # Attach the seed disk to the VM BEFORE the seal so the seal's host-truth scan records it.
     $null = & $Backend.AddHardDiskDrive @{ VMName = $name; Path = $seedPath }

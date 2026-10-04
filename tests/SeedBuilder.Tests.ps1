@@ -957,3 +957,178 @@ Describe 'New-CidataUserData - the serial baseline and serial egress seeds narra
         $script:SerialEgressUd | Should -BeLike '*iptables -P OUTPUT DROP*'
     }
 }
+
+# ===========================================================================
+#  Serial + HostProxy: the guest side of host-enforced egress (EgressMode='HostProxy')
+# ===========================================================================
+Describe 'New-CidataUserData and New-CidataNetworkConfig - Serial + HostProxy' {
+
+    BeforeAll {
+        $script:HPProfile = @{
+            Tier = 1; Name = 'ralph'; WorkloadMode = 'Serial'; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'
+            Entrypoint = 'bash /opt/ralph/ralph-claude-code/ralph_loop.sh'; EgressAllowlist = @('api.example.com', '.files.example.org')
+        }
+        $script:HPPlan = Get-EgressAddressPlan -VMName 'sbx-seed' -SwitchName 'sbx-seed-int'
+        $script:HPUd = New-CidataUserData -Profile $script:HPProfile -Egress $script:HPPlan
+        $script:HPNc = New-CidataNetworkConfig -Egress $script:HPPlan
+        $script:HPProxy = "http://$($script:HPPlan.GatewayIP):13128"
+
+        function script:Get-HPSeedFile {
+            param([string] $UserData, [string] $Path)
+            $lines = $UserData -split "`n"
+            $start = [array]::IndexOf($lines, "  - path: $Path")
+            $start | Should -BeGreaterOrEqual 0 -Because "the seed must write $Path"
+            $i = $start + 1
+            while ($i -lt $lines.Count -and $lines[$i] -notmatch '^    content: \|') { $i++ }
+            $body = [System.Collections.Generic.List[string]]::new()
+            for ($i = $i + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - path: ' -or $lines[$i] -match '^  #' -or $lines[$i] -match '^\S') { break }
+                $body.Add(($lines[$i] -replace '^      ', ''))
+            }
+            return ($body -join "`n").TrimEnd()
+        }
+        function script:Get-HPRunCmd {
+            param([string] $UserData)
+            $lines = $UserData -split "`n"
+            $at = [array]::IndexOf($lines, 'runcmd:')
+            $out = [System.Collections.Generic.List[string]]::new()
+            for ($i = $at + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - ') { $out.Add($lines[$i].Trim()) } elseif ($lines[$i] -match '^\S') { break }
+            }
+            return @($out)
+        }
+        $script:HPPosixSh = $null
+        if ($IsWindows) {
+            foreach ($git in @(Get-Command git -CommandType Application -All -ErrorAction SilentlyContinue)) {
+                $dir = Split-Path -Parent $git.Source
+                for ($up = 0; $up -lt 3 -and -not $script:HPPosixSh -and $dir; $up++) {
+                    $dir = Split-Path -Parent $dir
+                    foreach ($c in 'usr\bin\dash.exe', 'usr\bin\sh.exe') {
+                        $cand = Join-Path $dir $c
+                        if (Test-Path -LiteralPath $cand) { $script:HPPosixSh = $cand; break }
+                    }
+                }
+                if ($script:HPPosixSh) { break }
+            }
+        }
+        else {
+            $sh = Get-Command dash, sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sh) { $script:HPPosixSh = $sh.Source }
+        }
+    }
+
+    It 'keeps the serial command channel and substitutes every token' {
+        $script:HPUd | Should -Match '#cloud-config'
+        $script:HPUd | Should -Match '--autologin sandbox'
+        $script:HPUd | Should -Not -Match '__[A-Z_]+__' -Because 'an unsubstituted token would ship a broken seed'
+        $script:HPUd | Should -Not -Match "`r"
+    }
+
+    It 'points every client at the host proxy, with NO_PROXY empty, in /etc/environment and a login profile script' {
+        $envFile = script:Get-HPSeedFile $script:HPUd '/etc/environment'
+        @($envFile -split "`n") | Should -Be @("HTTPS_PROXY=$($script:HPProxy)", "https_proxy=$($script:HPProxy)", 'NO_PROXY=', 'no_proxy=')
+        $script:HPUd | Should -Match '(?m)^    append: true$' -Because '/etc/environment is appended to, not replaced'
+        $prof = script:Get-HPSeedFile $script:HPUd '/etc/profile.d/voidseal-egress-proxy.sh'
+        $prof | Should -Match ([regex]::Escape("export HTTPS_PROXY=$($script:HPProxy)"))
+        $prof | Should -Match '(?m)^export NO_PROXY=$'
+        $script:HPUd | Should -Not -Match 'HTTP_PROXY=' -Because 'there is no plain-HTTP proxying'
+    }
+
+    It 'configures apt for the proxy and moves the Debian sources to https' {
+        $apt = script:Get-HPSeedFile $script:HPUd '/etc/apt/apt.conf.d/99voidseal-proxy'
+        $apt | Should -Match ([regex]::Escape("Acquire::https::Proxy `"$($script:HPProxy)/`";"))
+        $cmds = script:Get-HPRunCmd $script:HPUd
+        ($cmds -join "`n") | Should -Match 'http://deb\.debian\.org#https://deb\.debian\.org'
+    }
+
+    It 'the in-guest default-DROP allows only TCP to the gateway proxy port (nftables, with an iptables fallback)' {
+        $lock = script:Get-HPSeedFile $script:HPUd '/usr/local/sbin/voidseal-egress-lockdown'
+        $lock | Should -Match 'policy drop;'
+        $lock | Should -Match ([regex]::Escape("ip daddr $($script:HPPlan.GatewayIP) tcp dport 13128 accept"))
+        $lock | Should -Match ([regex]::Escape("iptables -A OUTPUT -p tcp -d $($script:HPPlan.GatewayIP) --dport 13128 -j ACCEPT"))
+        $lock | Should -Match 'iptables -P OUTPUT DROP'
+        $lock | Should -Not -Match 'dport 53|dport 80\b|dport 443|REDIRECT' -Because 'no DNS and no direct web egress in HostProxy mode'
+    }
+
+    It 'applies the lockdown in runcmd before any apt step, and runs the diag script last' {
+        $cmds = script:Get-HPRunCmd $script:HPUd
+        $iLock = [array]::IndexOf($cmds, '- systemctl enable --now voidseal-egress.service')
+        $iApt  = [array]::IndexOf($cmds, '- [ apt-get, update ]')
+        $iLock | Should -BeGreaterOrEqual 0
+        $iLock | Should -BeLessThan $iApt
+        $cmds[-1] | Should -Be '- [ /usr/local/sbin/voidseal-serial-diag ]'
+        $script:HPUd | Should -Match 'Before=network-pre\.target'
+    }
+
+    It 'the diag script narrates the egress facts structurally' {
+        $diag = script:Get-HPSeedFile $script:HPUd '/usr/local/sbin/voidseal-serial-diag'
+        foreach ($m in 'egress_mode=hostproxy', 'guest_addr=', 'default_routes=', 'nameservers=', 'proxy_env=', 'egress_unit_enabled=', 'proxy_reachable=') {
+            $diag | Should -BeLike "*$m*"
+        }
+        $diag | Should -Match '(?m)^set \+e$'
+    }
+
+    It 'the lockdown and diag scripts parse as POSIX sh (sh -n)' -ForEach @(
+        @{ Path = '/usr/local/sbin/voidseal-egress-lockdown' }, @{ Path = '/usr/local/sbin/voidseal-serial-diag' }
+    ) {
+        if (-not $script:HPPosixSh) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $f = Join-Path $TestDrive ("hp-" + (Split-Path -Leaf $Path) + '.sh')
+        [System.IO.File]::WriteAllText($f, (script:Get-HPSeedFile $script:HPUd $Path) + "`n", [System.Text.UTF8Encoding]::new($false))
+        $out = & $script:HPPosixSh -n $f 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because "sh -n reported: $out"
+    }
+
+    It 'the user-data and network-config parse as YAML (when PyYAML is available)' {
+        $py = $null
+        try { $py = Resolve-PythonExe } catch { $py = $null }
+        if (-not $py) { Set-ItResult -Skipped -Because 'no host Python'; return }
+        & $py -c 'import yaml' 2>$null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'PyYAML is not installed'; return }
+        $toJson = 'import sys,yaml,json; print(json.dumps(yaml.safe_load(open(sys.argv[1],encoding="utf-8"))))'
+        $parsed = @{}
+        foreach ($doc in @(@{ Name = 'ud'; Text = $script:HPUd }, @{ Name = 'nc'; Text = $script:HPNc })) {
+            $f = Join-Path $TestDrive "hp-$($doc.Name).yaml"
+            [System.IO.File]::WriteAllText($f, $doc.Text, [System.Text.UTF8Encoding]::new($false))
+            $out = & $py -c $toJson $f 2>&1
+            $LASTEXITCODE | Should -Be 0 -Because "YAML parse of $($doc.Name) reported: $out"
+            $parsed[$doc.Name] = ($out | Out-String) | ConvertFrom-Json
+        }
+        $nc = $parsed['nc']
+        $nc.version | Should -Be 2
+        @($nc.ethernets.eth0.addresses) | Should -Be @("$($script:HPPlan.GuestIP)/30")
+        $nc.ethernets.eth0.dhcp4 | Should -BeFalse
+        $nc.ethernets.eth0.PSObject.Properties.Name | Should -Not -Contain 'routes'
+        $nc.ethernets.eth0.PSObject.Properties.Name | Should -Not -Contain 'gateway4'
+        $nc.ethernets.eth0.PSObject.Properties.Name | Should -Not -Contain 'nameservers'
+        @($parsed['ud'].write_files | Where-Object { $_.path -eq '/etc/environment' })[0].append | Should -BeTrue
+    }
+
+    It 'the network-config is one static address with DHCP off and no route or resolver' {
+        $script:HPNc | Should -Match '(?m)^version: 2$'
+        $script:HPNc | Should -Match ([regex]::Escape("      - $($script:HPPlan.GuestIP)/30"))
+        $script:HPNc | Should -Match 'dhcp4: false'
+        $script:HPNc | Should -Not -Match 'gateway|routes|nameservers|via'
+    }
+
+    It 'FAILS CLOSED without a plan, with a malformed plan, or with an empty allowlist' {
+        { New-CidataUserData -Profile $script:HPProfile } | Should -Throw "New-CidataUserData: a Serial+HostProxy seed needs the VM's egress address plan (-Egress, from the descriptor); none was given. Fail closed."
+        $bad = @{} + $script:HPPlan; $bad['GatewayIP'] = "10.231.0.1'; reboot; '"
+        { New-CidataUserData -Profile $script:HPProfile -Egress $bad } | Should -Throw 'New-CidataUserData: the egress address plan is malformed*'
+        $far = @{} + $script:HPPlan; $far['GuestIP'] = '192.168.7.2'
+        { New-CidataNetworkConfig -Egress $far } | Should -Throw "New-CidataUserData: the egress plan's gateway * and guest 192.168.7.2 are not two addresses in one /30. Fail closed."
+        $empty = $script:HPProfile.Clone(); $empty['EgressAllowlist'] = @()
+        { New-CidataUserData -Profile $empty -Egress $script:HPPlan } | Should -Throw 'New-CidataUserData: a Serial+HostProxy profile must have a non-empty EgressAllowlist (fail-closed).'
+    }
+
+    It 'FAILS CLOSED for a Disk-mode Tier-1 HostProxy profile (no Disk runner uses the host proxy)' {
+        $disk = $script:HPProfile.Clone(); $disk['WorkloadMode'] = 'Disk'; $disk['Entrypoint'] = 'python3 /mnt/in/x.py'
+        { New-CidataUserData -Profile $disk -Egress $script:HPPlan } | Should -Throw "New-CidataUserData: 'HostProxy' is wired for SERIAL-mode Tier-1 seeds*"
+    }
+
+    It 'a Tier-0 HostProxy profile (sealed with no adapter) keeps the offline seed' {
+        $t0 = @{ Tier = 0; Name = 't0'; WorkloadMode = 'Serial'; Network = 'HostProxyAllowlist'; EgressMode = 'HostProxy'; EgressAllowlist = @() }
+        New-CidataUserData -Profile $t0 | Should -Not -Match 'HTTPS_PROXY|voidseal-egress'
+        $disk0 = $script:DiskProfile.Clone(); $disk0['EgressMode'] = 'HostProxy'
+        New-CidataUserData -Profile $disk0 | Should -Not -Match 'HTTPS_PROXY'
+    }
+}

@@ -65,6 +65,7 @@ $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
 . (Join-Path $script:DeployLibDir 'SeedBuilder.ps1')
 . (Join-Path $script:DeployLibDir 'SensitivityGate.ps1')
 . (Join-Path $script:DeployLibDir 'DataDisks.ps1')
+. (Join-Path $script:DeployLibDir 'HostEgress.ps1')
 
 # --------------------------------------------------------------------------
 # C1.2: shared outbox-producer READ template — user-space, NEVER Mount-VHD.
@@ -555,6 +556,9 @@ function Invoke-Voidseal {
         # got, deleted at teardown) and Changed.
         DataDiskChanged   = $null
         DataDisks         = $null
+        # HostProxy runs only: the host egress proxy's per-connection JSON log (one line per CONNECT
+        # attempt: name, decision, reason, byte counts; never payload). $null when no proxy ran.
+        EgressProxyLog    = $null
     }
 
     $descriptor = $null
@@ -776,6 +780,22 @@ function Invoke-Voidseal {
             throw "Invoke-Voidseal: seal gate did not certify '$Name' (Assert-Sealed returned a non-true verdict); refusing to run the workload."
         }
         $states.Add('SEALED')
+
+        # --- HostProxy: start the host egress proxy AFTER the gate, BEFORE the guest boots -----------
+        # Lock-Sandbox installed the gateway address, firewall rules and port ACL, and Assert-Sealed has
+        # just read them back. The proxy (HostEgress.ps1 Start-SandboxEgressProxy) is the one door they
+        # leave open: it listens on the gateway address only and enforces the merged EgressAllowlist. It
+        # starts only for a run whose guest will boot, its log lands in the run's artifact folder, and it
+        # exits on its own at the run's deadline plus a margin or when this process exits; teardown
+        # (Remove-Sandbox) stops it first. A proxy that does not come up is a lifecycle failure.
+        $guestWillBoot = ($workloadMode -eq 'Disk') -or -not [string]::IsNullOrWhiteSpace($entrypoint)
+        if ($guestWillBoot -and (Test-SandboxUsesHostProxy -Descriptor $descriptor)) {
+            Start-SandboxEgressProxy -Descriptor $descriptor -Allowlist @($resolved['EgressAllowlist']) `
+                -RunDirectory $ArtifactRoot -MaxLifetimeSeconds ($effectiveTimeoutSeconds + $BootWaitSeconds + 900) `
+                -PythonExe (Resolve-PythonExe) -Backend $Backend
+            $report.EgressProxyLog = [string]$descriptor.EgressProxy.LogPath
+            $report.Descriptor = $descriptor
+        }
 
         # --- RUNNING / CAPTURED / EXTRACTED -------------------------------
         if ($workloadMode -eq 'Disk') {
