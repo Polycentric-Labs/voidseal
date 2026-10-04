@@ -37,3 +37,36 @@ places where a check is an argument rather than a measurement.
   first with the legacy exFAT OUTPUT disk (2026-06-25) and then with the current user-space outbox
   transport (2026-07-21). The **Tier-1 `ralph` live run is still pending** (operator-run, elevated; see
   `docs/live-smoke-test.md`). Tier 2 and Tier 3 are scaffold-only and have had no live run.
+- Fixed: the sensitivity screener of a processor profile now runs in the guest, with `--mode` taken
+  from `ScreenConfig`. The shared outbox runner had hard-coded `--transport-only`, so the producer
+  packed an empty `verdicts.json` and the host gate refused every staged file; no processor run could
+  release anything. `Invoke-Voidseal` also refuses a processor whose Inputs lack
+  `run_disk_workload.py`, `outbox.py` or `screener.py`, before provisioning. A shared
+  `Test-IsProcessorProfile` predicate keeps the guest screening and the host gating in agreement.
+- Fixed: the Serial-mode seed now rides a CIDATA data disk that survives the seal, as Disk mode
+  already did. It was attached as a DVD and ejected before the guest's only boot, so cloud-init never
+  saw it. `Add-SandboxSeed` is removed.
+- Fixed: teardown removes the per-VM `<vm>-int` Internal switch the provision created, recorded as
+  `CreatedSwitches` on the descriptor. A switch that already existed and was reused is left alone.
+- Fixed: the Disk runners' INPUT mount fallback arm is now `mount -o ro LABEL=INPUT`, so INPUT stays
+  read-only when the kernel rejects the uid/gid options. `ro` keeps a buggy workload from rewriting
+  its inputs; it is not a boundary against a hostile guest.
+- Fixed: the outbox reader resolves a real Python interpreter and skips Windows App Execution Alias
+  stubs, whose first launch could fail with a misleading `StandardOutputEncoding` error.
+- Fixed: `Resolve-PythonExe` also refuses `.bat` and `.cmd` shims, which run through `cmd.exe` and can
+  rewrite arguments. On Windows only an `.exe` is accepted; the failure message names each skipped
+  alias and shim.
+- Fixed: `Invoke-SensitivityGate` Run mode launches the screener with a resolved interpreter instead
+  of a bare `python`. `Resolve-PythonExe` moved to `scripts/lib/PythonResolver.ps1`, and the gate takes
+  an optional `-PythonExe` that defaults to it. No production caller uses Run mode; tests and manual
+  host screening do.
+- Fixed: the outbox helper preflight now covers transport-only `OutboxOutput` Disk profiles such as
+  `firefox`. A run whose effective Inputs lack `run_disk_workload.py` or `outbox.py` is refused before
+  provisioning, naming the missing files, instead of failing later as "outbox header missing".
+- Docs: a profile's `Packages` list is declared but nothing installs it, `Mounts` is declared but
+  moves no files, and a `StageAssets` ISO is ejected by the seal before the guest's only boot, so only
+  Disk-mode `Inputs` reach a running workload. Tests pin each claim against the code, and the
+  `Packages` check now matches its key without regard to case, with a planted-reader control.
+- Docs: the `ralph` profile's `ExtraAllowlist` comment no longer calls `claude.ai` and
+  `storage.googleapis.com` install-time only. They stay reachable for the whole sealed run, and
+  `storage.googleapis.com` admits any public bucket, so it is the wider of the two.

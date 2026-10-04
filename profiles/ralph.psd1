@@ -61,17 +61,23 @@
     Entrypoint = 'bash /opt/ralph/ralph-claude-code/ralph_loop.sh'
 
     # ------------------------------------------------------------------
-    # ExtraAllowlist — FQDNs unioned onto tier1's EgressAllowlist (which already
+    # ExtraAllowlist: FQDNs unioned onto tier1's EgressAllowlist (which already
     # carries api.anthropic.com, registry.npmjs.org, github.com + the GitHub raw/
-    # codeload hosts, pypi.org, files.pythonhosted.org — all that the clone +
-    # cloud-Claude calls need). The one host tier1 lacks is the Claude Code
-    # installer/auto-update origin, so Ralph's `claude` CLI can be installed +
-    # self-update inside the (still-open, pre-seal) window. NB the loop's normal
-    # API traffic is api.anthropic.com (already in tier1); this is install-time only.
+    # codeload hosts, pypi.org, files.pythonhosted.org, all that the clone +
+    # cloud-Claude calls need). The two hosts below are the Claude Code CLI
+    # installer/auto-update origins. NB the loop's normal API traffic is
+    # api.anthropic.com (already in tier1).
+    #
+    # These hosts are NOT install-time only. The seal runs before the guest's only
+    # boot (see StageAssets below), so there is no still-open pre-seal window in
+    # which a CLI install could run, and Import-WorkloadProfile unions this list
+    # into the run's EgressAllowlist with no time limit. Both hosts stay reachable
+    # for the whole sealed run. storage.googleapis.com is the wider of the two: it
+    # admits any public bucket, not just the CLI release artifacts.
     # ------------------------------------------------------------------
     ExtraAllowlist = @(
         'claude.ai',          # Claude Code CLI installer / auth origin
-        'storage.googleapis.com'   # CLI release artifact CDN (install-time only; pre-seal)
+        'storage.googleapis.com'   # CLI release artifact CDN; admits ANY public bucket, reachable for the whole sealed run
     )
 
     # ------------------------------------------------------------------

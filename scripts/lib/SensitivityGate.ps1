@@ -147,6 +147,11 @@ Set-StrictMode -Version Latest
 # own Describe blocks do, to call Test-ReleaseAllowed/Register-Release directly).
 . (Join-Path $PSScriptRoot 'ReleaseGovernor.ps1')
 
+# Run mode shells the screener on the host, so it needs a real interpreter, not a bare `python`
+# that PATH may map to a Windows App Execution Alias stub. Resolve-PythonExe lives in its own lib
+# so this file and Invoke-Voidseal.ps1 share one implementation.
+. (Join-Path $PSScriptRoot 'PythonResolver.ps1')
+
 # ---------------------------------------------------------------------------
 # C2.4 — REGENERATOR CORE. The host is the sole author of the RELEASED surface: it validates
 # every consumed verdict against the SAME fixed enum schema the producer (guest/screener.py,
@@ -312,6 +317,11 @@ function Invoke-SensitivityGate {
 .PARAMETER ScreenerPath
     (Run mode) Absolute path to screener.py. Explicit to keep test injection clean.
 
+.PARAMETER PythonExe
+    (Run mode, optional) Interpreter used to run screener.py. Defaults to Resolve-PythonExe, which
+    skips Windows App Execution Alias stubs and fails closed if no real interpreter is found.
+    Tests inject a path here; it is not consulted in Consume mode.
+
 .PARAMETER VerdictsPath
     (Consume mode) Absolute path to a verdicts.json produced in-guest. The file is copied
     into the run's manifest/ dir as an audit record, then goes through the identical
@@ -362,6 +372,7 @@ function Invoke-SensitivityGate {
         [Parameter(Mandatory)] [string] $OutputDir,
         [ValidateSet('aggressive','moderate')] [string] $Mode = 'aggressive',
         [Parameter(Mandatory, ParameterSetName='Run')]     [string] $ScreenerPath,
+        [Parameter(ParameterSetName='Run')]                [string] $PythonExe,
         [Parameter(Mandatory, ParameterSetName='Consume')] [string] $VerdictsPath,
         # C2.5 — released-byte budget backstop. FORK (Allen, plan Task C2.5): these are
         # conservative placeholder defaults, tunable at Phase 6 — NOT a claim that 1 MiB / 16
@@ -407,9 +418,13 @@ function Invoke-SensitivityGate {
         # Capture stdout+stderr together so we can surface the diagnostic in the throw message.
         # The screener writes its JSON to --out $vjson directly; we are not parsing stdout.
         # FAIL CLOSED: any non-zero exit means classification is incomplete => throw, release nothing.
-        # NOTE: the python executable ('python' on the host, 'python3' in-guest) and the gate's
-        # production runtime location (host vs in-guest) are wired in Phase 1 — out of scope here.
-        $screenerOutput = & python $ScreenerPath --in $StagingDir --out $vjson --mode $Mode 2>&1
+        # NOTE: no production caller uses Run mode. The processor screener runs in the guest and
+        # Invoke-Voidseal consumes its verdicts through Consume mode (-VerdictsPath). Run mode
+        # serves tests and manual host-side screening, where the interpreter is the host's
+        # (Windows 'python', not the guest's 'python3'). It comes from -PythonExe, or from
+        # Resolve-PythonExe when that is omitted, so an App Execution Alias stub is never launched.
+        if ([string]::IsNullOrWhiteSpace($PythonExe)) { $PythonExe = Resolve-PythonExe }
+        $screenerOutput = & $PythonExe $ScreenerPath --in $StagingDir --out $vjson --mode $Mode 2>&1
         if ($LASTEXITCODE -ne 0) {
             # $screenerOutput can be $null/empty (a screener that exits non-zero silently). Coerce to a
             # human-readable placeholder so the diagnostic never renders a bare 'Output: '.

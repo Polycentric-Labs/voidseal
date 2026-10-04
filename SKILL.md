@@ -84,9 +84,12 @@ $report = Invoke-Voidseal -Tier 1 -Profile ralph `
     -Workload @{ ResultPath = 'C:\sandbox\ralph-workdir\out' } `
     -ParentDiskPath 'C:\sandbox\golden\debian-12-cloud.vhdx'
 
-# Tier-0 Firefox bookmark organizer (offline, on a profile COPY):
+# Tier-0 Firefox bookmark organizer (offline, on a profile COPY). Disk mode: $inputs holds the
+# organizer, a sample profile, and the guest helpers run_disk_workload.py + outbox.py (a run
+# without the helpers is refused up front). See docs/live-smoke-test.md section 4A.
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `
-    -Workload @{ ResultPath = 'C:\sandbox\firefox-organizer-out\bookmarks.html' }
+    -Workload @{ WorkloadMode = 'Disk'; Inputs = $inputs } `
+    -ParentDiskPath 'C:\sandbox\golden\debian-12-cloud.vhdx'
 
 $report.States        # the states traversed, in order (INIT..DESTROYED on success)
 $report.SealVerdict   # $true only if Assert-Sealed certified the VM

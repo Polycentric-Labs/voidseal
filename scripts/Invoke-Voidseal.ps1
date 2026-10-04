@@ -55,6 +55,7 @@ Set-StrictMode -Version Latest
 # from any working directory.
 # --------------------------------------------------------------------------
 $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
+. (Join-Path $script:DeployLibDir 'PythonResolver.ps1')
 . (Join-Path $script:DeployLibDir 'HyperVBackend.ps1')
 . (Join-Path $script:DeployLibDir 'ProfileLoader.ps1')
 . (Join-Path $script:DeployLibDir 'Provisioner.ps1')
@@ -63,73 +64,6 @@ $script:DeployLibDir = Join-Path $PSScriptRoot 'lib'
 . (Join-Path $script:DeployLibDir 'Workload.ps1')
 . (Join-Path $script:DeployLibDir 'SeedBuilder.ps1')
 . (Join-Path $script:DeployLibDir 'SensitivityGate.ps1')
-
-# --------------------------------------------------------------------------
-# Fold-in #1: Resolve-PythonExe — robust host python3/python resolution.
-#
-# A hard `& python3` BREAKS the Windows host: the Windows Python installer provides
-# `python`, not `python3`. The in-guest binary is `python3` (Debian), but the HOST
-# shelling `host/read_outbox.py` at the seam-#2 gate is Windows PowerShell, which
-# needs the Windows `python` executable. Get-Command probes both names; throw fail-
-# closed naming both if NEITHER resolves (prefer python3 on non-Windows for safety).
-#
-# Windows App Execution Aliases (zero-byte python.exe / python3.exe reparse points under
-# %LOCALAPPDATA%\Microsoft\WindowsApps) are skipped. Launching one goes through MSIX package
-# activation, and what runs next is up to the package: the Store redirector, a packaged
-# interpreter, or the Python install manager's launcher, which picks a runtime from its own
-# settings. So the interpreter that parses a guest-written outbox can be chosen by something
-# other than PATH, and activation adds a step that can fail. PowerShell 7 reports a failed first
-# launch as "StandardOutputEncoding is only supported when standard output is redirected" (its
-# ShellExecute retry keeps the encoding it set for captured output), which hides the Win32 error.
-# The result is the first non-alias match: python3 before python, each name in PATH order.
-# --------------------------------------------------------------------------
-<#
-.SYNOPSIS
-    Resolve the host Python executable path (python3 preferred, python fallback).
-.DESCRIPTION
-    A hard `& python3` breaks on Windows hosts where the Python installer provides
-    `python`. This asks Get-Command for every Application match of each name and returns
-    the first real interpreter, skipping Windows App Execution Aliases. Throws a clear
-    fail-closed message naming both candidates if neither resolves, listing any alias it
-    skipped.
-.PARAMETER CommandLookup
-    Returns the PATH-ordered Application matches for one command name. Defaults to
-    Get-Command -Name <name> -CommandType Application -All; tests inject a fake so the
-    result does not depend on the machine's PATH.
-#>
-function Resolve-PythonExe {
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [scriptblock] $CommandLookup = {
-            param($Name) Get-Command -Name $Name -CommandType Application -All -ErrorAction SilentlyContinue
-        }
-    )
-
-    $skippedAliases = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in 'python3', 'python') {
-        foreach ($cmd in @(& $CommandLookup $name)) {
-            if ($null -eq $cmd) { continue }
-            # Aliases are recognized by location: a \Microsoft\WindowsApps\ segment pair matches the
-            # alias directory under any profile root plus its per-package subfolders, with no
-            # file-system access, so the choice depends only on what the lookup returned.
-            if ($cmd.Source -match '[\\/]Microsoft[\\/]WindowsApps[\\/]') {
-                $skippedAliases.Add($cmd.Source)
-                continue
-            }
-            return $cmd.Source
-        }
-    }
-
-    $aliasNote = ''
-    if ($skippedAliases.Count -gt 0) {
-        $aliasNote = (' as a real interpreter (skipped Windows App Execution Alias stub(s), which ' +
-                      'launch through MSIX package activation: {0})') -f ($skippedAliases -join ', ')
-    }
-    throw ("Resolve-PythonExe: neither 'python3' nor 'python' was found on PATH$aliasNote. " +
-           "Install Python and ensure it is on the PATH (Windows: the Python installer " +
-           "adds 'python'; Linux/macOS: 'python3'). Failing closed.")
-}
 
 # --------------------------------------------------------------------------
 # C1.2: shared outbox-producer READ template — user-space, NEVER Mount-VHD.
@@ -492,28 +426,40 @@ function Invoke-Voidseal {
                "(Invoke-BuilderVM) and must never be passed to Invoke-Voidseal directly. Fail closed.")
     }
 
-    # --- PROCESSOR preflight: the in-guest producer, outbox module and screener must ride INPUT ---
-    # A processor's seed runs `python3 /mnt/in/run_disk_workload.py --mode <mode>`, which imports
-    # outbox.py and runs screener.py from its own directory. If any of the three is missing, the guest
-    # producer exits non-zero and writes no outbox, and all the host can report is "outbox header
-    # missing", which reads like a transport fault. Refuse here instead, before anything is
-    # provisioned. The effective Inputs follow the same rule the Disk branch applies when it folds the
-    # override in: a non-empty -Workload.Inputs wins, otherwise the profile's own Inputs count.
-    # (Transport-only profiles such as firefox are not checked: the mock suite runs them with empty
-    # Inputs by design, and their helper delivery is the documented live-run step.)
-    if ($workloadMode -eq 'Disk' -and (Test-IsProcessorProfile -Profile $resolved)) {
+    # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT ---
+    # Every outbox-transport Disk run (a processor, or a transport-only OutboxOutput profile such as
+    # firefox) executes `python3 /mnt/in/run_disk_workload.py` from the INPUT disk, and that script
+    # imports outbox.py from its own directory. A processor also runs screener.py beside them. If any
+    # required file is missing, the guest producer exits non-zero and writes no outbox, and all the
+    # host can report is "outbox header missing", which reads like a transport fault. Refuse here
+    # instead, before anything is provisioned. The effective Inputs follow the same rule the Disk
+    # branch applies when it folds the override in: a non-empty -Workload.Inputs wins, otherwise the
+    # profile's own Inputs count. The shipped firefox profile declares empty Inputs on purpose (a
+    # .psd1 cannot inline a Python file), so a live run supplies the helpers through
+    # -Workload.Inputs, as docs/live-smoke-test.md section 4A shows. Both profile kinds come from the
+    # shared predicates in ProfileLoader.ps1 (Test-UsesOutboxTransport / Test-IsProcessorProfile).
+    if ($workloadMode -eq 'Disk' -and (Test-UsesOutboxTransport -Profile $resolved)) {
+        $isProcessorShape = Test-IsProcessorProfile -Profile $resolved
+        $requiredHelpers  = if ($isProcessorShape) { @('run_disk_workload.py', 'outbox.py', 'screener.py') }
+                            else                   { @('run_disk_workload.py', 'outbox.py') }
         $effectiveInputs = Get-WorkloadField -Workload $Workload -Name 'Inputs'
         if (-not ($effectiveInputs -is [System.Collections.IDictionary] -and $effectiveInputs.Count -gt 0)) {
             $effectiveInputs = if ($resolved.ContainsKey('Inputs')) { $resolved['Inputs'] } else { $null }
         }
-        $missingHelpers = @(@('run_disk_workload.py', 'outbox.py', 'screener.py') | Where-Object {
+        $missingHelpers = @($requiredHelpers | Where-Object {
             -not ($effectiveInputs -is [System.Collections.IDictionary] -and $effectiveInputs.Contains($_))
         })
         if ($missingHelpers.Count -gt 0) {
-            throw ("Invoke-Voidseal: REFUSING processor '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
-                   "processor's in-guest runner executes run_disk_workload.py from the INPUT disk, and that script " +
-                   "imports outbox.py and runs screener.py beside it. Stage all three from the repo's guest/ " +
-                   "directory in Inputs (or -Workload.Inputs). Fail closed.")
+            if ($isProcessorShape) {
+                throw ("Invoke-Voidseal: REFUSING processor '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
+                       "processor's in-guest runner executes run_disk_workload.py from the INPUT disk, and that script " +
+                       "imports outbox.py and runs screener.py beside it. Stage all three from the repo's guest/ " +
+                       "directory in Inputs (or -Workload.Inputs). Fail closed.")
+            }
+            throw ("Invoke-Voidseal: REFUSING outbox profile '$Name': its Inputs lack $($missingHelpers -join ', '). The " +
+                   "in-guest runner executes run_disk_workload.py from the INPUT disk, and that script imports " +
+                   "outbox.py beside it. Stage both from the repo's guest/ directory in Inputs (or " +
+                   "-Workload.Inputs). Fail closed.")
         }
     }
 

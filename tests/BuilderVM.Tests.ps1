@@ -239,6 +239,45 @@ Describe 'Resolve-PythonExe — robust host python resolution (fold-in #1)' {
         $err.Exception.Message | Should -BeLike "*$($script:AliasPython)*"
     }
 
+    It 'skips a .bat shim that sits ahead of a real .exe and returns the .exe' {
+        # Get-Command -CommandType Application matches any PATHEXT file; a shim runs through cmd.exe.
+        $lookup = New-FakeCommandLookup @{
+            python3 = @('C:\Tools\shims\python3.bat')
+            python  = @('C:\Tools\shims\python.cmd', $script:RealPython)
+        }
+        Resolve-PythonExe -CommandLookup $lookup | Should -Be $script:RealPython
+    }
+
+    It 'skips a shim in any extension case and prefers a later real python3.exe' {
+        $realPython3 = 'C:\Tools\Python\python3.exe'
+        $lookup = New-FakeCommandLookup @{
+            python3 = @('C:\Tools\shims\python3.BAT', $realPython3)
+            python  = @($script:RealPython)
+        }
+        Resolve-PythonExe -CommandLookup $lookup | Should -Be $realPython3
+    }
+
+    It 'fails closed when PATH offers only shims, naming each shim it skipped' {
+        $lookup = New-FakeCommandLookup @{
+            python3 = @('C:\Tools\shims\python3.bat')
+            python  = @('C:\Tools\shims\python.cmd')
+        }
+        $err = { Resolve-PythonExe -CommandLookup $lookup } | Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike "*'python3'*'python'*"
+        $err.Exception.Message | Should -BeLike '*C:\Tools\shims\python3.bat*' -Because 'the operator needs to see which shim was refused'
+        $err.Exception.Message | Should -BeLike '*C:\Tools\shims\python.cmd*'
+    }
+
+    It 'names both skipped aliases and skipped shims when PATH offers nothing else' {
+        $lookup = New-FakeCommandLookup @{
+            python3 = @($script:AliasPython3)
+            python  = @('C:\Tools\shims\python.bat')
+        }
+        $err = { Resolve-PythonExe -CommandLookup $lookup } | Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike "*$($script:AliasPython3)*"
+        $err.Exception.Message | Should -BeLike '*C:\Tools\shims\python.bat*'
+    }
+
     It 'by default asks Get-Command for every Application match, so a real python behind an alias is reachable' {
         # Without -All, Get-Command stops at the first match on PATH; when that match is an alias, a
         # real interpreter further down would never be seen.

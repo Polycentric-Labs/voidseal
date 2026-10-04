@@ -120,8 +120,9 @@ pwsh scripts/Get-VoidsealGoldenImage.ps1        # add -Plan first to preview the
 ```powershell
 # From the repo root, dot-source the engine, then run the Tier-0 example.
 # firefox is a Disk-mode profile: populate -Workload.Inputs with the organizer script + a
-# sample bookmark profile first (built from profiles/firefox.psd1's InputFiles — see
-# docs/live-smoke-test.md §4A for the walkthrough).
+# sample bookmark profile first (built from profiles/firefox.psd1's InputFiles), plus the guest
+# helpers run_disk_workload.py and outbox.py. A run whose Inputs lack either helper is refused
+# before anything is provisioned. See docs/live-smoke-test.md §4A for the walkthrough.
 . .\scripts\Invoke-Voidseal.ps1
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `
     -ParentDiskPath <golden.vhdx> -Destination <out-dir> -Workload @{ Inputs = $inputs }
