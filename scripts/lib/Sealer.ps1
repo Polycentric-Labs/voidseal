@@ -645,6 +645,10 @@ function Assert-Sealed {
     # records on the descriptor. Until 2026-10-03 production never recorded Network, so the processor
     # branch below could fire only in tests that injected the field by hand.
     $network     = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'Network')
+    # "Processor" here means Network='None' alone, which only picks the wording of the NIC refusal below.
+    # ProfileLoader's Test-IsProcessorProfile also requires a ScreenConfig because it decides screener
+    # routing, and the descriptor does not carry ScreenConfig. The two can disagree on a no-network
+    # profile without a ScreenConfig, but the NIC policy is NoAdapter under both, so no outcome changes.
     $isProcessor = ($network.Trim() -eq 'None')
 
     # --- FAIL CLOSED: if the host can't be queried, do NOT certify --------
@@ -672,7 +676,15 @@ function Assert-Sealed {
         throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the descriptor records no " +
                "Network posture, so its network-adapter policy cannot be determined. Fail closed.")
     }
-    $nicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
+    # Since 2026-10-03 the predicate throws for a Tier-1 label it does not recognize; turn that into a
+    # named refusal so the operator sees the gate's verdict rather than a bare predicate error.
+    try {
+        $nicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
+    }
+    catch {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because its network-adapter policy cannot be " +
+               "determined ($($_.Exception.Message)). Fail closed.")
+    }
     # Get-SealNicPolicy returns exactly two values today. A third would skip BOTH NIC branches below
     # and fall through to certification, the same "no branch means no check" shape that let Tier 0
     # escape the adapter check before 2026-10-03. Refuse anything unrecognized: fail closed.

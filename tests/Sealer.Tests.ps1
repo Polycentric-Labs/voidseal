@@ -1160,6 +1160,14 @@ Describe 'Lock-Sandbox + Assert-Sealed: the NIC policy is enforced at every tier
             Should -Throw -ExpectedMessage '*no Network posture*'
     }
 
+    It 'Assert-Sealed REFUSES a Tier-1 descriptor whose Network label the policy does not recognize' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-np-badlabel'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $sb.Desc.Network = 'Internal'
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*REFUSING to certify 'sbx-np-badlabel' SEALED because its network-adapter policy cannot be determined*Tier-1 Network label 'Internal' is not recognized*"
+    }
+
     It 'Lock-Sandbox removes the NIC whenever the policy is not exactly IsolatedInternalSwitch (allow-list polarity): <Label>' -ForEach @(
         @{ Policy = 'HostProxyAdapter'; Label = 'an unknown name' },
         @{ Policy = $null;              Label = 'null' }

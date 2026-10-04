@@ -839,6 +839,47 @@ Describe 'Get-SealNicPolicy: the single NIC-posture predicate (Provisioner, Lock
         Get-SealNicPolicy -Tier -1 -Network 'Internal+Allowlist' | Should -Be 'NoAdapter'
         Get-SealNicPolicy -Tier 7  -Network 'Internal+Allowlist' | Should -Be 'NoAdapter'
     }
+
+    It 'the permissive label is exactly the one tier1.psd1 ships' {
+        (Import-TierProfile -Path (Join-Path $script:SkillRoot 'tier-profiles/tier1.psd1')).Network |
+            Should -BeExactly 'Internal+Allowlist' -Because 'the predicate allow-lists this exact value'
+    }
+
+    It 'REFUSES (throws) a Tier-1 label that is neither the allow-listed one nor None: <Label>' -ForEach @(
+        @{ Label = 'Internal' },
+        @{ Label = 'External' },
+        @{ Label = 'internal+allowlist' },
+        @{ Label = 'Internal+Allowlist+Extra' }
+    ) {
+        { Get-SealNicPolicy -Tier 1 -Network $Label } |
+            Should -Throw -ExpectedMessage "*Tier-1 Network label '$Label' is not recognized*" -Because 'only the exact shipped label may keep a NIC; anything else must stop, not guess'
+    }
+
+    It 'Network=None is NoAdapter whether or not the profile screens (the two "processor" definitions agree on the NIC)' {
+        # The loader's Test-IsProcessorProfile needs Network='None' AND a ScreenConfig, because it decides
+        # screener routing; the NIC predicate keys on Network='None' alone. They differ on a no-screen
+        # no-network profile, and the NIC outcome must be NoAdapter either way.
+        $screened   = @{ Tier = 1; Network = 'None'; ScreenConfig = @{} }
+        $unscreened = @{ Tier = 1; Network = 'None' }
+        Test-IsProcessorProfile -Profile $screened   | Should -BeTrue
+        Test-IsProcessorProfile -Profile $unscreened | Should -BeFalse
+        Get-SealNicPolicy -Tier $screened.Tier   -Network $screened.Network   | Should -Be 'NoAdapter'
+        Get-SealNicPolicy -Tier $unscreened.Tier -Network $unscreened.Network | Should -Be 'NoAdapter'
+    }
+
+    It 'an unrecognized label at any tier other than 1 is still plain NoAdapter (no NIC to decide about)' {
+        Get-SealNicPolicy -Tier 0 -Network 'Internal' | Should -Be 'NoAdapter'
+        Get-SealNicPolicy -Tier 2 -Network 'Internal' | Should -Be 'NoAdapter'
+    }
+
+    It 'New-SandboxVM refuses a Tier-1 profile with an unrecognized Network label before creating anything' {
+        $p = (Import-TierProfile -Path (Join-Path $script:SkillRoot 'tier-profiles/tier1.psd1')).Clone()
+        $p['Network'] = 'Internal'
+        $b = New-FakeHyperVBackend
+        { New-SandboxVM -Profile $p -Name 'sbx-badlabel' -Backend $b } |
+            Should -Throw -ExpectedMessage "*Tier-1 Network label 'Internal' is not recognized*"
+        (& $b.GetVM @{ Name = 'sbx-badlabel' }) | Should -BeNullOrEmpty -Because 'the refusal comes before any VM is created'
+    }
 }
 
 # ===========================================================================

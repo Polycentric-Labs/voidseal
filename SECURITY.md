@@ -22,7 +22,10 @@ Discrete Device Assignment, which could be a physical NIC that the virtual-adapt
 and `Assert-Sealed` alike: Tier 0, Tier >= 2, and any profile that declares `Network='None'` (a
 "processor") at any tier get no adapter. Real `New-VM` always creates one, so the seal removes it and the
 gate requires the host to report none; a descriptor that records no `Network`, or a policy value the
-predicate does not recognize, is refused outright. For a
+predicate does not recognize, is refused outright. The one permissive case is an exact allow-list
+entry: a Tier-1 VM keeps a NIC only when its `Network` label is exactly `Internal+Allowlist`, the value
+`tier-profiles/tier1.psd1` ships. Any other Tier-1 label stops `New-SandboxVM` before it creates
+anything and is refused by the gate. For a
 Tier-1 VM, which legitimately keeps a NIC
 (net-restricted, not no-net), the seal instead certifies that NIC's vSwitch is an isolated **Internal**
 switch — never an unfiltered External or Private switch — so the guest's only possible route off-box is
