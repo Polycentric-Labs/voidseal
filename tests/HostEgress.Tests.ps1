@@ -43,6 +43,23 @@ AfterAll {
     Remove-Item -LiteralPath $script:TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Describe 'HostEgress: the shipped profiles' {
+
+    It 'tier1 ships EgressMode HostProxy, and ralph inherits it with the merged allowlist the proxy enforces' {
+        (Import-TierProfile -Path (Join-Path $script:TierDir 'tier1.psd1'))['EgressMode'] | Should -Be 'HostProxy'
+        $ralph = Import-WorkloadProfile -Path (Join-Path $script:SkillRoot 'profiles/ralph.psd1') -TierProfileDir $script:TierDir
+        $ralph['EgressMode'] | Should -Be 'HostProxy'
+        $allow = ConvertTo-EgressProxyAllowlist -Allowlist $ralph['EgressAllowlist']
+        @($allow) | Should -Contain 'api.anthropic.com'
+        @($allow) | Should -Contain 'claude.ai' -Because 'the workload ExtraAllowlist is merged in'
+    }
+
+    It 'the builder keeps SquidSniProxy' {
+        $builder = Import-WorkloadProfile -Path (Join-Path $script:SkillRoot 'profiles/builder.psd1') -TierProfileDir $script:TierDir
+        $builder['EgressMode'] | Should -Be 'SquidSniProxy'
+    }
+}
+
 Describe 'HostEgress: the address plan' {
 
     It 'is deterministic per name, a /30 inside 10.231.0.0/16, gateway .1 and guest .2 of it' {

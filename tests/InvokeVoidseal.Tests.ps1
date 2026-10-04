@@ -721,8 +721,8 @@ Describe 'Invoke-Voidseal: Serial mode seeds the guest on a CIDATA data disk tha
     BeforeEach {
         $script:SerialB   = New-FakeHyperVBackend
         $script:FirstBoot = script:New-FirstBootProbe -Backend $script:SerialB
-        # Tier 1 is EgressMode='InGuestSquid' with a non-empty allowlist, so its seed carries the egress
-        # layer. The SeedIso file EXISTS here, so a run that still took the old DVD path would complete
+        # Tier 1 is EgressMode='HostProxy' with a non-empty allowlist, so its seed carries the host-proxy
+        # settings (tests/HostEgress.Tests.ps1 covers them). The SeedIso file EXISTS here, so a run that still took the old DVD path would complete
         # and these tests would fail on the seed itself, not on a missing file.
         $script:SerialSeedIso = Join-Path $script:TmpRoot ("serial-seed-{0}.iso" -f ([guid]::NewGuid().ToString('N')))
         Set-Content -LiteralPath $script:SerialSeedIso -Value 'placeholder-seed' -NoNewline -Encoding ascii
@@ -758,7 +758,8 @@ Describe 'Invoke-Voidseal: Serial mode seeds the guest on a CIDATA data disk tha
             Should -Be 1 -Because 'NoCloud needs meta-data next to user-data'
     }
 
-    It 'a Tier-1 (InGuestSquid) seed carries the in-guest egress layer built from the merged allowlist' {
+    It 'a Tier-1 profile set to InGuestSquid still gets the in-guest egress layer built from the merged allowlist' {
+        $script:SerialProfile['EgressMode'] = 'InGuestSquid'
         $report = Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
             -Name 'sbx-serialseed-egress' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
         $ud = script:Get-SeedUserData -Backend $script:SerialB -SeedPath ([string]$report.Descriptor.SeedDiskPath)

@@ -2,28 +2,28 @@
     # Voidseal — Tier 1 isolation contract (net-restricted Hyper-V VM).
     # Declarative; consumed by the profile loader (Import-TierProfile).
     Tier            = 1
-    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress = in-guest iptables default-DROP + transparent Squid domain-ACL (defense-in-depth, NOT a boundary; the host-verified boundary is Phase-6). Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
+    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress is host-enforced: the guest has no route, NAT or resolver and reaches only a host CONNECT allowlist proxy on its own switch, behind host firewall rules and a port ACL that the seal gate verifies. An in-guest default-DROP is defense in depth. Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
     Substrate       = 'HyperV-Gen2'
-    Network         = 'Internal+Allowlist'      # Internal vSwitch + static host IP; in-guest egress is defense-in-depth only — the host-side boundary is Phase-6
-    # HONESTY (2026-07-18): EgressMode names the real mechanism this tier ships as — in-guest
-    # iptables default-DROP + transparent Squid dstdomain ACL over EgressAllowlist, ported from
-    # the builder's proven mechanism (SeedBuilder.ps1) — replacing the fabricated/schema-only
-    # 'NftablesAllowlist' (design-invalidated 2026-06-28: static nftables/ipset
-    # allowlists don't survive CDN IP rotation). Now WIRED into New-CidataUserData's serial seed
-    # (CidataSerialEgressTemplate) — the in-guest Squid defense-in-depth control SHIPS, mock-
-    # asserted for SHAPE only (real packet-drop + the activation-timing ordering vs pre-seal
-    # package install are unproven until a live run). This is NOT a boundary — a compromised/
-    # root guest can disable it — the host-verified boundary is Phase-6 (host-side
-    # NAT/Squid/default-DROP).
-    EgressMode      = 'InGuestSquid'             # v1 credential-FREE. Phase-1B: 'HostEnvoy' (deferred)
+    Network         = 'Internal+Allowlist'      # per-VM Internal vSwitch; the host holds the gateway address of the VM's /30
+    # EgressMode (2026-10-03): 'HostProxy', the host-enforced design (scripts/lib/HostEgress.ps1).
+    # The VM gets a deterministic /30 from its name; the host puts the gateway address on the VM's
+    # switch, adds firewall rules on that interface and a port ACL on the VM's NIC that leave one door
+    # open (TCP to the proxy port on the gateway, from the guest's address), and runs
+    # scripts/egress/voidseal_egress_proxy.py there, which tunnels only CONNECT host:443 for names on
+    # the merged EgressAllowlist, resolving them itself and refusing private answers. No NAT, no route,
+    # no resolver in the guest. Assert-Sealed reads the host objects back before the proxy and the VM
+    # start. Mock-green only: the first elevated run is the first live exercise
+    # (docs/phase-6-live-runbook.md section 2). 'InGuestSquid' (the in-guest Squid + iptables layer,
+    # defense in depth and NOT a boundary) still works for a tier file that sets it.
+    EgressMode      = 'HostProxy'                # credential-FREE. Phase-1B: 'HostEnvoy' (deferred)
     EgressAllowlist = @(
         'api.anthropic.com',
         'registry.npmjs.org',
         'github.com', 'raw.githubusercontent.com', 'objects.githubusercontent.com', 'codeload.github.com',
         'pypi.org', 'files.pythonhosted.org'
     )
-    # DECLARATIVE ONLY: no code reads this array. Not the loader, not SeedBuilder. The builder seed's
-    # default-DROP ruleset is a superset of this list but is written literally and never consults it.
+    # DECLARATIVE ONLY: no code reads this array. HostProxy blocks these by construction anyway: the
+    # host proxy tunnels TCP CONNECT to port 443 only, and the host firewall and port ACL drop all UDP.
     BlockProtocols  = @('QUIC', 'UDP/443', 'DoH', 'DoT')
     Credentials     = 'ScopedOnDemand'           # default none; a scoped token only when the task needs a live API
     GuestImage      = 'debian-12-cloud'          # Debian 12 cloud image .vhdx + cloud-init NoCloud
@@ -33,7 +33,7 @@
     NestedVirt      = $false                      # bare-VM agent runtime — no nested Docker needed
     ManagementChannel = 'Com1Serial'              # PowerShell Direct is Windows-guest-only; Linux = COM1 serial + cloud-init
     HostChannels    = @{ Clipboard = $false; Shares = $false; GuestServices = $false; EnhancedSession = $false }
-    Capture         = @{ Mode = 'HostSide+ProxyLog'; Otlp = $true }
+    Capture         = @{ Mode = 'HostSide+ProxyLog'; Otlp = $true }   # ProxyLog = the host proxy's per-connection JSON log in the run folder
     Extraction      = 'HostReadResultDir'         # Tier 1 isn't running presumed-hostile code
     Lifecycle       = 'SnapshotRevert'
     Controls        = @('NonRoot', 'ReadOnlyCodeMount', 'SecretFileExclusion', 'DeferTrust', 'SymlinkGuard', 'NativeBubblewrap')
