@@ -340,6 +340,27 @@ Describe 'Invoke-Voidseal data-disk preflight (refused before anything is provis
             -ParentDiskPath $gold -Name 'sbx-dd-gold' -Backend $b } | Should -Throw -ExpectedMessage '*golden parent*'
     }
 
+    It 'protects the run''s resolved storage root (-StorageRoot), not the default one' {
+        $custom = Join-Path $TestDrive 'custom-root'
+        $b = New-FakeHyperVBackend
+        $inCustom = Join-Path $custom 'sbx-other\sbx-other-input.vhdx'
+        { Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = @(& $script:Decl 'corpus' $inCustom) } `
+            -StorageRoot $custom -Name 'sbx-dd-custom' -Backend $b } | Should -Throw -ExpectedMessage "*storage root ('$custom')*"
+        (& $b.GetVM @{ Name = 'sbx-dd-custom' }) | Should -BeNullOrEmpty
+    }
+
+    It 'protects a storage root given by VOIDSEAL_STORAGE_ROOT' {
+        $envRoot = Join-Path $TestDrive 'env-root'
+        $saved = $env:VOIDSEAL_STORAGE_ROOT
+        try {
+            $env:VOIDSEAL_STORAGE_ROOT = $envRoot
+            $b = New-FakeHyperVBackend
+            { Invoke-Voidseal -Tier 0 -Profile $script:Fx -Workload @{ WorkloadMode = 'Disk'; DataDisks = @(& $script:Decl 'corpus' (Join-Path $envRoot 'x\x.vhdx')) } `
+                -Name 'sbx-dd-envroot' -Backend $b } | Should -Throw -ExpectedMessage "*storage root ('$envRoot')*"
+        }
+        finally { $env:VOIDSEAL_STORAGE_ROOT = $saved }
+    }
+
     It 'a -Workload.DataDisks value replaces the profile''s, and an empty one removes them' {
         $profileDecl = @(@{ Name = 'BAD!'; Path = 'C:\vs\x.vhdx'; ImageHash = ('a' * 64) })
         # The profile's (invalid) declaration is never consulted when the workload supplies its own.
@@ -891,6 +912,15 @@ Describe 'scripts/New-VoidsealDataDisk.ps1 (fake backend)' {
         $inRoot = Join-Path (Split-Path -Parent (Get-SandboxStorageRoot -Name 'x')) 'x.vhdx'
         { New-VoidsealDataDisk -SourceDir $src -Path $inRoot -Name 'x' -Backend $b } | Should -Throw -ExpectedMessage '*storage root*'
         @($b.FakeCallLog | Where-Object { $_.Op -eq 'CopyDirectoryToVhdx' }).Count | Should -Be 0
+    }
+
+    It 'refuses a destination under a non-default -StorageRoot' {
+        $b = New-FakeHyperVBackend
+        $src = & $script:NewCorpus 'customroot'
+        $custom = Join-Path $TestDrive 'dd-custom-root'
+        New-Item -ItemType Directory -Path $custom -Force | Out-Null
+        { New-VoidsealDataDisk -SourceDir $src -Path (Join-Path $custom 'x.vhdx') -Name 'x' -StorageRoot $custom -Backend $b } |
+            Should -Throw -ExpectedMessage "*storage root ('$custom')*"
     }
 
     It 'removes the half-built disk when the copy fails' {

@@ -37,6 +37,9 @@
     The data disk name (1 to 8 lowercase letters or digits).
 .PARAMETER SizeBytes
     Optional virtual size. Must be at least 64 MB and at least the rounded content size.
+.PARAMETER StorageRoot
+    The sandbox storage root the disk must stay out of. Same precedence as Invoke-Voidseal:
+    this parameter, then VOIDSEAL_STORAGE_ROOT, then %ProgramData%\Voidseal\sandboxes.
 .PARAMETER DotSourceOnly
     Internal: define the function and dot-source the engine, then return (for Pester).
 
@@ -49,6 +52,7 @@ param(
     [string] $Path,
     [string] $Name,
     [long]   $SizeBytes = 0,
+    [string] $StorageRoot,
     [switch] $DotSourceOnly
 )
 
@@ -68,6 +72,7 @@ function New-VoidsealDataDisk {
         [Parameter(Mandatory)] [string] $Path,
         [Parameter(Mandatory)] [string] $Name,
         [long] $SizeBytes = 0,
+        [string] $StorageRoot,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -95,7 +100,7 @@ function New-VoidsealDataDisk {
             throw "New-VoidsealDataDisk: -Path '$dest' is inside -SourceDir '$src'; the disk would try to copy itself. Failing closed."
         }
     }
-    $storageBase = Split-Path -Parent (Get-SandboxStorageRoot -Name 'x')
+    $storageBase = Resolve-SandboxStorageBase -StorageRoot $StorageRoot
     foreach ($root in @($storageBase, (Resolve-HostFinalPath -Path $storageBase)) | Select-Object -Unique) {
         foreach ($cand in @($dest, $destFinal)) {
             if (Test-PathUnderRoot -Candidate $cand -Root $root) {
@@ -191,7 +196,7 @@ function New-VoidsealDataDisk {
 
 if ($DotSourceOnly) { return }
 
-$result = New-VoidsealDataDisk -SourceDir $SourceDir -Path $Path -Name $Name -SizeBytes $SizeBytes
+$result = New-VoidsealDataDisk -SourceDir $SourceDir -Path $Path -Name $Name -SizeBytes $SizeBytes -StorageRoot $StorageRoot
 Write-Host ''
 Write-Host "Data disk ready: $($result.Path)"
 Write-Host "  Label     : $($result.Label) (mounts read-only at /mnt/data/$($result.Name))"
