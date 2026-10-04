@@ -29,7 +29,12 @@ Set-StrictMode -Version Latest
 # other than PATH, and activation adds a step that can fail. PowerShell 7 reports a failed first
 # launch as "StandardOutputEncoding is only supported when standard output is redirected" (its
 # ShellExecute retry keeps the encoding it set for captured output), which hides the Win32 error.
-# The result is the first non-alias match: python3 before python, each name in PATH order.
+#
+# Script shims (python.bat / python.cmd) are skipped too. Get-Command -CommandType Application
+# matches any PATHEXT file, and a shim runs through cmd.exe, which re-parses and can rewrite the
+# arguments the caller passes (quotes, %, ^, &). On Windows only an .exe is accepted; on other
+# hosts an extensionless file is. The result is the first match that is neither an alias nor a
+# shim: python3 before python, each name in PATH order.
 # --------------------------------------------------------------------------
 <#
 .SYNOPSIS
@@ -37,8 +42,9 @@ Set-StrictMode -Version Latest
 .DESCRIPTION
     A hard `& python3` breaks on Windows hosts where the Python installer provides
     `python`. This asks Get-Command for every Application match of each name and returns
-    the first real interpreter, skipping Windows App Execution Aliases. Throws a clear
-    fail-closed message naming both candidates if neither resolves, listing any alias it
+    the first real interpreter, skipping Windows App Execution Aliases and, because a shim
+    runs through cmd.exe, any .bat/.cmd (or other non-.exe) match on Windows. Throws a clear
+    fail-closed message naming both candidates if neither resolves, listing any alias or shim it
     skipped.
 .PARAMETER CommandLookup
     Returns the PATH-ordered Application matches for one command name. Defaults to
@@ -55,6 +61,7 @@ function Resolve-PythonExe {
     )
 
     $skippedAliases = [System.Collections.Generic.List[string]]::new()
+    $skippedShims   = [System.Collections.Generic.List[string]]::new()
     foreach ($name in 'python3', 'python') {
         foreach ($cmd in @(& $CommandLookup $name)) {
             if ($null -eq $cmd) { continue }
@@ -65,15 +72,29 @@ function Resolve-PythonExe {
                 $skippedAliases.Add($cmd.Source)
                 continue
             }
+            # Shims are recognized by extension. Windows accepts only .exe; elsewhere an
+            # extensionless executable is the norm, so a file with no extension is accepted there.
+            $ext = [System.IO.Path]::GetExtension([string]$cmd.Source)
+            $isRealBinary = ($ext -ieq '.exe') -or (-not $IsWindows -and [string]::IsNullOrEmpty($ext))
+            if (-not $isRealBinary) {
+                $skippedShims.Add($cmd.Source)
+                continue
+            }
             return $cmd.Source
         }
     }
 
-    $aliasNote = ''
+    $skipNotes = [System.Collections.Generic.List[string]]::new()
     if ($skippedAliases.Count -gt 0) {
-        $aliasNote = (' as a real interpreter (skipped Windows App Execution Alias stub(s), which ' +
-                      'launch through MSIX package activation: {0})') -f ($skippedAliases -join ', ')
+        $skipNotes.Add(('skipped Windows App Execution Alias stub(s), which launch through MSIX ' +
+                        'package activation: {0}') -f ($skippedAliases -join ', '))
     }
+    if ($skippedShims.Count -gt 0) {
+        $skipNotes.Add(('skipped script shim(s), which run through cmd.exe and can rewrite arguments: ' +
+                        '{0}') -f ($skippedShims -join ', '))
+    }
+    $aliasNote = ''
+    if ($skipNotes.Count -gt 0) { $aliasNote = ' as a real interpreter (' + ($skipNotes -join '; ') + ')' }
     throw ("Resolve-PythonExe: neither 'python3' nor 'python' was found on PATH$aliasNote. " +
            "Install Python and ensure it is on the PATH (Windows: the Python installer " +
            "adds 'python'; Linux/macOS: 'python3'). Failing closed.")
