@@ -136,7 +136,7 @@ traverses the whole state machine, certifies the seal from the host, and tears d
 $report.States              # INIT PROVISIONED STAGED SEALED RUNNING CAPTURED EXTRACTED DESTROYED
 $report.SealVerdict         # True    — Assert-Sealed certified the VM (the workload runs ONLY if True)
 $report.RunResult.Status    # Success
-$report.RunResult.ExitCode  # 0
+$report.RunResult.ExitCode  # 0       the entrypoint's own exit code, carried back through the outbox
 $report.ExtractedArtifact   # <out-dir>\result.html  — a real, guest-generated Netscape-HTML file
 $report.Error               # $null   on full success
 $report.TeardownStatus      # OK (VM removed, created disks deleted)
@@ -147,6 +147,10 @@ outbox transport on 2026-07-21 (Milestone 3, on 2026-06-25, proved the legacy ex
 is `False` the run **aborted before the workload ran** (the seal gate refused);
 `$report.Error` says why, and the VM is still torn down. The full walkthrough — building `$inputs` and a
 failure-triage table — is in [`docs/live-smoke-test.md`](docs/live-smoke-test.md) §4A.
+
+If the entrypoint exits non-zero, `RunResult.Status` is `WorkloadFailed`, `RunResult.ExitCode` carries the
+code, and nothing is released (`ExtractedArtifact` stays empty). That is a workload failure, not a transport
+fault; before this the same run surfaced only as a missing `result.html` candidate.
 
 See [`docs/operator-runbook.md`](docs/operator-runbook.md) for the full provision → run → teardown walk,
 [`docs/tier-reference.md`](docs/tier-reference.md) for the per-tier containment rubric, and

@@ -392,6 +392,25 @@ Describe 'New-CidataUserData — OutboxOutput disk runner (C1.3, firefox transpo
         { New-CidataUserData -Profile $proc } | Should -Throw -ExpectedMessage '*mode*' -Because 'only the two screener modes may reach the runner''s shell line'
     }
 
+    # The entrypoint's exit code used to go only to a console diagnostic, so a failed workload reached the
+    # host as a missing result file. The runner now passes the code it captured to the producer, which
+    # records it in the outbox. Both outbox profile shapes share the runner, so both are checked.
+    It 'the outbox runner passes the entrypoint exit code to the producer (transport-only and processor)' {
+        $proc = @{ Tier = 0; Name = 'proc-rc'; WorkloadMode = 'Disk'; Network = 'None'
+                   ScreenConfig = @{ mode = 'aggressive' }; Entrypoint = 'python3 /mnt/in/proc.py --out /run/staging/result.html' }
+        foreach ($prof in @($script:OutboxProfile, $proc)) {
+            $lines    = @((New-CidataUserData -Profile $prof) -split "`r?`n")
+            $producer = @($lines | Where-Object { $_ -match '^\s*python3\s+/mnt/in/run_disk_workload\.py\s' })
+            $producer.Count | Should -Be 1
+            $producer[0] | Should -Match '\s--workload-rc\s+"\$erc"(\s|$)' -Because 'the producer records the code the runner captured'
+            $capture = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -match '^\s*erc=\$\?\s*$' })
+            $capture.Count | Should -Be 1 -Because 'the code is captured exactly once'
+            $lines[$capture[0] - 1].Trim() | Should -Be 'fi' -Because 'it is captured straight after the entrypoint ran, before any other command can overwrite $?'
+            $producerIdx = [array]::IndexOf($lines, $producer[0])
+            $producerIdx | Should -BeGreaterThan $capture[0] -Because 'the code exists before the producer is called'
+        }
+    }
+
     It 'a transport-only OutboxOutput seed still skips the screener (no --mode)' {
         $line = @((New-CidataUserData -Profile $script:OutboxProfile) -split "`r?`n" | Where-Object { $_ -match '^\s*python3\s+/mnt/in/run_disk_workload\.py\s' })
         $line[0] | Should -Match '--transport-only'

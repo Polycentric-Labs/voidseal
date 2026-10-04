@@ -345,7 +345,9 @@ write_files:
       # for a transport-only profile (no screener; a placeholder verdicts.json keeps the container
       # parseable), or --mode <mode> for a processor, whose screener runs here so the outbox carries
       # the verdict the host gate requires for every staged file.
-      python3 /mnt/in/run_disk_workload.py --staging /run/staging --verdicts /run/verdicts.json --out "$OUTPUT_DEV" __PRODUCER_SCREEN_ARGS__ 2> /run/producer.err
+      # --workload-rc hands the entrypoint's exit code to the producer, which records it in the outbox
+      # so the host can report a failed workload as such. The producer packs staging either way.
+      python3 /mnt/in/run_disk_workload.py --staging /run/staging --verdicts /run/verdicts.json --out "$OUTPUT_DEV" --workload-rc "$erc" __PRODUCER_SCREEN_ARGS__ 2> /run/producer.err
       prc=$?
       diag "producer_rc=$prc"
       # The producer's stderr is FIXED structural strings (run_disk_workload/outbox raise SystemExit /

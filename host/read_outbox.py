@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Voidseal host OUTPUT reader. Takes the raw "outbox" bytes the orchestrator read off the DETACHED OUTPUT
 VHDX (via the ReadVhdxRawRegion backend method) and, fail-closed, materializes the gate's input:
-<out>/verdicts.json + <out>/staging/<candidate> for each whitelisted candidate. ANY anomaly -> nothing is
+<out>/verdicts.json + <out>/staging/<candidate> for each whitelisted candidate, plus <out>/workload.json
+({"exit_code": N}, re-serialized from the validated entry) when the producer recorded the entrypoint's exit
+code. workload.json is never a candidate. ANY anomaly -> nothing is
 written under <out> and the process exits non-zero (mirrors how the screener fails closed). The host NEVER
 mounts the guest FS; this only ever parses the memory-safe outbox container (guest/outbox.py)."""
 import sys, argparse, pathlib, shutil, json
@@ -23,7 +25,7 @@ def main(argv=None):
         allowed = set(args.allowed.split(",")) if args.allowed else None
         # outbox.read_and_verify fails closed: bad magic/version/bounds, per-entry SHA mismatch, bad name,
         # name not in allowlist, or a missing verdicts.json all raise OutboxError.
-        verdicts_obj, candidates = outbox.read_and_verify(blob, allowed_names=allowed)
+        verdicts_obj, candidates, exit_code = outbox.read_and_verify_full(blob, allowed_names=allowed)
     except Exception as e:                       # OutboxError | OS error | JSON error -> fail closed
         # Emit NOTHING under <out> (no partial staging the gate could mis-read as a real release).
         shutil.rmtree(out, ignore_errors=True)
@@ -38,6 +40,8 @@ def main(argv=None):
             out.unlink()
         staging.mkdir(parents=True, exist_ok=True)
         (out / "verdicts.json").write_text(json.dumps(verdicts_obj), encoding="utf-8")
+        if exit_code is not None:
+            (out / outbox.META_NAME).write_bytes(outbox.pack_workload_meta(exit_code))
         for name, data in candidates.items():
             target = staging / name
             # name already passed outbox's strict charset (no path sep / '..'); re-guard against escape anyway.

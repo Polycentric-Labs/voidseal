@@ -138,3 +138,66 @@ def test_verdict_sha256_reconciles_with_outbox_record_sha256_for_every_candidate
     # confirm its record sha256 matches its own on-disk bytes too (the container's internal integrity,
     # not the verdict<->content binding, but worth pinning alongside since it rides the same table).
     assert record_sha_by_name["verdicts.json"] == hashlib.sha256(verdicts_path.read_bytes()).hexdigest()
+
+# --- the entrypoint exit code (--workload-rc) -------------------------------------------------------
+# The seed runner runs the entrypoint into staging and then calls this producer with the entrypoint's
+# exit code. The producer records it in the outbox (workload.json) and STILL packs staging: whether a
+# failed workload's output is released is the host's decision, not the producer's.
+
+def _pack_transport(tmp_path, *extra):
+    staging = tmp_path / "staging"; staging.mkdir(exist_ok=True)
+    (staging / "result.html").write_bytes(b"<html>partial</html>")
+    out = tmp_path / "outbox.bin"
+    r = _run("--staging", str(staging), "--verdicts", str(tmp_path / "verdicts.json"), "--out", str(out),
+             "--transport-only", *extra)
+    return r, out
+
+def test_workload_rc_is_recorded_in_the_outbox_and_staging_is_still_packed(tmp_path):
+    r, out = _pack_transport(tmp_path, "--workload-rc", "7")
+    assert r.returncode == 0, r.stderr
+    verdicts_obj, candidates, rc = outbox.read_and_verify_full(out.read_bytes())
+    assert rc == 7
+    assert verdicts_obj == []
+    assert candidates == {"result.html": b"<html>partial</html>"}, "a failed workload's staging is still packed"
+
+def test_workload_rc_zero_is_recorded(tmp_path):
+    r, out = _pack_transport(tmp_path, "--workload-rc", "0")
+    assert r.returncode == 0, r.stderr
+    assert outbox.read_and_verify_full(out.read_bytes())[2] == 0
+
+def test_no_workload_rc_records_nothing(tmp_path):
+    r, out = _pack_transport(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert outbox.read_and_verify_full(out.read_bytes())[2] is None
+
+def test_workload_rc_is_recorded_on_the_screened_path_too(tmp_path):
+    staging = tmp_path / "staging"; staging.mkdir()
+    (staging / "creds.txt").write_text("password=s3cr3tP@ssw0rd123\n", encoding="utf-8")
+    out = tmp_path / "outbox.bin"
+    r = _run("--staging", str(staging), "--verdicts", str(tmp_path / "v.json"), "--out", str(out), "--workload-rc", "2")
+    assert r.returncode == 0, r.stderr
+    verdicts_obj, candidates, rc = outbox.read_and_verify_full(out.read_bytes())
+    assert rc == 2
+    assert {v["name"]: v["verdict"] for v in verdicts_obj} == {"creds.txt": "HELD"}
+    assert set(candidates) == {"creds.txt"}
+
+def test_out_of_range_workload_rc_fails_closed_no_outbox_written(tmp_path):
+    for bad in ("256", "-1", "99999"):
+        t = tmp_path / ("rc" + bad.replace("-", "m")); t.mkdir()
+        r, out = _pack_transport(t, "--workload-rc", bad)
+        assert r.returncode != 0
+        assert not out.exists(), "fail-closed: an invalid exit code writes no outbox"
+
+def test_non_integer_workload_rc_is_rejected_by_the_argument_parser(tmp_path):
+    r, out = _pack_transport(tmp_path, "--workload-rc", "$erc")
+    assert r.returncode != 0
+    assert not out.exists()
+
+def test_a_staged_workload_json_fails_closed_no_outbox_written(tmp_path):
+    staging = tmp_path / "staging"; staging.mkdir()
+    (staging / "workload.json").write_text('{"exit_code":0}', encoding="utf-8")
+    out = tmp_path / "outbox.bin"
+    r = _run("--staging", str(staging), "--verdicts", str(tmp_path / "v.json"), "--out", str(out),
+             "--transport-only", "--workload-rc", "1")
+    assert r.returncode != 0
+    assert not out.exists()
