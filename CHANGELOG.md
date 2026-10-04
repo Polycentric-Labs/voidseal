@@ -37,3 +37,7 @@ places where a check is an argument rather than a measurement.
   anything, when the host's free RAM is below the guest's memory plus `-HostMemoryMarginBytes` (default
   2GB) or cannot be read. Backend additions: `SetProcessor` `Maximum`/`RelativeWeight` and
   `GetHostMemory`.
+- Configurable sandbox storage root: `-StorageRoot` on `Invoke-Voidseal`, `Invoke-BuilderVM` and
+  `New-SandboxVM`, then the `VOIDSEAL_STORAGE_ROOT` environment variable, then the existing
+  `%ProgramData%\Voidseal\sandboxes` default. The root must be an absolute local path (relative, UNC and
+  device paths are refused before anything is created), and every disk of a run lands under it.

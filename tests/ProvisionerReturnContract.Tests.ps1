@@ -119,3 +119,12 @@ Describe 'Real backend - New-SandboxVM applies the CPU caps and the free-RAM gat
         $script:Cap.noMemNewVMCalled | Should -BeFalse
     }
 }
+
+Describe 'Real backend - New-SandboxVM -StorageRoot reaches New-VM and New-VHD (out-of-process; E2)' {
+
+    It 'the rooted run passes New-VM -Path <root>\<name> and creates the system disk beneath it' {
+        $script:Cap.rootErr | Should -BeNullOrEmpty
+        $script:Cap.rootNewVMPath | Should -Be $script:Cap.rootExpectedDir
+        $script:Cap.rootNewVHDPath | Should -BeLike ($script:Cap.rootExpectedDir + '*')
+    }
+}

@@ -271,3 +271,50 @@ Describe 'Invoke-BuilderVM - passes -HostMemoryMarginBytes to the provisioner (E
         (& $b.GetVM @{ Name = 'bld-margin' }) | Should -BeNullOrEmpty
     }
 }
+
+# ===========================================================================
+#  -StorageRoot covers the builder's disks (E2)
+# ===========================================================================
+Describe 'Invoke-BuilderVM - honors -StorageRoot (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    BeforeAll {
+        function script:New-DiskPathRecorder {
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateDepsImageBlob ([byte[]](1..8))
+            $made = [System.Collections.Generic.List[string]]::new()
+            $origVhd = $b.NewVHD; $origOut = $b.NewOutputVhdx
+            $b.NewVHD        = { param($P) $made.Add([string]$P.Path); & $origVhd $P }.GetNewClosure()
+            $b.NewOutputVhdx = { param($P) $made.Add([string]$P.Path); & $origOut $P }.GetNewClosure()
+            $b['Made'] = $made
+            return $b
+        }
+    }
+
+    It 'creates every disk (system, input, output, seed) under -StorageRoot\<name>' {
+        $b = script:New-DiskPathRecorder
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root' -StorageRoot 'D:\vs-bld' `
+            -Backend $b -DepsDiskPath (Join-Path $TestDrive 'deps-root.vhdx')
+        $r.Status | Should -Be 'Success'
+        $dir = Join-Path 'D:\vs-bld' 'bld-root'
+        $b.Made.Count | Should -BeGreaterThan 3
+        foreach ($p in $b.Made) { $p | Should -BeLike "$dir*" }
+    }
+
+    It 'honors VOIDSEAL_STORAGE_ROOT when the parameter is omitted' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-bld-env'
+        $b = script:New-DiskPathRecorder
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root-env' `
+            -Backend $b -DepsDiskPath (Join-Path $TestDrive 'deps-root-env.vhdx')
+        $r.Status | Should -Be 'Success'
+        foreach ($p in $b.Made) { $p | Should -BeLike (Join-Path 'D:\vs-bld-env' 'bld-root-env*') }
+    }
+
+    It 'a relative -StorageRoot is refused before anything is created' {
+        $b = New-FakeHyperVBackend
+        { Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-root-bad' -StorageRoot 'relative\dir' -Backend $b } |
+            Should -Throw -ExpectedMessage '*absolute local path*'
+        (& $b.GetVM @{ Name = 'bld-root-bad' }) | Should -BeNullOrEmpty
+    }
+}

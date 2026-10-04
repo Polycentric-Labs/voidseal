@@ -385,6 +385,12 @@ function Get-WorkloadField {
 .PARAMETER MaxReleasesPerDay
     (Optional) C2.6 per-profile, per-UTC-day release-event cap passed through to Invoke-SensitivityGate.
     Default 5 (ReleaseGovernor.ps1's own conservative FORK default for Allen, tunable at Phase 6).
+.PARAMETER StorageRoot
+    (Optional) the base directory for this run's disks: the VM folder is <StorageRoot>\<Name> and holds the
+    system, CIDATA seed, INPUT and OUTPUT disks. Beats the VOIDSEAL_STORAGE_ROOT environment variable, which
+    beats the %ProgramData%\Voidseal\sandboxes default. Must be an absolute local path; a relative, UNC or
+    device path throws before the run starts (a caller error, like a bad -Tier). -ArtifactRoot is separate
+    and unchanged.
 .PARAMETER HostMemoryMarginBytes
     (Optional) headroom the host must keep free beyond the guest's memory, passed to New-SandboxVM's
     free-RAM gate. Omit it to take the provisioner's default (2GB); the gate refuses a run, before
@@ -404,6 +410,7 @@ function Invoke-Voidseal {
         [string] $ArtifactRoot,
         [string] $Destination,
         [string] $ParentDiskPath,
+        [string] $StorageRoot,
         [int]    $BootWaitSeconds = 180,
         [int]    $BootPollDelaySeconds = 5,
         [int]    $WorkloadTimeoutSeconds = 600,
@@ -430,6 +437,11 @@ function Invoke-Voidseal {
     if ([string]::IsNullOrWhiteSpace($Name)) {
         $Name = "sbx-{0}-{1}" -f $Tier, ([guid]::NewGuid().ToString('N').Substring(0, 8))
     }
+    # E2: resolve the storage root ONCE (a bad root is a caller error and throws before INIT). The same
+    # base goes to New-SandboxVM, and every later disk uses $vmStorageDir, so the system, seed, INPUT and
+    # OUTPUT disks all land beside each other under one root.
+    $storageBase  = Resolve-SandboxStorageBase -StorageRoot $StorageRoot
+    $vmStorageDir = Join-Path $storageBase $Name
     if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
         $ArtifactRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("Voidseal\artifacts\{0}" -f $Name)
     }
@@ -550,7 +562,7 @@ function Invoke-Voidseal {
 
     try {
         # --- PROVISIONED ---------------------------------------------------
-        $provArgs = @{ Profile = $resolved; Name = $Name; Backend = $Backend }
+        $provArgs = @{ Profile = $resolved; Name = $Name; StorageRoot = $storageBase; Backend = $Backend }
         if (-not [string]::IsNullOrWhiteSpace($ParentDiskPath)) { $provArgs.ParentDiskPath = $ParentDiskPath }
         # Pass the margin only when the caller bound it, so New-SandboxVM's own default stays the single truth.
         if ($PSBoundParameters.ContainsKey('HostMemoryMarginBytes')) { $provArgs.HostMemoryMarginBytes = $HostMemoryMarginBytes }
@@ -585,7 +597,7 @@ function Invoke-Voidseal {
         # DISK: built below, alongside the INPUT/OUTPUT disks; there the seed carries the disk-mode runner.
         if ($workloadMode -ne 'Disk' -and -not [string]::IsNullOrWhiteSpace($entrypoint)) {
             $descriptor = New-WorkloadSeedDisk -Descriptor $descriptor -Profile $resolved `
-                -StorageRoot (Get-SandboxStorageRoot -Name $Name) -Backend $Backend
+                -StorageRoot $vmStorageDir -Backend $Backend
             $report.Descriptor = $descriptor
         }
 
@@ -593,7 +605,7 @@ function Invoke-Voidseal {
         # The INPUT/OUTPUT data disks must be attached AND recorded on the descriptor (InputDiskPath/
         # OutputDiskPath) BEFORE Lock-Sandbox so Assert-Sealed's host-truth scan accepts them as known
         # data disks (an UNRECORDED attached disk fails the seal gate). Use the SAME storage root the
-        # provisioner derives for the system disk (Get-SandboxStorageRoot -Name $Name) so the data disks
+        # provisioner derives for the system disk ($vmStorageDir, resolved once above) so the data disks
         # land beside it and the Reaper's storage-root cleanup covers them. Serial mode skips this.
         if ($workloadMode -eq 'Disk') {
             # Allow -Workload.Inputs to override/populate the profile's Inputs (innerName -> content), so a
@@ -610,7 +622,7 @@ function Invoke-Voidseal {
                 $resolved['Inputs'] = $workloadInputs
             }
 
-            $diskStorageRoot = Get-SandboxStorageRoot -Name $Name
+            $diskStorageRoot = $vmStorageDir
             # New-WorkloadDisks now RECORDS each data disk on the descriptor INCREMENTALLY (its path
             # field AND a deduped append to CreatedDisks) right after it is created — so the INPUT/
             # OUTPUT VHDX files are on CreatedDisks for the Reaper's -DeleteDisks pass, and a mid-

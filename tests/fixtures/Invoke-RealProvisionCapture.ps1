@@ -64,10 +64,14 @@ $script:CreatedVMs = [System.Collections.Generic.HashSet[string]]::new(
 #     EMITS a dummy object to the output stream — mimicking the REAL Hyper-V cmdlets that pollute
 #     the stream and which, uncaptured, leak into New-SandboxVM's return value. ----------------
 
+# Where New-VM / New-VHD were last asked to put things (E2: the storage root must reach both).
+$script:LastNewVMPath  = $null
+$script:LastNewVHDPath = $null
 function New-VHD {
     [CmdletBinding()]
     param([string] $Path, [long] $SizeBytes, [switch] $Differencing,
           [string] $ParentPath, [switch] $Dynamic, [switch] $Fixed)
+    $script:LastNewVHDPath = $Path
     # Real New-VHD emits a Microsoft.Vhd.PowerShell.VirtualHardDisk object.
     [pscustomobject]@{ __Stub = 'VHD'; Path = $Path }
 }
@@ -77,6 +81,7 @@ function New-VM {
     param([string] $Name, [int] $Generation, [long] $MemoryStartupBytes,
           [string] $Path, [string] $SwitchName, [switch] $NoVHD)
     [void]$script:CreatedVMs.Add($Name)
+    $script:LastNewVMPath = $Path
     # Real New-VM emits a Microsoft.HyperV.PowerShell.VirtualMachine object — the headline polluter
     # (this is the raw VM object that became element [0] of New-SandboxVM's return in the live bug).
     [pscustomobject]@{ __Stub = 'VM'; VMName = $Name; ProcessorCount = 0 }
@@ -240,6 +245,15 @@ try {
 catch { $capsErr = $_.Exception.Message }
 $capsProc = if ($script:ProcCalls.Count -gt 0) { $script:ProcCalls[0] } else { $null }
 
+# E2: a run with an explicit -StorageRoot must hand New-VM and New-VHD paths under it.
+$rootBase = Join-Path ([System.IO.Path]::GetTempPath()) 'voidseal-root-capture'
+$rootErr = $null
+try { $null = New-SandboxVM -Profile $profile -Name 'sbx-root' -StorageRoot $rootBase -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend) }
+catch { $rootErr = $_.Exception.Message }
+$rootNewVMPath  = $script:LastNewVMPath
+$rootNewVHDPath = $script:LastNewVHDPath
+$rootExpectedDir = Join-Path $rootBase 'sbx-root'
+
 $script:cimMode = 'low'
 $lowMemErr = $null
 try { $null = New-SandboxVM -Profile $profile -Name 'sbx-lowmem' -ParentDiskPath $goldenParent -Backend (New-RealHyperVBackend) }
@@ -290,6 +304,10 @@ $out = [ordered]@{
     capsProcMaximum                = if ($null -ne $capsProc) { [long]$capsProc.Maximum } else { $null }
     capsProcRelativeWeightGiven    = if ($null -ne $capsProc) { [bool]$capsProc.RelativeWeightGiven } else { $null }
     capsProcRelativeWeight         = if ($null -ne $capsProc) { [int]$capsProc.RelativeWeight } else { $null }
+    rootErr                        = $rootErr
+    rootExpectedDir                = $rootExpectedDir
+    rootNewVMPath                  = $rootNewVMPath
+    rootNewVHDPath                 = $rootNewVHDPath
     lowMemErr                      = $lowMemErr
     lowMemNewVMCalled              = [bool]$lowMemNewVMCalled
     noMemErr                       = $noMemErr

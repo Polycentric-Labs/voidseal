@@ -78,6 +78,10 @@ Set-StrictMode -Version Latest
 .PARAMETER WorkloadTimeoutSeconds
     (Optional) wall-clock deadline for the guest to self-power-off. Default 600. Pass 0 in
     tests (one instant poll then trips the deadline — no real sleep).
+.PARAMETER StorageRoot
+    (Optional) the base directory for the builder's disks (<StorageRoot>\<Name>). Beats the
+    VOIDSEAL_STORAGE_ROOT environment variable, which beats the %ProgramData%\Voidseal\sandboxes default.
+    Must be an absolute local path; anything else throws before the run starts.
 .PARAMETER HostMemoryMarginBytes
     (Optional) headroom the host must keep free beyond the guest's memory, passed to New-SandboxVM's
     free-RAM gate (see Invoke-Voidseal). Omit it to take the provisioner's default (2GB).
@@ -93,6 +97,7 @@ function Invoke-BuilderVM {
         [string]    $DepsDiskPath,
         [string]    $RunnerScriptPath = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'guest\fetch_deps.py'),
         [int]       $WorkloadTimeoutSeconds = 600,
+        [string]    $StorageRoot,
         [ValidateRange(0, [long]::MaxValue)] [long] $HostMemoryMarginBytes,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
@@ -113,6 +118,11 @@ function Invoke-BuilderVM {
     if ([string]::IsNullOrWhiteSpace($Name)) {
         $Name = "bld-{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8))
     }
+
+    # E2: resolve the storage root once; a bad root throws here, before any backend call. Every disk of the
+    # run (system, INPUT, OUTPUT, seed) lives under <base>\<Name>.
+    $storageBase  = Resolve-SandboxStorageBase -StorageRoot $StorageRoot
+    $vmStorageDir = Join-Path $storageBase $Name
 
     # Inject the runner + the DepsSpec into the INPUT disk at deploy time (mirrors how
     # the firefox orchestrator injects the organizer script via -Workload.Inputs).
@@ -144,13 +154,13 @@ function Invoke-BuilderVM {
 
     try {
         # --- PROVISIONED: create the Tier-1 VM (NIC stays up — net-restricted, not no-NIC) ---
-        $provArgs = @{ Profile = $resolved; Name = $Name; Backend = $Backend }
+        $provArgs = @{ Profile = $resolved; Name = $Name; StorageRoot = $storageBase; Backend = $Backend }
         if ($PSBoundParameters.ContainsKey('HostMemoryMarginBytes')) { $provArgs.HostMemoryMarginBytes = $HostMemoryMarginBytes }
         $descriptor = New-SandboxVM @provArgs
         $states.Add('PROVISIONED')
 
         # --- STAGED: workload data disks + CIDATA seed disk (RC6, mirrors the disk-mode path) ---
-        $diskStorageRoot = Get-SandboxStorageRoot -Name $Name
+        $diskStorageRoot = $vmStorageDir
 
         # INPUT disk (runner + DepsSpec) + OUTPUT disk (will hold deps after the fetch).
         # New-WorkloadDisks records both on the descriptor (InputDiskPath / OutputDiskPath +

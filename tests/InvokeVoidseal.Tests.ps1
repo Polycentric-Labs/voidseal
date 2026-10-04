@@ -377,6 +377,23 @@ Describe 'Invoke-Voidseal — Disk mode: full lifecycle seals, attaches+detaches
         $report.RunResult | Should -Not -BeNullOrEmpty
     }
 
+    It 'Disk mode with -StorageRoot places the system, INPUT, OUTPUT and seed disks beside each other under it (E2)' {
+        $root = 'D:\vs-orch-disk'
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Tier0Disk `
+            -Workload @{ WorkloadMode = 'Disk' } -StorageRoot $root `
+            -Name 'sbx-disk-root' -ArtifactRoot $script:Art -Destination $script:Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $script:DiskB
+        $report.States | Should -Contain 'SEALED'
+        $expectedDir = Join-Path $root 'sbx-disk-root'
+        $d = $report.Descriptor
+        foreach ($p in @($d.DiskPath, $d.InputDiskPath, $d.OutputDiskPath)) {
+            $p | Should -Not -BeNullOrEmpty
+            $p | Should -BeLike "$expectedDir*"
+        }
+        # The CIDATA seed disk exists only when the fixture carries an entrypoint; when it does, it sits there too.
+        if ($d.SeedDiskPath) { $d.SeedDiskPath | Should -BeLike "$expectedDir*" }
+    }
+
     It 'Disk mode attaches BOTH data disks before the seal, folds them into CreatedDisks, and DETACHES them before the host read (proven via the call log)' {
         # The data disks are recorded on the descriptor and attached pre-seal; after the run they are
         # detached (RemoveHardDiskDrive) BEFORE the host reads the OUTPUT volume (ReadVhdxRawRegion, the
@@ -1937,5 +1954,47 @@ Describe 'Invoke-Voidseal - passes -HostMemoryMarginBytes to the provisioner (E1
             -Workload @{ Entrypoint = 'true' } -ArtifactRoot (Join-Path $script:TmpRoot 'art-ov-default') -Backend $b -WarningAction SilentlyContinue
         $report.Error | Should -Match '(?i)free memory'
         $report.Error | Should -Match ([regex]::Escape([string]2GB))
+    }
+}
+
+# ===========================================================================
+#  -StorageRoot / VOIDSEAL_STORAGE_ROOT place every disk of a run (E2)
+# ===========================================================================
+Describe 'Invoke-Voidseal - the storage root covers the system, seed and data disks (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    It 'a Serial run with -StorageRoot puts the system disk and the CIDATA seed disk under it' {
+        $b = New-FakeHyperVBackend
+        $root = 'D:\vs-orch'
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-root' `
+            -Workload @{ Entrypoint = 'true' } -StorageRoot $root `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-root') -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -BeNullOrEmpty
+        $expectedDir = Join-Path $root 'sbx-orch-root'
+        $report.Descriptor.DiskPath     | Should -BeLike "$expectedDir*"
+        $report.Descriptor.SeedDiskPath | Should -BeLike "$expectedDir*"
+    }
+
+    It 'VOIDSEAL_STORAGE_ROOT is honored when -StorageRoot is omitted, and the parameter wins when both are given' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-orch-env'
+        $b1 = New-FakeHyperVBackend
+        $r1 = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-env' -Workload @{ Entrypoint = 'true' } `
+            -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-env') -Backend $b1 -WarningAction SilentlyContinue
+        $r1.Descriptor.DiskPath | Should -BeLike (Join-Path 'D:\vs-orch-env' 'sbx-orch-env*')
+
+        $b2 = New-FakeHyperVBackend
+        $r2 = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-both' -Workload @{ Entrypoint = 'true' } `
+            -StorageRoot 'D:\vs-orch-param' -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-both') -Backend $b2 -WarningAction SilentlyContinue
+        $r2.Descriptor.DiskPath | Should -BeLike (Join-Path 'D:\vs-orch-param' 'sbx-orch-both*')
+    }
+
+    It 'a relative -StorageRoot is a caller error: it throws before INIT and creates nothing' {
+        $b = New-FakeHyperVBackend
+        { Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'sbx-orch-bad' -Workload @{ Entrypoint = 'true' } `
+            -StorageRoot 'relative\dir' -ArtifactRoot (Join-Path $script:TmpRoot 'art-orch-bad') -Backend $b } |
+            Should -Throw -ExpectedMessage '*absolute local path*'
+        (& $b.GetVM @{ Name = 'sbx-orch-bad' }) | Should -BeNullOrEmpty
     }
 }

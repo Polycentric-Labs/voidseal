@@ -324,6 +324,33 @@ something or lower the margin if a roomy-looking host is refused. And the real r
 (`Get-CimInstance Win32_OperatingSystem`, KiB converted to bytes) is pinned by an out-of-process stub
 test but has not run on a live host yet.
 
+### 1.6 Where the disks live: `-StorageRoot` and `VOIDSEAL_STORAGE_ROOT`
+
+Every run keeps its VM folder and disks (system, CIDATA seed, INPUT, OUTPUT) under one base directory, in a
+folder named after the VM: `<base>\<vm-name>\`. The base is chosen in this order:
+
+1. the `-StorageRoot` parameter of `Invoke-Voidseal`, `Invoke-BuilderVM` or `New-SandboxVM`;
+2. the `VOIDSEAL_STORAGE_ROOT` environment variable;
+3. the default, `%ProgramData%\Voidseal\sandboxes`.
+
+```powershell
+$report = Invoke-Voidseal -Tier 1 -Profile ralph -StorageRoot 'D:\VoidsealSandboxes' ...
+# or, for every run in this session:
+$env:VOIDSEAL_STORAGE_ROOT = 'D:\VoidsealSandboxes'
+```
+
+A blank value counts as unset. A chosen root must be an absolute local path: a relative path, a drive-relative
+path (`D:dir`), a rooted path with no drive (`\dir`) and any UNC, extended or device path (`\\server\share`,
+`\\?\D:\dir`) is refused, and `Invoke-Voidseal` throws before the run starts. The host free-space check
+measures the volume that hosts the chosen root, so moving the root to a bigger drive is the fix for
+`insufficient host free space`. `-ArtifactRoot` (where the Runner's capture and the extracted result go) is a
+separate setting and is unchanged.
+
+Teardown deletes only the disk paths the run's descriptor recorded; it never recomputes the root, so
+changing the environment variable between a provision and its teardown cannot redirect a delete. Live-only,
+not yet exercised: on a real host the VM folder is created by Hyper-V when the first disk is made, as it is
+under the default root today, so the drive must exist and be writable by the Hyper-V service.
+
 ---
 
 ## 2. Credential handling (binding — a strict secret-handling protocol)
@@ -399,5 +426,6 @@ do not ship. Run the Python suite too if you touched anything under `guest/`:
 | `declares a secret-shaped mount source …` at load | a `Mounts` source matches the secret list (e.g. the live `.credentials.json`) | mount a copied `.token` file in a non-secret path instead (§2) |
 | `seal gate did not certify …` in the report | `Assert-Sealed` failed (NIC still attached / a host channel readable) | inspect the profile's `HostChannels` (all `$false` for VM tiers) + that `Lock-Sandbox` removed the NIC; the abort already tore the VM down |
 | `Tier-… cold-VHDX … is NOT IMPLEMENTED` | a Tier ≥ 2 extraction was attempted | expected — Tier ≥ 2 extraction is post-v1; do not run hostile tiers live in v1 |
+| `... is not an absolute local path` from a `Sandbox storage root` message | `-StorageRoot` or `VOIDSEAL_STORAGE_ROOT` is relative, drive-relative, UNC or a device path | set an absolute local path such as `D:\VoidsealSandboxes` (§1.6) |
 | `refusing to provision ...: host free memory is ... bytes but the guest needs ...` | the host's free RAM is below the guest's `Memory` plus the margin, or the host memory read failed | free host memory, lower the profile's `Memory`, or lower `-HostMemoryMarginBytes` (§1.5) |
 | serial console silent on a live Tier-1 boot | guest `serial-getty@ttyS0` not enabled / wrong `CIDATA` label | re-check the seed `user-data` + that the ISO volume label is exactly `CIDATA` (see the guest-image recipe) |

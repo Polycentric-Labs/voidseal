@@ -223,25 +223,63 @@ function ConvertTo-Bytes {
 
 <#
 .SYNOPSIS
-    Compute the default sandbox storage root (host-side). Disks + the COM1 pipe live here.
+    Resolve the BASE directory that holds every sandbox's folder (host-side).
 .DESCRIPTION
-    Defaults to %ProgramData%\Voidseal\sandboxes\<vmName> on Windows, with a temp-dir
-    fallback for the non-Windows test/dev host (the fake backend never touches the FS, so
-    these are just record strings the descriptor carries — no directory is created here).
+    Precedence (E2): an explicit -StorageRoot beats the VOIDSEAL_STORAGE_ROOT environment variable,
+    which beats the default of %ProgramData%\Voidseal\sandboxes (a temp-dir fallback on a non-Windows
+    test/dev host). A blank or whitespace value counts as unset and falls through to the next source.
+
+    A chosen root must be an ABSOLUTE LOCAL path. A relative path, a drive-relative path (C:dir), a
+    rooted path with no drive (\dir) and any UNC, extended or device path (\\server\share, \\?\C:\dir,
+    \\.\C:\dir) is refused, fail closed, with a message naming which source supplied it. The guard keeps
+    a typo from landing a VM's disks relative to whatever the working directory happens to be, and keeps
+    the system and data disks off a network share. Nothing is created here: the fake backend never
+    touches the filesystem and the real NewVHD creates the files.
+#>
+function Resolve-SandboxStorageBase {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string] $StorageRoot)
+
+    $candidate = $null
+    $source    = $null
+    if (-not [string]::IsNullOrWhiteSpace($StorageRoot)) {
+        $candidate = $StorageRoot.Trim(); $source = '-StorageRoot'
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:VOIDSEAL_STORAGE_ROOT)) {
+        $candidate = $env:VOIDSEAL_STORAGE_ROOT.Trim(); $source = 'the VOIDSEAL_STORAGE_ROOT environment variable'
+    }
+
+    if ($null -ne $candidate) {
+        if (($candidate -match '^(\\\\|//)') -or -not [System.IO.Path]::IsPathFullyQualified($candidate)) {
+            throw ("Sandbox storage root: $source value '$candidate' is not an absolute local path " +
+                   "(for example 'D:\VoidsealSandboxes'). Relative, drive-relative, UNC, extended and device " +
+                   "paths are refused. Failing closed BEFORE anything is created.")
+        }
+        return $candidate
+    }
+
+    if ($env:ProgramData -and -not [string]::IsNullOrWhiteSpace($env:ProgramData)) {
+        return (Join-Path $env:ProgramData 'Voidseal\sandboxes')
+    }
+    return (Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\sandboxes')
+}
+
+<#
+.SYNOPSIS
+    Compute one sandbox's storage folder, <base>\<vmName> (host-side). Disks + the COM1 pipe live here.
+.DESCRIPTION
+    The base comes from Resolve-SandboxStorageBase: -StorageRoot, then VOIDSEAL_STORAGE_ROOT, then
+    %ProgramData%\Voidseal\sandboxes. The folder is always <base>\<vmName>.
 #>
 function Get-SandboxStorageRoot {
     [CmdletBinding()]
     [OutputType([string])]
-    param([Parameter(Mandatory)] [string] $Name)
-
-    $base = $null
-    if ($env:ProgramData -and -not [string]::IsNullOrWhiteSpace($env:ProgramData)) {
-        $base = Join-Path $env:ProgramData 'Voidseal\sandboxes'
-    }
-    else {
-        $base = Join-Path ([System.IO.Path]::GetTempPath()) 'Voidseal\sandboxes'
-    }
-    return (Join-Path $base $Name)
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [string] $StorageRoot
+    )
+    return (Join-Path (Resolve-SandboxStorageBase -StorageRoot $StorageRoot) $Name)
 }
 
 <#
@@ -330,6 +368,12 @@ function New-SandboxDescriptor {
     actionable message naming the `fsutil sparse setflag <path> 0` fix BEFORE any artifact is created.
 .PARAMETER SystemDiskSizeBytes
     (Optional) Size of a fresh system disk when no ParentDiskPath is given. Default 40GB.
+.PARAMETER StorageRoot
+    (Optional) the base directory under which this VM's folder (<root>\<name>) and every disk the
+    provision creates live. Beats the VOIDSEAL_STORAGE_ROOT environment variable, which beats the
+    %ProgramData%\Voidseal\sandboxes default. Must be an absolute local path (Resolve-SandboxStorageBase
+    refuses anything else, before any backend call). Teardown never recomputes it: Remove-Sandbox deletes
+    only the paths the descriptor recorded.
 .PARAMETER HostMemoryMarginBytes
     (Optional) headroom the HOST must keep free on top of the guest's memory. Before creating anything,
     New-SandboxVM reads the host's free physical memory through the backend's GetHostMemory and refuses
@@ -346,6 +390,7 @@ function New-SandboxVM {
         [Parameter(Mandatory)] [AllowEmptyString()] [string] $Name,
         [string] $ParentDiskPath,
         [long]   $SystemDiskSizeBytes = 40GB,
+        [string] $StorageRoot,
         [ValidateRange(0, [long]::MaxValue)] [long] $HostMemoryMarginBytes = 2GB,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
@@ -360,6 +405,10 @@ function New-SandboxVM {
     if ([string]::IsNullOrWhiteSpace($Name)) {
         throw "New-SandboxVM: -Name is blank. A sandbox VM needs a non-empty name."
     }
+    # E2: resolve (and validate) the storage root up front so a bad root fails closed before ANY backend
+    # call. PowerShell variable names are case-insensitive, so the per-VM folder is $vmStorageDir, not
+    # $storageRoot (which would alias the -StorageRoot parameter).
+    $vmStorageDir = Join-Path (Resolve-SandboxStorageBase -StorageRoot $StorageRoot) $Name
 
     # --- preflight: is Hyper-V usable? (fail-closed) ----------------------
     $probe = & $Backend.TestAvailable @{}
@@ -446,8 +495,7 @@ function New-SandboxVM {
     }
 
     # Storage layout (record strings — the FS isn't touched here; the real NewVHD creates the file).
-    $storageRoot = Get-SandboxStorageRoot -Name $Name
-    $systemDisk  = Join-Path $storageRoot ("{0}-system.vhdx" -f $Name)
+    $systemDisk  = Join-Path $vmStorageDir ("{0}-system.vhdx" -f $Name)
     $comPipe     = "\\.\pipe\{0}-com1" -f $Name
 
     # --- host-free-space preflight (I6b; fail-closed; pure host-FS, BEFORE any creation) --
@@ -456,16 +504,18 @@ function New-SandboxVM {
     # PARENT's on-disk size is the conservative bound (the child grows toward the parent's data,
     # and a bad/sparse parent was already rejected above so the parent's Length is a real number
     # here); for a fresh disk, the full requested $SystemDiskSizeBytes (a dynamic disk's worst
-    # case at CREATE time, since currentFileSize≈0). Measures the volume hosting $storageRoot —
-    # the REAL sandbox storage root every provision uses (ProgramData or TEMP), not a caller-
-    # supplied path — so this never depends on a test's fake VM name resolving to a real drive.
+    # case at CREATE time, since currentFileSize≈0). Measures the volume hosting $vmStorageDir,
+    # the resolved sandbox storage folder every provision uses (-StorageRoot, the
+    # VOIDSEAL_STORAGE_ROOT variable, or the ProgramData default), so a relocated root is the volume
+    # that gets checked. The read goes through the backend seam, so a mock-backed run never depends
+    # on a fake VM name resolving to a real drive.
     $requiredBytes = if (-not [string]::IsNullOrWhiteSpace($ParentDiskPath)) {
         (Get-Item -LiteralPath $ParentDiskPath).Length
     }
     else {
         $SystemDiskSizeBytes
     }
-    $null = Test-HostFreeSpace -Path $storageRoot -RequiredBytes $requiredBytes -Backend $Backend
+    $null = Test-HostFreeSpace -Path $vmStorageDir -RequiredBytes $requiredBytes -Backend $Backend
 
     # --- artifact tracking for mid-provision ROLLBACK ---------------------
     # If ANY creation step below throws, the catch best-effort tears down EXACTLY what was
@@ -502,7 +552,7 @@ function New-SandboxVM {
         # NoVHD=$true: New-VM must NOT auto-create a blank boot VHD (real Hyper-V otherwise
         # emits a diskless-VM warning and/or makes a disk we don't want). We attach our own
         # system disk in step 8. (The fake ignores NoVHD; the real backend honors it.)
-        $null = & $Backend.NewVM @{ Name = $Name; Generation = $generation; MemoryStartupBytes = $memoryBytes; Path = $storageRoot; NoVHD = $true }
+        $null = & $Backend.NewVM @{ Name = $Name; Generation = $generation; MemoryStartupBytes = $memoryBytes; Path = $vmStorageDir; NoVHD = $true }
         $vmCreated = $true
 
         # --- 2a. disable automatic checkpoints (RC7) ----------------------

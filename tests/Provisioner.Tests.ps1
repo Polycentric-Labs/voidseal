@@ -984,3 +984,125 @@ Describe 'ConvertTo-ProfileMemoryBytes (loader) and ConvertTo-Bytes (Provisioner
         }
     }
 }
+
+# ===========================================================================
+#  Storage root: -StorageRoot > VOIDSEAL_STORAGE_ROOT > the ProgramData default (E2)
+# ===========================================================================
+Describe 'Get-SandboxStorageRoot - precedence and validation (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    It 'defaults to the ProgramData sandboxes folder with nothing set (behavior unchanged)' {
+        $want = Join-Path (Join-Path $env:ProgramData 'Voidseal\sandboxes') 'vm-a'
+        Get-SandboxStorageRoot -Name 'vm-a' | Should -Be $want
+    }
+
+    It 'uses VOIDSEAL_STORAGE_ROOT when it is set' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
+        Get-SandboxStorageRoot -Name 'vm-a' | Should -Be (Join-Path 'D:\vs-env' 'vm-a')
+    }
+
+    It 'an explicit -StorageRoot beats the environment variable' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot 'E:\vs-param' | Should -Be (Join-Path 'E:\vs-param' 'vm-a')
+    }
+
+    It 'ignores a blank environment variable and a blank -StorageRoot (treated as unset)' {
+        $env:VOIDSEAL_STORAGE_ROOT = '   '
+        $want = Join-Path (Join-Path $env:ProgramData 'Voidseal\sandboxes') 'vm-a'
+        Get-SandboxStorageRoot -Name 'vm-a' | Should -Be $want
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot '' | Should -Be $want
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot ' ' | Should -Be (Join-Path 'D:\vs-env' 'vm-a') -Because 'a blank parameter falls through to the next source'
+    }
+
+    It 'tolerates a trailing separator and forward slashes' {
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot 'D:\vms\' | Should -Be (Join-Path 'D:\vms\' 'vm-a')
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot 'D:/vms'  | Should -Be (Join-Path 'D:/vms' 'vm-a')
+    }
+
+    It 'REFUSES a relative path, a drive-relative path and a rooted path with no drive, naming the source' {
+        foreach ($bad in @('sandboxes', '.\sandboxes', '..\sandboxes', 'C:sandboxes', '\sandboxes')) {
+            { Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot $bad } |
+                Should -Throw -ExpectedMessage '*absolute local path*' -Because "'$bad' is not an absolute local path"
+        }
+        $env:VOIDSEAL_STORAGE_ROOT = 'relative\dir'
+        { Get-SandboxStorageRoot -Name 'vm-a' } | Should -Throw -ExpectedMessage '*VOIDSEAL_STORAGE_ROOT*'
+    }
+
+    It 'REFUSES UNC, extended and device paths (the root must be local)' {
+        foreach ($bad in @('\\fileserver\share\vs', '//fileserver/share/vs', '\\?\C:\vs', '\\.\C:\vs', '\\?\UNC\fileserver\share\vs')) {
+            { Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot $bad } |
+                Should -Throw -ExpectedMessage '*absolute local path*' -Because "'$bad' is a UNC/extended/device path"
+        }
+    }
+}
+
+Describe 'New-SandboxVM - honors the storage root (E2)' {
+
+    BeforeEach { $script:SavedRoot = $env:VOIDSEAL_STORAGE_ROOT; $env:VOIDSEAL_STORAGE_ROOT = $null }
+    AfterEach  { $env:VOIDSEAL_STORAGE_ROOT = $script:SavedRoot }
+
+    BeforeAll {
+        # Record where the VM and its disks are asked to live.
+        function script:New-PathRecordingBackend {
+            $b = New-FakeHyperVBackend
+            $paths = [ordered]@{ NewVMPath = $null; Vhds = [System.Collections.Generic.List[string]]::new() }
+            $origNewVM  = $b.NewVM
+            $origNewVHD = $b.NewVHD
+            $b.NewVM  = { param($P) $paths.NewVMPath = [string]$P.Path; & $origNewVM $P }.GetNewClosure()
+            $b.NewVHD = { param($P) $paths.Vhds.Add([string]$P.Path); & $origNewVHD $P }.GetNewClosure()
+            $b['Paths'] = $paths
+            return $b
+        }
+    }
+
+    It 'places the VM folder and the system disk under -StorageRoot' {
+        $b = script:New-PathRecordingBackend
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root1' -StorageRoot 'D:\vs-root' -Backend $b
+        $b.Paths.NewVMPath | Should -Be (Join-Path 'D:\vs-root' 'sbx-root1')
+        $desc.DiskPath     | Should -Be (Join-Path (Join-Path 'D:\vs-root' 'sbx-root1') 'sbx-root1-system.vhdx')
+        $b.Paths.Vhds[0]   | Should -Be $desc.DiskPath
+        @($desc.CreatedDisks) | Should -Contain $desc.DiskPath
+    }
+
+    It 'falls back to VOIDSEAL_STORAGE_ROOT, and an explicit parameter still wins over it' {
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
+        $b = script:New-PathRecordingBackend
+        $d1 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root2' -Backend $b
+        $d1.DiskPath | Should -Be (Join-Path (Join-Path 'D:\vs-env' 'sbx-root2') 'sbx-root2-system.vhdx')
+        $d2 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root3' -StorageRoot 'E:\vs-param' -Backend $b
+        $d2.DiskPath | Should -Be (Join-Path (Join-Path 'E:\vs-param' 'sbx-root3') 'sbx-root3-system.vhdx')
+    }
+
+    It 'keeps the old default when neither is set' {
+        $b = New-FakeHyperVBackend
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root4' -Backend $b
+        $desc.DiskPath | Should -Be (Join-Path (Get-SandboxStorageRoot -Name 'sbx-root4') 'sbx-root4-system.vhdx')
+        $desc.DiskPath | Should -Match ([regex]::Escape((Join-Path $env:ProgramData 'Voidseal\sandboxes')))
+    }
+
+    It 'refuses a relative or UNC root before any backend call: no VM, no disk' {
+        foreach ($bad in @('relative\dir', '\\fileserver\share\vs')) {
+            $b = New-FakeHyperVBackend
+            { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root5' -StorageRoot $bad -Backend $b } |
+                Should -Throw -ExpectedMessage '*absolute local path*'
+            (& $b.GetVM @{ Name = 'sbx-root5' }) | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'teardown deletes only the disks the descriptor recorded, even if the environment root changed since' {
+        $b = New-FakeHyperVBackend
+        $desc = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root6' -StorageRoot 'D:\vs-a' -Backend $b
+
+        # An unrelated VHD that sits where a recomputed root WOULD point.
+        $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-b'
+        $bystander = Join-Path (Join-Path 'D:\vs-b' 'sbx-root6') 'sbx-root6-system.vhdx'
+        & $b.NewVHD @{ Path = $bystander; SizeBytes = 1GB; Dynamic = $true }
+
+        Remove-Sandbox -Name 'sbx-root6' -DeleteDisks -Descriptor $desc -Backend $b
+        (& $b.GetVHDInfo @{ Path = $desc.DiskPath }) | Should -BeNullOrEmpty -Because 'the recorded disk is deleted'
+        (& $b.GetVHDInfo @{ Path = $bystander })     | Should -Not -BeNullOrEmpty -Because 'teardown must never recompute the root and reach for a different path'
+    }
+}
