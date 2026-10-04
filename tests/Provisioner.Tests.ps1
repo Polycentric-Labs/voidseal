@@ -762,3 +762,95 @@ Describe 'Get-VMField — reads a field off EITHER backend VM shape (fake hashta
         Get-VMField -VM @{ Name = 'x' }                    -Name 'State' -Default 'Unknown' | Should -Be 'Unknown'
     }
 }
+
+# ===========================================================================
+#  Get-SealNicPolicy: the ONE predicate for a VM's network-adapter posture
+# ===========================================================================
+#  The Provisioner, Lock-Sandbox and Assert-Sealed used to answer "does this VM keep a NIC?" on their own
+#  and drifted apart. All three now ask this function, which is an allow-list with one entry.
+Describe 'Get-SealNicPolicy: the single NIC-posture predicate (Provisioner, Lock-Sandbox, Assert-Sealed)' {
+
+    It 'Tier 1 with a non-processor label is the ONLY permissive case: IsolatedInternalSwitch' {
+        Get-SealNicPolicy -Tier 1 -Network 'Internal+Allowlist' | Should -Be 'IsolatedInternalSwitch'
+    }
+
+    It 'Tier 0 is NoAdapter whatever its label says' {
+        Get-SealNicPolicy -Tier 0 -Network 'HostProxyAllowlist' | Should -Be 'NoAdapter'
+    }
+
+    It 'Tier 2 and Tier 3 are NoAdapter' {
+        Get-SealNicPolicy -Tier 2 -Network 'Private-NoNIC' | Should -Be 'NoAdapter'
+        Get-SealNicPolicy -Tier 3 -Network 'Private-NoNIC' | Should -Be 'NoAdapter'
+    }
+
+    It 'a processor (Network=None) is NoAdapter at every tier, Tier 1 included' {
+        foreach ($t in 0..3) {
+            Get-SealNicPolicy -Tier $t -Network 'None' | Should -Be 'NoAdapter' -Because "a processor has no NIC at Tier $t"
+        }
+    }
+
+    It 'matches None case-insensitively and ignores surrounding whitespace' {
+        Get-SealNicPolicy -Tier 1 -Network 'none'   | Should -Be 'NoAdapter'
+        Get-SealNicPolicy -Tier 1 -Network 'NONE'   | Should -Be 'NoAdapter'
+        Get-SealNicPolicy -Tier 1 -Network ' None ' | Should -Be 'NoAdapter'
+    }
+
+    It 'a blank or missing label is NoAdapter, even at Tier 1 (unexpected input lands on the strict side)' {
+        Get-SealNicPolicy -Tier 1 -Network ''    | Should -Be 'NoAdapter'
+        Get-SealNicPolicy -Tier 1 -Network '  '  | Should -Be 'NoAdapter'
+        Get-SealNicPolicy -Tier 1 -Network $null | Should -Be 'NoAdapter'
+    }
+
+    It 'an out-of-range tier is NoAdapter' {
+        Get-SealNicPolicy -Tier -1 -Network 'Internal+Allowlist' | Should -Be 'NoAdapter'
+        Get-SealNicPolicy -Tier 7  -Network 'Internal+Allowlist' | Should -Be 'NoAdapter'
+    }
+}
+
+# ===========================================================================
+#  New-SandboxVM: records Network; builds a switch only for an IsolatedInternalSwitch VM
+# ===========================================================================
+Describe 'New-SandboxVM: records Network and builds a switch only for an IsolatedInternalSwitch VM' {
+
+    It 'records the profile''s Network label on the descriptor' {
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-netrec' -Backend $b
+        $d.Network | Should -Be 'Internal+Allowlist' -Because 'Lock-Sandbox and Assert-Sealed derive the NIC policy from the recorded Network'
+    }
+
+    It 'a Tier-1 non-processor keeps its sbx-netnp-int Internal switch and exactly one connected NIC' {
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-netnp' -Backend $b
+        $d.SwitchName | Should -Be 'sbx-netnp-int'
+        $nics = & $b.GetNetworkAdapter @{ VMName = 'sbx-netnp' }
+        $nics.Count | Should -Be 1 -Because 'the provisioner connects the default adapter instead of adding a second'
+        $nics[0].SwitchName | Should -Be 'sbx-netnp-int'
+    }
+
+    It 'a Tier-1 PROCESSOR (Network=None) gets NO switch, and its default adapter stays unconnected' {
+        $proc = $script:Tier1.Clone()
+        $proc['Network']         = 'None'
+        $proc['EgressMode']      = 'None'
+        $proc['EgressAllowlist'] = @()
+        Assert-TierProfileValid -Profile $proc -Context 'TEST Tier-1 processor fixture'
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $proc -Name 'sbx-netproc1' -Backend $b
+        $d.Network    | Should -Be 'None'
+        $d.SwitchName | Should -BeNullOrEmpty -Because 'a processor is never wired to a switch, not even before the seal'
+        (& $b.GetSwitch @{ Name = 'sbx-netproc1-int' }) | Should -BeNullOrEmpty -Because 'no switch is created for a NoAdapter VM'
+        $nics = & $b.GetNetworkAdapter @{ VMName = 'sbx-netproc1' }
+        $nics.Count | Should -Be 1 -Because 'real New-VM always leaves one adapter; Lock-Sandbox removes it at the seal'
+        [string]$nics[0].SwitchName | Should -BeNullOrEmpty -Because 'the default adapter is never connected'
+    }
+
+    It 'a Tier-0 VM on the Hyper-V substrate gets NO switch (Tier 0 is NoAdapter)' {
+        $t0 = $script:Tier1.Clone()
+        $t0['Tier']        = 0
+        $t0['Description'] = 'TEST FIXTURE: Tier 0 on the Hyper-V substrate.'
+        Assert-TierProfileValid -Profile $t0 -Context 'TEST Tier-0 Hyper-V fixture'
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $t0 -Name 'sbx-net0' -Backend $b
+        $d.SwitchName | Should -BeNullOrEmpty
+        (& $b.GetSwitch @{ Name = 'sbx-net0-int' }) | Should -BeNullOrEmpty
+    }
+}

@@ -28,7 +28,7 @@
     are satisfied — switch/VHD must exist before they're referenced):
         preflight -> idempotency check -> NewVHD (system disk) -> NewVM (Gen2, NoVHD)
         -> SetMemory -> SetProcessor (+nested virt) -> SetFirmware (SecureBoot template)
-        -> SetComPort (COM1, Linux mgmt) -> NewSwitch + ConnectNetworkAdapter (VM tiers)
+        -> SetComPort (COM1, Linux mgmt) -> NewSwitch + ConnectNetworkAdapter (IsolatedInternalSwitch VMs only)
         -> AddHardDiskDrive (attach system disk).
     The VM is left POWERED OFF — the Sealer runs before first boot.
 
@@ -54,6 +54,10 @@
         provision rollback (above) deletes any vSwitch the provision created so a failed
         provision leaves no orphaned switch. Real backend = Remove-VMSwitch -Force (guarded by
         a Get so it's idempotent); fake = drops its in-memory record. (Also usable by the Sealer.)
+    NIC POLICY (2026-10-03):
+      * Get-SealNicPolicy is the single predicate for whether a VM keeps a NIC, shared with Lock-Sandbox
+        and Assert-Sealed. New-SandboxVM records the profile's Network label on the descriptor so all
+        three compute the same answer. Only a Tier-1 non-processor gets a switch and a connected NIC.
     AUTOMATIC CHECKPOINTS (RC7 — gap CLOSED 2026-06-25):
       * Hyper-V defaults `AutomaticCheckpointsEnabled=ON`, which pins a differencing AVHDX per disk at
         VM start: the guest writes its result into the .avhdx while the host reads the empty BASE .vhdx,
@@ -257,6 +261,7 @@ function New-SandboxDescriptor {
         [string]   $ComPipePath,
         [string]   $SwitchName,
         [string]   $SwitchType,
+        [string]   $Network = $null,               # the profile's Network posture label; with Tier it decides the NIC policy (Get-SealNicPolicy)
         [string]   $DiskPath,                      # the primary / system disk
         [string[]] $DiskPaths   = @(),             # all attached disks
         [string[]] $CreatedDisks = @(),            # disks THIS provision created (Remove -DeleteDisks targets these)
@@ -281,6 +286,7 @@ function New-SandboxDescriptor {
         ComPipePath                  = $ComPipePath
         SwitchName                   = $SwitchName
         SwitchType                   = $SwitchType
+        Network                      = $Network
         DiskPath                     = $DiskPath
         DiskPaths                    = @($DiskPaths)
         CreatedDisks                 = @($CreatedDisks)
@@ -301,6 +307,39 @@ function New-SandboxDescriptor {
         WorkloadDiskStatus           = $WorkloadDiskStatus
         WorkloadDiskStatusReason     = $WorkloadDiskStatusReason
     }
+}
+
+<#
+.SYNOPSIS
+    The ONE predicate for a sandbox VM's network-adapter posture: 'IsolatedInternalSwitch' or 'NoAdapter'.
+.DESCRIPTION
+    Three call sites used to answer "does this VM keep a NIC?" on their own: the Provisioner keyed on
+    Substrate, Lock-Sandbox on Tier, and Assert-Sealed on Tier plus a Network field that production
+    never recorded. They drifted, so a processor kept its default adapter through the seal and a Tier-1
+    processor was certified with a CONNECTED adapter. All three now ask this function.
+
+    The rule is an allow-list with one entry. A VM keeps a NIC (on an isolated Internal vSwitch) only
+    when its Tier is exactly 1 AND its Network label is present and is not 'None'. Every other input
+    returns 'NoAdapter': Tier 0, Tier >= 2, a processor (Network='None') at any tier, a blank label,
+    and an out-of-range tier. Unexpected input therefore lands on the strict side. The 'None' match is
+    case-insensitive, like the loader's processor rule, and it also trims surrounding whitespace, which
+    the loader does not, so this predicate is the stricter of the two.
+.PARAMETER Tier
+    The VM's risk tier (descriptor or profile Tier).
+.PARAMETER Network
+    The VM's Network posture label (descriptor or profile Network). Blank or $null means NoAdapter.
+#>
+function Get-SealNicPolicy {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [int] $Tier,
+        [Parameter(Mandatory)] [AllowNull()] [AllowEmptyString()] [string] $Network
+    )
+    if ($Tier -eq 1 -and -not [string]::IsNullOrWhiteSpace($Network) -and $Network.Trim() -ne 'None') {
+        return 'IsolatedInternalSwitch'
+    }
+    return 'NoAdapter'
 }
 
 # --------------------------------------------------------------------------
@@ -372,6 +411,13 @@ function New-SandboxVM {
     $guestImage  = if ($Profile.ContainsKey('GuestImage')) { [string]$Profile['GuestImage'] } else { $null }
     $secureTmpl  = if ($Profile.ContainsKey('SecureBootTemplate')) { [string]$Profile['SecureBootTemplate'] } else { $null }
     $mgmtChannel = if ($Profile.ContainsKey('ManagementChannel')) { [string]$Profile['ManagementChannel'] } else { $null }
+
+    # The Network posture label decides, with the tier, whether this VM keeps a NIC at all
+    # (Get-SealNicPolicy). It is recorded on the descriptor so Lock-Sandbox and Assert-Sealed enforce
+    # the SAME decision this provision makes. Before 2026-10-03 it was never recorded, which left the
+    # seal gate's processor check unable to fire in production.
+    $network   = if ($Profile.ContainsKey('Network')) { [string]$Profile['Network'] } else { $null }
+    $nicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
 
     $nestedVirt = $false
     if ($Profile.ContainsKey('NestedVirt') -and $null -ne $Profile['NestedVirt']) {
@@ -496,12 +542,14 @@ function New-SandboxVM {
             $null = & $Backend.SetComPort @{ VMName = $Name; Number = 1; Path = $comPipe }
         }
 
-        # --- 7. network: VM-tier switch + NIC -----------------------------
-        # v1 scope is Tier 0/1. Tier 1 (Substrate=HyperV-Gen2, Network=Internal+Allowlist)
-        # gets an Internal vSwitch + a connected NIC. (Tier 0 is a container substrate handled
-        # outside Hyper-V; a future no-NIC VM tier would skip this block.) Create the switch
-        # FIRST (the backend rejects connecting a NIC to a non-existent switch — real-HV parity).
-        if ($Profile['Substrate'] -eq 'HyperV-Gen2') {
+        # --- 7. network: switch + NIC ONLY for a VM that keeps one ---------
+        # Get-SealNicPolicy is the single predicate, shared with Lock-Sandbox and Assert-Sealed. Only an
+        # IsolatedInternalSwitch VM (Tier 1, non-processor) on the Hyper-V substrate gets an Internal
+        # vSwitch and a connected NIC. A NoAdapter VM (Tier 0, Tier >= 2, any processor) gets NO switch:
+        # the default adapter real New-VM creates stays unconnected until Lock-Sandbox removes it.
+        # Create the switch FIRST (the backend rejects connecting a NIC to a non-existent switch, as
+        # real Hyper-V does).
+        if ($Profile['Substrate'] -eq 'HyperV-Gen2' -and $nicPolicy -eq 'IsolatedInternalSwitch') {
             $switchType = 'Internal'
             $switchName = "{0}-int" -f $Name
             if ($null -eq (& $Backend.GetSwitch @{ Name = $switchName })) {
@@ -528,6 +576,7 @@ function New-SandboxVM {
             -ComPipePath        $comPipe `
             -SwitchName         $switchName `
             -SwitchType         $switchType `
+            -Network            $network `
             -DiskPath           $systemDisk `
             -DiskPaths          @($systemDisk) `
             -CreatedDisks       @($createdDisks) `

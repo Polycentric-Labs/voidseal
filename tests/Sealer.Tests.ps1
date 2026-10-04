@@ -22,8 +22,8 @@
     args, invoked as `& $backend.X @{ key = val }`. Collection-returning methods
     (GetNetworkAdapter / GetCheckpoint) preserve array semantics — read `.Count` directly.
 
-    SECURITY MODEL: the SEAL is host-verified. For Tier >= 2,
-    Get-VMNetworkAdapter MUST be empty (NIC removed, not just disconnected), no import media
+    SECURITY MODEL: the SEAL is host-verified. For every NoAdapter VM (Tier 0, Tier >= 2, any
+    processor; Get-SealNicPolicy), Get-VMNetworkAdapter MUST be empty (NIC removed, not just disconnected), no import media
     (DVD / transfer-VHD) attached, and all host channels off — the guest's own view is never
     authoritative. Assert-Sealed FAILS CLOSED: if a check cannot be performed, it refuses to
     certify. A deliberately-not-sealed VM MUST fail this gate.
@@ -336,7 +336,7 @@ Describe 'Assert-Sealed — FAILS CLOSED on any residual host channel / NIC / me
         (& $script:B.GetNetworkAdapter @{ VMName = 'sbx-gate' }).Count | Should -Be 1 -Because 'precondition: a NIC is present'
 
         { Assert-Sealed -Descriptor $script:Desc -Backend $script:B } |
-            Should -Throw -ExpectedMessage '*network adapter*' -Because 'a Tier>=2 VM with ANY NIC must FAIL the seal gate (host-verified, not guest-trusted)'
+            Should -Throw -ExpectedMessage '*Tier>=2 VM MUST have NO NIC*' -Because 'a Tier>=2 VM with ANY NIC must FAIL the seal gate (host-verified, not guest-trusted)'
     }
 
     It 'FAILS when an import DVD (ISO) is still attached' {
@@ -373,7 +373,7 @@ Describe 'Assert-Sealed — FAILS CLOSED on any residual host channel / NIC / me
         # none) — pin that specific reason so a wrong-reason throw (e.g. a StrictMode $null.Count)
         # cannot pass this security-critical test green.
         { Assert-Sealed -Descriptor $script:Desc -Backend $script:B } |
-            Should -Throw -ExpectedMessage '*network adapter*' -Because 'a VM that was never sealed MUST NOT pass the gate (a Tier>=2 VM fails first on its still-attached NIC)'
+            Should -Throw -ExpectedMessage '*Tier>=2 VM MUST have NO NIC*' -Because 'a VM that was never sealed MUST NOT pass the gate (a Tier>=2 VM fails first on its still-attached NIC)'
     }
 
     It 'FAILS when a (simulated) attached secret volume is present (SCHEMA invariant 6)' {
@@ -530,10 +530,11 @@ Describe 'Assert-Sealed — Tier-1 certifies the net-restricted seal WITHOUT req
 #  Finding I4: Assert-Sealed verified Tier>=2/processor VMs have NO NIC, but for a Tier-1
 #  (net-restricted, non-processor) VM that legitimately HAS a NIC, it did NOT verify WHICH
 #  switch the NIC is on. A Tier-1 VM on an unfiltered External/Default switch would seal
-#  clean while its egress bypasses the host chokepoint entirely. Real Tier-1 provisioning
-#  (New-SandboxVM/Provisioner.ps1, Substrate='HyperV-Gen2') always wires an Internal switch,
-#  so these tests simulate a MISCONFIGURED/tampered NIC (re-pointed at a different switch
-#  after provisioning) to prove the gate now catches what provisioning alone does not.
+#  clean while its egress bypasses the host chokepoint entirely. Real provisioning of a Tier-1
+#  NON-PROCESSOR (New-SandboxVM/Provisioner.ps1, Substrate='HyperV-Gen2') always wires an Internal
+#  switch (a Tier-1 processor gets no switch and no kept NIC), so these tests simulate a
+#  MISCONFIGURED/tampered NIC (re-pointed at a different switch after provisioning) to prove the
+#  gate now catches what provisioning alone does not.
 # ===========================================================================
 Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSwitch' {
 
@@ -543,7 +544,7 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
         Lock-Sandbox -Descriptor $d -Backend $b
         $nic = @(& $b.GetNetworkAdapter @{ VMName = 'sbx-i4-internal' })[0]
         (& $b.GetSwitch @{ Name = $nic.SwitchName }).SwitchType |
-            Should -Be 'Internal' -Because 'precondition: real Tier-1 provisioning always wires an Internal switch'
+            Should -Be 'Internal' -Because 'precondition: real provisioning of a Tier-1 non-processor always wires an Internal switch'
         { Assert-Sealed -Descriptor $d -Backend $b } |
             Should -Not -Throw -Because 'a Tier-1 NIC on an isolated Internal vSwitch is exactly the required posture'
         Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
@@ -607,9 +608,9 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
     }
 
     It 'Tier>=2/processor (no-NIC) regression: the switch-isolation check does not fire when there is no NIC' {
-        # Regression guard: the I4 block is gated on ($tier -eq 1 -and -not $isProcessor). A
-        # Tier>=2 VM (or any processor) has already been refused/certified by the earlier
-        # no-NIC block before this code path is ever reached; prove the addition does not
+        # Regression guard: the I4 block runs only for the IsolatedInternalSwitch policy (Tier 1,
+        # non-processor). A Tier>=2 VM (or any processor) is NoAdapter, so the zero-adapter block has
+        # already refused or certified it before this code path is reached; prove the addition does not
         # change that outcome for a correctly-sealed Tier-2 VM (no NIC at all).
         $sb = & $script:NewTestSandbox -Profile $script:Tier2 -Name 'sbx-i4-tier2ok'
         $b = $sb.Backend; $d = $sb.Desc
@@ -1064,6 +1065,136 @@ Describe 'Import-SandboxAsset / Lock-Sandbox / Assert-Sealed — input validatio
 }
 
 # ===========================================================================
+#  Lock-Sandbox + Assert-Sealed follow the NIC policy (Get-SealNicPolicy)
+# ===========================================================================
+#  Only a Tier-1 non-processor keeps a NIC. Tier 0, Tier >= 2 and every processor are NoAdapter:
+#  Lock-Sandbox removes the default adapter real New-VM creates, and Assert-Sealed requires the host to
+#  report none. A descriptor with no Network posture is refused at every tier.
+Describe 'Lock-Sandbox + Assert-Sealed: the NIC policy is enforced at every tier' {
+
+    BeforeAll {
+        # Tier 0 on the Hyper-V substrate: the Tier-1 shape with the tier dropped to 0.
+        $script:T0 = $script:Tier1.Clone()
+        $script:T0['Tier']        = 0
+        $script:T0['Description'] = 'TEST FIXTURE: Tier 0 for the NIC-policy tests.'
+        Assert-TierProfileValid -Profile $script:T0 -Context 'TEST Tier-0 NIC-policy fixture'
+
+        # A Tier-1 processor: Network='None' forces EgressMode='None' and an empty allowlist.
+        $script:T1Proc = $script:Tier1.Clone()
+        $script:T1Proc['Network']         = 'None'
+        $script:T1Proc['EgressMode']      = 'None'
+        $script:T1Proc['EgressAllowlist'] = @()
+        Assert-TierProfileValid -Profile $script:T1Proc -Context 'TEST Tier-1 processor fixture'
+    }
+
+    It 'Lock-Sandbox removes the default adapter of a Tier-0 VM, and the gate certifies' {
+        $sb = & $script:NewTestSandbox -Profile $script:T0 -Name 'sbx-np-t0'
+        (& $sb.Backend.GetNetworkAdapter @{ VMName = 'sbx-np-t0' }).Count | Should -Be 1 -Because 'precondition: real New-VM leaves one adapter'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        (& $sb.Backend.GetNetworkAdapter @{ VMName = 'sbx-np-t0' }).Count | Should -Be 0 -Because 'Tier 0 is NoAdapter'
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+
+    It 'Lock-Sandbox removes the adapter of a Tier-1 processor (which was never connected), and the gate certifies' {
+        $sb = & $script:NewTestSandbox -Profile $script:T1Proc -Name 'sbx-np-t1proc'
+        $sb.Desc.SwitchName | Should -BeNullOrEmpty -Because 'precondition: the provisioner built no switch for a processor'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        (& $sb.Backend.GetNetworkAdapter @{ VMName = 'sbx-np-t1proc' }).Count | Should -Be 0
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+
+    It 'Assert-Sealed REFUSES a Tier-0 VM whose adapter survived the seal (Tier-0 reason)' {
+        $sb = & $script:NewTestSandbox -Profile $script:T0 -Name 'sbx-np-t0-left'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        (& $sb.Backend.GetVM @{ Name = 'sbx-np-t0-left' }).NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter' })
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*Tier-0*network adapter*Tier-1 non-processor*' -Because 'an unconnected adapter is still an adapter; Tier 0 must have none'
+    }
+
+    It 'Assert-Sealed REFUSES a Tier-1 processor that still has an adapter (processor reason, not the switch check)' {
+        $sb = & $script:NewTestSandbox -Profile $script:T1Proc -Name 'sbx-np-t1proc-left'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        & $sb.Backend.NewSwitch @{ Name = 'sbx-np-leak-int'; SwitchType = 'Internal' }
+        & $sb.Backend.ConnectNetworkAdapter @{ VMName = 'sbx-np-t1proc-left'; SwitchName = 'sbx-np-leak-int' }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*certify processor VM*' -Because 'a Tier-1 processor must have zero NICs, even one on an isolated Internal switch'
+    }
+
+    It 'Assert-Sealed REFUSES a Tier-1 descriptor that records no Network posture' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-np-nonet1'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $sb.Desc.Network = ''
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*no Network posture*'
+    }
+
+    It 'Assert-Sealed REFUSES a Tier-2 descriptor that records no Network posture (the rule holds at every tier)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier2 -Name 'sbx-np-nonet2'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $sb.Desc.Network = $null
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*no Network posture*'
+    }
+
+    It 'Lock-Sandbox removes the NIC whenever the policy is not exactly IsolatedInternalSwitch (allow-list polarity): <Label>' -ForEach @(
+        @{ Policy = 'HostProxyAdapter'; Label = 'an unknown name' },
+        @{ Policy = $null;              Label = 'null' }
+    ) {
+        # Under the REAL predicate a Tier-1 non-processor keeps one connected NIC. The Mock is declared
+        # only AFTER provisioning, so New-SandboxVM still builds that NIC; the seal then meets a policy
+        # value it has never heard of and must treat "not IsolatedInternalSwitch" as "remove".
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-np-polarity'
+        (& $sb.Backend.GetNetworkAdapter @{ VMName = 'sbx-np-polarity' }).Count |
+            Should -Be 1 -Because 'precondition: the real predicate left the Tier-1 non-processor one connected NIC'
+        # A script-scoped variable carries the injected value into the Mock whatever scope Pester gives its body.
+        $script:InjectedPolicy = $Policy
+        Mock Get-SealNicPolicy { $script:InjectedPolicy }
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        (& $sb.Backend.GetNetworkAdapter @{ VMName = 'sbx-np-polarity' }).Count |
+            Should -Be 0 -Because 'only IsolatedInternalSwitch may keep a NIC, so an unrecognized policy must never keep one'
+    }
+
+    It 'Assert-Sealed REFUSES an unrecognized NIC policy instead of skipping the NIC checks (fail closed): <Label>' -ForEach @(
+        @{ Policy = 'HostProxyAdapter'; Label = 'an unknown name' },
+        @{ Policy = '';                 Label = 'an empty string' },
+        @{ Policy = $null;              Label = 'null' }
+    ) {
+        # Seal with the REAL predicate (the Tier-1 NIC stays), then Mock the predicate AFTER provisioning
+        # and sealing. A third policy value matches neither NIC branch, and the gate used to fall through
+        # to certification. The empty and null rows also pin the guard against a truthiness shortcut.
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-np-unknown'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        (& $sb.Backend.GetNetworkAdapter @{ VMName = 'sbx-np-unknown' }).Count |
+            Should -Be 1 -Because 'precondition: the real predicate left the Tier-1 NIC in place'
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend |
+            Should -BeTrue -Because 'precondition: under the real predicate this seal certifies'
+        # A script-scoped variable carries the injected value into the Mock whatever scope Pester gives its body.
+        $script:InjectedPolicy = $Policy
+        Mock Get-SealNicPolicy { $script:InjectedPolicy }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*network-adapter policy*is not recognized*' -Because 'a policy the gate does not know must be refused, never certified by default'
+    }
+
+    It 'Assert-Sealed gives the PROCESSOR reason for a Tier-2 processor that still has an adapter (processor precedence at Tier>=2)' {
+        # A Tier-2 processor matches both the processor refusal and the Tier>=2 refusal. The processor reason
+        # must win, because its guarantee comes from Network='None' and not from the tier integer. Tier 2
+        # already carries EgressMode='None' and an empty allowlist, which the processor rule requires.
+        $t2proc = $script:Tier2.Clone()
+        $t2proc['Network'] = 'None'
+        Assert-TierProfileValid -Profile $t2proc -Context 'TEST Tier-2 processor fixture'
+        $sb = & $script:NewTestSandbox -Profile $t2proc -Name 'sbx-np-t2proc-left'
+        $b = $sb.Backend
+        $sb.Desc.Network | Should -Be 'None' -Because 'precondition: New-SandboxVM recorded the processor label'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $b
+        (& $b.GetNetworkAdapter @{ VMName = 'sbx-np-t2proc-left' }).Count |
+            Should -Be 0 -Because 'precondition: the seal removed the default adapter'
+        (& $b.GetVM @{ Name = 'sbx-np-t2proc-left' }).NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter' })
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $b } |
+            Should -Throw -ExpectedMessage '*certify processor VM*' -Because 'both the processor and the Tier>=2 refusal apply here, and the processor reason takes precedence'
+    }
+}
+
+# ===========================================================================
 #  Assert-Sealed — processor (Network=None) checks
 #  Task 1.3: a Tier-0 processor profile (Network='None') is structurally no-NIC
 #  like Tier>=2 — the seal gate MUST enforce NIC absence even though the tier
@@ -1073,50 +1204,36 @@ Describe 'Import-SandboxAsset / Lock-Sandbox / Assert-Sealed — input validatio
 Describe 'Assert-Sealed — processor (Network=None) checks' {
 
     BeforeAll {
-        # Helper: build a sealed Tier-0 descriptor marked as a processor (Network='None'),
-        # with the NIC removed and all channels off. Returns @{ Backend; Desc }.
-        # The descriptor does NOT carry Network in the standard shape (New-SandboxDescriptor
-        # omits it), so we add it via Set-DescriptorField after provisioning — exactly the
-        # same pattern test fixtures use for SeedDiskPath / InputDiskPath / etc.
+        # Helper: a sealed Tier-0 processor. Network='None' now arrives from the profile through
+        # New-SandboxVM (no hand injection), and Lock-Sandbox removes the default adapter itself,
+        # because a processor is NoAdapter at every tier. Returns @{ Backend; Desc }.
         $script:NewSealedProcessor = {
             param([string] $Name = 'sbx-proc')
             $t0 = $script:Tier1.Clone()
-            $t0['Tier']        = 0
-            $t0['Description'] = 'TEST FIXTURE — Tier 0 processor (Network=None).'
+            $t0['Tier']            = 0
+            $t0['Description']     = 'TEST FIXTURE: Tier 0 processor (Network=None).'
+            $t0['Network']         = 'None'
+            $t0['EgressMode']      = 'None'
+            $t0['EgressAllowlist'] = @()
             Assert-TierProfileValid -Profile $t0 -Context "TEST processor fixture '$Name'"
             $b = New-FakeHyperVBackend
             $d = New-SandboxVM -Profile $t0 -Name $Name -Backend $b
-            # Mark the descriptor as a processor (no-NIC intent).
-            Set-DescriptorField -Descriptor $d -Name 'Network' -Value 'None'
-            # Remove the NIC the provisioner wired (processor VMs have no NIC by contract;
-            # Lock-Sandbox does not strip the NIC for Tier<2, so we do it here in the fixture
-            # to represent a correctly-configured processor VM before sealing).
-            $null = & $b.RemoveNetworkAdapter @{ VMName = $Name }
-            # Seal: eject media + turn off channels + mark State=Sealed (no NIC removal by
-            # Lock-Sandbox for Tier-0, but the NIC was already removed above).
             Lock-Sandbox -Descriptor $d -Backend $b
             return @{ Backend = $b; Desc = $d }
         }
     }
 
-    It 'processor with a NIC still attached FAILS the seal gate (0-NIC processor check)' {
-        # A Tier-0 descriptor with Network='None' and a NIC still attached must be REFUSED —
-        # the processor check must fire regardless of the tier integer (Tier<2 but Network='None').
-        # Build the VM, mark it as a processor, and seal WITHOUT removing the NIC first.
-        $t0 = $script:Tier1.Clone()
-        $t0['Tier']        = 0
-        $t0['Description'] = 'TEST FIXTURE — Tier 0 processor (NIC-still-attached).'
-        Assert-TierProfileValid -Profile $t0 -Context 'TEST processor NIC fixture'
-        $b = New-FakeHyperVBackend
-        $d = New-SandboxVM -Profile $t0 -Name 'sbx-proc-nic' -Backend $b
-        Set-DescriptorField -Descriptor $d -Name 'Network' -Value 'None'
-        # Seal WITHOUT removing the NIC — this is the error condition.
-        Lock-Sandbox -Descriptor $d -Backend $b
-        # Precondition: the NIC is still present (Lock-Sandbox does not strip at Tier<2).
-        (& $b.GetNetworkAdapter @{ VMName = 'sbx-proc-nic' }).Count |
-            Should -Be 1 -Because 'precondition: the NIC was not removed (Tier<2 + Network=None misconfiguration)'
+    It 'processor whose adapter survives the seal FAILS the gate with the processor reason (0-NIC processor check)' {
+        # Lock-Sandbox strips the default adapter of a processor. Re-adding one after the seal models an
+        # adapter that survived; the gate must refuse it for the processor reason even though the tier
+        # integer is 0.
+        $r = & $script:NewSealedProcessor -Name 'sbx-proc-nic'
+        $b = $r.Backend; $d = $r.Desc
+        $d.Network | Should -Be 'None' -Because 'precondition: New-SandboxVM recorded the processor label'
+        (& $b.GetNetworkAdapter @{ VMName = 'sbx-proc-nic' }).Count | Should -Be 0 -Because 'precondition: Lock-Sandbox removed the default adapter'
+        (& $b.GetVM @{ Name = 'sbx-proc-nic' }).NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter' })
         { Assert-Sealed -Descriptor $d -Backend $b } |
-            Should -Throw -ExpectedMessage '*network adapter*' -Because 'a processor (Network=None) with ANY NIC MUST fail the seal gate — it is structurally no-NIC like Tier>=2'
+            Should -Throw -ExpectedMessage '*certify processor VM*' -Because 'a processor (Network=None) with ANY NIC MUST fail the seal gate, at any tier'
     }
 
     It 'processor with recorded DepsDiskPath PASSES; an unrecorded extra disk FAILS' {
@@ -1158,22 +1275,90 @@ Describe 'Assert-Sealed — processor (Network=None) checks' {
     }
 
     It 'a non-processor Tier-1 VM with a NIC is NOT failed by the processor check (regression guard)' {
-        # The processor check fires ONLY when Network='None' is on the descriptor. A normal
-        # non-processor VM (no Network field, or Network != 'None') with a NIC must certify
-        # exactly as before — the new guard must NOT add behavior for any other descriptor.
+        # The processor check fires ONLY when the descriptor's Network is 'None'. A standard Tier-1 VM
+        # records its own non-processor label and keeps its NIC; it must certify exactly as before.
         # This fixture is a standard Tier-1 VM (profile $script:Tier1), which legitimately keeps its NIC.
         $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-nonproc'
         $b = $sb.Backend; $d = $sb.Desc
         Import-SandboxAsset -Descriptor $d -Source $script:IsoSrc -As Iso -Backend $b
         Lock-Sandbox -Descriptor $d -Backend $b
-        # Precondition: the descriptor carries NO Network='None' marker — it is a normal Tier-1 VM.
+        # Precondition: the descriptor records the profile's own label, which is not the processor marker.
         [string](Get-DescriptorField -Descriptor $d -Name 'Network') |
-            Should -BeNullOrEmpty -Because 'precondition: a standard Tier-1 descriptor has no Network=None marker'
+            Should -Be 'Internal+Allowlist' -Because 'precondition: a standard Tier-1 descriptor records its non-processor Network label'
         # Precondition: the NIC is still present (Tier-1 keeps it).
         (& $b.GetNetworkAdapter @{ VMName = 'sbx-nonproc' }).Count |
             Should -Be 1 -Because 'precondition: Tier-1 keeps its NIC'
         { Assert-Sealed -Descriptor $d -Backend $b } |
             Should -Not -Throw -Because 'a standard Tier-1 VM with a NIC and no Network=None marker must NOT be failed by the processor check'
         Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
+    }
+}
+
+# ===========================================================================
+#  Assert-Sealed: no passthrough device at any tier
+# ===========================================================================
+#  A GPU partition adapter exposes the host GPU driver stack to the guest; a device assigned by Discrete
+#  Device Assignment hands the guest a whole host PCIe device, which can be a physical NIC that
+#  GetNetworkAdapter never lists. Voidseal never assigns either, so any present must refuse the seal at
+#  every tier. Devices are seeded by adding to the fake VM record (the idiom used for NICs above); a
+#  failed read is injected by overriding one backend method (the idiom Provisioner.Tests.ps1 uses).
+Describe 'Assert-Sealed: refuses any passthrough device (GPU partition adapter or assigned device) at every tier' {
+
+    BeforeAll {
+        # Provision and seal a VM at Tier 0, 1 or 2; returns @{ Backend; Desc }.
+        $script:NewSealedAtTier = {
+            param([int] $Tier, [string] $Name)
+            $p = $script:Tier1
+            if ($Tier -eq 0) {
+                $p = $script:Tier1.Clone()
+                $p['Tier']        = 0
+                $p['Description'] = 'TEST FIXTURE: Tier 0 for the passthrough gate.'
+            }
+            elseif ($Tier -eq 2) { $p = $script:Tier2 }
+            $sb = & $script:NewTestSandbox -Profile $p -Name $Name
+            Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+            return $sb
+        }
+    }
+
+    It 'certifies a correctly sealed VM with no passthrough device at Tiers 0, 1 and 2' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedAtTier -Tier $t -Name "sbx-pt-clean$t"
+            Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue -Because "a clean Tier-$t seal must still certify"
+        }
+    }
+
+    It 'REFUSES a GPU partition adapter at Tiers 0, 1 and 2' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedAtTier -Tier $t -Name "sbx-pt-gpu$t"
+            (& $sb.Backend.GetVM @{ Name = "sbx-pt-gpu$t" }).GpuPartitionAdapters.Add(@{ Id = "gpu-p-$t" })
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage '*GPU partition adapter(s) are attached*' -Because "a GPU partition adapter must be refused at Tier $t"
+        }
+    }
+
+    It 'REFUSES an assigned (DDA) device at Tiers 0, 1 and 2' {
+        foreach ($t in 0, 1, 2) {
+            $sb = & $script:NewSealedAtTier -Tier $t -Name "sbx-pt-dda$t"
+            (& $sb.Backend.GetVM @{ Name = "sbx-pt-dda$t" }).AssignableDevices.Add(@{ LocationPath = "PCIROOT(0)#PCI(030$t)" })
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage '*assigned (passthrough) device(s) are attached*' -Because "an assigned device must be refused at Tier $t"
+        }
+    }
+
+    It 'REFUSES (fail closed) when either passthrough read throws' {
+        foreach ($m in 'GetGpuPartitionAdapters', 'GetAssignableDevices') {
+            $sb = & $script:NewSealedAtTier -Tier 1 -Name "sbx-pt-err-$m"
+            $sb.Backend[$m] = { param($P) throw 'INJECTED: passthrough query failed' }.GetNewClosure()
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+                Should -Throw -ExpectedMessage '*could not report*' -Because "an unreadable $m must refuse, never certify"
+        }
+    }
+
+    It 'REFUSES (fail closed) when a passthrough read returns nothing instead of a collection' {
+        $sb = & $script:NewSealedAtTier -Tier 1 -Name 'sbx-pt-null'
+        $sb.Backend.GetGpuPartitionAdapters = { param($P) return $null }.GetNewClosure()
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage '*could not report*'
     }
 }

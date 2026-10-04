@@ -32,14 +32,15 @@
     THE SEAL (Lock-Sandbox; "Re-connection prevention"):
       Lock-Sandbox handles VM-CONFIG isolation:
         1. detach every import-only medium (ISO DVD + transfer VHDs recorded on the descriptor),
-        2. for a no-NIC tier (Tier >= 2) `RemoveNetworkAdapter` (remove, not disconnect),
+        2. for a NoAdapter VM (Tier 0, Tier >= 2, any processor; see Get-SealNicPolicy in
+           Provisioner.ps1) `RemoveNetworkAdapter` (remove, not disconnect),
         3. turn OFF every host<->guest channel (clipboard / shares / guest-services /
            enhanced-session) via the backend's SetHostChannel,
         4. mark the descriptor State='Sealed'.
       It does NOT power the VM on (the seal runs before first boot) and it does NOT itself filter
-      egress — Tier-1 net-restriction relies on in-guest controls (Squid SNI proxy + allowlist) as
+      egress: Tier-1 net-restriction relies on in-guest controls (Squid SNI proxy + allowlist) as
       defense-in-depth today; host-side egress enforcement (Squid/NAT/default-DROP) is Phase-6-live,
-      not this function's job. Tier-1 keeps its NIC; Tier >= 2 has it removed.
+      not this function's job. A Tier-1 non-processor keeps its NIC; every other VM has it removed.
 
     THE GATE (Assert-Sealed; SCHEMA.md invariant 6 — the runtime pre-seal gate):
       Verifies the seal FROM THE HOST via backend Get* calls — the guest's own view is NEVER
@@ -47,7 +48,14 @@
         * preflight TestAvailable: if the host can't be queried, REFUSE to certify (an inability
           to check is never a pass).
         * the VM must exist (a missing VM cannot be certified).
-        * Tier >= 2: GetNetworkAdapter MUST be empty (no NIC / live egress route).
+        * the descriptor must record its Network posture (refused at every tier when blank).
+        * an unrecognized network-adapter policy (anything but NoAdapter or IsolatedInternalSwitch) is
+          refused before either NIC check runs.
+        * NoAdapter VMs (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): GetNetworkAdapter
+          MUST be empty (no NIC, no live egress route). A Tier-1 non-processor keeps one NIC, which
+          must sit on an isolated Internal vSwitch that is not the Default Switch.
+        * ANY tier: no GPU partition adapter and no device assigned by Discrete Device Assignment
+          (GetGpuPartitionAdapters / GetAssignableDevices; a read that fails refuses).
         * ANY tier: no import DVD attached; no transfer/import medium recorded on the descriptor
           still attached.
         * a secret-SHAPED attached disk path (Test-IsSecretPath) is REFUSED at any tier.
@@ -73,6 +81,8 @@
       * SetHostChannel @{ VMName; Channel; Enabled } and GetHostChannels @{ VMName } — the seam the
         seal turns OFF and the gate host-verifies, so the Sealer never reaches for a raw Set-VM /
         *-VMIntegrationService cmdlet.
+      * GetGpuPartitionAdapters @{ VMName } and GetAssignableDevices @{ VMName }: host-truth reads of
+        passthrough devices, so the gate can refuse any without reaching for a raw Get-VM* cmdlet.
 
     LINUX-GUEST SEAL MODEL (the channels split into TWO classes):
       * GuestServices = the ONE REAL autonomous host<->guest data channel (Copy-VMFile / 'Guest
@@ -488,22 +498,23 @@ function Dismount-SandboxAsset {
 
 <#
 .SYNOPSIS
-    Seal a sandbox VM to its tier's required isolation: detach import media, (Tier>=2) remove
-    the NIC, turn off all host channels, and mark the descriptor Sealed. Runs before first boot.
+    Seal a sandbox VM to its tier's required isolation: detach import media, remove the NIC of every
+    NoAdapter VM, turn off all host channels, and mark the descriptor Sealed. Runs before first boot.
 .DESCRIPTION
     Handles VM-CONFIG isolation only ("Re-connection prevention"):
       1. detach every import-only ISO/DVD (the imported media recorded on the descriptor, plus
          a defensive detach of whatever DVD the host actually shows attached),
       2. detach every transfer VHD recorded on the descriptor (scripted — NOT inherently one-way),
-      3. for a no-NIC tier (Tier >= 2): RemoveNetworkAdapter (remove, not disconnect),
+      3. for a NoAdapter VM (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): RemoveNetworkAdapter
+         (remove, not disconnect; real New-VM always creates one adapter, so there is always one to remove),
       4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session),
       5. set the descriptor State = 'Sealed'.
-    It does NOT power the VM on, and does NOT itself filter egress — Tier-1 net-restriction today
+    It does NOT power the VM on, and does NOT itself filter egress: Tier-1 net-restriction today
     relies on in-guest controls (Squid SNI proxy + allowlist) as defense-in-depth, not this
-    function's job; host-side egress enforcement is Phase-6-live. Tier-1 KEEPS its
-    NIC; only Tier >= 2 is no-NIC. Generic over the tier so a future no-NIC profile seals correctly.
+    function's job; host-side egress enforcement is Phase-6-live. A Tier-1 non-processor KEEPS its
+    NIC; Tier 0, Tier >= 2 and every processor are no-NIC.
 .PARAMETER Descriptor
-    The New-SandboxVM descriptor (consumed + updated; its Tier drives the NIC decision).
+    The New-SandboxVM descriptor (consumed + updated; its Tier and Network drive the NIC decision).
 .PARAMETER Backend
     The Hyper-V backend.
 #>
@@ -565,10 +576,18 @@ function Lock-Sandbox {
         Dismount-SandboxAsset -Descriptor $Descriptor -Path $disk -Backend $Backend
     }
 
-    # --- 3. no-NIC tiers (Tier >= 2): remove the NIC entirely -------------
-    # Tier-1 is net-RESTRICTED, not no-net — its NIC stays (egress control today is in-guest
-    # defense-in-depth, not the seal; host-side enforcement is Phase-6-live). Generic over the tier.
-    if ($tier -ge 2) {
+    # --- 3. remove every NIC unless the policy is exactly IsolatedInternalSwitch ---
+    # Get-SealNicPolicy (Provisioner.ps1) is the single predicate shared with the Provisioner and
+    # Assert-Sealed. Only a Tier-1 non-processor keeps its NIC: it is net-RESTRICTED, not no-net (egress
+    # control today is in-guest defense-in-depth, not the seal; host-side enforcement is Phase-6-live).
+    # Every other VM is NoAdapter, and real New-VM always creates one adapter, so the seal removes it
+    # (remove, not disconnect) for Assert-Sealed's zero-adapter check to pass. A descriptor with no
+    # Network label lands on NoAdapter here and is then refused by the gate.
+    # The test is allow-list polarity: IsolatedInternalSwitch is the one permissive case, so the seal
+    # removes the NIC for any other value, including one this code does not recognize. An unrecognized
+    # policy can never keep a NIC.
+    $network = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'Network')
+    if ((Get-SealNicPolicy -Tier $tier -Network $network) -ne 'IsolatedInternalSwitch') {
         $null = & $Backend.RemoveNetworkAdapter @{ VMName = $vmName }
     }
 
@@ -596,10 +615,14 @@ function Lock-Sandbox {
       * preflight TestAvailable — if the host can't be queried, REFUSE (inability to check is
         never a pass).
       * the VM must exist on the backend (a missing VM cannot be certified).
-      * Tier >= 2: GetNetworkAdapter MUST be empty (no NIC = no live egress route). A Tier-1 VM
-        legitimately keeps its NIC, so the NIC check is tier-gated; the media + channel checks
-        apply to every tier.
-      * Tier == 1 (non-processor): every NIC MUST be on an isolated Internal vSwitch (I4) — its
+      * the descriptor MUST record its Network posture; a blank value is refused at every tier
+        (Get-SealNicPolicy cannot tell a networked Tier-1 VM from a Tier-1 processor without it).
+      * an unrecognized network-adapter policy (anything but NoAdapter or IsolatedInternalSwitch) is
+        refused before either NIC check runs.
+      * NoAdapter VMs (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): GetNetworkAdapter MUST
+        be empty (no NIC = no live egress route). Only a Tier-1 non-processor keeps a NIC; the media
+        and channel checks apply to every tier.
+      * IsolatedInternalSwitch (Tier 1, non-processor): every NIC MUST be on an isolated Internal vSwitch (I4). Its
         SwitchType is host-verified via GetSwitch. An External, Private, or unresolvable switch
         bypasses the host-controlled egress chokepoint and is refused, fail-closed. The
         built-in Default Switch is itself SwitchType=Internal (ICS/internet-connected), so the
@@ -608,6 +631,8 @@ function Lock-Sandbox {
         refusal that also covers LOCALIZED (non-English) Default-Switch names is Phase-6-live (see
         SECURITY.md). This is a switch-ISOLATION guarantee only — egress FILTERING is a separate,
         still-Phase-6-live layer.
+      * NO passthrough device at any tier: GetGpuPartitionAdapters and GetAssignableDevices must both
+        report none (a read that throws or returns no collection is a refusal).
       * no import DVD/ISO attached (a live read-only-but-present host<->guest medium).
       * no transfer/import VHD recorded on the descriptor still attached.
       * a secret-SHAPED attached disk path (Test-IsSecretPath) is refused at ANY tier.
@@ -630,7 +655,7 @@ function Lock-Sandbox {
 
     Throws a clear, named message on the FIRST violation. Returns $true when sealed.
 .PARAMETER Descriptor
-    The sandbox descriptor (Name, Tier, DiskPath, and the import-media lists drive the checks).
+    The sandbox descriptor (Name, Tier, Network, DiskPath, and the import-media lists drive the checks).
 .PARAMETER Backend
     The Hyper-V backend.
 #>
@@ -650,11 +675,12 @@ function Assert-Sealed {
         throw "Assert-Sealed: descriptor has no VM Name; cannot verify a seal."
     }
     $tier = [int](Get-DescriptorField -Descriptor $Descriptor -Name 'Tier' -Default 0)
-    # A processor profile carries Network='None' on the descriptor. It is structurally
-    # no-NIC — the same guarantee as Tier>=2 — even when the tier integer is 0 or 1.
-    # Read it once and propagate to the NIC check and error messaging below.
+    # The NIC policy comes from ONE predicate, Get-SealNicPolicy (Provisioner.ps1), shared with the
+    # Provisioner and Lock-Sandbox and computed from the Tier plus the Network label New-SandboxVM
+    # records on the descriptor. Until 2026-10-03 production never recorded Network, so the processor
+    # branch below could fire only in tests that injected the field by hand.
     $network     = [string](Get-DescriptorField -Descriptor $Descriptor -Name 'Network')
-    $isProcessor = ($network -eq 'None')
+    $isProcessor = ($network.Trim() -eq 'None')
 
     # --- FAIL CLOSED: if the host can't be queried, do NOT certify --------
     # An inability to perform the host-side check is never a pass — that is the whole point of
@@ -672,30 +698,51 @@ function Assert-Sealed {
         throw "Assert-Sealed: REFUSING to certify — no VM named '$vmName' exists on the host. Fail closed."
     }
 
-    # --- Tier >= 2 OR processor (Network='None'): NO NIC (host-verified; guest view irrelevant) ---
-    # A processor (Network='None') is structurally no-NIC at any tier — exactly the same
-    # guarantee as Tier>=2. We reuse the same GetNetworkAdapter call (D2: no new method)
-    # and branch the error message so the reason is unambiguous in the operator log: the
-    # PROCESSOR message fires for ANY processor tier (the no-NIC guarantee comes from
-    # Network='None', not the tier integer — so a Tier>=2 processor still gets the processor
-    # reason, never the generic one), and the generic Tier>=2 message is reserved for a
-    # NON-processor Tier>=2 VM (whose no-NIC guarantee comes purely from its tier).
-    # Read the collection DIRECTLY (the backend preserves array semantics; never re-wrap).
-    if ($tier -ge 2 -or $isProcessor) {
+    # --- the descriptor MUST record its network posture (fail closed, every tier) ---
+    # Without the Network label the policy cannot tell a Tier-1 VM that keeps an isolated NIC from a
+    # Tier-1 processor that must have none. New-SandboxVM always records it (the loader requires Network
+    # in every tier profile), so a blank value means the descriptor did not come from a real provision.
+    # Refused at EVERY tier: one invariant is simpler to reason about than a tier-conditional one.
+    if ([string]::IsNullOrWhiteSpace($network)) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the descriptor records no " +
+               "Network posture, so its network-adapter policy cannot be determined. Fail closed.")
+    }
+    $nicPolicy = Get-SealNicPolicy -Tier $tier -Network $network
+    # Get-SealNicPolicy returns exactly two values today. A third would skip BOTH NIC branches below
+    # and fall through to certification, the same "no branch means no check" shape that let Tier 0
+    # escape the adapter check before 2026-10-03. Refuse anything unrecognized: fail closed.
+    if ($nicPolicy -notin @('NoAdapter', 'IsolatedInternalSwitch')) {
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because its network-adapter policy " +
+               "'$nicPolicy' is not recognized (expected NoAdapter or IsolatedInternalSwitch). Fail closed.")
+    }
+
+    # --- NoAdapter (Tier 0, Tier >= 2, any processor): NO NIC, host-verified ---
+    # Real New-VM always creates one adapter and Lock-Sandbox removes it for every NoAdapter VM; this
+    # reads host truth to prove none survived (the guest's own view is irrelevant). The refusal names
+    # its reason: the processor message for a processor at ANY tier (its guarantee comes from
+    # Network='None', not the tier integer), then the Tier >= 2 message, then the one for Tier 0 and any
+    # other tier. Read the collection DIRECTLY (the backend preserves array semantics; never re-wrap).
+    if ($nicPolicy -eq 'NoAdapter') {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
         if ($nics.Count -ne 0) {
             if ($isProcessor) {
-                # Processor case (any tier): the no-NIC guarantee comes from Network='None'.
-                throw ("Assert-Sealed: REFUSING to certify processor VM '$vmName' SEALED — $($nics.Count) " +
-                       "network adapter(s) still attached. A processor (Network='None') MUST have NO NIC " +
-                       "(no live egress route — structurally no-net at Tier-$tier). Fail closed.")
+                throw ("Assert-Sealed: REFUSING to certify processor VM '$vmName' SEALED because " +
+                       "$($nics.Count) network adapter(s) are still attached. A processor (Network='None') " +
+                       "MUST have NO NIC at any tier (no live egress route; this one is Tier-$tier). Fail closed.")
             }
-            throw ("Assert-Sealed: REFUSING to certify Tier-$tier VM '$vmName' SEALED — $($nics.Count) network " +
-                   "adapter(s) still attached. A Tier>=2 VM MUST have NO NIC (no live egress route). Fail closed.")
+            if ($tier -ge 2) {
+                throw ("Assert-Sealed: REFUSING to certify Tier-$tier VM '$vmName' SEALED because " +
+                       "$($nics.Count) network adapter(s) are still attached. A Tier>=2 VM MUST have NO NIC " +
+                       "(no live egress route). Fail closed.")
+            }
+            throw ("Assert-Sealed: REFUSING to certify Tier-$tier VM '$vmName' SEALED because " +
+                   "$($nics.Count) network adapter(s) are still attached. Only a Tier-1 non-processor VM may " +
+                   "keep a NIC; this one must have none (Lock-Sandbox removes the default adapter Hyper-V " +
+                   "creates). Fail closed.")
         }
     }
 
-    # --- Tier 1 (net-restricted, non-processor): the NIC MUST be on the ISOLATED Internal vSwitch (I4) ---
+    # --- IsolatedInternalSwitch (Tier 1, non-processor): the NIC MUST be on the ISOLATED Internal vSwitch (I4) ---
     # A Tier-1 VM legitimately HAS a NIC (net-restricted, not no-net), but its egress must ride the HOST
     # chokepoint — an Internal vSwitch whose gateway the host controls (Pass A Q2). An External switch bypasses
     # the host TCP/IP stack (unfiltered egress) and is refused. NOTE (accuracy, whole-branch review): the
@@ -707,7 +754,7 @@ function Assert-Sealed {
     # (Phase-6 §Track item 1 — now shipped; see the dedicated throw for the LIVE-only GUID-hardening note).
     # Egress FILTERING via host Squid/NAT/default-DROP remains Phase-6-live; this asserts switch ISOLATION
     # only — the VM can reach only the host gateway of whatever (non-Default) Internal switch it's on.
-    if ($tier -eq 1 -and -not $isProcessor) {
+    if ($nicPolicy -eq 'IsolatedInternalSwitch') {
         $nics = & $Backend.GetNetworkAdapter @{ VMName = $vmName }
         foreach ($nic in $nics) {
             $switchName = [string]$nic.SwitchName
@@ -743,6 +790,35 @@ function Assert-Sealed {
                        "isolated Tier-1 Internal vSwitch. A Tier-1 VM MUST ride a purpose-built isolated Internal " +
                        "switch (host-controlled egress chokepoint). Fail closed.")
             }
+        }
+    }
+
+    # --- NO passthrough device at ANY tier (host-verified) ----------------
+    # A GPU partition adapter exposes the host GPU driver stack to the guest; a device assigned by
+    # Discrete Device Assignment hands it a whole host PCIe device, which can be a physical NIC that
+    # GetNetworkAdapter never lists. Voidseal never assigns either, so any present was added outside the
+    # tool and is refused at every tier. Only the COUNT is read, never device properties whose real
+    # shape cannot be verified without elevation. A read that throws, or that returns no collection at
+    # all, is a refusal: an inability to check is never a pass.
+    foreach ($passthrough in @(
+            @{ Method = 'GetGpuPartitionAdapters'; Label = 'GPU partition adapter' },
+            @{ Method = 'GetAssignableDevices';    Label = 'assigned (passthrough) device' })) {
+        $found = $null
+        try {
+            $found = & $Backend[$passthrough.Method] @{ VMName = $vmName }
+        }
+        catch {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not report " +
+                   "its $($passthrough.Label)s ($($_.Exception.Message)). Fail closed.")
+        }
+        if ($null -eq $found) {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because the host could not report " +
+                   "its $($passthrough.Label)s (the read returned no collection). Fail closed.")
+        }
+        if ($found.Count -ne 0) {
+            throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because $($found.Count) " +
+                   "$($passthrough.Label)(s) are attached. Voidseal never assigns one, so it was added " +
+                   "outside the tool; no passthrough device may reach a sealed sandbox at any tier. Fail closed.")
         }
     }
 
@@ -931,7 +1007,7 @@ function Assert-Sealed {
     }
 
     # --- POSITIVE post-seal COM1-liveness assertion (serial-managed guests only) ----------
-    # The seal closes host<->guest channels, removes NICs (Tier>=2), and ejects media. None of that
+    # The seal closes host<->guest channels, removes the NIC of every NoAdapter VM, and ejects media. None of that
     # may COLLATERALLY sever the Runner's COM1 serial command channel — the ONLY no-NIC management
     # path for a Linux guest (PowerShell Direct is Windows-guest-only). A live run confirmed the seal
     # (Disable-VMConsoleSupport for the ESM facets) does NOT break COM1, but inference is not host

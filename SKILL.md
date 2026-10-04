@@ -65,8 +65,9 @@ structurally small. Isolation strength is matched to the task's risk via the **t
 
 The loader **structurally enforces** the high-tier guarantees: a Tier ≥ 2 profile that
 declares any credential, egress mode, or allowlist entry is **refused at load time**
-(fail-closed), and the runtime seal gate refuses to mark a Tier-3 VM sealed if it detects
-any live NIC, secret volume, or egress route.
+(fail-closed). At runtime the seal gate refuses to certify any VM that must have no NIC
+(Tier 0, Tier ≥ 2, or a `Network='None'` processor) while the host still reports one, refuses
+any GPU partition adapter or assigned device at every tier, and refuses a secret or unrecorded volume.
 
 ## How to invoke
 
