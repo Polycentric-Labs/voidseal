@@ -135,3 +135,16 @@ places where a check is an argument rather than a measurement.
   and package presence, Squid and IPv6 state, the lockdown's REDIRECT return codes), through the same
   `diag()` helper, so a misbehaving ralph seed can be told apart from the serial capture alone. Counts
   and yes/no facts only, never file content or workload names.
+- Unknown profile keys are refused. `Import-WorkloadProfile`, `Import-TierProfile` and the hashtable
+  path of `Invoke-Voidseal -Profile` now throw on any key outside the documented schema and name it
+  (matched case-insensitively), where such a key used to vanish without a word: a typo, or a tier-owned
+  key such as `Credentials` set from a workload. The accepted lists are built from the loader's own key
+  constants (`Get-ProfileSchemaKeys`), `tier-profiles/SCHEMA.md` now documents the Disk-mode, builder
+  and processor keys it had skipped (`WorkloadMode`, `Inputs`, `InputFiles`, `FileSystem`,
+  `InputLabel`, `OutputLabel`, `DepsSpec`, `ScreenConfig`, `DepsDiskPath`, `OutboxOutput`), and a drift
+  test fails when the file and the loader disagree in either direction. A profile that set a key the
+  engine never read now fails to load.
+- `ResultInnerName` is a workload-profile key, layered like `Entrypoint`: the profile value names the
+  file a transport-only run releases, `-Workload.ResultInnerName` still wins, and the default stays
+  `result.html`. The name must be a plain outbox file name; `verdicts.json` and `workload.json` are
+  reserved.

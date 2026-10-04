@@ -94,8 +94,43 @@ function Test-AllowlistCoversHost {
     return $false
 }
 
+# Optional keys a tier profile may carry (SCHEMA.md "Tier-profile keys" marked opt, plus
+# WorkloadTimeoutSeconds, which Assert-TierProfileValid bounds on a bare tier and a merged workload alike).
+$script:TierOptionalKeys = @(
+    'BlockProtocols', 'SecureBootTemplate', 'CpuMaximumPercent', 'CpuRelativeWeight', 'NestedVirt',
+    'ManagementChannel', 'WorkloadTimeoutSeconds'
+)
+
 # Required keys for a workload profile.
 $script:WorkloadRequiredKeys = @('BaseTier', 'Name', 'Entrypoint')
+
+# Workload keys that layer onto the merged tier profile (Import-WorkloadProfile copies each one that
+# the workload sets). WorkloadMode selects the disk-driven run path, and Inputs / FileSystem /
+# InputLabel / OutputLabel configure the INPUT/OUTPUT data disks New-WorkloadDisks creates. Without
+# layering these, a 'Disk' workload profile (firefox.psd1) would lose its mode + data-disk config in
+# the merge and silently fall back to Serial. DepsSpec / ScreenConfig / DepsDiskPath are
+# processor-profile keys: DepsSpec carries the dependency set the builder stages; ScreenConfig
+# carries gate mode + categories; DepsDiskPath carries the pre-built deps disk path (optional,
+# resolved at runtime). OutboxOutput (C1.4) is the transport-only counterpart: a non-processor
+# Disk-mode workload (firefox) that still wants the Raw-OUTPUT / user-space-outbox-read path without
+# a ScreenConfig. DataDisks declares pre-built, hash-verified data disks (a -Workload.DataDisks value
+# replaces this one entirely at run time). ResultInnerName names the staged file a transport-only run
+# releases (a -Workload.ResultInnerName value wins over it).
+#
+# This is also the SCHEMA KEY LIST for the unknown-key refusal (Assert-KnownProfileKeys): a key that
+# is in no list in this file is refused at load rather than silently ignored.
+$script:WorkloadLayeredKeys = @(
+    'Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
+    'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
+    'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput',
+    'Memory', 'Cpu', 'CpuMaximumPercent', 'CpuRelativeWeight', 'WorkloadTimeoutSeconds',
+    'DataDisks', 'ResultInnerName'
+)
+
+# Workload keys that are legitimate but never layered onto the merged profile: ExtraAllowlist is
+# unioned into EgressAllowlist during the merge, and InputFiles is a documentation-only record of
+# the host files a live-acceptance step folds into Inputs (SCHEMA.md says so).
+$script:WorkloadMergeOnlyKeys = @('ExtraAllowlist', 'InputFiles')
 
 # Guest-sizing and run-time bounds (E1/E3). Enforced at load for a bare tier AND for a merged workload,
 # so a profile cannot ask Hyper-V for a guest the host could not run or a deadline that never fires.
@@ -110,6 +145,12 @@ $script:ProfileCpuRelativeWeightMin  = 1
 $script:ProfileCpuRelativeWeightMax  = 10000
 $script:ProfileWorkloadTimeoutMin    = 60
 $script:ProfileWorkloadTimeoutMax    = 86400
+
+# A ResultInnerName names one file in the outbox container (guest/outbox.py's name rule: 1 to 40 of
+# A-Z a-z 0-9 . _ -), and the host joins it onto a destination directory, so it must be a plain file
+# name. 'verdicts.json' and 'workload.json' are the container's own reserved entries.
+$script:ResultInnerNamePattern  = '^[A-Za-z0-9._-]{1,40}$'
+$script:ResultInnerNameReserved = @('verdicts.json', 'workload.json')
 
 # Linux guest-image detector (invariant 5).
 $script:LinuxImageRegex = '(?i)(debian|ubuntu|alpine|fedora|remnux|linux)'
@@ -454,6 +495,82 @@ function ConvertTo-DataDiskList {
 }
 
 # --------------------------------------------------------------------------
+# Schema key lists + unknown-key refusal
+# --------------------------------------------------------------------------
+
+<#
+.SYNOPSIS
+    The profile key lists the loader accepts, built from the schema constants above (no second list).
+.DESCRIPTION
+    Returns a hashtable of string[]:
+      Tier      the tier-owned keys: the required tier keys plus the optional ones.
+      Workload  keys a workload profile (profiles/*.psd1) may carry: its required keys, the layered
+                keys, and the merge-only keys (ExtraAllowlist, InputFiles).
+      Resolved  keys a RESOLVED profile may carry, which is what a tier file (tierN.psd1) or a
+                -Profile hashtable is: the tier keys, the layered workload keys, BaseTier and Name.
+                A tier file may carry the layered keys because the engine reads them straight off
+                a tier profile run on its own (Entrypoint, Mounts, DataDisks, ...).
+      All       the union of the three, which tier-profiles/SCHEMA.md must document key for key
+                (tests/ProfileLoader.Tests.ps1 pins both directions).
+    Each list is distinct and ordered; compare it case-insensitively (a hashtable key lookup is).
+#>
+function Get-ProfileSchemaKeys {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+    $distinct = {
+        param([string[]] $Keys)
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $out  = [System.Collections.Generic.List[string]]::new()
+        foreach ($k in $Keys) { if ($seen.Add($k)) { $out.Add($k) } }
+        return , $out.ToArray()
+    }
+    $tier     = & $distinct (@($script:TierRequiredKeys) + @($script:TierOptionalKeys))
+    $workload = & $distinct (@($script:WorkloadRequiredKeys) + @($script:WorkloadLayeredKeys) + @($script:WorkloadMergeOnlyKeys))
+    $resolved = & $distinct (@($tier) + @($script:WorkloadLayeredKeys) + @('BaseTier', 'Name'))
+    $all      = & $distinct (@($tier) + @($workload) + @($resolved))
+    return @{ Tier = $tier; Workload = $workload; Resolved = $resolved; All = $all }
+}
+
+<#
+.SYNOPSIS
+    Refuse any profile key that is not in the documented schema (fail-closed, case-insensitive).
+.DESCRIPTION
+    A key the loader never reads would otherwise vanish without a word: a workload that sets
+    ResultInnerName (before it became a layered key), a typo such as 'Entrypont', or a tier-owned key
+    such as 'Credentials' set from a workload. -Kind picks the list from Get-ProfileSchemaKeys.
+    Matching is case-insensitive because the loader reads every key through a case-insensitive
+    hashtable, so 'entrypoint' IS read as Entrypoint. Throws naming every unknown key.
+#>
+function Assert-KnownProfileKeys {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Profile,
+        [Parameter(Mandatory)] [ValidateSet('Workload', 'Resolved')] [string] $Kind,
+        [Parameter(Mandatory)] [string] $Context
+    )
+    $schema  = Get-ProfileSchemaKeys
+    $allowed = [System.Collections.Generic.HashSet[string]]::new([string[]]@($schema[$Kind]), [System.StringComparer]::OrdinalIgnoreCase)
+    $unknown = @(@($Profile.Keys) | ForEach-Object { [string]$_ } | Where-Object { -not $allowed.Contains($_) } | Sort-Object)
+    if ($unknown.Count -eq 0) { return }
+
+    $hints = [System.Collections.Generic.List[string]]::new()
+    foreach ($k in $unknown) {
+        if ($Kind -eq 'Workload' -and (@($schema.Tier) -contains $k)) {
+            $hints.Add("'$k' is a tier-owned key: set it in the tier file, or pick a different BaseTier")
+        }
+        elseif ($Kind -eq 'Resolved' -and (@($schema.Workload) -contains $k)) {
+            $hints.Add("'$k' is a workload-file key: ExtraAllowlist is unioned into EgressAllowlist and InputFiles is a documentation-only record, so neither exists on a resolved profile")
+        }
+    }
+    $hintText = if ($hints.Count -gt 0) { " Hint: $($hints -join '; ')." } else { '' }
+    $names    = ($unknown | ForEach-Object { "'$_'" }) -join ', '
+    throw ("Schema validation: '$Context' has unknown key$(if ($unknown.Count -ne 1) { 's' }) $names. " +
+           "A key that is not in tier-profiles/SCHEMA.md is never read by the engine, so it would be silently ignored; " +
+           "check the spelling (key names are matched case-insensitively) or remove it. Failing closed.$hintText")
+}
+
+# --------------------------------------------------------------------------
 # Shared validation (applied to a tier profile AND to a merged workload)
 # --------------------------------------------------------------------------
 
@@ -525,6 +642,21 @@ function Assert-OptionalIntInRange {
 
 <#
 .SYNOPSIS
+    Assert that a ResultInnerName is a plain, non-reserved outbox file name. Throws otherwise.
+#>
+function Assert-ResultInnerName {
+    [CmdletBinding()]
+    param([AllowNull()] $Value, [Parameter(Mandatory)] [string] $Context)
+    if (-not ($Value -is [string]) -or $Value -cnotmatch $script:ResultInnerNamePattern -or $Value -in @('.', '..')) {
+        throw "Schema validation: '$Context' field 'ResultInnerName' must be a plain file name matching $script:ResultInnerNamePattern (got '$Value')."
+    }
+    if ($script:ResultInnerNameReserved -contains $Value.ToLowerInvariant()) {
+        throw "Schema validation: '$Context' field 'ResultInnerName' '$Value' is reserved for the outbox container ($($script:ResultInnerNameReserved -join ', '))."
+    }
+}
+
+<#
+.SYNOPSIS
     Validates a (tier-shaped) profile hashtable against the schema + invariants 1-5.
     Used both for a bare tier profile and for the merged tier+workload result.
 #>
@@ -559,6 +691,12 @@ function Assert-TierProfileValid {
     Assert-OptionalIntInRange -Profile $Profile -Key 'CpuMaximumPercent' -Min $script:ProfileCpuMaximumPercentMin -Max $script:ProfileCpuMaximumPercentMax -Context $Context
     Assert-OptionalIntInRange -Profile $Profile -Key 'CpuRelativeWeight' -Min $script:ProfileCpuRelativeWeightMin -Max $script:ProfileCpuRelativeWeightMax -Context $Context
     Assert-OptionalIntInRange -Profile $Profile -Key 'WorkloadTimeoutSeconds' -Min $script:ProfileWorkloadTimeoutMin -Max $script:ProfileWorkloadTimeoutMax -Context $Context
+
+    # ResultInnerName (optional): the one staged file a transport-only run releases. It is joined onto a
+    # host directory and matched against the outbox's entry names, so it must be a plain file name.
+    if ($Profile.ContainsKey('ResultInnerName') -and $null -ne $Profile['ResultInnerName']) {
+        Assert-ResultInnerName -Value $Profile['ResultInnerName'] -Context $Context
+    }
 
     # Tier int 0..3
     $tier = $Profile['Tier']
@@ -810,6 +948,7 @@ function Import-TierProfile {
     }
 
     $ctx = "tier profile '$([System.IO.Path]::GetFileName($Path))'"
+    Assert-KnownProfileKeys -Profile $normalized -Kind Resolved -Context $ctx
     Assert-TierProfileValid -Profile $normalized -Context $ctx
 
     return $normalized
@@ -859,6 +998,9 @@ function Import-WorkloadProfile {
     }
 
     $wlName = [System.IO.Path]::GetFileName($Path)
+
+    # --- unknown keys: refuse any key outside the documented schema (it would be silently ignored) ----
+    Assert-KnownProfileKeys -Profile $raw -Kind Workload -Context "workload '$wlName'"
 
     # --- workload required keys (invariant 6 for the workload layer) ------
     foreach ($key in $script:WorkloadRequiredKeys) {
@@ -914,23 +1056,9 @@ function Import-WorkloadProfile {
     $merged['BaseTier'] = $baseTier
     $merged['Name']     = $raw['Name']
 
-    # Disk-mode workload keys are layered too: WorkloadMode selects the disk-driven run path,
-    # and Inputs / FileSystem / InputLabel / OutputLabel configure the INPUT/OUTPUT data disks that
-    # New-WorkloadDisks creates. Without layering these, a 'Disk' workload profile (firefox.psd1)
-    # would lose its mode + data-disk config in the merge and silently fall back to Serial.
-    # DepsSpec / ScreenConfig / DepsDiskPath are processor-profile keys: DepsSpec carries the
-    # dependency set the builder stages; ScreenConfig carries gate mode + categories;
-    # DepsDiskPath carries the pre-built deps disk path (optional, resolved at runtime).
-    # OutboxOutput (C1.4) is the transport-only counterpart: a non-processor Disk-mode workload
-    # (firefox) that still wants the Raw-OUTPUT / user-space-outbox-read path (Workload.ps1's
-    # Raw-OUTPUT predicate + Invoke-Voidseal.ps1's post-detach outbox read) without a ScreenConfig.
-    # DataDisks declares pre-built, hash-verified data disks (validated above in Assert-TierProfileValid;
-    # a -Workload.DataDisks value replaces this one entirely at run time).
-    foreach ($layerKey in @('Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
-                            'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
-                            'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput',
-                            'Memory', 'Cpu', 'CpuMaximumPercent', 'CpuRelativeWeight', 'WorkloadTimeoutSeconds',
-                            'DataDisks')) {
+    # The layered keys are listed once, with their roles, in $script:WorkloadLayeredKeys (top of this
+    # file); that list is also what the unknown-key refusal accepts, so the two cannot drift.
+    foreach ($layerKey in $script:WorkloadLayeredKeys) {
         if ($raw.ContainsKey($layerKey)) {
             $merged[$layerKey] = $raw[$layerKey]
         }

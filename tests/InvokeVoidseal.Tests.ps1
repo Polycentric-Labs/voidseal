@@ -2317,3 +2317,83 @@ Describe 'Invoke-Voidseal - the workload deadline comes from -WorkloadTimeoutSec
         }
     }
 }
+
+# ===========================================================================
+#  Profile key strictness + ResultInnerName layering (hashtable -Profile path)
+# ===========================================================================
+Describe 'Invoke-Voidseal: unknown profile keys and ResultInnerName layering' {
+
+    BeforeAll {
+        $fx = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $fx = @{} + $fx
+        $fx['Name']         = 'rin-test'
+        $fx['WorkloadMode'] = 'Disk'
+        $fx['Inputs']       = script:New-OutboxHelperInputs
+        $fx['FileSystem']   = 'exFAT'
+        $fx['OutboxOutput'] = $true
+        $fx['Entrypoint']   = 'python3 /mnt/in/work.py --out /run/staging/report.html'
+        $script:RinProfile  = $fx
+
+        # An outbox whose sole candidate is report.html (not the default result.html).
+        $staging = Join-Path $script:TmpRoot ("rin-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        $script:RinBytes = [System.Text.Encoding]::UTF8.GetBytes('<html>report</html>')
+        [System.IO.File]::WriteAllBytes((Join-Path $staging 'report.html'), $script:RinBytes)
+        $verdicts = Join-Path $script:TmpRoot ("rin-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        '[]' | Set-Content -LiteralPath $verdicts -Encoding utf8 -NoNewline
+        $blobFile = Join-Path $script:TmpRoot ("rin-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$staging', r'$verdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0
+        $script:RinBlob = [System.IO.File]::ReadAllBytes($blobFile)
+    }
+
+    It 'refuses a hashtable -Profile that carries an unknown key, naming it, before anything is provisioned' {
+        $bad = @{} + $script:RinProfile
+        $bad['ResultInnerNam'] = 'report.html'
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        { Invoke-Voidseal -Tier 0 -Profile $bad -Name 'sbx-rin-unknown' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage "*unknown key 'ResultInnerNam'*"
+        (& $b.GetVM @{ Name = 'sbx-rin-unknown' }) | Should -BeNullOrEmpty
+    }
+
+    It 'refuses a workload .psd1 passed by path that carries an unknown key' {
+        $wl = Join-Path $script:TmpRoot ("rin-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+        Set-Content -LiteralPath $wl -Encoding UTF8 -Value "@{ BaseTier = 0; Name = 'rin-path'; Entrypoint = 'true'; Bogus = 1 }"
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        { Invoke-Voidseal -Tier 0 -Profile $wl -Name 'sbx-rin-path' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage "*unknown key 'Bogus'*"
+    }
+
+    It 'a profile ResultInnerName names the file a transport-only run releases' {
+        $p = @{} + $script:RinProfile
+        $p['ResultInnerName'] = 'report.html'
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:RinBlob
+        $dest = Join-Path $script:TmpRoot ("dest-rin-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $p -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-rin-profile' -ArtifactRoot (Join-Path $script:TmpRoot 'art-rin1') -Destination $dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        $report.Error | Should -BeNullOrEmpty
+        $report.RunResult.Status | Should -Be 'Success'
+        [System.IO.Path]::GetFileName(@($report.ExtractedArtifact)[0]) | Should -Be 'report.html'
+        [System.IO.File]::ReadAllBytes(@($report.ExtractedArtifact)[0]) | Should -Be $script:RinBytes
+    }
+
+    It 'a -Workload ResultInnerName wins over the profile value' {
+        $p = @{} + $script:RinProfile
+        $p['ResultInnerName'] = 'result.html'          # the profile says one thing ...
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:RinBlob
+        $dest = Join-Path $script:TmpRoot ("dest-rin-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $p -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = 'report.html' } `
+            -Name 'sbx-rin-override' -ArtifactRoot (Join-Path $script:TmpRoot 'art-rin2') -Destination $dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b    # ... and the run overrides it
+        $report.Error | Should -BeNullOrEmpty
+        [System.IO.Path]::GetFileName(@($report.ExtractedArtifact)[0]) | Should -Be 'report.html'
+    }
+
+    It 'refuses a -Workload ResultInnerName that is not a plain file name' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:RinBlob
+        { Invoke-Voidseal -Tier 0 -Profile $script:RinProfile -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = '..\escape.html' } `
+            -Name 'sbx-rin-bad' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage '*ResultInnerName*'
+    }
+}

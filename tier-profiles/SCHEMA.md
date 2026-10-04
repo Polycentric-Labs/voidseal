@@ -4,6 +4,23 @@
 > agent MUST target. Tier profiles (`tier{0,1,2,3}.psd1`) define the **isolation contract**;
 > workload profiles (`profiles/*.psd1`) layer the **workload shape** over a base tier.
 
+## Unknown keys are refused
+
+Every key a profile file or a `-Profile` hashtable carries must be documented in this file: the
+tier-profile table, the workload-profile table, or both. The loader (`Import-TierProfile`,
+`Import-WorkloadProfile`, and the hashtable path of `Invoke-Voidseal`) throws on any other key and
+names it, so a typo or a key the engine never reads cannot vanish silently. Key names match
+case-insensitively, the way the loader reads them. The lists are built from the loader's own key
+constants (`Get-ProfileSchemaKeys` in `scripts/lib/ProfileLoader.ps1`), and a drift test fails when this
+file and the loader disagree in either direction. Where a key may appear:
+
+* a **workload profile** may carry the keys in the workload table (plus `BaseTier` and `Name`). A
+  tier-owned key such as `Credentials`, `Substrate` or `Extraction` is refused there rather than
+  dropped, because it was never layered onto the merge;
+* a **tier file** or a **`-Profile` hashtable** (a resolved profile) may carry the tier keys and the
+  workload keys the engine reads off a resolved profile. `ExtraAllowlist` and `InputFiles` are
+  workload-file keys and do not exist on a resolved profile.
+
 ## Tier-profile keys (all required unless noted)
 | Key | Type | Meaning |
 |---|---|---|
@@ -37,6 +54,16 @@
 | `Mounts` | hashtable | (opt) **declared but NOT wired into the guest**: nothing in the Provisioner or Runner attaches a host-guest bind mount (`docs/live-smoke-test.md` Gap 2). The loader still screens its source keys for secret-shaped paths. Files reach a running workload through Disk-mode `Inputs` (small, flat, written per run) or `DataDisks` (pre-built, hash-verified, any size and tree shape, mounted read-only): a `StageAssets` ISO is ejected by the seal before the guest's only boot, and the seed is built from the profile |
 | `DataDisks` | hashtable[] | (opt, Disk mode only) pre-built data disks, each `@{ Name = 'corpus'; Path = 'D:\vs\corpus.vhdx'; ImageHash = '<64 hex>' }`, built with `scripts/New-VoidsealDataDisk.ps1`, which prints the hash. `-Workload.DataDisks` replaces this value entirely (an empty array removes them). `Name` matches `^[a-z0-9]{1,8}$` and is unique; at most 8 disks. `Path` is a local drive-letter `.vhdx` path (no UNC, device or relative path, no alternate data stream), not secret-shaped, and outside the sandbox storage root; it may not be, or resolve through a junction or symbolic link to, the DEPS disk or `-ParentDiskPath`, and a file with a second hard link is refused. `ImageHash` is exactly 64 hex characters. `Invoke-Voidseal` refuses a Serial-mode run or a run with no `Entrypoint` that declares data disks. It never attaches the file named here: it copies each one into the run's own sandbox folder (a per-run **working copy**), refuses an unreadable or differencing original or a copy whose whole-image hash (user space) does not match, all before the first copy is attached, then attaches the copies and records them so `Assert-Sealed` accepts them. Teardown deletes the copies and never touches the originals, so a Hyper-V metadata update or a guest write cannot change the file you built. The cost is disk space and copy time on every run: each copy needs about the original's size free under the storage root (the free-space preflight budgets its virtual size plus 64 MB) and takes as long as a file copy of that size. The guest mounts each copy read-only by the label `VSD<NAME>` at `/mnt/data/<name>` and powers off without running the workload if one is missing or writable. After teardown each ORIGINAL is re-hashed; a change made on the host during the run sets the report's `DataDiskChanged`, and the report's `DataDisks` lists each disk's name, original path, verified hash, working copy and changed flag. A processor's `DepsDiskPath` gets the same working-copy treatment |
 | `Entrypoint` | string | workload command run by the Runner |
+| `WorkloadMode` | `'Serial'` \| `'Disk'` | (opt, default `'Serial'`) how the workload is delivered: over the COM1 serial seam, or by the seed-injected disk-mode runner with INPUT and OUTPUT data disks. `-Workload.WorkloadMode` wins over it |
+| `Inputs` | hashtable | (opt, Disk mode) inner file name to CONTENT, written onto the INPUT data disk. The shipped Disk-mode profiles carry `@{}` and fold real content in at run time |
+| `InputFiles` | hashtable | (opt, documentation only) inner file name to host file path: a record of where a live-acceptance step reads the content it folds into `Inputs`. It is accepted so a profile can carry the record, and never layered onto the merged profile |
+| `FileSystem` | string | (opt, Disk mode, default `'exFAT'`) the data-disk filesystem: `exFAT`, `FAT32`, `NTFS` or `FAT`. `Raw` is reserved for the engine's outbox OUTPUT disk and is not for a profile to set |
+| `InputLabel` / `OutputLabel` | string | (opt, Disk mode, defaults `'INPUT'` / `'OUTPUT'`) data-disk volume labels |
+| `DepsSpec` | hashtable | (required when `EgressMode` is `'SquidSniProxy'`, else opt) per-fetcher dependency spec (`Pip`, `Apt`, `HuggingFace`, `Github`) the builder fetches over its Squid SNI egress. The merged `EgressAllowlist` must cover every declared fetcher's representative hosts (the builder rule) |
+| `ScreenConfig` | hashtable | (opt, processor only) `mode` (`'aggressive'` default, or `'moderate'`) and `categories` (default none), routing the post-detach Sensitivity Gate. A processor is `Network = 'None'` plus a `ScreenConfig` |
+| `DepsDiskPath` | string | (opt) host path to a pre-built `deps.vhdx` a processor run attaches, usually supplied as a `-Workload` override |
+| `OutboxOutput` | bool | (opt) opts a non-processor Disk-mode workload into the user-space outbox transport (Raw OUTPUT disk, read with `ReadVhdxRawRegion`, never `Mount-VHD`). Transport only: never paired with `ScreenConfig` |
+| `ResultInnerName` | string | (opt, default `'result.html'`) the one staged file a transport-only (`OutboxOutput`) run releases, and the file name the legacy exFAT path reads. Layers like `Entrypoint`: `-Workload.ResultInnerName` wins over the profile value, which wins over the default. A plain file name of 1 to 40 characters from `A-Z a-z 0-9 . _ -`; `verdicts.json` and `workload.json` are the outbox container's own entries and are refused |
 | `Memory` / `Cpu` | string / int | (opt) guest sizing for this workload. Layers onto the tier like `Entrypoint`: a workload value replaces the tier's, an omitted key keeps the tier's. Same format and bounds as the tier keys (`Memory` `512MB` to `64GB`, `Cpu` 1 to 32), enforced on the merged profile |
 | `CpuMaximumPercent` / `CpuRelativeWeight` | int | (opt) the CPU caps described in the tier table, settable from a workload; the workload value wins over a tier value. Absent from both = no cap |
 | `WorkloadTimeoutSeconds` | int 60–86400 | (opt) the overall deadline for the workload run, after which the guest is force-stopped and the run reports Failed. `Invoke-Voidseal -WorkloadTimeoutSeconds` wins only when it is explicitly passed; otherwise this key; otherwise 600. The same precedence applies to `Invoke-BuilderVM`. The bounds are checked at load |

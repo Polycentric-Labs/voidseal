@@ -49,9 +49,14 @@ ask for a guest the loader would refuse on a tier.
 
 Every other tier-profile field (`Substrate`, `Network`, `Credentials`, `GuestImage`,
 `HostChannels`, `Extraction`, `Lifecycle`, `Controls`, …) is **immutable from the workload
-layer** — `Import-WorkloadProfile` simply never copies a workload key of that name onto the
-merged result. If your task needs a different isolation contract, that's a **different
-`BaseTier`**, not a workload-level override.
+layer**: `Import-WorkloadProfile` refuses a workload key of that name rather than ignoring it,
+naming the key in the error. If your task needs a different isolation contract, that's a
+**different `BaseTier`**, not a workload-level override.
+
+**Unknown keys are refused.** A key that is not in `tier-profiles/SCHEMA.md` (a typo such as
+`Entrypont`, a tier-owned key, a key the engine never reads) makes the loader throw and name it, for
+a workload file, a tier file and a hashtable passed as `-Profile` alike. Key names match
+case-insensitively. A drift test keeps `SCHEMA.md` and the loader's key lists identical.
 
 ## 2. The field contract
 
@@ -91,7 +96,8 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 |---|---|---|---|
 | `BaseTier` | **yes** | int selecting which `tier-profiles/tier<N>.psd1` to inherit | must resolve to an existing tier file |
 | `Name` | **yes** | the profile id | convention: matches the filename (minus `.psd1`) |
-| `Entrypoint` | **yes** | the command the Runner delivers | **Serial mode** (the default): delivered over the COM1 serial seam to the sealed guest. **Disk mode**: substituted for `__ENTRYPOINT__` in the runner the engine writes into the seed. For an `OutboxOutput` or processor profile (the only Disk shapes `Invoke-Voidseal` accepts) it reads `/mnt/in` and writes its result into `/run/staging/` (`result.html` unless you pass `ResultInnerName`), which the in-guest producer packs into the outbox; `/mnt/out` is never mounted there, and a seed whose `Entrypoint` names it is refused |
+| `Entrypoint` | **yes** | the command the Runner delivers | **Serial mode** (the default): delivered over the COM1 serial seam to the sealed guest. **Disk mode**: substituted for `__ENTRYPOINT__` in the runner the engine writes into the seed. For an `OutboxOutput` or processor profile (the only Disk shapes `Invoke-Voidseal` accepts) it reads `/mnt/in` and writes its result into `/run/staging/` (`result.html` unless the profile or `-Workload` sets `ResultInnerName`), which the in-guest producer packs into the outbox; `/mnt/out` is never mounted there, and a seed whose `Entrypoint` names it is refused. The entrypoint runs as the non-root sandbox user, which cannot create folders under `/run`: write into `/run/staging` (it already exists) or `/dev/shm`. |
+| `ResultInnerName` | no (default `'result.html'`) | the one staged file a transport-only (`OutboxOutput`) run releases, and the name the legacy exFAT path reads. Layers like `Entrypoint`: `-Workload.ResultInnerName` wins over the profile value, which wins over the default. Set it in the profile when the entrypoint writes a different file name, so every caller does not need a `-Workload` override | a plain file name, 1 to 40 characters from `A-Z a-z 0-9 . _ -`; `verdicts.json` and `workload.json` (the outbox container's own entries) are refused. The `-Workload` value is held to the same rule |
 | `Memory` / `Cpu` | no | size this workload's guest; replaces the tier's `Memory` / `Cpu` | same format and bounds as §2.1 (`512MB`..`64GB`, `1`..`32`), checked on the merged profile. Before the VM is created the provisioner also checks the host: free RAM must cover `Memory` plus a margin (default 2GB, `-HostMemoryMarginBytes`), or the run is refused |
 | `CpuMaximumPercent` / `CpuRelativeWeight` | no | the optional CPU caps from §2.1, set for this workload; the workload value wins over a tier value | integers in `1`..`100` and `1`..`10000`; each reaches `Set-VMProcessor` only when set, so an unset cap leaves Hyper-V's default alone |
 | `WorkloadTimeoutSeconds` | no (default 600) | the overall deadline for the run: past it the guest is force-stopped and the run reports `Failed`. Use it for a workload that legitimately runs longer than ten minutes (or one you want cut off sooner) | integer in `60`..`86400`, checked at load. `Invoke-Voidseal -WorkloadTimeoutSeconds` beats it, but only when you pass that parameter explicitly (an explicit value, including `0` in a test, always wins); with neither, the engine uses 600 |
@@ -100,9 +106,9 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `ExtraAllowlist` | no | FQDNs unioned onto the tier's `EgressAllowlist` | deduped case-insensitively; each entry still passes the tier's hostname-charset check |
 | `StageAssets` | no | host source path → a free-text pin note (for example a commit SHA). `Invoke-Voidseal` attaches each key as a read-only ISO before the seal, and the seal **ejects it before the guest's only boot**, so nothing in it reaches a running workload; use Disk-mode `Inputs` for files | the **key** must exist on the host (the import fails closed on a missing file) and is screened by invariant 1; no hash is checked on this path |
 | `SeedIso` | no | **not read by `Invoke-Voidseal`**: only the default output path for `New-CidataSeed` when you build a seed ISO by hand | the engine builds the cloud-init seed itself, from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (see §4 Step 6); a seed DVD would be ejected by the seal before the guest's only boot; not secret-shaped, so a `.iso` path is accepted |
-| `WorkloadMode` | no — default `'Serial'` | selects the delivery mechanism: `'Serial'` (COM1 entrypoint delivery) or `'Disk'` (seed-injected disk-mode runner + INPUT/OUTPUT data disks) | **not yet listed in `tier-profiles/SCHEMA.md`** — ProfileLoader-only today. `ralph.psd1` uses the implicit `'Serial'` default; `firefox.psd1`/`builder.psd1` set `'Disk'` explicitly |
+| `WorkloadMode` | no, default `'Serial'` | selects the delivery mechanism: `'Serial'` (COM1 entrypoint delivery) or `'Disk'` (seed-injected disk-mode runner + INPUT/OUTPUT data disks) | listed in `tier-profiles/SCHEMA.md`. `ralph.psd1` uses the implicit `'Serial'` default; `firefox.psd1`/`builder.psd1` set `'Disk'` explicitly |
 | `Inputs` | no (Disk-mode) | innerName → CONTENT written onto the INPUT data disk by `New-WorkloadDisks` | ships `@{}` in both shipped Disk-mode profiles — real content is folded in at run/live-acceptance time, not baked into the `.psd1` (a `.psd1` is static data; inlining a whole script as a here-string is unreadable/brittle) |
-| `InputFiles` | no (Disk-mode convention) | innerName → **host file path** — a documentation-only convention some Disk-mode profiles use to record where the live-acceptance step should read real file content from | **not consumed by the loader at all** — it is absent from `Import-WorkloadProfile`'s merge/layer list, so it never survives into the merged profile. A human (or the live-acceptance script) reads these host files and folds them into `Inputs` manually before deploy — see `firefox.psd1`'s `InputFiles` header comment |
+| `InputFiles` | no (Disk-mode convention) | innerName → **host file path**: a documentation-only convention some Disk-mode profiles use to record where the live-acceptance step should read real file content from | **never layered onto the merged profile**: it is accepted so a profile can carry the record, but it is not in `Import-WorkloadProfile`'s layer list, so nothing reads it at run time. A human (or the live-acceptance script) reads these host files and folds them into `Inputs` manually before deploy; see `firefox.psd1`'s `InputFiles` header comment |
 | `FileSystem` | no (Disk-mode; default `'exFAT'`) | the data disk filesystem | validated against the backend's `NewOutputVhdx`-accepted set (`exFAT`/`FAT32`/`NTFS`/`FAT`; `Raw` is also accepted but is engine-reserved for the raw-OUTPUT outbox path — not for a profile to set) |
 | `InputLabel` / `OutputLabel` | no (Disk-mode; default `'INPUT'`/`'OUTPUT'`) | data-disk volume labels | none |
 | `DepsSpec` | **required iff** `EgressMode='SquidSniProxy'`; otherwise no | per-fetcher (`Pip`/`Apt`/`HuggingFace`/`Github`) dependency spec the **builder** profile fetches over its Squid SNI egress | non-empty hashtable of recognized fetcher names; the merged `EgressAllowlist` must cover every declared fetcher's representative hosts or the loader refuses at load time (the "builder rule") — see `profiles/builder.psd1` |
@@ -111,12 +117,11 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `OutboxOutput` | no | opts a non-processor Disk-mode workload into the shared user-space outbox transport (Raw OUTPUT disk; the host reads it via `ReadVhdxRawRegion`, **never** `Mount-VHD`) | transport-only — never paired with `ScreenConfig` (see `firefox.psd1`) |
 | `DataDisks` | no (Disk-mode only) | pre-built, hash-verified data disks the guest mounts **read-only** at `/mnt/data/<name>`: bulk input of any size and tree shape, wheels, or model weights. Each entry is `@{ Name; Path; ImageHash }`, printed by `scripts/New-VoidsealDataDisk.ps1`. `-Workload.DataDisks` replaces the profile's list entirely | `Name` matches `^[a-z0-9]{1,8}$`, unique, at most 8 disks; `Path` a local `.vhdx` outside the sandbox storage root, not secret-shaped, never the DEPS disk or the golden parent; `ImageHash` 64 hex characters. Each run attaches a per-run working copy, never your file, and a copy that does not match the hash refuses the run before any data disk is attached. Budget the space and copy time of one copy per disk per run. Full rules: `tier-profiles/SCHEMA.md` |
 
-> **Fields marked "not yet in SCHEMA.md"** (`WorkloadMode`, `Inputs`, `InputFiles`, `FileSystem`,
-> `InputLabel`/`OutputLabel`, `DepsSpec`, `ScreenConfig`, `DepsDiskPath`, `OutboxOutput`) are real,
-> loader-exercised, test-covered fields — they simply postdate `SCHEMA.md`'s last full pass. This
-> guide's table is the accurate superset; treat `SCHEMA.md` as the terser tier-invariant reference
-> and this doc + `ProfileLoader.ps1` as the source of truth for the Disk-mode / builder / processor
-> fields.
+> **Every field in these tables is also in `tier-profiles/SCHEMA.md`.** The unknown-key refusal made
+> that a requirement (a drift test fails when the two lists differ), so the Disk-mode, builder and
+> processor fields (`WorkloadMode`, `Inputs`, `InputFiles`, `FileSystem`, `InputLabel`/`OutputLabel`,
+> `DepsSpec`, `ScreenConfig`, `DepsDiskPath`, `OutboxOutput`, `ResultInnerName`) are documented there
+> as well. This guide's table adds the detail and the reasoning.
 
 **Processor profiles stage three guest helpers.** A processor's seed runs
 `python3 /mnt/in/run_disk_workload.py --mode <ScreenConfig.mode>` inside the guest. That script
@@ -308,9 +313,11 @@ from-scratch skeleton above, copy `profiles/firefox.psd1` and strip it down:
    needs the second beside it. Never use real personal data by default (see the DATA-ACCESS rule in
    `firefox.psd1`'s header).
 4. Change `Entrypoint` to invoke your script: read from `/mnt/in` and write the result into
-   `/run/staging/` (`/run/staging/result.html` by default; pass a different `ResultInnerName` via a
-   `-Workload` override, as in `docs/operator-runbook.md` §1.1). `/mnt/out` is never mounted for an
-   outbox profile, and a seed whose `Entrypoint` names it is refused.
+   `/run/staging/` (`/run/staging/result.html` by default; set `ResultInnerName` in the profile for a
+   different name, or override it with `-Workload`, as in `docs/operator-runbook.md` §1.1). The
+   sandbox user cannot create folders under `/run`, so use `/run/staging` itself or `/dev/shm` for
+   scratch space. `/mnt/out` is never mounted for an outbox profile, and a seed whose `Entrypoint`
+   names it is refused.
 5. Drop the firefox-specific comments/`ExtraAllowlist` if your task doesn't need them.
 
 This gets you the Disk-mode shape with the INPUT/OUTPUT-disk plumbing, the shared outbox producer
@@ -320,8 +327,10 @@ moving parts than the from-scratch skeleton.
 ## 7. Common mistakes
 
 - **Trying to change `Credentials`, `Substrate`, `HostChannels`, or `Extraction` from the
-  workload layer.** These are tier-owned and simply never copied onto the merge — pick a
+  workload layer.** These are tier-owned and the loader refuses them in a workload file; pick a
   different `BaseTier` instead.
+- **Misspelling a key, or setting one the engine does not read.** The loader throws on any key
+  that is not in `tier-profiles/SCHEMA.md` and names it; it never drops one silently.
 - **Setting `EgressMode` to anything other than `'SquidSniProxy'` in a workload profile.** Every
   other `EgressMode` is tier-controlled; the loader refuses any other workload-level override.
 - **Mounting a live credential/secret file "just this once."** The loader refuses it by design —

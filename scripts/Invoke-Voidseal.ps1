@@ -191,6 +191,9 @@ function Resolve-DeployProfile {
     if ($Profile -is [System.Collections.IDictionary]) {
         $clone = @{}
         foreach ($k in $Profile.Keys) { $clone[$k] = $Profile[$k] }
+        # A hand-built hashtable gets the same unknown-key refusal as a loaded file: a key outside the
+        # schema would otherwise be dropped without a word.
+        Assert-KnownProfileKeys -Profile $clone -Kind Resolved -Context 'Invoke-Voidseal -Profile (hashtable)'
         Assert-TierProfileValid -Profile $clone -Context 'Invoke-Voidseal -Profile (hashtable)'
         return $clone
     }
@@ -424,7 +427,12 @@ function Invoke-Voidseal {
         $workloadMode = [string]$resolved['WorkloadMode']
     }
     if ([string]::IsNullOrWhiteSpace($workloadMode)) { $workloadMode = 'Serial' }
-    $resultInnerName   = [string](Get-WorkloadField -Workload $Workload -Name 'ResultInnerName'   -Default 'result.html')
+    # ResultInnerName layers like Entrypoint: the -Workload value wins, then the profile's own key
+    # (a workload profile may set it), then 'result.html'. The loader already validated the profile's
+    # value; the final one is checked here so a -Workload override is held to the same plain-name rule.
+    $profileResultName = if ($resolved.ContainsKey('ResultInnerName') -and $null -ne $resolved['ResultInnerName']) { [string]$resolved['ResultInnerName'] } else { 'result.html' }
+    $resultInnerName   = [string](Get-WorkloadField -Workload $Workload -Name 'ResultInnerName'   -Default $profileResultName)
+    Assert-ResultInnerName -Value $resultInnerName -Context 'Invoke-Voidseal -Workload'
     $sentinelInnerName = [string](Get-WorkloadField -Workload $Workload -Name 'SentinelInnerName' -Default 'result.exitcode')
 
     # --- D (structural C1 no-mount): refuse a Disk-mode profile that would reach the legacy

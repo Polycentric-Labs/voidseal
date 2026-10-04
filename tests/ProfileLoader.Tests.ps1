@@ -1157,3 +1157,145 @@ Describe 'WorkloadTimeoutSeconds profile key (E3)' {
         }
     }
 }
+
+Describe 'Unknown profile keys are refused (fail-closed)' {
+
+    It 'refuses an unknown key in a workload profile, naming the key' {
+        $wl = @{ BaseTier = 1; Name = 'typo'; Entrypoint = 'true'; Entrypont = 'oops' }
+        $p = script:New-Psd1File -Data $wl -Name 'typo.psd1'
+        { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } |
+            Should -Throw -ExpectedMessage "*unknown key 'Entrypont'*"
+    }
+
+    It 'names every unknown key when there are several' {
+        $wl = @{ BaseTier = 1; Name = 'many'; Entrypoint = 'true'; Alpha = 1; Beta = 2 }
+        $p = script:New-Psd1File -Data $wl -Name 'many.psd1'
+        { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } |
+            Should -Throw -ExpectedMessage "*unknown keys*'Alpha'*'Beta'*"
+    }
+
+    It 'refuses an unknown key in a tier file' {
+        $t = script:Get-ValidTier1Hashtable
+        $t.Surprise = 'x'
+        $p = script:New-Psd1File -Data $t -Name 'tier-surprise.psd1'
+        { Import-TierProfile -Path $p } | Should -Throw -ExpectedMessage "*unknown key 'Surprise'*"
+    }
+
+    It 'matches key names case-insensitively, as the loader reads them' {
+        $wl = @{ BASETIER = 1; name = 'cased'; entrypoint = 'true'; extraallowlist = @('example.com'); resultinnername = 'out.txt' }
+        $p = script:New-Psd1File -Data $wl -Name 'cased.psd1'
+        $m = Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir
+        $m.Entrypoint | Should -Be 'true'
+        @($m.EgressAllowlist) | Should -Contain 'example.com'
+        $m.ResultInnerName | Should -Be 'out.txt'
+    }
+
+    It 'refuses a tier-owned key set from a workload and says where it belongs' {
+        $wl = @{ BaseTier = 1; Name = 'weaken'; Entrypoint = 'true'; Credentials = 'None' }
+        $p = script:New-Psd1File -Data $wl -Name 'weaken.psd1'
+        { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } |
+            Should -Throw -ExpectedMessage "*unknown key 'Credentials'*tier-owned*"
+    }
+
+    It 'checks the unknown key before the missing-key check, so a typo is named' {
+        $wl = @{ BaseTier = 1; Name = 'typo2'; Entrypont = 'true' }
+        $p = script:New-Psd1File -Data $wl -Name 'typo2.psd1'
+        { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } |
+            Should -Throw -ExpectedMessage "*unknown key 'Entrypont'*"
+    }
+
+    It 'Assert-KnownProfileKeys refuses an unknown key on a resolved profile hashtable' {
+        $t = script:Get-ValidTier1Hashtable
+        { Assert-KnownProfileKeys -Profile $t -Kind Resolved -Context 'fixture' } | Should -Not -Throw
+        $t.ResultInnerNam = 'x'
+        { Assert-KnownProfileKeys -Profile $t -Kind Resolved -Context 'fixture' } |
+            Should -Throw -ExpectedMessage "*unknown key 'ResultInnerNam'*"
+        # ExtraAllowlist is unioned away at merge time, so a RESOLVED profile never carries it.
+        $u = script:Get-ValidTier1Hashtable
+        $u.ExtraAllowlist = @('example.com')
+        { Assert-KnownProfileKeys -Profile $u -Kind Resolved -Context 'fixture' } | Should -Throw -ExpectedMessage "*ExtraAllowlist*"
+    }
+
+    It 'every shipped tier and workload profile loads under the unknown-key rule' {
+        foreach ($f in @(Get-ChildItem -LiteralPath $script:TierDir -Filter 'tier*.psd1')) {
+            { Import-TierProfile -Path $f.FullName } | Should -Not -Throw -Because "tier-profiles/$($f.Name) ships with the repo"
+        }
+        foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $script:SkillRoot 'profiles') -Filter '*.psd1')) {
+            { Import-WorkloadProfile -Path $f.FullName -TierProfileDir $script:TierDir } | Should -Not -Throw -Because "profiles/$($f.Name) ships with the repo"
+        }
+    }
+
+    Context 'schema drift (SCHEMA.md and the loader list the same keys)' {
+        BeforeAll {
+            # Documented keys: every backticked identifier in the FIRST cell of a table row, between the
+            # tier-key table and the provision-time gate section.
+            $schemaText = Get-Content -LiteralPath (Join-Path $script:TierDir 'SCHEMA.md') -Raw
+            $start = $schemaText.IndexOf('## Tier-profile keys')
+            $end   = $schemaText.IndexOf('## Provision-time resource gate')
+            $start | Should -BeGreaterThan -1
+            $end   | Should -BeGreaterThan $start
+            $keys = [System.Collections.Generic.List[string]]::new()
+            foreach ($line in ($schemaText.Substring($start, $end - $start) -split "`r?`n")) {
+                if ($line -notmatch '^\|\s*(?<cell>[^|]+?)\s*\|') { continue }
+                foreach ($m in [regex]::Matches($Matches['cell'], '`(?<k>[A-Za-z][A-Za-z0-9]*)`')) { $keys.Add($m.Groups['k'].Value) }
+            }
+            $script:DocumentedKeys = @($keys | Sort-Object -Unique)
+        }
+
+        It 'parses a plausible number of documented keys (the parser itself is sound)' {
+            $script:DocumentedKeys | Should -Contain 'Entrypoint'
+            $script:DocumentedKeys | Should -Contain 'CpuMaximumPercent'
+            $script:DocumentedKeys | Should -Contain 'ResultInnerName'
+            $script:DocumentedKeys.Count | Should -BeGreaterThan 30
+        }
+
+        It 'every key documented in SCHEMA.md is accepted by the loader' {
+            $accepted = @((Get-ProfileSchemaKeys).All)
+            $notAccepted = @($script:DocumentedKeys | Where-Object { $accepted -notcontains $_ })
+            $notAccepted | Should -BeNullOrEmpty -Because "SCHEMA.md documents these keys but the loader would refuse them: $($notAccepted -join ', ')"
+        }
+
+        It 'every key the loader accepts is documented in SCHEMA.md' {
+            $undocumented = @((Get-ProfileSchemaKeys).All | Where-Object { $script:DocumentedKeys -notcontains $_ })
+            $undocumented | Should -BeNullOrEmpty -Because "the loader accepts these keys but SCHEMA.md does not document them: $($undocumented -join ', ')"
+        }
+
+        It 'the accepted lists come from the loader constants, not a second list' {
+            $s = Get-ProfileSchemaKeys
+            foreach ($k in $script:TierRequiredKeys)       { @($s.Tier) | Should -Contain $k }
+            foreach ($k in $script:TierOptionalKeys)       { @($s.Tier) | Should -Contain $k }
+            foreach ($k in $script:WorkloadLayeredKeys)    { @($s.Workload) | Should -Contain $k; @($s.Resolved) | Should -Contain $k }
+            foreach ($k in $script:WorkloadMergeOnlyKeys)  { @($s.Workload) | Should -Contain $k; @($s.Resolved) | Should -Not -Contain $k }
+        }
+    }
+}
+
+Describe 'ResultInnerName is a layered workload key' {
+
+    It 'layers a workload ResultInnerName onto the merged profile' {
+        $wl = @{ BaseTier = 1; Name = 'named'; Entrypoint = 'true'; ResultInnerName = 'report.json' }
+        $p = script:New-Psd1File -Data $wl -Name 'named.psd1'
+        (Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir).ResultInnerName | Should -Be 'report.json'
+    }
+
+    It 'is absent from the merged profile when the workload does not set it' {
+        $wl = @{ BaseTier = 1; Name = 'unnamed'; Entrypoint = 'true' }
+        $p = script:New-Psd1File -Data $wl -Name 'unnamed.psd1'
+        (Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir).ContainsKey('ResultInnerName') | Should -BeFalse
+    }
+
+    It 'refuses a name that is not a plain, non-reserved outbox file name' {
+        foreach ($bad in @('..', '.', 'a/b.txt', 'a\b.txt', 'has space.txt', '', ('x' * 41), 'verdicts.json', 'Verdicts.JSON', 'workload.json')) {
+            $wl = @{ BaseTier = 1; Name = 'badname'; Entrypoint = 'true'; ResultInnerName = $bad }
+            $p = script:New-Psd1File -Data $wl -Name ("badname-{0}.psd1" -f ([guid]::NewGuid().ToString('N')))
+            { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } |
+                Should -Throw -ExpectedMessage '*ResultInnerName*' -Because "'$bad' is not an acceptable result name"
+        }
+    }
+
+    It 'refuses a non-string ResultInnerName' {
+        $wl = @{ BaseTier = 1; Name = 'intname'; Entrypoint = 'true'; ResultInnerName = 7 }
+        $p = script:New-Psd1File -Data $wl -Name 'intname.psd1'
+        { Import-WorkloadProfile -Path $p -TierProfileDir $script:TierDir } | Should -Throw -ExpectedMessage '*ResultInnerName*'
+    }
+}
