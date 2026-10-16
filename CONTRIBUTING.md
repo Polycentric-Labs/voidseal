@@ -17,7 +17,8 @@ $c.Output.Verbosity = 'Detailed'
 Invoke-Pester -Configuration $c
 ```
 
-Every change must keep the suite green. CI runs the same on every push/PR (`.github/workflows/pester.yml`).
+Every change must keep the suite green. CI runs it, followed by the pytest suite, on pushes to `main` and on
+pull requests targeting `main` (`.github/workflows/pester.yml`); on other branches, run both locally.
 
 ## The one rule that matters most: the fake must match the real
 

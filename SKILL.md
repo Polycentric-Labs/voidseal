@@ -6,11 +6,12 @@ description: >
   required isolation, run the workload, capture results across a one-way boundary, and
   tear it down. Use when the user says "provision a sandbox VM", "spin up an isolated VM",
   "deploy a sandboxed / airgapped VM", "run this in a throwaway VM", "sandbox this
-  agent loop / plugin / untrusted code", or invokes /voidseal. Two v1 workload
-  profiles ship: `ralph` (Tier-1 net-restricted Claude Code agent loop) and `firefox`
-  (Tier-0 bookmark organizer on a profile COPY). Tier 0 is live-proven on real Hyper-V
-  (firefox disk-mode round-trip); Tier 1 (net-restricted VM) is mock-green with its live
-  run pending; Tier 2 (disposable no-net) + Tier 3 (airgapped detonation) are
+  agent loop / plugin / untrusted code", or invokes /voidseal. Four v1 workload
+  profiles ship: `ralph` (Tier-1 net-restricted Claude Code agent loop), `firefox`
+  (Tier-0 bookmark organizer on a profile COPY), `builder` (Tier-1 dependency fetcher) and
+  `example-skeleton` (a minimal Tier-0 template to copy). Tier 0 is live-proven on real
+  Hyper-V (firefox disk-mode round-trip); Tier 1 (net-restricted VM) is mock-green with its
+  live run pending; Tier 2 (disposable no-net) + Tier 3 (airgapped detonation) are
   scaffolded/harness-only in v1 — NO live malware or plugin detonation. Live runs
   require an ELEVATED session (Hyper-V Administrators).
 ---
@@ -109,18 +110,24 @@ mismatch is a caller error and throws). See the full parameter list in the
 - **PROVISIONED** — `New-SandboxVM` creates the substrate (Gen2, Secure Boot template, COM1 serial, Internal switch) from the profile. Left **powered off**.
 - **STAGED**: `Import-SandboxAsset` attaches each `StageAssets` entry as a read-only ISO **before** the seal, and the seal ejects it before the guest's only boot, so it never reaches a running workload; `New-WorkloadSeedDisk` builds the cloud-init seed here too. The loader screens both the `StageAssets` and the `Mounts` source keys against the secret-shaped-path list at load time, so a source whose *name* looks like a credential is refused before anything is attached. That screen is a path-shape lint, not a content scan: it catches the common accident, not a caller who renamed the file.
 - **SEALED** — `Lock-Sandbox` cuts the VM to the tier's isolation, then **`Assert-Sealed` is a HARD GATE**. If it fails, the deploy **aborts here** — the workload never runs and the VM is torn down.
-- **RUNNING** — `Start-SandboxWorkload` boots the sealed VM and delivers the entrypoint over the **COM1 named-pipe serial seam** (PowerShell Direct is Windows-guest-only; the Debian guest is driven over serial).
+- **RUNNING**: in **Disk mode** (`WorkloadMode='Disk'`, the only live-proven path) the orchestrator starts the sealed VM; the cloud-init runner on the seed disk runs the profile's entrypoint, reading the INPUT disk and writing the result to the OUTPUT disk (the outbox), then powers the guest off, and the host waits for that power-off (`Wait-WorkloadComplete` polls the VM state until `Off`, force-stopping a hung guest at the deadline). In **Serial mode** (the default) `Start-SandboxWorkload` boots the sealed VM and delivers the entrypoint over the **COM1 named-pipe serial seam** (PowerShell Direct is Windows-guest-only; the Debian guest is driven over serial).
 - **CAPTURED** — the run-result + its host-side capture artifact are recorded **out-of-band** (P8 — never trust the guest to self-report).
 - **EXTRACTED** — `Export-SandboxArtifact`, one-way OUT. Tier 0/1: a trusting host-read of the emitted result. **Tier ≥ 2: routes to the quarantine sink, which THROWS** (the cold-VHDX/CDR flow is post-v1) — a hostile-tier artifact is never trustingly copied to the host.
 - **DESTROYED** — `Remove-Sandbox` stops + unregisters + deletes the created disks. Teardown **always runs** (in a `finally`), so a mid-flow failure leaves no orphan.
   Teardown also removes the per-VM Internal switch the provision created (Tier 1).
 
-## The two v1 workload profiles
+## The v1 workload profiles
 
 | Profile | Tier | What it runs | Egress | Data |
 |---|---|---|---|---|
 | **`profiles/ralph.psd1`** | 1 | `bash ralph_loop.sh` (`frankbria/ralph-claude-code`, pinned by **commit SHA**; it's bash, has no tags). Drives the `claude` CLI ≥ 2.0.76 headless (`claude -p … --output-format json --allowedTools … --resume`; **no** `--dangerously-skip-permissions`). Bare Debian VM, no nested devcontainer; native bubblewrap for defense-in-depth. | inherits tier1's `EgressAllowlist` (`api.anthropic.com`, `github.com`, npm, pypi …), which tier1's `EgressMode='HostProxy'` enforces on the host (host CONNECT proxy, host firewall rules and port ACL, gate-verified; mock-green, never run live), with an in-guest default-DROP as defense in depth | OAuth token path **declared** as a read-only `.token` entry in `Mounts` (never `-e`, never embedded); `Mounts` is not wired into the guest, so no token reaches a live run yet |
 | **`profiles/firefox.psd1`** | 0 | `organize_bookmarks.py` — dedupe + frecency-rank + auto-folder a Firefox profile, emit an importable `<!DOCTYPE NETSCAPE-Bookmark-file-1>` HTML file. Operates on a **COPY** (`places.sqlite` closed-copy + `bookmarkbackups/*.jsonlz4` via `lz4.block`), never mutates live, never reads `logins.json`/`key4.db`/`cookies.sqlite`. | **none** (offline; the lone optional dead-link check escalates to Tier 1) | **defaults to SYNTHETIC/sample data**; real profile data needs explicit per-task authorization |
+
+Two more profiles ship alongside these. `profiles/builder.psd1` (Tier 1, Disk mode) runs a `DepsSpec` in a
+net-restricted VM over `HostProxy` and emits a hash-verified `deps.vhdx`; it is mock-green only, and its
+first live run is Phase 6. `profiles/example-skeleton.psd1` (Tier 0, Serial mode) is the minimal valid
+shape to copy when authoring a new profile; it has never been live-run. See
+[`docs/authoring-a-workload-profile.md`](docs/authoring-a-workload-profile.md).
 
 ## Load-time and runtime refusals (fail closed)
 

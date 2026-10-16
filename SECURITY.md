@@ -208,9 +208,9 @@ full privileges of whoever invokes it — here, the host operator.
   (AST-pinned by test, non-vacuously), but the actual confinement mechanism is **not yet wired**: a
   restricted-token/Job-Object shim for Tier-0/1 (drop privileges + cap resources on the child `qemu-img`
   process) or a Windows Sandbox for Tier-2/3 (full OS-level confinement for the disposable/detonation
-  tiers). **The real confinement mechanism is built and live-proven at Phase 6** — until then, treat the
-  convert step as running with full host-operator privileges, mitigated only by the version floor and
-  binary pin above.
+  tiers). **The real confinement mechanism will be built and live-proven in Phase 6**, which has not run
+  yet (`docs/phase-6-live-runbook.md` is marked NOT YET LIVE); until then, treat the convert step as
+  running with full host-operator privileges, mitigated only by the version floor and binary pin above.
 
 ## Status / honesty
 

@@ -147,10 +147,13 @@ check sits beside the NIC check. Only the count is read, and a read that fails r
 - **T2/T3 — N/A.** No NIC exists once sealed (see the row above), so there is no route for a filtering
   question to apply to.
 
-**Host↔guest channel left ON.** IN SCOPE, every tier. `Assert-Sealed` reads all four channels
-(clipboard/shares/guest-services/enhanced-session) back from the host via `GetHostChannels` and fails
-closed both if any channel is ON *and* if a channel's state cannot be read at all. A channel silently left
-enabled after `Lock-Sandbox` runs is a Voidseal defect at any tier.
+**Host↔guest channel left ON.** IN SCOPE, every tier. `Assert-Sealed` checks all four channels
+(clipboard/shares/guest-services/enhanced-session) through `GetHostChannels`, but only guest-services is
+read back from the host (`Get-VMIntegrationService`), failing closed both if it is ON and if its state
+cannot be read at all; the real backend reports clipboard, shares and enhanced-session off by
+construction, on the argument documented in that function that Hyper-V exposes no per-VM Enhanced
+Session signal (see `SECURITY.md`, "Status / honesty"). A channel silently left enabled after
+`Lock-Sandbox` runs is a Voidseal defect at any tier.
 
 **Integration service left ON.** IN SCOPE, every tier, since 2026-10-03. Time Synchronization, Key-Value
 Pair Exchange, Backup (VSS) and Heartbeat are live VMBus channels the engine never uses. `Lock-Sandbox`

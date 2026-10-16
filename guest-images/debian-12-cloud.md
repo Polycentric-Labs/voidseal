@@ -173,7 +173,7 @@ same two documents into an ISO for you.
 >
 > **Live-acceptance updates (2026-06-24, from the first live runs):** the
 > shipped runner now also (RC2) **creates the non-root `sandbox` user** via a cloud-config `users:` block
-> (the golden image has none); (RC4) **mounts robustly** — tries the `uid=/gid=` mount then **falls back
+> (the golden image has none); (RC4) **mounts with a fallback**: tries the `uid=/gid=` mount then **falls back
 > to a plain `mount LABEL=…`** (the live cloud kernel failed the uid/gid mount where a plain mount
 > worked), tracking whether OUTPUT mounted sandbox-owned so it only runs the entrypoint as `sandbox` when
 > that user can actually write; and (RC3) *attempts* to **mask `systemd-networkd-wait-online.service`**
@@ -338,7 +338,7 @@ runcmd:
    read-only mount without uid/gid**. Hyper-V cannot attach the disk read-only (D3), so `ro` is INPUT's
    only read-only control, and since the `sandbox` user has passwordless sudo it is not a boundary. The
    workload never writes its inputs; it reads a copy and emits a fresh result.
-3. OUTPUT mounts **robustly** (RC4): the runner first tries the `sandbox`-owning
+3. OUTPUT mounts **with a fallback** (RC4): the runner first tries the `sandbox`-owning
    `mount -o uid=…,gid=… LABEL=OUTPUT /mnt/out` and records whether **that** form won
    (`OUT_SANDBOX_OWNED=1`), then `mountpoint -q /mnt/out || mount LABEL=OUTPUT /mnt/out` **falls back to a
    plain mount** so OUTPUT mounts even where the live cloud kernel rejects the uid/gid options. OUTPUT

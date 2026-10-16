@@ -803,7 +803,7 @@ function Assert-Sealed {
 
     # --- IsolatedInternalSwitch (Tier 1, non-processor): the NIC MUST be on the ISOLATED Internal vSwitch (I4) ---
     # A Tier-1 VM legitimately HAS a NIC (net-restricted, not no-net), but its egress must ride the HOST
-    # chokepoint — an Internal vSwitch whose gateway the host controls (Pass A Q2). An External switch bypasses
+    # chokepoint: an Internal vSwitch whose gateway the host controls (see the design notes). An External switch bypasses
     # the host TCP/IP stack (unfiltered egress) and is refused. NOTE (accuracy, whole-branch review): the
     # built-in "Default Switch" is ITSELF SwitchType='Internal' (it is Hyper-V's ICS/internet-connected
     # switch, confirmed on real hardware) — so the SwitchType-based check alone does NOT distinguish it from a
@@ -856,7 +856,7 @@ function Assert-Sealed {
             }
             # By-NAME refusal of the built-in "Default Switch" (Phase-6 §Track item 1 — now shipped). The
             # SwitchType check above is necessary but NOT sufficient: the Default Switch is ITSELF
-            # SwitchType=Internal (Hyper-V's ICS/internet-connected switch — Pass A Q2, confirmed on real
+            # SwitchType=Internal (Hyper-V's ICS/internet-connected switch, per the design notes, confirmed on real
             # hardware), so a Default-Switch-connected NIC would PASS the type check and be certified. It gives
             # unmediated ICS internet egress the host gateway does not control — the opposite of an isolated
             # Tier-1 Internal switch. Real Tier-1 provisioning names its switch "<vm>-int" (Provisioner.ps1),

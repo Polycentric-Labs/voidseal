@@ -173,7 +173,8 @@ The whole engine runs against a **fake Hyper-V backend** — no elevation, no re
 Invoke-Pester -Path tests
 ```
 
-CI runs the same on every push/PR. See [`CONTRIBUTING.md`](CONTRIBUTING.md) — especially the rule that the
+CI runs the same suite, followed by pytest, on pushes to `main` and on pull requests targeting `main`
+(`.github/workflows/pester.yml`). See [`CONTRIBUTING.md`](CONTRIBUTING.md), especially the rule that the
 fake backend must match real Hyper-V behavior.
 
 ## AI Assistance

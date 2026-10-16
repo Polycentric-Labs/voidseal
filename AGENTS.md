@@ -46,9 +46,9 @@ python -m pytest tests/guest tests/host -q
 ```
 
 Run the Python suite too if you touched anything under `guest/` (the in-guest screener/outbox
-producer) or `tests/guest`/`tests/host`. CI runs the Pester suite on every push/PR
-(`.github/workflows/pester.yml`); the pytest suite is not yet wired into CI, so it's on you to run
-it locally when relevant.
+producer) or `tests/guest`/`tests/host`. CI runs both suites, Pester first and then pytest, on
+pushes to `main` and on pull requests that target `main` (`.github/workflows/pester.yml`); on a
+branch with no PR open yet, it is on you to run them locally.
 
 **3. Honesty discipline.** Every claim in a doc, comment, or commit message about what Voidseal
 *guarantees* must match what the code actually does — no overclaiming a containment property that
