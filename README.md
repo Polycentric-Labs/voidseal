@@ -31,8 +31,8 @@ rather than duplicating it.
 >   resolver; a host CONNECT allowlist proxy on the VM's own /30 is the only way out, behind host
 >   firewall rules and a port ACL that the seal gate reads back. Do not run a hostile workload at
 >   Tier 1 until the live checks in [`docs/phase-6-live-runbook.md`](docs/phase-6-live-runbook.md)
->   section 2 pass. A profile set to `InGuestSquid` instead gets only the in-guest iptables and Squid
->   layer, which a root guest can disable (see the Egress note in
+>   section 2 pass. It is the one egress model for a VM that keeps its NIC, in Serial and Disk mode
+>   alike, and the builder runs on it too (see the Egress note in
 >   [`docs/tier-reference.md`](docs/tier-reference.md)).
 > - **A profile's `Mounts` block does not deliver anything into the guest, and neither does
 >   `StageAssets`.** Nothing in the Provisioner or Runner attaches a host-guest bind mount; the backend
@@ -41,14 +41,16 @@ rather than duplicating it.
 >   ejected by it before the guest's only boot. Files reach a running workload only through Disk-mode
 >   `Inputs` (the INPUT data disk) or `DataDisks` (pre-built, hash-verified disks the guest mounts
 >   read-only; build one with `scripts/New-VoidsealDataDisk.ps1`); the cloud-init seed is built from
->   the profile and carries none of yours. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
+>   the profile and carries none of yours. Both work on a Tier-1 `HostProxy` VM as well as offline: a
+>   Disk-mode run on a kept-NIC VM gets the proxy settings, the in-guest lockdown and a static
+>   network-config in its seed. See Gap 2 in [`docs/live-smoke-test.md`](docs/live-smoke-test.md).
 > - **On the `Invoke-Voidseal` path, `BlockProtocols` is declarative and `EgressAllowlist` is enforced on
->   the host for a Tier-1 Serial run.** No code reads `BlockProtocols` (HostProxy blocks UDP and
+>   the host for a Tier-1 run in either mode.** No code reads `BlockProtocols` (HostProxy blocks UDP and
 >   non-443 traffic by construction anyway). `EgressAllowlist` is validated, merged and deduped; with
 >   `EgressMode='HostProxy'` (what `tier1.psd1` ships, so `ralph` uses it) it is the list the host
 >   CONNECT proxy enforces, behind host firewall rules and a port ACL that the seal gate verifies, and
->   the guest has no route, NAT or resolver of its own. This is mock-green and has never run live. A
->   profile set to `InGuestSquid` instead gets the in-guest Squid layer, which is defense in depth only.
+>   the guest has no route, NAT or resolver of its own. This is mock-green and has never run live. The
+>   in-guest default-DROP in the seed is defense in depth only.
 
 ## What it is
 
@@ -64,7 +66,7 @@ insider, and make the blast radius structurally small.
 
 | Tier | Boundary | Network | Credentials | Use |
 |---|---|---|---|---|
-| **0** | lightweight / offline (no-NIC VM in v1) | default-offline (host-proxy allowlist declared, not yet implemented) | none | trusted local workloads, file organizers |
+| **0** | lightweight / offline (no-NIC VM in v1) | none: the VM seals with no adapter (`HostProxy` is implemented for Tier 1 and moot here) | none | trusted local workloads, file organizers |
 | **1** | net-restricted Hyper-V VM | Internal-switch isolation (seal-verified); host-enforced egress allowlist (`HostProxy`: host CONNECT proxy, host firewall rules and port ACL, gate-verified; mock-green, never run live) | scoped, on-demand | autonomous agent loops against a target repo |
 | **2** | disposable, **no NIC** | none (structurally starved) | none (refused at load) | untrusted code *(scaffold-only in v1)* |
 | **3** | air-gapped + sinkhole | none | none | malware detonation *(scaffold-only in v1)* |

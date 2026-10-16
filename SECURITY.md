@@ -227,19 +227,20 @@ full privileges of whoever invokes it — here, the host operator.
 - **Tier 2/3 (disposable no-net / air-gapped detonation) and the cold-VHDX→quarantine extraction are
   scaffold-only** in v1 (the quarantine sink throws `NotImplemented`). No live malware or untrusted-plugin
   detonation should be run until verified isolation is in place.
-- **Tier-1 egress: host-enforced under HostProxy, in-guest only under InGuestSquid and the builder.**
-  With `EgressMode='HostProxy'` (what `tier-profiles/tier1.psd1` ships since 2026-10-03, so ralph uses it)
-  the guest has one static address in a /30 of its own switch and no route, NAT or resolver. The host
+- **Tier-1 egress: host-enforced under HostProxy, the one model for a VM that keeps its NIC.**
+  With `EgressMode='HostProxy'` (what `tier-profiles/tier1.psd1` ships since 2026-10-03, so ralph and the
+  builder use it) the guest has one static address in a /30 of its own switch and no route, NAT or resolver. The host
   holds the gateway address, runs `scripts/egress/voidseal_egress_proxy.py` on it, and closes everything
   else twice: host firewall rules on that interface and a port ACL on the VM's NIC both admit only TCP from
   the guest's address to the proxy port. The proxy tunnels only `CONNECT <name>:443` for names on the
   run's merged `EgressAllowlist`, resolves each name itself, and refuses an answer that contains a private,
   loopback, link-local, multicast, reserved or otherwise non-global address, so the guest picks a name and
   the host picks the address. Nothing in the guest takes part in the decision. The in-guest default-DROP
-  the seed still installs is defense in depth. The builder (`SquidSniProxy`) and any profile set to
-  `InGuestSquid` still rely on rules *inside* the VM: a guest with code execution can flush its own
-  `iptables` rules or kill its own Squid, so for those modes the untrusted principal is policing itself.
-  Treat in-guest rules as raising the bar for a non-adversarial workload, not as the boundary.
+  the seed installs (Serial and Disk seeds alike, the builder's included) is defense in depth: a guest
+  with code execution can remove it, so treat it as raising the bar for a non-adversarial workload, not
+  as the boundary. Since 2026-10-16 there is no other egress model: a kept NIC under any other
+  `EgressMode` is refused at load, at the seal and at the gate, and the builder's former in-guest proxy
+  is gone.
 - **A domain allowlist is only as narrow as the names on it.** The HostProxy allowlist admits names, not
   parties: an allowed name that fronts a shared CDN or a public storage service (ralph's
   `storage.googleapis.com` admits any public bucket) can carry traffic to or from someone other than the
@@ -311,8 +312,8 @@ full privileges of whoever invokes it — here, the host operator.
     the one-NAT-per-host contention with Docker and WSL does not arise. What remains unproven is live
     behavior (rule matching on a real interface, ACL evaluation at the vSwitch port, the proxy under a
     real client); **until the first elevated run, read "host-enforced" as "host-enforced by design and in
-    the mock suite."** `InGuestSquid` and the builder's `SquidSniProxy` have no host filtering. See
-    `docs/phase-6-live-runbook.md` for the live sequence and checks.
+    the mock suite."** A kept NIC has no other egress model: the loader, the seal and the gate each refuse
+    one. See `docs/phase-6-live-runbook.md` for the live sequence and checks.
 
 Do not rely on Voidseal as your sole boundary for genuinely hostile code until the higher tiers are
 completed and you have independently verified the isolation on your host.

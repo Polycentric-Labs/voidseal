@@ -54,9 +54,13 @@ Describe 'HostEgress: the shipped profiles' {
         @($allow) | Should -Contain 'claude.ai' -Because 'the workload ExtraAllowlist is merged in'
     }
 
-    It 'the builder keeps SquidSniProxy' {
+    It 'the builder inherits HostProxy from tier1 and its merged allowlist covers the mirrors its fetchers need' {
         $builder = Import-WorkloadProfile -Path (Join-Path $script:SkillRoot 'profiles/builder.psd1') -TierProfileDir $script:TierDir
-        $builder['EgressMode'] | Should -Be 'SquidSniProxy'
+        $builder['EgressMode'] | Should -Be 'HostProxy'
+        $allow = ConvertTo-EgressProxyAllowlist -Allowlist $builder['EgressAllowlist']
+        foreach ($h in 'deb.debian.org', 'security.debian.org', 'pypi.org', 'files.pythonhosted.org', 'huggingface.co', '*.hf.co') {
+            @($allow) | Should -Contain $h
+        }
     }
 }
 
@@ -230,10 +234,14 @@ Describe 'HostEgress: provisioning records the plan and refuses a collision befo
         $d.EgressGatewayAddress | Should -BeNullOrEmpty -Because 'nothing is installed on the host until the seal'
     }
 
-    It 'an InGuestSquid Tier-1 VM and a Tier-0 VM get no plan' {
+    It 'a Tier-0 VM gets no plan, and a kept-NIC descriptor built without one cannot be sealed' {
         $b = New-FakeHyperVBackend
-        $sq = $script:T1HP.Clone(); $sq['EgressMode'] = 'InGuestSquid'
-        (New-SandboxVM -Profile $sq -Name 'sbx-sq' -StorageRoot $script:TmpRoot -Backend $b).Egress | Should -BeNullOrEmpty
+        # New-SandboxVM does not run the loader, so a kept-NIC profile that bypassed it with another mode
+        # gets no plan; the seal then refuses it (the loader refuses the same profile at load).
+        $none = $script:T1HP.Clone(); $none['EgressMode'] = 'None'; $none['EgressAllowlist'] = @()
+        $d = New-SandboxVM -Profile $none -Name 'sbx-none' -StorageRoot $script:TmpRoot -Backend $b
+        $d.Egress | Should -BeNullOrEmpty
+        { Lock-Sandbox -Descriptor $d -Backend $b } | Should -Throw "Install-SandboxEgressNetwork: 'sbx-none' does not record EgressMode='HostProxy' with an Egress plan. Fail closed."
         $t0 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
         $d0 = New-SandboxVM -Profile $t0 -Name 'sbx-t0' -StorageRoot $script:TmpRoot -Backend $b
         $d0.EgressMode | Should -Be 'HostProxy'
@@ -610,13 +618,12 @@ Describe 'HostEgress: Assert-Sealed refusals for a Tier-1 HostProxy VM (each mes
         { Assert-Sealed -Descriptor $script:D -Backend $script:B } | Should -Throw "*its NIC is on switch 'other-int', not this VM's own recorded switch 'sbx-g-int'*"
     }
 
-    It 'an InGuestSquid Tier-1 VM is not held to the HostProxy checks' {
-        $b = New-FakeHyperVBackend
-        $sq = $script:T1HP.Clone(); $sq['EgressMode'] = 'InGuestSquid'
-        $d = New-SandboxVM -Profile $sq -Name 'sbx-sq2' -StorageRoot $script:TmpRoot -Backend $b
-        Lock-Sandbox -Descriptor $d -Backend $b
-        Assert-Sealed -Descriptor $d -Backend $b | Should -BeTrue
-        @($b.FakeCallLog | Where-Object { $_.Op -eq 'AddSwitchHostIPAddress' }).Count | Should -Be 0
+    It 'a kept-NIC VM is held to the HostProxy checks whatever its descriptor says: the gate refuses another mode outright' {
+        # Until 2026-10-16 a kept-NIC descriptor under another mode skipped every egress check and certified
+        # with a connected adapter nothing host-side restricted.
+        $script:D.EgressMode = 'None'
+        { Assert-Sealed -Descriptor $script:D -Backend $script:B } |
+            Should -Throw "Assert-Sealed: REFUSING to certify Tier-1 VM 'sbx-g' SEALED because it keeps a network adapter but its descriptor records EgressMode='None', not 'HostProxy'; a kept NIC is allowed only behind the host-enforced proxy the seal installs and this gate reads back. Fail closed."
     }
 }
 
@@ -665,7 +672,7 @@ Describe 'HostEgress: Start-SandboxEgressProxy' {
         Start-SandboxEgressProxy -Descriptor $d -Allowlist @('api.example.com') -RunDirectory $run -MaxLifetimeSeconds 60 -PythonExe 'py' -Backend $b
         { Start-SandboxEgressProxy -Descriptor $d -Allowlist @('api.example.com') -RunDirectory $run -MaxLifetimeSeconds 60 -PythonExe 'py' -Backend $b } |
             Should -Throw "Start-SandboxEgressProxy: 'sbx-px' already records a running egress proxy. Fail closed."
-        $plain = [pscustomobject]@{ Name = 'x'; EgressMode = 'InGuestSquid'; Egress = $null }
+        $plain = [pscustomobject]@{ Name = 'x'; EgressMode = 'None'; Egress = $null }
         { Start-SandboxEgressProxy -Descriptor $plain -Allowlist @('a.example.com') -RunDirectory $run -MaxLifetimeSeconds 60 -PythonExe 'py' -Backend $b } |
             Should -Throw "Start-SandboxEgressProxy: 'x' does not record EgressMode='HostProxy' with an Egress plan. Fail closed."
     }

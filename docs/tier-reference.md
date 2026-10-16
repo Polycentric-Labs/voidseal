@@ -18,7 +18,7 @@ small. The tier you pick = how much capability you're willing to grant.
 | Tier | Use it for | Substrate | Network | Egress (v1) | Credentials | Extraction | Lifecycle | v1 status |
 |---|---|---|---|---|---|---|---|---|
 | **0** | trusted dev + productivity on copies (e.g. the Firefox organizer) | **Hyper-V path / lightweight guest** in v1 — container runtime (Docker / devcontainer / `docker sbx` / sandbox-runtime) is **PLANNED, not yet built** | host-proxy allowlist | host firewall / proxy (default **offline**) | injected at proxy (none by default) | host reads result dir | `--rm` per task (container tier, when built) | **validated (mock-backed; live run = the live smoke test, operator-run, elevated)** |
-| **1** | agent loops (Ralph), organizers, steady-state services | Hyper-V **Gen2 VM** | Internal switch (NIC kept; switch-isolation + Default-Switch by-name refusal are seal-verified) | **host-enforced, `EgressMode='HostProxy'`**: no route, NAT or resolver in the guest; a host CONNECT allowlist proxy on the VM's own /30 is the only way out, behind host firewall rules and a port ACL that `Assert-Sealed` verifies; in-guest default-DROP as defense in depth. Mock-green only | scoped, on-demand, **default none** | host reads result dir | snapshot-revert | **provisioning/seal: validated (mock-backed; live run = the live smoke test, operator-run, elevated). Egress: HostProxy built and gate-verified in the mock suite; NOT yet live-exercised (the first elevated run is Phase 6).** |
+| **1** | agent loops (Ralph), organizers, steady-state services | Hyper-V **Gen2 VM** | Internal switch (NIC kept; switch-isolation + Default-Switch by-name refusal are seal-verified) | **host-enforced, `EgressMode='HostProxy'`**, the one model for a kept NIC, in Serial and Disk mode alike: no route, NAT or resolver in the guest; a host CONNECT allowlist proxy on the VM's own /30 is the only way out, behind host firewall rules and a port ACL that `Assert-Sealed` verifies; in-guest default-DROP as defense in depth. Mock-green only | scoped, on-demand, **default none** | host reads result dir | ephemeral (`Lifecycle` is declared, not wired; the seal refuses checkpoints) | **provisioning/seal: validated (mock-backed; live run = the live smoke test, operator-run, elevated). Egress: HostProxy built and gate-verified in the mock suite; NOT yet live-exercised (the first elevated run is Phase 6).** |
 | **2** | disposable analysis of semi-trusted artifacts | Hyper-V VM, disposable | **Private switch, no NIC** | **none** | **none** (enforced) | **cold output-VHDX → quarantine VM → CDR → inert promote** | create → destroy | **scaffold / benign dry-run** |
 | **3** | airgapped detonation (eventually: malware) | Hyper-V Gen2, **no virtual NIC** + sinkhole VM | **structurally no egress** | **none** | **none** (enforced) | same as Tier 2, **mandatory** | detonate → wipe (revert between runs) | **scaffold / benign dry-run** |
 
@@ -53,9 +53,12 @@ small. The tier you pick = how much capability you're willing to grant.
   refuses unless each is on the host exactly as recorded, the record is complete for the VM's plan, and
   no NAT covers the subnet. The proxy starts after the gate and before the guest boots; teardown removes
   exactly what was recorded.
-- **Guest side.** `HTTPS_PROXY` / `https_proxy` (with `NO_PROXY` empty) in `/etc/environment` and a login
-  profile script, apt's proxy setting with https sources, and an in-guest default-DROP that allows only
-  the proxy port, applied on the guest's single boot. The in-guest layer is defense in depth.
+- **Guest side.** In Serial mode `HTTPS_PROXY` / `https_proxy` (with `NO_PROXY` empty) in `/etc/environment`
+  and a login profile script; in Disk mode (the builder included) `http_proxy`, `https_proxy` and their
+  uppercase twins to the gateway proxy, exported by the runner before the entrypoint. Both carry apt's
+  proxy setting with https sources and the same in-guest default-DROP that allows only the proxy port,
+  applied by its unit on the guest's single boot; the Disk seeds install `nftables` through the proxy in
+  cloud-init's package stage. The in-guest layer is defense in depth.
 
 **Residual:** an allowlist admits names, not parties, so a name that fronts a shared CDN or a public
 storage service can carry traffic for someone else (`docs/threat-model.md`); keep allowlists narrow.
@@ -63,17 +66,17 @@ storage service can carry traffic for someone else (`docs/threat-model.md`); kee
 cmdlets; nothing has crossed a real interface yet ([`phase-6-live-runbook.md`](phase-6-live-runbook.md)
 section 2 lists the checks for the first elevated run).
 
-`EgressMode='InGuestSquid'` still works for a tier file that sets it: the Serial seed's
-`CidataSerialEgressTemplate` (`SeedBuilder.ps1`) installs **iptables default-DROP OUTPUT** plus a
-**transparent Squid `dstdomain` allowlist** over the `EgressAllowlist`, ported from the builder's
-mechanism. That mode is **defense in depth, not a boundary**: a compromised or root guest can flush its
-own iptables or kill its own Squid, and the mock suite asserts the seed's shape only. It retired the
-earlier schema-only `EgressMode='NftablesAllowlist'`, whose static FQDN-to-IP approach could not survive
-CDN IP rotation; both Squid's `dstdomain` and the HostProxy proxy decide per request, by name, so
-rotation behind a name does not matter to them. The builder keeps `SquidSniProxy`. **No bearer tokens
-flow through egress** in v1 regardless, so the credential-injecting host-Envoy / presence-boolean risk
-stays out of scope (deferred to Phase-1B). (This is also why the Tier-0 Firefox example workload is the
-lead proof: the core ships and is validated without depending on the riskiest, not-yet-live-proven piece.)
+`'HostProxy'` and `'None'` are the only `EgressMode` values. A VM that keeps its NIC (Tier 1 with
+`Network='Internal+Allowlist'`) must use `'HostProxy'`: the loader refuses any other value there (and
+refuses a workload file that sets the key at all), the seal refuses to install anything else, and
+`Assert-Sealed` refuses a kept NIC whose descriptor records another mode. The in-guest proxy modes that
+preceded it (a Serial-seed variant and the builder's own) are gone: both put the filter inside the guest,
+where a root guest could remove it, and left the kept NIC with no host-side restriction. The builder runs
+on `'HostProxy'` too (since 2026-10-16), through `Invoke-BuilderVM`'s seal, gate and proxy start. The proxy
+decides per request, by name, so CDN address rotation behind a name does not matter to it. **No bearer
+tokens flow through egress** in v1, so the credential-injecting host-Envoy / presence-boolean risk stays
+out of scope (deferred to Phase-1B). (This is also why the Tier-0 Firefox example workload is the lead
+proof: the core ships and is validated without depending on the riskiest, not-yet-live-proven piece.)
 
 ### Structural enforcement (not just convention)
 
@@ -111,9 +114,9 @@ row is green across P1–P10.** Use this as the sign-off checklist before trusti
 | **P1** | Supervise **capability**, not behavior | the tier model itself — match isolation strength to task risk | ✅ | ✅ | ✅ | ✅ |
 | **P2** | **Default-deny egress** | allowlist (T0/T1) / **no NIC** (T2/T3) | ✅ offline, no NIC: the seal removes the default adapter and `Assert-Sealed` host-verifies zero adapters (`Get-SealNicPolicy` returns `NoAdapter` for Tier 0); the declared `HostProxy` mode has nothing to act on without an adapter, tier0's `EgressAllowlist` is empty, and opt-in net steps escalate to Tier 1 | ✅ host-enforced allowlist (`HostProxy`: host CONNECT proxy, host firewall rules and a port ACL, verified by `Assert-Sealed`; no route, NAT or resolver in the guest); mock-green, not yet live-exercised | ✅ no NIC | ✅ no NIC |
 | **P3** | **Provenance proxy** (request attribution) | Phase-1B (v1 = FQDN + TLS-terminate; provenance deferred with credentials) | ➖ deferred | ➖ deferred | n/a (no egress) | n/a (no egress) |
-| **P4** | **Credentials out of env** | injected-at-proxy (T0) / starved (T2/T3); never `-e`, file bind-mount only | ✅ | ✅ default-none | ✅ none | ✅ none |
+| **P4** | **Credentials out of env** | starved (T2/T3); default none at T0/T1. The Tier-1 token path (ralph's read-only `.token` entry in `Mounts`) is declared, not wired: nothing attaches a bind mount, so no credential reaches a live run yet and none travels through the proxy | ✅ none | ✅ default-none (token path declared, not wired) | ✅ none | ✅ none |
 | **P5** | **Least privilege** | non-root run-user, read-only code mounts, **secret-file refusal** | ✅ | ✅ | ✅ | ✅ |
-| **P6** | **Ephemeral** | lifecycle per tier (`--rm` / snapshot-revert / create-destroy / detonate-wipe) | ✅ | ✅ | ✅ | ✅ |
+| **P6** | **Ephemeral** | every run tears its VM and the disks it created down in a `finally`; the `Lifecycle` key is declared, not wired (`tier1.psd1` says `'Ephemeral'`; `'SnapshotRevert'` stays in the enum but would need a checkpoint the seal refuses) | ✅ | ✅ | ✅ | ✅ |
 | **P7** | **Battle-tested primitive** | Hyper-V (not a custom hypervisor) + container runtime | ✅ | ✅ | ✅ | ✅ |
 | **P8** | **Out-of-band logging** | host/hypervisor-side capture; **never trust the in-guest trace** | ✅ proxy log | ✅ proxy + host telemetry | ✅ host capture only | ✅ host/hypervisor forensic review of outputs only |
 | **P9** | **Human-in-the-loop**, sized to risk | extraction-gate at T2/T3; **absolute** at T3 | ➖ low risk | ➖ low risk | ✅ extraction gate | ✅ absolute gate |

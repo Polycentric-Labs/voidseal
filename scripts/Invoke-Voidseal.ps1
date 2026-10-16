@@ -541,8 +541,8 @@ function Invoke-Voidseal {
     # that branch — both are gated onto the user-space outbox read (Read-OutboxToGateInput ->
     # ReadVhdxRawRegion, never Mount-VHD; see the $usesOutbox gate in the post-detach read block).
     #
-    # NO BUILDER CARVE-OUT (deliberate, Step-1 finding): the builder (EgressMode='SquidSniProxy') has
-    # its OWN, entirely separate orchestrator (Invoke-BuilderVM, BuilderVM.ps1) — it never calls
+    # NO BUILDER CARVE-OUT (deliberate, Step-1 finding): the builder (the profile with a DepsSpec) has
+    # its OWN, entirely separate orchestrator (Invoke-BuilderVM, BuilderVM.ps1); it never calls
     # Invoke-Voidseal at all, and never calls Read-WorkloadResult; it hashes its OUTPUT disk whole-file
     # via GetVhdxImageHash, and its one host read of that disk is its own verdict (Read-BuilderVerdict,
     # two small files). Nothing in Invoke-Voidseal.ps1 or any test/caller ever
@@ -568,20 +568,11 @@ function Invoke-Voidseal {
                "(Invoke-BuilderVM) and must never be passed to Invoke-Voidseal directly. Fail closed.")
     }
 
-    # --- HostProxy preflight: no Disk-mode runner points its workload at the host proxy ------------------
-    # A VM that keeps its NIC (the seal NIC policy is IsolatedInternalSwitch) and whose profile says
-    # EgressMode='HostProxy' gets its egress from the seed's proxy settings and static network-config,
-    # which only the Serial-mode seed carries. New-CidataUserData refuses the combination too, but only
-    # after the system, INPUT and OUTPUT disks were created and copied. Refuse here, before anything
-    # exists; the seed-builder check stays as the backstop for a caller that reaches it another way.
-    if ($workloadMode -eq 'Disk' -and
-        [string]$resolved['EgressMode'] -eq 'HostProxy' -and
-        (Get-SealNicPolicy -Tier ([int]$resolved['Tier']) -Network ([string]$resolved['Network'])) -eq 'IsolatedInternalSwitch') {
-        throw ("Invoke-Voidseal: REFUSING a Disk-mode workload for '$Name': this VM keeps its NIC and its profile sets " +
-               "EgressMode='HostProxy', but no Disk-mode runner points its workload at the host proxy (the seed's proxy " +
-               "settings and static network-config exist only in Serial mode). Run it in Serial mode, or use a profile " +
-               "with no NIC (Network='None'). Nothing was provisioned. Fail closed.")
-    }
+    # A Disk-mode workload on a VM that keeps its NIC is a HostProxy run like a Serial one: New-SandboxVM
+    # plans the /30, the seed (New-CidataUserData, both Disk runners) carries the proxy environment, the apt
+    # setting, the in-guest lockdown and the static network-config, Lock-Sandbox installs the host side,
+    # Assert-Sealed reads it back, and the proxy starts below, after the gate and before StartVM. Until
+    # 2026-10-16 this spot refused the combination because only the Serial seed knew the proxy.
 
     # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT, as this checkout's copies ---
     # Every outbox-transport Disk run (a processor, or a transport-only OutboxOutput profile such as
@@ -738,9 +729,10 @@ function Invoke-Voidseal {
         # attached, Assert-Sealed accepts it and teardown deletes it. The profile's SeedIso is never read
         # here: it is only New-CidataSeed's default output path for an ISO built by hand.
         # SERIAL: built here, for every run with an entrypoint (a run without one never boots the guest).
-        #   The user-data is the serial-getty AUTOLOGIN baseline the Runner's COM1 client needs, plus the
-        #   in-guest egress layer for an EgressMode='InGuestSquid' profile (New-CidataUserData fails closed
-        #   on an empty allowlist). The Entrypoint itself still travels over COM1, not in the seed.
+        #   The user-data is the serial-getty AUTOLOGIN baseline the Runner's COM1 client needs, plus, for
+        #   a VM that keeps its NIC (HostProxy), the proxy settings, lockdown and network-config
+        #   (New-CidataUserData fails closed on an empty allowlist or a missing plan). The Entrypoint
+        #   itself still travels over COM1, not in the seed.
         # DISK: built below, alongside the INPUT/OUTPUT disks; there the seed carries the disk-mode runner.
         if ($workloadMode -ne 'Disk' -and -not [string]::IsNullOrWhiteSpace($entrypoint)) {
             $descriptor = New-WorkloadSeedDisk -Descriptor $descriptor -Profile $resolved `

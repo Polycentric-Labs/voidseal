@@ -39,7 +39,7 @@ Scoped to Voidseal, gVisor-style (each rung names a starting capability, not a s
 |---|---|---|
 | **Remote** | No local presence at all — only whatever a sealed VM's tier lets its workload reach outbound (e.g. a malicious response served to an allowlisted fetch). | Folds into **GuestUser** below the moment the workload acts on it — Voidseal's design (P1) assumes every workload is a *possible* prompt-injectable insider from the start, so it does not need to reason separately about how a Remote attacker got in. |
 | **GuestUser** | Arbitrary code execution inside the guest as the sandboxed, non-root run-user. | **The assumed baseline.** Every tier's isolation is designed against this starting point. |
-| **GuestRoot** | Root/Administrator inside the guest. | Still assumed possible; this is the level at which any *in-guest* control (iptables, Squid, the ESM facets) is attacker-controlled and can be disabled — see the Tier-1 egress row below. |
+| **GuestRoot** | Root/Administrator inside the guest. | Still assumed possible; this is the level at which any *in-guest* control (the in-guest lockdown, the ESM facets) is attacker-controlled and can be disabled; see the Tier-1 egress row below. |
 | **MaliciousProfile** | No guest code-execution needed — the attack is at profile-authoring time: a crafted `.psd1` tries to smuggle a secret mount, weaken Tier ≥ 2 starvation, widen a builder allowlist, or downgrade `EgressMode`. | **In scope.** `ProfileLoader.ps1`'s `Assert-TierProfileValid` (run on every tier profile and every merged workload) is Voidseal's answer to exactly this rung. |
 | **HostOperatorMisconfig** | The human running Voidseal makes an operational mistake — an unpatched host below the Hyper-V CVE floor, elevation granted more broadly than intended, a golden disk pointed at the wrong image. | **Out of scope**, by definition: this is a process/documentation problem, not a code defect, and no automated check can substitute for the operator reading `docs/operator-runbook.md` §0. |
 | **HostRoot** | Administrator on the physical host itself, or a Hyper-V hypervisor-boundary compromise (a VM-escape 0-day). | **Out of scope for any sandbox tool.** If the attacker already owns the substrate underneath Voidseal, the sandbox boundary built on top of it is moot — the same floor gVisor, Kata, and Docker's own security model all draw under the host kernel/hypervisor they sit on. |
@@ -57,7 +57,7 @@ Legend: 🟢 **IN SCOPE** (a bug here is a Voidseal defect — see the gate name
 | **VM-escape** (guest breaks the Hyper-V hypervisor boundary itself) | ⚪ | ⚪ | ⚪ | ⚪ |
 | **Live NIC / egress route present at seal time** | 🟢 zero NICs required | 🟢 exactly one NIC, on the VM's own recorded Internal switch (zero NICs for a processor) | 🟢 zero NICs required | 🟢 zero NICs required |
 | **Passthrough device present at seal time** (GPU partition adapter, device assigned by DDA) | 🟢 | 🟢 | 🟢 | 🟢 |
-| **Egress filtering** (which destinations are reachable through whatever route exists) | ➖ no route exists | 🟢 HostProxy: host-enforced allowlist proxy, gate-verified host objects, mock-green only; residual: CDN-hosted allowed names (🟡 for an `InGuestSquid` profile: in-guest only, GuestRoot-disableable) | ➖ no route exists | ➖ no route exists |
+| **Egress filtering** (which destinations are reachable through whatever route exists) | ➖ no route exists | 🟢 HostProxy: host-enforced allowlist proxy, gate-verified host objects, mock-green only; residual: CDN-hosted allowed names | ➖ no route exists | ➖ no route exists |
 | **Host↔guest channel left ON** (clipboard / shares / guest-services / enhanced-session) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Integration service left ON** (Time Synchronization, Key-Value Pair Exchange, Backup, Heartbeat) | 🟢 | 🟢 | 🟢 | 🟢 |
 | **Host time reaching the guest** (reference TSC page, after Time Synchronization is off) | 🟡 | 🟡 | 🟡 | 🟡 |
@@ -140,10 +140,10 @@ check sits beside the NIC check. Only the count is read, and a read that fails r
   rule. Everything here is mock-green; the first elevated run is the first time any of it meets a real
   host (`phase-6-live-runbook.md` §2 lists the checks).
 
-  A Tier-1 profile set to `EgressMode='InGuestSquid'`, and the builder (`SquidSniProxy`), still rely on an
-  **in-guest** mechanism (iptables default-DROP plus a transparent Squid `dstdomain` allowlist). That is
-  **defense in depth, not a boundary**: a GuestRoot attacker can flush its own iptables rules or kill its
-  own Squid process, so the untrusted principal is policing itself.
+  The builder is a HostProxy run too (since 2026-10-16): the same host objects, the same gate, the same
+  proxy, started by `Invoke-BuilderVM` before the guest boots. The in-guest lockdown every kept-NIC seed
+  installs is **defense in depth, not a boundary**: a GuestRoot attacker can remove it, which is why
+  nothing that matters depends on it. There is no egress model in which the guest polices itself.
 - **T2/T3 — N/A.** No NIC exists once sealed (see the row above), so there is no route for a filtering
   question to apply to.
 
@@ -207,10 +207,12 @@ profile *and* every merged workload) refuses: a secret-shaped `Mounts` source (`
 Tier ≥ 2 profile that doesn't set `Credentials='None'` / `EgressMode='None'` / an empty allowlist; a Tier ≥
 2 profile that doesn't use `Extraction='ColdVHDX-Quarantine-CDR'`; a `HyperV-Gen2` profile with any
 `HostChannels` entry `$true`; a Linux `GuestImage` without `ManagementChannel='Com1Serial'`; a
-`Network='None'` processor that still declares egress; a builder (`EgressMode='SquidSniProxy'`) profile
-with no `DepsSpec`, or an allowlist that doesn't cover its fetchers' required hosts; and an
-`EgressAllowlist` entry containing a character outside the safe hostname charset (the guard against
-injecting directives into the Squid `dstdomain` ACL); and a malformed or secret-shaped `DataDisks`
+`Network='None'` processor that still declares egress; a kept-NIC profile (Tier 1,
+`Network='Internal+Allowlist'`) that is not `EgressMode='HostProxy'`; a `DepsSpec` (builder) profile
+that is not that kept-NIC HostProxy shape, or whose allowlist doesn't cover its fetchers' required hosts;
+a workload file that sets `EgressMode` at all; an `EgressAllowlist` entry containing a character outside
+the safe hostname charset (the guard against reshaping the host proxy's allowlist arguments); and a
+malformed or secret-shaped `DataDisks`
 declaration. A profile that got any of these past the loader would
 be a Voidseal defect.
 
@@ -321,9 +323,11 @@ blend them: something can be correctly scoped as IN SCOPE and still be unproven 
   resolver; the host bodies (gateway address, firewall rules, port ACL, NAT read, proxy start and stop) run
   against stub cmdlets and a stub child process; the seed is checked as text, with `sh -n` and a YAML
   parse. No real packet has crossed any of it (`phase-6-live-runbook.md` §2).
-- **Tier-1 in-guest egress (InGuestSquid, the builder):** shape-asserted only. The mock suite proves the
-  rendered Squid config text, the iptables rule text, and the ACL substitution are correct; it does not
-  prove a real Squid/iptables process has ever spliced or dropped a real packet (`phase-6-live-runbook.md` §5).
+- **In-guest lockdown and proxy environment (every HostProxy seed, the builder included):** shape-asserted
+  only. The mock suite proves the rendered files, runs the runner and lockdown scripts under `sh -n` and
+  parses the user-data as YAML; it does not prove that `nftables` installs through the proxy on the real
+  image, that `nft` applies the table, or that the fetchers honor the exported variables on a real guest
+  (`phase-6-live-runbook.md` §5). The host layers do not depend on any of it.
 - **Tier 2/3: scaffold-only.** There is **no shipped `tier-profiles/tier2.psd1` or `tier3.psd1`** — only
   `tier0.psd1` and `tier1.psd1` exist in the repo. The Tier ≥ 2 invariants above are enforced generically
   and unit-tested against inline fixture hashtables (`tests/ProfileLoader.Tests.ps1`), but an operator

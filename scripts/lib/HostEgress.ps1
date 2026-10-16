@@ -250,7 +250,7 @@ function Get-EgressAclSpec {
 .SYNOPSIS
     The proxy's allowlist from the run's merged EgressAllowlist.
 .DESCRIPTION
-    The loader's allowlist syntax is Squid's: a leading dot ('.example.com') means the domain AND its
+    The loader's allowlist syntax: a leading dot ('.example.com') means the domain AND its
     subdomains. The proxy names subdomains only with an explicit '*.' rule, so '.example.com' becomes
     both 'example.com' and '*.example.com'. Every other entry passes through. Duplicates (any case) go.
 #>

@@ -1721,3 +1721,68 @@ Describe 'Get-SealNicPolicy loads with Sealer.ps1 and with Provisioner.ps1, each
         $defs | Should -Be @('SealPolicy.ps1')
     }
 }
+
+# ===========================================================================
+#  A kept NIC means host-enforced egress, installed by the seal and read back by the gate
+# ===========================================================================
+#  One egress model: a Tier-1 VM that keeps its NIC must record EgressMode='HostProxy' with an address
+#  plan. Lock-Sandbox installs the host side from that plan for EVERY kept NIC (it used to key on the
+#  EgressMode string), and Assert-Sealed refuses a kept NIC under any other mode (it used to run the
+#  readback only when the string said HostProxy, so a kept NIC under another mode certified with zero
+#  host-side egress checks). The tier1 profile is the kept-NIC HostProxy shape; the descriptors below are
+#  mutated by hand to model a record that drifted.
+Describe 'Lock-Sandbox + Assert-Sealed: a kept NIC is sealed only behind host-enforced egress' {
+
+    It 'Lock-Sandbox refuses to seal a kept-NIC VM whose descriptor records EgressMode None and no plan' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-kn-lock'
+        $sb.Desc.EgressMode = 'None'; $sb.Desc.Egress = $null
+        { Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw "Install-SandboxEgressNetwork: 'sbx-kn-lock' does not record EgressMode='HostProxy' with an Egress plan. Fail closed."
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'SetHostChannel' }).Count |
+            Should -Be 0 -Because 'the seal stops at the egress install, before the channel step; nothing is marked Sealed'
+        $sb.Desc.State | Should -Not -Be 'Sealed'
+    }
+
+    It 'Assert-Sealed refuses a kept-NIC VM whose descriptor records EgressMode None, even with the host egress installed' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-kn-gate'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue -Because 'precondition: the untouched install certifies'
+        $sb.Desc.EgressMode = 'None'
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw ("Assert-Sealed: REFUSING to certify Tier-1 VM 'sbx-kn-gate' SEALED because it keeps a network adapter but " +
+                           "its descriptor records EgressMode='None', not 'HostProxy'; a kept NIC is allowed only behind the " +
+                           "host-enforced proxy the seal installs and this gate reads back. Fail closed.")
+    }
+
+    It 'Assert-Sealed refuses a kept-NIC HostProxy VM whose descriptor records no egress plan' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-kn-plan'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $sb.Desc.Egress = $null
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw "Assert-Sealed: REFUSING to certify Tier-1 HostProxy VM 'sbx-kn-plan' SEALED because the descriptor records EgressMode='HostProxy' but no egress plan. Fail closed."
+    }
+
+    It 'the egress readback runs for every kept-NIC VM the gate certifies: all seven rules and the port ACL are read from the host' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-kn-read'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $ruleReads = [System.Collections.Generic.List[string]]::new()
+        $aclReads  = [System.Collections.Generic.List[string]]::new()
+        $b = $sb.Backend.Clone()
+        $innerRule = $sb.Backend.GetHostFirewallRule
+        $innerAcl  = $sb.Backend.GetNetworkAdapterAcls
+        $b.GetHostFirewallRule  = { param($P) $ruleReads.Add([string]$P.Name); & $innerRule $P }.GetNewClosure()
+        $b.GetNetworkAdapterAcls = { param($P) $aclReads.Add([string]$P.VMName); & $innerAcl $P }.GetNewClosure()
+        Assert-Sealed -Descriptor $sb.Desc -Backend $b | Should -BeTrue
+        @($ruleReads | Sort-Object -Unique).Count | Should -Be 7 -Because 'the gate reads back each of the seven recorded rules'
+        @($ruleReads | Where-Object { $_ -notlike 'Voidseal-egress-sbx-kn-read-*' }) | Should -BeNullOrEmpty
+        $aclReads | Should -Contain 'sbx-kn-read'
+    }
+
+    It 'a NoAdapter VM (Tier 0) is untouched by the rule: no host egress is installed and the gate certifies with no readback' {
+        $t0 = $script:Tier1.Clone(); $t0['Tier'] = 0
+        $sb = & $script:NewTestSandbox -Profile $t0 -Name 'sbx-kn-t0'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -in @('AddSwitchHostIPAddress', 'NewHostFirewallRule') }).Count | Should -Be 0
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+}
