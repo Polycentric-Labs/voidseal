@@ -208,12 +208,14 @@ seed's disk-mode runner invokes after the organizer writes `result.html` into st
 
 ```powershell
 # Populate the INPUT-disk inputs from the host files — the organizer + sample profile (the
-# workload) and run_disk_workload.py + outbox.py (the shared outbox producer, C1.3/C1.4).
+# workload) and run_disk_workload.py + outbox.py (the shared outbox producer, C1.3/C1.4). The two
+# helpers come from this checkout's guest directory (run from the repo root), never a side copy:
+# the engine refuses a run whose Inputs lack them but cannot tell a stale copy from the current one.
 $inputs = @{
     'organize_bookmarks.py' = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\organize_bookmarks.py' -Raw)
     'sample-bookmarks.json' = (Get-Content -LiteralPath 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json' -Raw)
-    'run_disk_workload.py'  = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\run_disk_workload.py' -Raw)
-    'outbox.py'             = (Get-Content -LiteralPath 'C:\sandbox\organizer-src\outbox.py' -Raw)
+    'run_disk_workload.py'  = (Get-Content -LiteralPath '.\guest\run_disk_workload.py' -Raw)
+    'outbox.py'             = (Get-Content -LiteralPath '.\guest\outbox.py' -Raw)
 }
 
 $report = Invoke-Voidseal -Tier 0 -Profile firefox `

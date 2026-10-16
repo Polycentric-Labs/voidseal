@@ -569,11 +569,13 @@ $GoldenVhdx = 'C:\sandbox\golden\debian-12-cloud.vhdx'
 # InputFiles map, the source of truth). Omitting the two guest helpers -> the runner's
 # `python3 /mnt/in/run_disk_workload.py` cannot run -> no outbox is written -> the host read fails
 # closed with "OUTPUT outbox header missing/!magic".
+# Both helpers come from THIS checkout's guest directory (the snippet runs from the repo root). The
+# engine refuses a run whose Inputs lack them, but it cannot tell a stale copy from the current one.
 $inputs = @{
     'organize_bookmarks.py' = Get-Content -LiteralPath 'C:\sandbox\organizer-src\organize_bookmarks.py' -Raw
     'sample-bookmarks.json' = Get-Content -LiteralPath 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json' -Raw
-    'run_disk_workload.py'  = Get-Content -LiteralPath 'C:\sandbox\organizer-src\run_disk_workload.py'  -Raw
-    'outbox.py'             = Get-Content -LiteralPath 'C:\sandbox\organizer-src\outbox.py'             -Raw
+    'run_disk_workload.py'  = Get-Content -LiteralPath '.\guest\run_disk_workload.py' -Raw
+    'outbox.py'             = Get-Content -LiteralPath '.\guest\outbox.py' -Raw
 }
 
 . .\scripts\Invoke-Voidseal.ps1

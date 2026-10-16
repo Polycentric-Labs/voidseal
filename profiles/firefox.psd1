@@ -90,12 +90,15 @@
     # `python3 /mnt/in/run_disk_workload.py --transport-only` after the Entrypoint populates staging,
     # and run_disk_workload.py imports `outbox` off its OWN directory (sys.path.insert(0, HERE)) — so
     # outbox.py must land alongside it at /mnt/in, not just organize_bookmarks.py's own dependencies.
+    # Both helpers come from the engine checkout being run (its guest directory, relative to the repo
+    # root). The engine refuses a run whose Inputs lack them, but it cannot tell a stale copy from the
+    # current one, so never stage them in a side folder.
     # ------------------------------------------------------------------
     InputFiles = @{
         'organize_bookmarks.py' = 'C:\sandbox\organizer-src\organize_bookmarks.py'
         'sample-bookmarks.json' = 'C:\sandbox\firefox-sample-profile\sample-bookmarks.json'
-        'run_disk_workload.py'  = 'C:\sandbox\organizer-src\run_disk_workload.py'
-        'outbox.py'             = 'C:\sandbox\organizer-src\outbox.py'
+        'run_disk_workload.py'  = '.\guest\run_disk_workload.py'
+        'outbox.py'             = '.\guest\outbox.py'
     }
 
     # ------------------------------------------------------------------
