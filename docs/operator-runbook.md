@@ -292,11 +292,10 @@ $report.RunResult.ExitCode
 > that fronts a shared CDN or a public storage service can carry traffic for parties other than the
 > intended one.
 >
-> The in-guest controls (the in-guest default-DROP the HostProxy seed still installs, and, for a profile
-> set to `InGuestSquid` or the builder, the in-guest iptables and Squid) are **not** a containment
-> boundary: a compromised or adversarial guest with code execution can flush its own rules or kill its own
-> Squid. Under `InGuestSquid` and the builder they are the only egress control, so a "sealed" VM in those
-> modes is isolation-verified, not egress-filtered; see `SECURITY.md` for the full writeup. The full live
+> The in-guest control (the default-DROP every HostProxy seed installs, the builder's included) is **not**
+> a containment boundary: a compromised or adversarial guest with code execution can remove its own rules.
+> It is defense in depth under the host objects above, which are the control; there is no egress model
+> in which the in-guest rules are the only one. See `SECURITY.md` for the full writeup. The full live
 > sequence (host egress enforcement, qemu-img confinement, seal-time assertions) is
 > `docs/phase-6-live-runbook.md`.
 

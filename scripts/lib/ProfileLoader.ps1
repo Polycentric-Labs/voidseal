@@ -55,9 +55,9 @@ $script:TierRequiredKeys = @(
 $script:Enum_Substrate         = @('Container', 'HyperV-Gen2')
 # One egress model: 'HostProxy' for a VM that keeps a NIC (the host plans its /30, the seal installs the
 # gateway address, firewall rules and port ACL, the gate reads them back, the orchestrator runs the
-# CONNECT proxy), 'None' for everything that seals with no adapter. The in-guest Squid modes
-# ('InGuestSquid', 'SquidSniProxy') and the deferred 'HostEnvoy' are retired: a kept NIC behind a
-# guest-side filter was a NIC the host never restricted.
+# CONNECT proxy), 'None' for everything that seals with no adapter. The two in-guest proxy modes and
+# the deferred host-Envoy mode are retired: a kept NIC behind a guest-side filter was a NIC the host
+# never restricted.
 $script:Enum_EgressMode        = @('HostProxy', 'None')
 $script:Enum_Credentials       = @('None', 'ScopedOnDemand')
 $script:Enum_ManagementChannel = @('Com1Serial', 'PSDirect')

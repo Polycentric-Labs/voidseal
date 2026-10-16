@@ -329,8 +329,9 @@ Remove-Sandbox -Name '<the VM name from $report.Name, e.g. sbx-0-xxxxxxxx>' -Del
 > first Tier-1 live run must walk the checks in
 > [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2 before trusting it, and it needs an
 > elevated session that may create a host address, firewall rules and port ACL entries. **Do NOT run
-> untrusted or hostile agent workloads at Tier 1 until those checks pass.** A profile set to
-> `InGuestSquid` has only the in-guest layer, which a root guest can disable.
+> untrusted or hostile agent workloads at Tier 1 until those checks pass.** It is the only egress model
+> for a VM that keeps its NIC; the in-guest default-DROP in the seed is defense in depth, which a root
+> guest can disable.
 
 **Proves milestone 5: net-reachable, with the host-enforced allowlist exercised live for the
 first time.** A Gen2 VM that keeps its NIC (not no-net) and runs a **bounded** Ralph loop reaching
@@ -398,8 +399,7 @@ $report.ExtractedArtifact    # the extracted workspace diff/output dir, copied t
   `Voidseal-egress-<vm>-*` firewall rules and the port ACL entries. `Assert-Sealed` then reads
   them back and refuses to certify on any mismatch; the CONNECT allowlist proxy starts after the
   gate. The guest has no route, NAT or resolver, and the seed's in-guest default-DROP is defense
-  in depth only. A profile set to `InGuestSquid` instead relies on the in-guest iptables and Squid
-  layer, which a compromised/root guest can disable. The full live check list is
+  in depth only (a compromised/root guest can disable it). The full live check list is
   [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2.
 - The Ralph loop is **bounded**: rate/iteration caps (`MAX_CALLS_PER_HOUR`,
   `CLAUDE_TIMEOUT_MINUTES`, etc.) are env settings in the **guest**, not profile fields. The
@@ -681,8 +681,7 @@ $report.SealVerdict    # MUST be $true for BOTH milestones — the workload only
 Under `EgressMode='HostProxy'` the seal installs the host side of egress and the gate reads it
 back (§4.4), and this is the **first live exercise** of it. The mock suite runs the host bodies
 against stub cmdlets and the proxy on loopback sockets; no real packet has crossed any of it.
-Run this to see what the live guest actually does, not to confirm a known gap. (For a profile
-set to `InGuestSquid`, the same commands exercise only the in-guest iptables and Squid layer.)
+Run this to see what the live guest actually does, not to confirm a known gap.
 
 ```text
 # In the guest serial console (the host drives \\.\pipe\<vm>-com1):
@@ -697,8 +696,8 @@ designed. **If BOTH succeed:** the host enforcement did not take effect; stop an
 live-validation finding, not something to silently patch around. **Do not treat one passing
 spot check as clearing Tier-1 for a hostile workload:** that needs the whole check list in
 [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2, including the readback of all
-seven firewall rules. For an `InGuestSquid` profile, whatever the result, the control is
-defense in depth only (a compromised/root guest can flush its own iptables or kill Squid).
+seven firewall rules. Whatever the result, the in-guest default-DROP is defense in depth only (a
+compromised/root guest can remove it); the host layers are the control under test.
 
 ### 5.3 First boot with Time Synchronization and Key-Value Pair Exchange off
 
@@ -797,9 +796,9 @@ Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows 
 - **Does not prove the egress control holds against a hostile guest.** The host-enforced
   `HostProxy` control is gate-verified in the mock suite and this run is its first live check
   (§5.2); one run is not a certification against adversarial code, which needs the full
-  [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2 list. The in-guest layers
-  (the seed's default-DROP, and the iptables+Squid of an `InGuestSquid` profile) are defense
-  in depth, not a boundary: a compromised/root guest can disable them.
+  [`phase-6-live-runbook.md`](phase-6-live-runbook.md) section 2 list. The in-guest layer
+  (the seed's default-DROP) is defense in depth, not a boundary: a compromised/root guest can
+  disable it.
 
 ---
 

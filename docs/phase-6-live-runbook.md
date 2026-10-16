@@ -1,20 +1,15 @@
-# Phase-6 live runbook — first LIVE Tier-1 builder round-trip
+# Phase-6 live runbook: the first live Tier-1 builder round trip
 
-> **Status: PRESCRIBED, NOT YET BUILT / NOT YET LIVE-TESTED.** Every mechanism below is either (a) not yet
-> implemented, or (b) implemented mock-green only (fake Hyper-V backend, no elevation, no real VM). Nothing
-> in this document has been exercised on real Hyper-V. It consolidates the live-run design that is
-> currently scattered across three in-tree synthesis passes so the first live run has one sequence to
-> follow, not three docs to cross-reference. Sources cited inline; nothing here is invented — every cmdlet,
-> version, and CVE traces to one of (**internal research notes — gitignored, not present in the public
-> repo; a reader outside this working tree cannot open these paths**):
-> - `_dev/labcoat/PassA-SecurityFrontier/PASSA-SYNTHESIS.md` §Q2 (host egress topology) and §Q3
->   (SNI-splice residuals) — hereafter **Pass A**.
-> - `_dev/labcoat/PassB-ClientHVPrimitives/PASSB-SYNTHESIS.md` §Q4 (qemu-img confinement) — hereafter
->   **Pass B**.
-> - `.superpowers/sdd/progress.md` §Track and the Phase-6-prep log entries — hereafter **progress.md**.
+> **Status: NOT YET LIVE.** The host egress in section 2 is built and mock-green (fake Hyper-V backend, no
+> elevation, no real VM); the qemu-img confinement in section 3 is prescribed, not built. Nothing in this
+> document has been exercised on real Hyper-V. It gives the first live run one sequence to follow. The
+> design record behind it (the host egress topology, the SNI-splice residuals that retired the earlier
+> plan, the qemu-img confinement research and the per-phase progress log) is private and not part of the
+> public repo; where this document says "the design record", that is what it means. Nothing here is
+> invented: every cmdlet, version and CVE traces to that record or to the code named inline.
 >
 > See also `SECURITY.md` and `docs/operator-runbook.md` for the mock-green engine's current, shipped
-> guarantees — this doc is the delta: what Phase 6 adds, live, on top of that.
+> guarantees; this doc is the delta: what Phase 6 adds, live, on top of that.
 
 ---
 
@@ -29,22 +24,23 @@
   (airgapped detonation) stay gated behind an explicit, separate verified-isolation green-light — this
   runbook does not arm them (`docs/operator-runbook.md` §3, "Tier 2/3, not armed in v1," is
   unaffected by this doc).
-- §2 (host egress) is now built as engine code (2026-10-03, `EgressMode='HostProxy'`) and is mock-green:
-  every host call goes through the backend seam and runs in the suite against the fake and against stub
-  cmdlets, but none of it has touched a real interface. §3 (qemu-img confinement) is still a native-shim
-  mechanism outside the mock-green engine. §4 lists which seal-time assertions are shipped vs. still a
-  live-only add.
+- §2 (host egress) is built as engine code (`EgressMode='HostProxy'`, the one egress model for a VM that
+  keeps its NIC; since 2026-10-16 the builder runs on it too, through `Invoke-BuilderVM`'s seal, gate and
+  proxy start) and is mock-green: every host call goes through the backend seam and runs in the suite
+  against the fake and against stub cmdlets, but none of it has touched a real interface. §3 (qemu-img
+  confinement) is still a native-shim mechanism outside the mock-green engine. §4 lists which seal-time
+  assertions are shipped vs. still a live-only add.
 
 ---
 
 ## 2. Host egress enforcement (B': host CONNECT proxy, no NAT)
 
-*Decision of 2026-10-03 (private memo): the earlier plan in this section (a host Squid SNI splice plus
-`New-NetNat` plus a host default-DROP) is replaced by B'. B' keeps the property that the host enforces,
-drops the NAT and the guest's internet route entirely, and does not depend on SNI, so ECH and SNI spoofing
-stop mattering. Implemented in `scripts/lib/HostEgress.ps1`, `scripts/egress/voidseal_egress_proxy.py`,
-the HostProxy backend methods in `scripts/lib/HyperVBackend.ps1`, and the HostProxy seed in
-`scripts/lib/SeedBuilder.ps1`. Mock-green; not yet run on a live host.*
+*Decision of 2026-10-03 (the design record): the earlier plan in this section (a host SNI-splicing proxy
+plus `New-NetNat` plus a host default-DROP) is replaced by B'. B' keeps the property that the host
+enforces, drops the NAT and the guest's internet route entirely, and does not depend on SNI, so ECH and SNI
+spoofing stop mattering. Implemented in `scripts/lib/HostEgress.ps1`, `scripts/egress/voidseal_egress_proxy.py`,
+the HostProxy backend methods in `scripts/lib/HyperVBackend.ps1`, and the HostProxy seeds (Serial and
+Disk, the builder among them) in `scripts/lib/SeedBuilder.ps1`. Mock-green; not yet run on a live host.*
 
 ### 2.1 What the engine does, in order
 
@@ -54,9 +50,12 @@ the HostProxy backend methods in `scripts/lib/HyperVBackend.ps1`, and the HostPr
    refuses the provision. The plan is recorded on the descriptor (`EgressMode`, `Egress`).
 2. **Switch.** `New-VMSwitch -SwitchType Internal` named `<vm>-int`, as before (never the Default Switch).
 3. **Seed.** The CIDATA disk carries a `network-config` (eth0, the guest address, DHCP off, no route, no
-   nameservers), `HTTPS_PROXY`/`https_proxy` with `NO_PROXY` empty, apt's proxy setting with https
-   sources, and an in-guest default-DROP (nftables, iptables fallback) that allows only TCP to the proxy
-   port and is applied before networking on the guest's only boot.
+   nameservers), the proxy settings (the Serial seed: `HTTPS_PROXY`/`https_proxy` with `NO_PROXY` empty;
+   the Disk runners, the builder among them: `http_proxy`, `https_proxy` and their uppercase twins to the
+   gateway proxy, `no_proxy` for loopback, exported again by the runner before the entrypoint), apt's
+   proxy setting with https sources, and an in-guest default-DROP (nftables, iptables fallback) that
+   allows only TCP to the proxy port, applied by its unit before the workload runs on the guest's only
+   boot. The Disk seeds also install `nftables` through the proxy in cloud-init's package stage.
 4. **Seal (Lock-Sandbox).** `New-NetIPAddress -InterfaceAlias 'vEthernet (<vm>-int)' -PolicyStore
    ActiveStore` for the gateway; seven `New-NetFirewallRule -PolicyStore ActiveStore` rules in the group
    `Voidseal egress`, named `Voidseal-egress-<vm>-*` (the active store for the rules too, so neither
@@ -74,13 +73,13 @@ the HostProxy backend methods in `scripts/lib/HyperVBackend.ps1`, and the HostPr
    interface with prefix 30, no other host address overlaps the /30, no NAT covers it, every recorded rule
    exists, is enabled and matches its record, the adapter carries exactly the recorded ACL entries, and
    the record is the full set the plan requires. Any failed read refuses.
-6. **Proxy (Invoke-Voidseal, after the gate, before StartVM).** `python voidseal_egress_proxy.py
+6. **Proxy (Invoke-Voidseal and Invoke-BuilderVM, after the gate, before StartVM).** `python voidseal_egress_proxy.py
    --listen-host <gateway> --listen-port 13128 --allow ...` as a plain child process; the engine waits for
    its ready file. It exits on its stop file, at the run deadline plus 15 minutes, or when the PowerShell
    process that started it exits. Log: `<ArtifactRoot>\egress-proxy.log`.
-7. **Teardown (Remove-Sandbox).** Stop the proxy, stop the VM, remove the ACL entries, the rules and the
-   address, remove the VM and the switch. Anything that cannot be removed stays recorded and is named in
-   `TeardownStatus`.
+7. **Teardown (Remove-Sandbox).** Stop the VM, then stop the proxy and remove the ACL entries, the rules
+   and the address, then remove the VM, delete the disks the run created and remove the switch. Anything
+   that cannot be removed stays recorded and is named in `TeardownStatus`.
 
 **State plainly:** the guest does not police itself in this mode. Its in-guest default-DROP is belt and
 braces. What the guest can reach is decided by host objects the gate has read back, and by a proxy that
@@ -89,10 +88,13 @@ public storage service can carry traffic for other parties (`docs/threat-model.m
 
 ### 2.2 Live checks for the first elevated run
 
-Run the steps by hand in an elevated PowerShell first (`New-SandboxVM`, `New-WorkloadSeedDisk`,
-`Lock-Sandbox`, `Assert-Sealed`, then `Start-SandboxEgressProxy` and `Start-SandboxWorkload`), so each
-host object can be inspected before the next step. Use a throwaway profile with a short synthetic
-allowlist. Every item below is something the mock suite cannot prove.
+The builder is the headline run: `Invoke-BuilderVM -Profile builder` (the shipped `profiles/builder.psd1`,
+or a copy with a shorter `DepsSpec`; pip `urllib3` alone is the smallest) provisions, seeds, seals, gates,
+starts the proxy, starts the guest and reads the verdict in one call. To inspect each host object before
+the next step, run the same functions by hand in an elevated PowerShell in the order `Invoke-BuilderVM`
+uses them (`New-SandboxVM`, `New-WorkloadDisks`, `New-BuilderVerdictDisk`, `New-WorkloadSeedDisk`,
+`Lock-Sandbox`, `Assert-Sealed`, `Start-SandboxEgressProxy`, then `StartVM` through the backend). Every
+item below is something the mock suite cannot prove.
 
 **Before provisioning**
 
@@ -149,10 +151,13 @@ allowlist. Every item below is something the mock suite cannot prove.
 
 **After the guest boots (serial capture attached first, as always)**
 
-11. Serial markers: `egress_lockdown=hostproxy-applied tool=nft rc=0` (or `tool=iptables`),
-    `egress_mode=hostproxy guest_addr=1 default_routes=0 nameservers=0 proxy_env=1`, and
-    `proxy_reachable=yes`. `guest_addr=1` also proves the NIC is `eth0`; if it is 0, the network-config
-    key must change.
+11. Serial markers from the builder runner: `egress_lockdown=hostproxy-applied tool=nft rc=0` (or
+    `tool=iptables`; `egress_lockdown=skipped` means neither tool was present, so the nftables install
+    through the proxy failed and only the host layers stand), `egress_mode=hostproxy proxy=http://<gateway>:13128
+    default_routes=0 nameservers=0 ipv6_disabled=1`, and `egress_unit_enabled=enabled nft_present=yes
+    proxy_reachable=yes`. A Serial (ralph) run prints `egress_mode=hostproxy guest_addr=1 default_routes=0
+    nameservers=0 proxy_env=1` and `proxy_reachable=yes` from its diag script instead; `guest_addr=1` also
+    proves the NIC is `eth0` (if it is 0, the network-config key must change).
 11a. First boot with four integration services off. `Lock-Sandbox` turns off Time Synchronization,
     Key-Value Pair Exchange, Backup and Heartbeat, and `Assert-Sealed` refuses a VM with any of them on.
     Neither the mock suite nor any earlier live run has booted a guest that way. Check both effects:
@@ -172,7 +177,11 @@ allowlist. Every item below is something the mock suite cannot prove.
       bound such runs with `-WorkloadTimeoutSeconds`. Do not re-enable Time Synchronization or open UDP
       123 to fix it: the seal verifies the first and the firewall rules block the second, so either would
       be a deliberate design change to record, not a workaround.
-12. From the guest (a test entrypoint, run as the sandbox user):
+12. For the builder, the fetch is the test: `entrypoint_rc=0`, `fetched pip=N apt=N hf=N` with a non-zero
+    count for each declared fetcher, `manifest_present=yes`, and `egress-proxy.log` showing one allowed
+    CONNECT per name the fetchers used (`pypi.org`, `files.pythonhosted.org`, the Debian mirrors, the
+    Hugging Face hosts) and nothing else. From a guest shell (a Serial run's test entrypoint, run as the
+    sandbox user):
     - `curl -sS -o /dev/null -w '%{http_code}' https://<an allowlisted name>/` succeeds through the proxy.
     - `curl https://<a name not on the list>/` fails with the proxy's 403; the log shows
       `"reason": "not-allowlisted"`.
@@ -207,20 +216,22 @@ allowlist. Every item below is something the mock suite cannot prove.
     rules, with a message that names them and the removal command. Confirm that refusal, then clean up
     and confirm the next run installs.
 
-The builder (`SquidSniProxy`) is unchanged by B': it still uses its in-guest Squid and has no host
-enforcement. Moving it to the host proxy is a follow-up (its Disk-mode runner would need the same proxy
-settings and network-config).
+The builder runs on B' too (since 2026-10-16): `Invoke-BuilderVM` seals, gates and starts the proxy
+before the guest boots, its seed carries the proxy environment, the apt setting, the lockdown and the
+network-config, and `pip download`, `apt-get download` and `huggingface-cli` fetch through the host
+proxy. There is no in-guest proxy any more, and no other egress model for a VM that keeps its NIC: the
+loader, the seal and the gate each refuse one.
 
 ---
 
 ## 3. qemu-img confinement shim
 
-*Source: Pass B §Q4. This is the real mechanism behind `Invoke-ConfinedQemu` (`scripts/lib/
+*Source: the design record's qemu-img confinement research. This is the real mechanism behind `Invoke-ConfinedQemu` (`scripts/lib/
 HyperVBackend.ps1`, the confinement seam — locate by function name; line numbers drift), which today is
 a v1 pass-through seam — every native `qemu-img convert` call is routed through it, AST-pinned by test,
 but nothing yet confines the child process.*
 
-- **Threat framing (honest, per Pass B):** of the ~12 CVE IDs the fleet initially attached to QEMU's VHDX
+- **Threat framing (honest, per the design record):** of the ~12 CVE IDs the fleet initially attached to QEMU's VHDX
   parser, exactly one is genuine — **`CVE-2014-0148`**, and it is a **DoS** (crash/hang, missing BAT
   bounds check), fixed at QEMU 2.0 — NOT an RCE. The real concern for the live convert step is the
   **undiscovered-bug class**: an unpatched memory-safety bug in an offline parser handling adversarial
@@ -230,12 +241,12 @@ but nothing yet confines the child process.*
   (there is only the one, ancient, DoS fix).
 - **Pin qemu-img by SHA-256** (`Resolve-QemuImg -PinnedSha256`; `Resolve-QemuImg` (`scripts/lib/
   HyperVBackend.ps1` — locate by function name; line numbers drift)).
-  Pass B prefers **MSYS2 `mingw-w64-x86_64-qemu`** (SHA-256-published, GPG-DB-signed, hash-pinnable). The
+  The design record prefers **MSYS2 `mingw-w64-x86_64-qemu`** (SHA-256-published, GPG-DB-signed, hash-pinnable). The
   **weilnetz** Windows build is acceptable-by-hash but its Authenticode certificate is **EXPIRED** — do
   **NOT** gate on `Get-AuthenticodeSignature` reporting a `Valid` chain for that build; the SHA-256 pin is
   the real control there, not Authenticode validity. Signature-validity gating only makes sense for the
   MSYS2 route (GPG-DB-signed, not Authenticode).
-- **Confine the convert per tier** (Pass B, all four models unanimous on the ranking, matches MS docs):
+- **Confine the convert per tier** (the design record, all four models unanimous on the ranking, matches MS docs):
   - **Tier 0/1** (light reads): a restricted-token + Low-IL (or Job-Object-wrapped) launcher via a **tiny
     native/C# shim** — `CreateRestrictedToken` / Job Object both need P/Invoke, not native PS7. **Job
     Object alone is NOT a security boundary** (resource/teardown only) — it must be paired with a
@@ -255,8 +266,8 @@ but nothing yet confines the child process.*
 
 ## 4. Seal-time host assertions to add live
 
-*Source: Pass A §Q2 point 6 ("Seal-time host assertions"), cross-referenced against `progress.md`'s §Track
-/ Phase-6-prep entries for shipped-vs-remaining status as of this doc.*
+*Source: the design record's seal-time host assertions, cross-referenced against its progress log for
+shipped-vs-remaining status as of this doc.*
 
 | Assertion | Status |
 |---|---|
@@ -285,9 +296,9 @@ diff are still live-only additions.
 
 ## 5. Live-validation checklist
 
-*Source: `progress.md` — items explicitly logged as LIVE-ONLY-UNPROVEN or Phase-6-deferred across the
-Phase-1–5 task rollups. These are mock-green (fake-backend) today; the first live run is what actually
-proves them.*
+*Source: the design record's progress log, the items logged as live-only-unproven or Phase-6-deferred
+across the Phase 1 to 5 task rollups. These are mock-green (fake-backend) today; the first live run is
+what actually proves them.*
 
 - **I6a — silent-guest `ReadLine` timeout.** The force-stop-on-guest-command-timeout path is mock-verified
   against the fake backend's simulated timeout; the real timeout path against a genuinely silent guest is
@@ -319,11 +330,12 @@ proves them.*
   `verdict_dev=`), and the real `ReadVhdxRawRegion` read-back of that disk after the detach (watch
   `verdict_head=` against `Status`). Confirm that no `deps-manifest.json` copy is lost: the exFAT deps disk
   keeps its own.
-- **Real Squid domain-ACL packet behavior (builder and InGuestSquid only).** The builder seed's Squid egress config (SEC-2, mock-shipped
-  per `progress.md`: default-DROP + minimal allow-list, `BlockProtocols` enforced by construction,
-  DoH/DoT/QUIC dropped) is asserted at the level of seed **shape** only — the seed template is correct,
-  but no test has observed a real Squid process actually splicing/dropping real packets. The first live
-  fetch is what proves the ACL behaves as configured.
+- **In-guest lockdown and proxy environment (every HostProxy seed, the builder included).** Shape-asserted
+  only: the suite checks the rendered files as text, runs the runner and lockdown scripts under `sh -n`,
+  and parses the user-data as YAML. Whether `nftables` installs through the proxy on the real image,
+  whether `nft -f -` applies the table, and whether `pip download`, `apt-get download` and
+  `huggingface-cli` honor the exported variables on the real guest are live questions. The host layers
+  do not depend on any of it.
 
 Until every item above has been exercised live, treat the mock-green suite as proof of *shape*
 correctness, not proof of live behavior.
@@ -344,9 +356,9 @@ OutboxOutput runner's discipline; asserted by `SeedBuilder.Tests.ps1`):
 
 | Marker | What it attributes |
 |---|---|
-| `squid_active=` | a dead Squid (every fetch becomes an opaque connection failure) |
-| `egress_lockdown=v4-applied redirect80_rc= redirect443_rc=` | lockdown applied; an unapplied REDIRECT silently bypasses the domain-ACL |
-| `ip6_lockdown=applied\|skipped` | the IPv6 belt-and-braces outcome |
+| `egress_mode=hostproxy proxy= default_routes= nameservers= ipv6_disabled=` | the proxy address the fetchers were given, that no route and no resolver exist, and that IPv6 is off |
+| `egress_unit_enabled= nft_present= proxy_reachable=` | the lockdown unit, whether nftables arrived through the proxy, and a TCP connect to the proxy port (a `no` here means every fetch fails before any allowlist decision) |
+| `egress-lockdown start mode=hostproxy` / `egress_lockdown=hostproxy-applied tool=nft\|iptables rc=` / `egress_lockdown=skipped` | from the lockdown script, when its unit runs: which tool applied the default-DROP, or that neither was present |
 | `ABORT output-not-mounted` / `ABORT input-not-mounted` / `ABORT verdict-candidates-not-1` | the fail-closed poweroff branches (formerly silent); the last means the raw verdict disk could not be picked out |
 | `verdict_candidates=` / `verdict_dev=` and `skip <dev> (has partitions\|has a filesystem signature)` | which whole disks the runner considered and the one it chose to pack the verdict into |
 | `verdict_producer_rc=` / `verdict_head=` | the producer's exit code, and the container magic read back from the verdict device (`56534f5554425831` = `VSOUTBX1`) |
@@ -360,9 +372,8 @@ Read the live verdict off `Status` and `ExitCode` first, and cross-check it agai
 Markers are structural only (liveness/rc/counts/presence); dependency payload bytes never ride the
 console.
 
-The Serial baseline and Serial egress seeds (ralph) emit the same kind of markers, from
-`/usr/local/sbin/voidseal-serial-diag` (run last in `runcmd`) and, for egress, from the lockdown script
-itself:
+The Serial seeds (ralph: the HostProxy seed) emit the same kind of markers, from
+`/usr/local/sbin/voidseal-serial-diag` (run last in `runcmd`) and from the lockdown script itself:
 
 | Marker | What it attributes |
 |---|---|
@@ -370,8 +381,9 @@ itself:
 | `sandbox_user=` | the non-root run user exists |
 | `serial_getty_active= autologin_dropin= grub_ttyS0_lines= cmdline_ttyS0=` | the COM1 command channel: getty up, autologin drop-in written, console arguments in GRUB and on the running kernel |
 | `bwrap_present= ca_certificates=` | the installs that follow `apt-get update` |
-| `squid_present= squid_active= egress_unit_enabled= ipv6_disabled= output_policy=` | egress seed only: Squid, the lockdown unit, IPv6 and the OUTPUT chain policy |
-| `egress_lockdown=v4-applied redirect80_rc= redirect443_rc=` and `ip6_lockdown=` | egress seed, written when the lockdown unit runs (the next boot), same fields as the builder |
+| `egress_mode=hostproxy guest_addr= default_routes= nameservers= proxy_env=` | the static address landed on `eth0`, no route, no resolver, the proxy variable is in `/etc/environment` |
+| `egress_unit_enabled= ipv6_disabled= proxy_reachable=` | the lockdown unit, IPv6 off, and a TCP connect to the proxy port |
+| `egress-lockdown start mode=hostproxy` / `egress_lockdown=hostproxy-applied tool=nft\|iptables rc=` / `egress_lockdown=skipped` | from the lockdown script (the same block the Disk seeds carry), when its unit runs |
 | `failed_units=` | count of failed systemd units |
 
 ## 6. Builder output: what a good run leaves
