@@ -328,6 +328,19 @@ Describe 'Invoke-Voidseal — SealVerdict guard: a non-throwing FALSE verdict st
         $report.Error     | Should -Not -BeNullOrEmpty -Because 'the guard records why it refused to run'
     }
 
+    It 'does NOT reach RUNNING when Assert-Sealed returns a non-boolean that a [bool] cast would call true (an array holding $true)' {
+        Mock Assert-Sealed { return @('leak', $true) }
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
+            -Name 'sbx-verdictarray' -ArtifactRoot $script:Art -Destination $script:Dest -Backend $script:B -ErrorAction SilentlyContinue
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'only a [bool] $true certifies; a truthy non-boolean is refused'
+        @($report.States) | Should -Not -Contain 'SEALED'
+        $report.SealVerdict | Should -BeFalse -Because 'the recorded verdict is not a [bool] cast of whatever came back'
+        $report.Error | Should -Match 'non-boolean verdict of type Object\[\]'
+        $report.RunResult | Should -BeNullOrEmpty
+        (& $script:B.GetVM @{ Name = 'sbx-verdictarray' }) | Should -BeNullOrEmpty -Because 'teardown still runs'
+        $report.TeardownStatus | Should -BeLike 'OK*'
+    }
+
     It 'tears down the VM when the verdict guard refuses (no orphan)' {
         Mock Assert-Sealed { return $false }
         Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `

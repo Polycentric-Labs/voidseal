@@ -109,6 +109,7 @@ function Add-VMNetworkAdapter {
 $script:stubGpu      = @()
 $script:stubDda      = @()
 $script:stubGpuThrow = $false
+$script:stubDdaThrow = $false
 $script:capReadVM    = $null
 
 function Get-VMGpuPartitionAdapter {
@@ -123,6 +124,7 @@ function Get-VMAssignableDevice {
     [CmdletBinding()]
     param([string[]] $VMName)
     $script:capReadVM = $VMName
+    if ($script:stubDdaThrow) { throw 'stub: simulated Get-VMAssignableDevice failure' }
     foreach ($d in $script:stubDda) { $d }
 }
 
@@ -270,7 +272,9 @@ function Invoke-ReadScenario {
     param([string] $Method, [object[]] $Items, [switch] $Throw)
     $script:stubGpu      = @()
     $script:stubDda      = @()
-    $script:stubGpuThrow = $Throw.IsPresent
+    # -Throw makes the cmdlet behind the method under test fail (the GPU read or the DDA read).
+    $script:stubGpuThrow = $Throw.IsPresent -and ($Method -eq 'GetGpuPartitionAdapters')
+    $script:stubDdaThrow = $Throw.IsPresent -and ($Method -eq 'GetAssignableDevices')
     $script:capReadVM    = $null
     if ($Method -eq 'GetGpuPartitionAdapters') { $script:stubGpu = $Items } else { $script:stubDda = $Items }
     $err = $null; $r = $null
@@ -343,6 +347,7 @@ $out = [ordered]@{
     Guards_GetFail   = Invoke-GuardGetScenario -Adapters @() -Fail
     Dda_None  = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @()
     Dda_One   = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @([pscustomobject]@{ LocationPath = 'PCIROOT(0)#PCI(0300)' })
+    Dda_Throw = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @() -Throw
     Com2_Empty = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '' }
     Com2_Path  = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '\\.\pipe\extra' }
     Com2_Fail  = Invoke-ComScenario -Number 2 -Fail

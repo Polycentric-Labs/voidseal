@@ -826,13 +826,20 @@ function Invoke-Voidseal {
         # it THROWS, we do NOT catch-and-continue — we let it propagate to the outer catch, which
         # records the seal failure and runs teardown. The workload-run state is unreachable on failure.
         $sealOk = Assert-Sealed -Descriptor $descriptor -Backend $Backend
-        $report.SealVerdict = [bool]$sealOk
+        # Only the literal $true certifies. A [bool] cast would accept any truthy value (a non-empty array,
+        # a string, a number), so the verdict is recorded and tested as "a [bool] that is true".
+        $report.SealVerdict = ($sealOk -is [bool] -and $sealOk)
         # Belt-and-braces (defense-in-depth): today Assert-Sealed is throw-only, so reaching here means
-        # the gate certified. But if a FUTURE refactor ever made it RETURN $false instead of throwing,
-        # this explicit verdict gate ensures the workload still cannot run on an uncertified VM. We throw
-        # into the same outer catch (records the failure + tears down), exactly as a thrown gate would.
+        # the gate certified. But if a FUTURE refactor ever made it RETURN $false, or return something that
+        # is not a boolean at all (an array that happens to hold $true, an object, nothing), this explicit
+        # verdict gate still keeps the workload off an uncertified VM. We throw into the same outer catch
+        # (records the failure + tears down), exactly as a thrown gate would.
+        if ($sealOk -isnot [bool]) {
+            $verdictKind = if ($null -eq $sealOk) { 'null' } else { $sealOk.GetType().Name }
+            throw "Invoke-Voidseal: seal gate did not certify '$Name' (Assert-Sealed returned a non-boolean verdict of type $verdictKind instead of exactly `$true); refusing to run the workload."
+        }
         if (-not $sealOk) {
-            throw "Invoke-Voidseal: seal gate did not certify '$Name' (Assert-Sealed returned a non-true verdict); refusing to run the workload."
+            throw "Invoke-Voidseal: seal gate did not certify '$Name' (Assert-Sealed returned `$false); refusing to run the workload."
         }
         $states.Add('SEALED')
 

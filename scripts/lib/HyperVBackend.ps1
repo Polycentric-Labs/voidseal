@@ -84,8 +84,10 @@ $script:HostChannelNames = @(
 # Time Synchronization 2497F4DE, Key-Value Pair Exchange 2A34B1C2, VSS 5CED1297, Guest Service Interface
 # 6C09BB55). LIVE-UNVERIFIED: no run has yet read these Ids off a real VM. A mismatch fails CLOSED (no
 # match throws), so the worst case is a seal that refuses, never one that certifies a service it did not
-# read. GuestServices keeps its older by-name read (see GetHostChannels).
+# read. Since 2026-10-16 GuestServices (the Guest Service Interface) is matched the same way; until then
+# it alone was looked up by its English display name, which a localized host does not report.
 $script:IntegrationServiceIds = [ordered]@{
+    GuestServices    = '6C09BB55-D683-4DA0-8931-C9BF705F6480'
     TimeSync         = '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
     KeyValueExchange = '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
     Backup           = '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
@@ -1255,11 +1257,12 @@ function New-RealHyperVBackend {
     # Toggle ONE host<->guest channel on/off. The four logical channels split into TWO classes on a
     # Linux guest (the deployer's target — stock Debian/Ubuntu/etc. cloud images):
     #
-    #   GuestServices  = the ONE REAL autonomous host<->guest DATA channel. Maps to
-    #                    Enable/Disable-VMIntegrationService 'Guest Service Interface' (the
-    #                    Copy-VMFile / file-copy VMBus channel). This is the channel the seal MUST
-    #                    close and Assert-Sealed MUST host-verify (its GET reads the real .Enabled,
-    #                    fail-closed). Kept exactly as-is — DO NOT weaken.
+    #   GuestServices  = the ONE REAL autonomous host<->guest DATA channel: the Guest Service Interface
+    #                    integration service (the Copy-VMFile / file-copy VMBus channel), found by its
+    #                    component GUID 6C09BB55 like the other four (until 2026-10-16 it alone was looked
+    #                    up by its English display name, which a localized host does not report). This is
+    #                    the channel the seal MUST close and Assert-Sealed MUST host-verify (its GET reads
+    #                    the real .Enabled, fail-closed). DO NOT weaken.
     #
     #   EnhancedSession / Clipboard / Shares = ESM facets. On Hyper-V there is NO per-facet cmdlet
     #                    and — critically — NO per-VM "ESM off" toggle at all. ESM clipboard / drive-
@@ -1285,11 +1288,11 @@ function New-RealHyperVBackend {
     # facets ON forever and Assert-Sealed could NEVER certify a real Linux VM. The fix reports the
     # ESM facets OFF BY CONSTRUCTION (see GetHostChannels). The SET path here is unchanged.
     #
-    # TimeSync / KeyValueExchange / Backup / Heartbeat (design E6, 2026-10-03) are integration services
-    # like GuestServices, but are found by their stable component GUID ($script:IntegrationServiceIds)
-    # rather than by the localized display name. The SET enumerates the VM's services, picks the one
-    # matching object (zero or several matches throw, fail closed) and pipes it to
-    # Enable/Disable-VMIntegrationService, so no localized -Name is ever passed.
+    # GuestServices, TimeSync, KeyValueExchange, Backup and Heartbeat are integration services found by
+    # their stable component GUID ($script:IntegrationServiceIds) rather than by the localized display
+    # name (design E6, 2026-10-03, extended to GuestServices on 2026-10-16). The SET enumerates the VM's
+    # services, picks the one matching object (zero or several matches throw, fail closed) and pipes it
+    # to Enable/Disable-VMIntegrationService, so no localized -Name is ever passed.
     $channelNames = $script:HostChannelNames
     $isIds        = $script:IntegrationServiceIds
     $FindIS       = $script:SbFindIntegrationService
@@ -1310,10 +1313,6 @@ function New-RealHyperVBackend {
                 return
             }
             switch ($channel) {
-                'GuestServices' {
-                    if ($enabled) { Enable-VMIntegrationService  -VMName $vm -Name 'Guest Service Interface' -ErrorAction Stop }
-                    else          { Disable-VMIntegrationService -VMName $vm -Name 'Guest Service Interface' -ErrorAction Stop }
-                }
                 'EnhancedSession' {
                     # Per-VM Enhanced Session / console channel. Disable = the seal (KVM off, no
                     # clipboard / drive redirection). NEVER Set-VM -EnhancedSessionTransportType
@@ -1337,21 +1336,15 @@ function New-RealHyperVBackend {
         param([System.Collections.IDictionary] $P)
         $vm = & $AssertArg $P 'VMName' 'GetHostChannels'
         & $InvokeOp {
-            # Host-side read of the host<->guest channels — the authoritative seal check.
+            # Host-side read of the host<->guest channels, the authoritative seal check.
             #
-            # GuestServices = the ONE channel the host can read as TRUE per-VM state: the Guest
-            # Service Interface integration service (the Copy-VMFile / file-copy VMBus channel — the
-            # one REAL autonomous host<->guest data channel). This read is FAIL-CLOSED: the catch
-            # RETHROWS. If it fails, the host cannot know whether the bidirectional Copy-VMFile
-            # channel is live, so the seal gate (Assert-Sealed) MUST fail closed. Swallowing the
-            # error to $gsiOn=$false would report GuestServices OFF while actually ON and let
-            # Assert-Sealed certify SEALED with the worst channel live — a fail-OPEN. DO NOT weaken.
-            $gsiOn = $false
-            try {
-                $gsi = Get-VMIntegrationService -VMName $vm -Name 'Guest Service Interface' -ErrorAction Stop
-                $gsiOn = [bool]$gsi.Enabled
-            }
-            catch { throw }   # SECURITY: an unreadable REAL channel MUST propagate — never coerce to off.
+            # GuestServices = the Guest Service Interface integration service (the Copy-VMFile / file-copy
+            # VMBus channel, the one REAL autonomous host<->guest data channel). Since 2026-10-16 it is read
+            # in the GUID loop below with the other four services, so a localized host reads it correctly.
+            # The loop is FAIL-CLOSED on every path (an enumeration that throws, a missing or duplicated
+            # service and a non-boolean Enabled all throw). Nothing may coerce an unreadable channel to off:
+            # that would report GuestServices OFF while actually ON and let Assert-Sealed certify SEALED
+            # with the worst channel live, a fail-OPEN. DO NOT weaken.
 
             # EnhancedSession / Clipboard / Shares = ESM facets, reported OFF BY CONSTRUCTION.
             #
@@ -1379,15 +1372,14 @@ function New-RealHyperVBackend {
             $out = @{
                 Clipboard       = $false
                 Shares          = $false
-                GuestServices   = $gsiOn
                 EnhancedSession = $false
             }
 
-            # TimeSync / KeyValueExchange / Backup / Heartbeat: REAL per-VM reads, never constants. One
-            # enumeration of the VM's integration services, then each service is picked by its stable
-            # component GUID (not the localized Name) and its .Enabled is read. FAIL-CLOSED on every
-            # path: the enumeration throws through $InvokeOp, a missing or duplicated service throws in
-            # $FindIS, and an .Enabled that is not a real [bool] throws here. None of these may degrade
+            # GuestServices / TimeSync / KeyValueExchange / Backup / Heartbeat: REAL per-VM reads, never
+            # constants. One enumeration of the VM's integration services, then each service is picked by
+            # its stable component GUID (not the localized Name) and its .Enabled is read. FAIL-CLOSED on
+            # every path: the enumeration throws through $InvokeOp, a missing or duplicated service throws
+            # in $FindIS, and an .Enabled that is not a real [bool] throws here. None of these may degrade
             # to "off".
             $all = @(Get-VMIntegrationService -VMName $vm -ErrorAction Stop)
             foreach ($name in $isIds.Keys) {

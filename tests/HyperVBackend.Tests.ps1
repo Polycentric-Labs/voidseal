@@ -837,11 +837,6 @@ Describe 'Real backend — GetHostChannels rethrows the unreadable REAL channel 
         }, $true) | Select-Object -First 1
         $script:RealFnAst | Should -Not -BeNullOrEmpty -Because 'the real backend factory must exist'
 
-        # The GuestServices read try/catch inside the real GetHostChannels op (the ONE real channel).
-        $allTry = $script:RealFnAst.FindAll({
-            param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)
-        $script:GsiTry = $allTry | Where-Object { $_.Body.Extent.Text -match 'Guest Service Interface' } | Select-Object -First 1
-
         # Locate the `$b.GetHostChannels = { ... }` assignment body so we can scan the whole method.
         $script:RealChanAssign = $script:RealFnAst.FindAll({
             param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
@@ -849,21 +844,28 @@ Describe 'Real backend — GetHostChannels rethrows the unreadable REAL channel 
         }, $true) | Select-Object -First 1
     }
 
-    It 'the Guest Service Interface (GuestServices) read catch RETHROWS — never coerces to off (THE fix)' {
-        $script:GsiTry | Should -Not -BeNullOrEmpty -Because 'the GSI channel read must be wrapped in a try/catch'
-        $catch = @($script:GsiTry.CatchClauses)[0]
-        $catch | Should -Not -BeNullOrEmpty
-
-        $hasThrow = $null -ne ($catch.Body.FindAll({
-            param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true) | Select-Object -First 1)
-        $hasThrow | Should -BeTrue -Because 'an unreadable GuestServices channel MUST propagate so Assert-Sealed fails closed'
-
-        # The fail-OPEN signature the review caught: `catch { $gsiOn = $false }`. It must be gone.
-        $hasFailOpenAssign = $null -ne ($catch.Body.FindAll({
-            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-                      $n.Left.Extent.Text -eq '$gsiOn'
-        }, $true) | Select-Object -First 1)
-        $hasFailOpenAssign | Should -BeFalse -Because 'coercing an unreadable GuestServices channel to $false (off) is the fail-OPEN bug; the catch must rethrow, not assign'
+    It 'the Guest Service Interface (GuestServices) is read by component GUID in the fail-closed loop: no by-name lookup, no fail-open shape, every catch rethrows' {
+        $script:RealChanAssign | Should -Not -BeNullOrEmpty -Because 'the real factory must define GetHostChannels'
+        # No Get-VMIntegrationService -Name call remains (the English display name is not what a localized
+        # host reports; the GUID read covers GuestServices with the other four services).
+        $byName = @($script:RealChanAssign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                      $n.GetCommandName() -eq 'Get-VMIntegrationService' -and
+                      @($n.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Name' }).Count -gt 0
+        }, $true))
+        $byName.Count | Should -Be 0 -Because 'GuestServices must be found by its component GUID, never by the localized display name'
+        # The fail-OPEN signature the review once caught, `catch { $gsiOn = $false }`, must not come back
+        # in any form: no $gsiOn variable at all, and every catch in the method rethrows.
+        $gsiAssign = @($script:RealChanAssign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$gsiOn' }, $true))
+        $gsiAssign.Count | Should -Be 0
+        $catches = @($script:RealChanAssign.FindAll({ param($n) $n -is [System.Management.Automation.Language.CatchClauseAst] }, $true))
+        foreach ($c in $catches) {
+            $rethrows = $null -ne ($c.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true) | Select-Object -First 1)
+            $rethrows | Should -BeTrue -Because 'an unreadable channel MUST propagate so Assert-Sealed fails closed; a catch that swallows is the fail-open bug'
+        }
+        # And GuestServices is produced by the GUID table, which carries it.
+        $script:IntegrationServiceIds.Contains('GuestServices') | Should -BeTrue
     }
 
     It 'the ESM facets are NOT read from a host property (no Get-CimInstance / ConsoleMode member access gates the seal)' {
@@ -1001,28 +1003,33 @@ Describe 'Real backend — Linux-guest host-channel seal model (invalid-enum SET
         $script:ChCap.GetGsiOffAtConsoleMode0.EnhancedSession | Should -BeFalse
     }
 
-    It 'GetHostChannels RETHROWS when the GuestServices read fails (the one real channel is unreadable => fail closed)' {
-        # The fail-closed guard, behaviorally: if the host cannot read the Guest Service Interface state,
-        # GetHostChannels must propagate the error (never coerce to off) so Assert-Sealed refuses.
-        $script:ChCap.GetGsiThrows.err | Should -Not -BeNullOrEmpty -Because 'an unreadable GuestServices channel must propagate so the gate fails closed'
-        $script:ChCap.GetGsiThrows.ch  | Should -BeNullOrEmpty -Because 'no channel hashtable should be returned when the real channel read throws'
+    It 'GetHostChannels THROWS when the Guest Service Interface is missing from the enumeration (the one real channel is unreadable => fail closed)' {
+        # The fail-closed guard, behaviorally: if the host cannot report the Guest Service Interface,
+        # GetHostChannels must throw (never coerce to off) so Assert-Sealed refuses.
+        $script:ChCap.GetGsiThrows.err | Should -BeLike "*could not identify the 'GuestServices' integration service*0 matching*"
+        $script:ChCap.GetGsiThrows.ch  | Should -BeNullOrEmpty -Because 'no channel hashtable should be returned when the real channel cannot be read'
+    }
+
+    It 'SetHostChannel GuestServices-disable pipes the GUID-matched Guest Service Interface object, never a -Name' {
+        $script:ChCap.SetGsiDisable.disableGsiById   | Should -BeTrue -Because 'the Guest Service Interface is found by its component GUID (a German-named stub here)'
+        $script:ChCap.SetGsiDisable.disableGsiByName | Should -BeFalse -Because 'the English display name is not what a localized host reports'
     }
 
     # ---- integration services (design E6): REAL reads by stable component GUID ------------------
     # The harness stubs return services with GERMAN display names, so these pass only if the real body
     # matches on the Id's trailing component GUID. Shutdown and Guest Service Interface are in the stub
     # set too, so a match that grabbed the wrong service would read the wrong value.
-    It 'GetHostChannels reads the four integration services from the host (all ON) and returns all eight keys' {
+    It 'GetHostChannels reads the five integration services from the host (all ON) and returns all eight keys' {
         $c = $script:ChCap.IsGetAllOn
         $c.err  | Should -BeNullOrEmpty
         $c.keys | Should -Be 'Backup,Clipboard,EnhancedSession,GuestServices,Heartbeat,KeyValueExchange,Shares,TimeSync'
-        foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeTrue -Because "$k is enabled on the host" }
+        foreach ($k in 'GuestServices', 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeTrue -Because "$k is enabled on the host" }
     }
 
     It 'GetHostChannels reads them OFF when the host reports them disabled (a real read, not a constant)' {
         $c = $script:ChCap.IsGetAllOff
         $c.err | Should -BeNullOrEmpty
-        foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeFalse -Because "$k is disabled on the host" }
+        foreach ($k in 'GuestServices', 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeFalse -Because "$k is disabled on the host" }
     }
 
     It 'GetHostChannels maps each value to its own service (mixed states, localized names)' {
@@ -1054,6 +1061,7 @@ Describe 'Real backend — Linux-guest host-channel seal model (invalid-enum SET
 
     It 'SetHostChannel disables each integration service by piping the ID-matched object, never by -Name' {
         $expect = @{
+            IsSetGsiOff       = '6C09BB55-D683-4DA0-8931-C9BF705F6480'
             IsSetTimeSyncOff  = '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
             IsSetKvpOff       = '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
             IsSetBackupOff    = '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
@@ -1136,8 +1144,9 @@ Describe 'Real backend — never binds the nonexistent EnhancedSessionTransportT
 # ===========================================================================
 Describe 'Integration-service seal: matched by stable component GUID, never by localized name (AST-pinned real)' {
 
-    It 'the component GUID table names exactly the four sealed services with their Hyper-V component ids' {
-        $script:IntegrationServiceIds.Keys -join ',' | Should -Be 'TimeSync,KeyValueExchange,Backup,Heartbeat'
+    It 'the component GUID table names exactly the five sealed services with their Hyper-V component ids' {
+        $script:IntegrationServiceIds.Keys -join ',' | Should -Be 'GuestServices,TimeSync,KeyValueExchange,Backup,Heartbeat'
+        $script:IntegrationServiceIds.GuestServices    | Should -Be '6C09BB55-D683-4DA0-8931-C9BF705F6480' -Because 'the Guest Service Interface is matched by GUID like the rest since 2026-10-16'
         $script:IntegrationServiceIds.TimeSync         | Should -Be '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
         $script:IntegrationServiceIds.KeyValueExchange | Should -Be '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
         $script:IntegrationServiceIds.Backup           | Should -Be '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
@@ -1146,7 +1155,7 @@ Describe 'Integration-service seal: matched by stable component GUID, never by l
     }
 
     It 'neither real SetHostChannel nor real GetHostChannels passes an English integration-service name to a cmdlet' {
-        $english = @('Time Synchronization', 'Key-Value Pair Exchange', 'Backup (volume shadow copy)', 'Heartbeat', 'Shutdown')
+        $english = @('Time Synchronization', 'Key-Value Pair Exchange', 'Backup (volume shadow copy)', 'Heartbeat', 'Shutdown', 'Guest Service Interface')
         foreach ($method in 'SetHostChannel', 'GetHostChannels') {
             $assign = & $script:GetRealBackendAssign $method
             $assign | Should -Not -BeNullOrEmpty
@@ -2361,9 +2370,12 @@ Describe 'Seal-device methods: the REAL bodies, executed out of process against 
         $script:SealDevCap.CpList_Fail.err     | Should -Match 'simulated Get-VMSnapshot failure' -Because 'an unreadable checkpoint list must not read as empty'
     }
 
-    It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal)' {
+    It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal), for the GPU and the DDA read alike' {
         $script:SealDevCap.Gpu_Throw.err | Should -Match 'simulated Get-VMGpuPartitionAdapter failure'
         $script:SealDevCap.Gpu_Throw.queriedVM | Should -Be 'vm1' -Because 'the throwing cmdlet was still asked about the right VM'
+        $script:SealDevCap.Dda_Throw.err | Should -Match 'simulated Get-VMAssignableDevice failure'
+        $script:SealDevCap.Dda_Throw.queriedVM | Should -Be 'vm1'
+        $script:SealDevCap.Dda_Throw.isArray | Should -BeFalse -Because 'a throw returns nothing, so no array can be read as "no devices"'
     }
 
     It 'RemoveHardDiskDrive detaches exactly the drive with the path, and THROWS when no attached drive has it' {
