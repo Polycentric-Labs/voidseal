@@ -180,6 +180,18 @@ Describe 'Host egress backend methods: the fake' {
         (& $script:B.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = $r.StartTime }).AlreadyGone | Should -BeTrue
     }
 
+    It '-SimulateEgressProxyUnkillable makes StopEgressProxy report Stopped=$false with Killed=$true and leaves the process running' {
+        $b = New-FakeHyperVBackend -SimulateEgressProxyUnkillable
+        $r = & $b.StartEgressProxy @{ PythonExe = 'C:\py\python.exe'; ScriptPath = $script:ProxyScript; Arguments = @(); ReadyFile = 'C:\x\ready.json' }
+        $s = & $b.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = $r.StartTime; StopFile = 'C:\x\stop'; TimeoutSeconds = 1 }
+        $s.Stopped     | Should -BeOfType [bool]
+        $s.Stopped     | Should -BeFalse
+        $s.Killed      | Should -BeTrue
+        $s.AlreadyGone | Should -BeFalse
+        $b.FakeEgressProcesses[$r.ProcessId].Running | Should -BeTrue -Because 'the process survived the kill'
+        (& $script:B.StopEgressProxy @{ ProcessId = 1; StartTime = 'x' }).Stopped | Should -BeTrue -Because 'an unknown pid is already gone, which is a stopped state'
+    }
+
     It 'StartEgressProxy refuses a proxy script that does not exist, like the real body' {
         { & $script:B.StartEgressProxy @{ PythonExe = 'py'; ScriptPath = 'C:\nope\proxy.py'; ReadyFile = 'C:\x\r.json' } } | Should -Throw '*does not exist*'
     }
@@ -481,9 +493,36 @@ Describe 'Host egress backend methods: the REAL bodies, executed out of process 
         $script:Cap.Stop_Again.result.AlreadyGone | Should -BeTrue
     }
 
-    It 'StopEgressProxy kills a proxy that ignores the stop file' {
+    It 'StopEgressProxy kills a proxy that ignores the stop file, and reports Stopped=$true only because the kill ended it' {
         $script:Cap.Stop_Kill.result.Killed | Should -BeTrue
+        $script:Cap.Stop_Kill.result.Stopped | Should -BeTrue
         $script:Cap.Stop_Kill.alive | Should -BeFalse
+    }
+
+    It 'the REAL StopEgressProxy derives Stopped from the post-kill WaitForExit instead of asserting $true (AST-pinned; an unkillable process cannot be driven here)' {
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:LibPath, [ref]$tokens, [ref]$errors)
+        $assign = $ast.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                      $n.Left.Extent.Text -eq '$b.StopEgressProxy' -and
+                      $n.Right.Extent.Text -match 'GetProcessById'
+        }, $true) | Select-Object -First 1
+        $assign | Should -Not -BeNullOrEmpty -Because 'the real factory must define StopEgressProxy'
+        # The post-kill WaitForExit result must be captured into a plain variable other than $null (the
+        # outer `$b.StopEgressProxy = {...}` assignment is excluded: its Left is a member expression).
+        $captured = @($assign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                      $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                      $n.Left.Extent.Text -ne '$null' -and
+                      $n.Right.Extent.Text -match 'WaitForExit\(5000\)'
+        }, $true))
+        $captured.Count | Should -Be 1 -Because 'the result of the post-kill wait decides Stopped'
+        $stoppedVar = $captured[0].Left.Extent.Text
+        # And the final return's Stopped field reads that variable, not a constant.
+        $returns = @($assign.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] }, $true) |
+            Where-Object { $_.Extent.Text -match 'AlreadyGone = \$false' })
+        $returns.Count | Should -Be 1
+        $returns[0].Extent.Text | Should -Match ('Stopped = \[bool\]' + [regex]::Escape($stoppedVar))
     }
 
     It 'StartEgressProxy THROWS for an early exit, a ready timeout, a ready file naming another pid and a missing script' {

@@ -7,6 +7,9 @@ port on the gateway and nothing else; there is no NAT and no route), so it is wh
 decided, on the host, outside the guest's trust domain.
 
 What it does, per connection:
+  * with ``--client <ip>`` (the guest's address, which the host side always passes), closes at once any
+    connection whose peer address is not that IP, logging ``decision="refused"`` and ``reason="client"``
+    and sending nothing. Without ``--client`` every peer is served (the test harness and manual runs).
   * reads one request head (bounded in bytes, lines and time) and accepts only
     ``CONNECT <host>:443 HTTP/1.1`` (HTTP/1.0 is accepted too, because CPython's http.client tunnels
     with it). Any other method gets 405; anything malformed gets 400; an oversized head gets 431.
@@ -187,13 +190,22 @@ class Allowlist:
 class ProxyConfig:
     def __init__(self, listen_host, listen_port, allowlist, log_path, max_connections=64,
                  header_timeout=10.0, connect_timeout=10.0, idle_timeout=120.0, total_timeout=3600.0,
-                 max_header_bytes=8192, max_header_lines=64, bind_retry_seconds=0.0):
+                 max_header_bytes=8192, max_header_lines=64, bind_retry_seconds=0.0, client_ip=None):
         try:
             addr = ipaddress.ip_address(listen_host)
         except ValueError:
             raise ValueError("listen host %r is not an IP literal" % (listen_host,)) from None
         if addr.is_unspecified:
             raise ValueError("refusing to listen on the unspecified address %s; bind the gateway address" % addr)
+        self.client_ip = None
+        if client_ip is not None:
+            try:
+                client = ipaddress.ip_address(client_ip)
+            except ValueError:
+                raise ValueError("client %r is not an IP literal" % (client_ip,)) from None
+            if client.is_unspecified:
+                raise ValueError("refusing the unspecified address %s as the client; pass the guest address" % client)
+            self.client_ip = str(client)
         if not isinstance(allowlist, Allowlist):
             raise ValueError("allowlist must be an Allowlist")
         if not (0 <= int(listen_port) <= 65535):
@@ -221,10 +233,11 @@ class ProxyConfig:
 
 
 class _Refusal(Exception):
-    def __init__(self, status, reason, **fields):
+    def __init__(self, status, reason, decision="deny", **fields):
         super().__init__(reason)
         self.status = status
         self.reason = reason
+        self.decision = decision
         self.fields = fields
 
 
@@ -322,6 +335,9 @@ class EgressProxy:
         upstream_writer = None
         self._active += 1
         try:
+            if cfg.client_ip is not None and not self._is_client(peer):
+                # Not the guest: close without a byte in reply. A status of None skips the response.
+                raise _Refusal(None, "client", decision="refused")
             if self._active > cfg.max_connections:
                 raise _Refusal(503, "connection-cap")
             target, port = await self._read_request(reader, record)
@@ -335,6 +351,7 @@ class EgressProxy:
             record["reason"] = await self._splice(reader, writer, upstream_reader, upstream_writer, started, record)
         except _Refusal as refusal:
             record["reason"] = refusal.reason
+            record["decision"] = refusal.decision
             record.update(refusal.fields)
             if refusal.status is not None:
                 record["status"] = refusal.status
@@ -351,6 +368,15 @@ class EgressProxy:
                     w.close()
             record["duration_ms"] = int((time.monotonic() - started) * 1000)
             self._log(record)
+
+    def _is_client(self, peer):
+        """True when the connection's peer address is the configured client (compared as parsed addresses)."""
+        if not peer:
+            return False
+        try:
+            return str(ipaddress.ip_address(peer[0])) == self.config.client_ip
+        except ValueError:
+            return False
 
     async def _send_error(self, reader, writer, status):
         head = "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Length: 0\r\n" % (status, REASON_PHRASES[status])
@@ -608,6 +634,8 @@ def main(argv=None):
     ap.add_argument("--bind-retry-seconds", type=float, default=15.0)
     ap.add_argument("--max-lifetime-seconds", type=float, default=None)
     ap.add_argument("--parent-pid", type=int, default=None)
+    ap.add_argument("--client", default=None,
+                    help="the one peer address served (the guest's IP); any other peer is closed at once")
     args = ap.parse_args(argv)
 
     try:
@@ -615,7 +643,8 @@ def main(argv=None):
             listen_host=args.listen_host, listen_port=args.listen_port, allowlist=Allowlist(args.allow),
             log_path=args.log, max_connections=args.max_connections, header_timeout=args.header_timeout,
             connect_timeout=args.connect_timeout, idle_timeout=args.idle_timeout,
-            total_timeout=args.total_timeout, bind_retry_seconds=args.bind_retry_seconds)
+            total_timeout=args.total_timeout, bind_retry_seconds=args.bind_retry_seconds,
+            client_ip=args.client)
     except ValueError as exc:
         print("voidseal-egress-proxy: configuration refused: %s" % exc, file=sys.stderr)
         return 2

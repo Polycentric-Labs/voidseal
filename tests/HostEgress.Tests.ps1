@@ -212,6 +212,8 @@ Describe 'HostEgress: the proxy allowlist and arguments' {
         $argv = Get-EgressProxyArguments -Plan $p -Allowlist @('api.example.com', '*.x.example.org') -LogPath 'C:\r\l.log' -StopFile 'C:\r\s' -ReadyFile 'C:\r\r.json' -MaxLifetimeSeconds 1500 -ParentPid 4242
         $i = [array]::IndexOf($argv, '--listen-host'); $argv[$i + 1] | Should -Be $p.GatewayIP
         $i = [array]::IndexOf($argv, '--listen-port'); $argv[$i + 1] | Should -Be '13128'
+        $i = [array]::IndexOf($argv, '--client'); $i | Should -BeGreaterOrEqual 0 -Because 'the proxy serves the guest address only'
+        $argv[$i + 1] | Should -Be $p.GuestIP
         $i = [array]::IndexOf($argv, '--max-lifetime-seconds'); $argv[$i + 1] | Should -Be '1500'
         $i = [array]::IndexOf($argv, '--parent-pid'); $argv[$i + 1] | Should -Be '4242'
         ($argv -join ' ') | Should -BeLike '*--allow api.example.com --allow `*.x.example.org*'
@@ -695,6 +697,22 @@ Describe 'HostEgress: teardown removes exactly what was recorded' {
         $d.EgressGatewayAddress | Should -BeNullOrEmpty
         $order = @($b.FakeCallLog | Where-Object { $_.Op -in @('StopEgressProxy', 'RemoveNetworkAdapterAcl', 'RemoveHostFirewallRule', 'RemoveSwitchHostIPAddress') } | ForEach-Object { $_.Op } | Select-Object -Unique)
         $order | Should -Be @('StopEgressProxy', 'RemoveNetworkAdapterAcl', 'RemoveHostFirewallRule', 'RemoveSwitchHostIPAddress')
+    }
+
+    It 'a proxy that survives its kill (Stopped=$false) is a teardown failure: the record stays, the rest of teardown runs, Remove-Sandbox names the pid' {
+        $b = New-FakeHyperVBackend -SimulateEgressProxyUnkillable
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-td3'
+        Start-SandboxEgressProxy -Descriptor $d -Allowlist @('api.example.com') -RunDirectory (Join-Path $script:TmpRoot 'run-td3') -MaxLifetimeSeconds 600 -PythonExe 'C:\py\python.exe' -Backend $b
+        $procId = $d.EgressProxy.ProcessId
+        { Remove-Sandbox -Name 'sbx-td3' -DeleteDisks -Descriptor $d -Backend $b } |
+            Should -Throw "Remove-Sandbox: host egress teardown for 'sbx-td3' could not remove: egress proxy pid ${procId}: the process did not exit after the stop file and a kill (Stopped=False); it stays recorded"
+        $d.EgressProxy | Should -Not -BeNullOrEmpty -Because 'a proxy the host could not end stays recorded for the operator'
+        $d.EgressProxy.ProcessId | Should -Be $procId
+        $b.FakeEgressProcesses[$procId].Running | Should -BeTrue
+        & $b.GetVM @{ Name = 'sbx-td3' } | Should -BeNullOrEmpty -Because 'the rest of teardown still ran'
+        @($b.FakeFirewallRules.Keys).Count | Should -Be 0
+        @($d.EgressFirewallRules).Count | Should -Be 0
+        $d.EgressGatewayAddress | Should -BeNullOrEmpty
     }
 
     It 'a removal that fails still runs the rest of teardown, keeps the record, and Remove-Sandbox throws naming it' {

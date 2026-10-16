@@ -366,7 +366,7 @@ function Get-HyperVBackendMethodManifest {
         GetHostFirewallProfiles = @()                              # -> @() of @{ Name; Enabled = [bool]; DefaultInboundAction = [string] }
         GetNetIPInterfaceForwarding = @('InterfaceAlias')          # -> @{ IPv4 = 'Enabled'|'Disabled'|'Missing'; IPv6 = the same }
         StartEgressProxy        = @('PythonExe', 'ScriptPath', 'Arguments', 'ReadyFile', 'ReadyTimeoutSeconds')   # -> @{ ProcessId; StartTime; CommandLine }
-        StopEgressProxy         = @('ProcessId', 'StartTime', 'StopFile', 'TimeoutSeconds')                   # -> @{ Stopped; Killed; AlreadyGone }
+        StopEgressProxy         = @('ProcessId', 'StartTime', 'StopFile', 'TimeoutSeconds')                   # -> @{ Stopped; Killed; AlreadyGone }; Stopped=$false when the process survived the kill
 
         # ---- checkpoint ----
         Checkpoint           = @('VMName', 'SnapshotName')
@@ -2328,7 +2328,9 @@ function New-RealHyperVBackend {
     }.GetNewClosure()
 
     # Stop asks first (the stop file), then kills after the timeout. The recorded StartTime guards against
-    # PID reuse: a process with that id but another start time is not ours and is left alone.
+    # PID reuse: a process with that id but another start time is not ours and is left alone. Stopped is
+    # $true only when the process has exited: a process that survives Kill (a stuck kernel wait) is
+    # reported as Stopped=$false, and Remove-SandboxEgress keeps it recorded as a teardown failure.
     $b.StopEgressProxy = {
         param([System.Collections.IDictionary] $P)
         $procId  = [int](& $AssertArg $P 'ProcessId' 'StopEgressProxy')
@@ -2345,13 +2347,14 @@ function New-RealHyperVBackend {
             if ($actual -ne $start) { return @{ Stopped = $true; Killed = $false; AlreadyGone = $true } }
         }
         if (-not [string]::IsNullOrWhiteSpace($stop)) { Set-Content -LiteralPath $stop -Value 'stop' -ErrorAction Stop }
-        $killed = $false
+        $killed  = $false
+        $stopped = $true
         if (-not $proc.WaitForExit($timeout * 1000)) {
             $proc.Kill()
-            $null = $proc.WaitForExit(5000)
-            $killed = $true
+            $killed  = $true
+            $stopped = $proc.WaitForExit(5000)   # $false when the process is still there after the kill
         }
-        return @{ Stopped = $true; Killed = $killed; AlreadyGone = $false }
+        return @{ Stopped = [bool]$stopped; Killed = $killed; AlreadyGone = $false }
     }.GetNewClosure()
 
     # ---- checkpoint ------------------------------------------------------
@@ -2589,6 +2592,10 @@ $script:SbCopyFakeVM = {
     The forwarding state GetNetIPInterfaceForwarding reports for every host interface, as
     @{ IPv4 = <text>; IPv6 = <text> }. The default is Disabled for both; pass 'Enabled' or 'Missing' for a
     family to drive the gate's refusals.
+.PARAMETER SimulateEgressProxyUnkillable
+    Make StopEgressProxy report Stopped=$false with Killed=$true and leave the process recorded as
+    Running, modeling a proxy that ignored its stop file and then survived the kill (the real body's
+    post-kill WaitForExit returning $false). Remove-SandboxEgress must treat that as a removal failure.
 .PARAMETER SimulateEgressMethodError
     Names of host egress methods (GetHostIPAddresses, AddSwitchHostIPAddress, NewHostFirewallRule,
     GetHostFirewallRule, GetHostFirewallRuleNames, GetHostFirewallProfiles, GetNetIPInterfaceForwarding,
@@ -2631,6 +2638,7 @@ function New-FakeHyperVBackend {
         [hashtable[]] $SimulateNetNat = @(),
         [hashtable[]] $SimulateFirewallProfile = @(),
         [hashtable] $SimulateNetIPInterfaceForwarding,
+        [switch] $SimulateEgressProxyUnkillable,
         [string[]] $SimulateEgressMethodError = @()
     )
 
@@ -2758,6 +2766,8 @@ function New-FakeHyperVBackend {
     # Captured by the egress methods: the named methods throw (a host cmdlet failing), so a test can drive
     # every fail-closed and rollback path.
     $egressErrors = @($SimulateEgressMethodError)
+    # Captured by the StopEgressProxy closure: the process survives the kill (see param help).
+    $proxyUnkillable = $SimulateEgressProxyUnkillable.IsPresent
     $egressFail = {
         param([string] $Method)
         if ($egressErrors -contains $Method) {
@@ -4020,6 +4030,8 @@ function New-FakeHyperVBackend {
         if (-not [string]::IsNullOrWhiteSpace($start) -and $state.EgressProcs[$procId].StartTime -ne $start) {
             return @{ Stopped = $true; Killed = $false; AlreadyGone = $true }
         }
+        # SimulateEgressProxyUnkillable: the stop file was ignored and the kill did not end the process.
+        if ($proxyUnkillable) { return @{ Stopped = $false; Killed = $true; AlreadyGone = $false } }
         $state.EgressProcs[$procId].Running = $false
         return @{ Stopped = $true; Killed = $false; AlreadyGone = $false }
     }.GetNewClosure()

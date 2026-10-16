@@ -584,6 +584,84 @@ def test_refuses_an_unspecified_or_non_literal_listen_address(host):
 
 
 # --------------------------------------------------------------------------------------------------
+# the client pin: only the guest's address is served
+# --------------------------------------------------------------------------------------------------
+def test_client_pin_serves_a_connection_from_the_pinned_address(tmp_path):
+    status, lines, h = run(status_of(tmp_path, ["api.example.com"], "api.example.com:443",
+                                     {"api.example.com": [PUBLIC_A]}, client_ip="127.0.0.1"))
+    assert status == 200
+    assert lines[0]["decision"] == "allow"
+    assert h.connect_calls == [(PUBLIC_A, 443)]
+
+
+async def send_then_read_until_closed(reader, writer, raw):
+    """Write raw, then read to the end. A peer the proxy closed at once may answer the write or the read
+    with a reset instead of a clean EOF (Windows resets a socket closed with unread bytes); either way
+    the proxy sent nothing, which is what the caller asserts."""
+    try:
+        writer.write(raw)
+        await writer.drain()
+        return await asyncio.wait_for(reader.read(), 3)
+    except (ConnectionError, OSError):
+        return b""
+
+
+def test_client_pin_closes_a_connection_from_another_address_without_a_reply(tmp_path):
+    async def body():
+        # The harness connects from 127.0.0.1; pinning 127.0.0.2 makes every connection a stranger's.
+        async with Harness(tmp_path, ["api.example.com"], {"api.example.com": [PUBLIC_A]},
+                           client_ip="127.0.0.2") as h:
+            reader, writer = await h.open()
+            data = await send_then_read_until_closed(reader, writer, connect_req("api.example.com:443"))
+            assert data == b"", "a stranger gets no bytes back, not even a status line"
+            await close(writer)
+            lines = await wait_for_log(h, 1)
+            assert len(lines) == 1
+            rec = lines[0]
+            assert rec["decision"] == "refused" and rec["reason"] == "client"
+            assert rec["status"] is None and rec["target"] is None, "the request head is never read"
+            assert rec["client"] == "127.0.0.1"
+            assert h.resolve_calls == [] and h.connect_calls == []
+    run(body())
+
+
+def test_client_pin_refuses_a_second_loopback_address_as_the_peer(tmp_path):
+    """The real shape of the check: the proxy pins 127.0.0.1 and a peer dials from 127.0.0.2."""
+    async def body():
+        async with Harness(tmp_path, ["api.example.com"], {"api.example.com": [PUBLIC_A]},
+                           client_ip="127.0.0.1") as h:
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", h.proxy.bound_port,
+                                                               local_addr=("127.0.0.2", 0))
+            except OSError:
+                pytest.skip("this host does not route 127.0.0.2 on loopback")
+            data = await send_then_read_until_closed(reader, writer, connect_req("api.example.com:443"))
+            assert data == b""
+            await close(writer)
+            lines = await wait_for_log(h, 1)
+            assert lines[0]["decision"] == "refused" and lines[0]["reason"] == "client"
+            assert lines[0]["client"] == "127.0.0.2"
+            # The pinned address is still served afterwards.
+            status, _, _, w = await h.request(connect_req("api.example.com:443"))
+            assert status == 200
+            await close(w)
+    run(body())
+
+
+def test_without_a_client_pin_every_peer_is_served(tmp_path):
+    status, lines, _ = run(status_of(tmp_path, ["api.example.com"], "api.example.com:443",
+                                     {"api.example.com": [PUBLIC_A]}))
+    assert status == 200 and lines[0]["decision"] == "allow"
+
+
+@pytest.mark.parametrize("client", ["guest.local", "", "0.0.0.0", "10.231.0.2/30"])
+def test_refuses_a_client_pin_that_is_not_a_usable_ip_literal(client):
+    with pytest.raises(ValueError):
+        vp.ProxyConfig(listen_host="127.0.0.1", listen_port=13128, allowlist=vp.Allowlist(["api.example.com"]),
+                       log_path=None, client_ip=client)
+
+
+# --------------------------------------------------------------------------------------------------
 # the command line: ready file, stop file, config errors (a real child process on loopback)
 # --------------------------------------------------------------------------------------------------
 def _spawn(tmp_path, *extra):
@@ -625,6 +703,7 @@ def test_cli_exits_at_the_maximum_lifetime(tmp_path):
     [],                                              # no allowlist at all
     ["--allow", "*.com"],                            # over-broad suffix
     ["--allow", "bad name"],                         # malformed
+    ["--allow", "api.example.com", "--client", "not-an-ip"],   # a client pin that is not an address
 ])
 def test_cli_refuses_a_bad_allowlist_with_exit_2(tmp_path, extra):
     proc = _spawn(tmp_path, *extra)

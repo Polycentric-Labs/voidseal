@@ -278,6 +278,9 @@ function ConvertTo-EgressProxyAllowlist {
 <#
 .SYNOPSIS
     The proxy's command-line arguments (after the script path) for a plan and a run.
+.DESCRIPTION
+    The proxy listens on the gateway address and serves one peer only: --client carries the plan's guest
+    address, so a connection from any other address on the switch is closed at once and logged as refused.
 #>
 function Get-EgressProxyArguments {
     [CmdletBinding()]
@@ -295,6 +298,7 @@ function Get-EgressProxyArguments {
     foreach ($pair in @(
             @('--listen-host', [string](Get-EgressPlanField $Plan 'GatewayIP')),
             @('--listen-port', [string](Get-EgressPlanField $Plan 'ProxyPort')),
+            @('--client', [string](Get-EgressPlanField $Plan 'GuestIP')),
             @('--log', $LogPath), @('--stop-file', $StopFile), @('--ready-file', $ReadyFile),
             @('--max-lifetime-seconds', [string]$MaxLifetimeSeconds), @('--parent-pid', [string]$ParentPid))) {
         $argv.Add($pair[0]); $argv.Add($pair[1])
@@ -527,8 +531,9 @@ function Start-SandboxEgressProxy {
     Order: stop the proxy (closes the door first), remove the port ACL entries (a VM that is already
     gone took them with it), the firewall rules, then the gateway address. Each removal is attempted
     even when an earlier one failed; a record is cleared only when its removal succeeded, so a failure
-    stays visible on the descriptor. Emits one message per failure (nothing when everything went);
-    collect it with @(...).
+    stays visible on the descriptor. A proxy stop that reports Stopped=$false (the process survived the
+    kill) is a failure too: the record stays and the message names the pid. Emits one message per
+    failure (nothing when everything went); collect it with @(...).
     Never touches an object it did not record, so a rule or address this run did not create is safe.
 #>
 function Remove-SandboxEgress {
@@ -541,14 +546,21 @@ function Remove-SandboxEgress {
 
     $proxy = Get-EgressDescriptorField -Descriptor $Descriptor -Name 'EgressProxy'
     if ($null -ne $proxy) {
+        $proxyPid = Get-EgressPlanField $proxy 'ProcessId'
         try {
-            $null = & $Backend.StopEgressProxy @{
-                ProcessId = [int](Get-EgressPlanField $proxy 'ProcessId'); StartTime = [string](Get-EgressPlanField $proxy 'StartTime')
+            $stopResult = & $Backend.StopEgressProxy @{
+                ProcessId = [int]$proxyPid; StartTime = [string](Get-EgressPlanField $proxy 'StartTime')
                 StopFile = [string](Get-EgressPlanField $proxy 'StopFile'); TimeoutSeconds = 10
             }
-            Set-EgressDescriptorField -Descriptor $Descriptor -Name 'EgressProxy' -Value $null
+            $stopped = Get-EgressPlanField $stopResult 'Stopped'
+            if ($stopped -is [bool] -and $stopped) {
+                Set-EgressDescriptorField -Descriptor $Descriptor -Name 'EgressProxy' -Value $null
+            }
+            else {
+                $failures.Add("egress proxy pid ${proxyPid}: the process did not exit after the stop file and a kill (Stopped=$stopped); it stays recorded")
+            }
         }
-        catch { $failures.Add("egress proxy pid $(Get-EgressPlanField $proxy 'ProcessId'): $($_.Exception.Message)") }
+        catch { $failures.Add("egress proxy pid ${proxyPid}: $($_.Exception.Message)") }
     }
 
     $keptAcls = [System.Collections.Generic.List[object]]::new()
