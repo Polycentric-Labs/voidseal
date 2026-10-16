@@ -469,9 +469,21 @@ $script:SbIsUnavailableError = {
         $ex -is [System.Management.Automation.CommandNotFoundException] -and
         $ex.CommandName -match '^\w+-(VM|VHD)') { return $true }
 
-    # Generic permission / elevation phrasing from any layer.
+    # Generic permission / elevation phrasing. Rebranded as "Hyper-V unavailable or insufficient privilege"
+    # only when it names Hyper-V or came from a Hyper-V-shaped cmdlet (Get-VM, New-VHD, Mount-VHD, ...).
+    # The same words from a plain file operation inside a real method (Copy-Item, Remove-Item, a .NET
+    # FileStream open) are an ACL problem on that file: until 2026-10-16 they were rebranded too, and the
+    # operator was told to run elevated when the fix was a folder permission. They now keep their own message.
     if ($msg -match '(?i)(do not have the required permission|requires elevation|access is denied|run as administrator|Hyper-V Administrators)') {
-        return $true
+        if ($msg -match '(?i)Hyper-V') { return $true }
+        $commandName = ''
+        try {
+            if ($null -ne $ErrorRecord.InvocationInfo -and $null -ne $ErrorRecord.InvocationInfo.MyCommand) {
+                $commandName = [string]$ErrorRecord.InvocationInfo.MyCommand.Name
+            }
+        }
+        catch { $commandName = '' }
+        if ($commandName -match '^\w+-(VM|VHD)') { return $true }
     }
 
     return $false
@@ -562,13 +574,23 @@ $script:SbInvokeWithLockRetry = {
         [string] $Context = 'ReadVhdxRawRegion'   # method name for the fail-closed message (backward-compat default)
     )
     # Lock-class signatures (case-insensitive). These are the Windows + qemu-img phrasings for a file that
-    # is still open by another handle (the unreleased Hyper-V worker-process handle, here).
+    # is still open by another handle (the unreleased Hyper-V worker-process handle, here). The Windows
+    # qemu-img build reports a CreateFile failure with the Win32 text, so a sharing violation reads "being
+    # used by another process" there too; 'Failed to get shared lock' is qemu's own lock message.
     $lockPatterns = @(
         'sharing violation',
         'used by another process',
         'being used by another',
-        'Failed to get shared lock',
-        'Permission denied'
+        'Failed to get shared lock'
+    )
+    # Access-denied signatures (case-insensitive): an ACL or read-only problem on the file or its folder.
+    # Until 2026-10-16 'Permission denied' sat in the lock set, so an ACL problem was retried five times and
+    # then reported as a lock that never released. It is not transient; it fails at once with its own cause.
+    $deniedPatterns = @(
+        'Permission denied',
+        'Access is denied',
+        'Access to the path',
+        'UnauthorizedAccess'
     )
     if ($MaxAttempts -lt 1) { $MaxAttempts = 1 }
     $attempt = 0
@@ -580,6 +602,13 @@ $script:SbInvokeWithLockRetry = {
         catch {
             $caught = $_
             $message = if ($caught -and $caught.Exception) { [string]$caught.Exception.Message } else { [string]$caught }
+            $isDenied = $false
+            foreach ($pat in $deniedPatterns) { if ($message -match ('(?i)' + [regex]::Escape($pat))) { $isDenied = $true; break } }
+            if ($isDenied) {
+                throw ("${Context}: access denied (`"$message`"). This is a permissions or read-only problem on the file or " +
+                       "its folder, not a transient lock, so it was not retried. Check the ACL and the read-only flag " +
+                       "on the VHDX and its directory. Failing closed.")
+            }
             $isLock = $false
             foreach ($pat in $lockPatterns) { if ($message -match ('(?i)' + [regex]::Escape($pat))) { $isLock = $true; break } }
             # Not a lock-class error -> a real failure (e.g. malformed image); rethrow unchanged (do NOT retry).
@@ -648,8 +677,11 @@ $script:SbValidateVhdxFormat = {
     # Raw = create-without-format: no Format-Volume, so no real label limit applies.
     # The Label on a Raw disk is a mock-internal discovery tag only — see NewOutputVhdx.
     if ($normalized -eq 'Raw') { return 'Raw' }
-    # Max volume-label length per filesystem (real Format-Volume limits).
-    $maxLabel = @{ exFAT = 15; FAT32 = 11; NTFS = 32; FAT = 11 }[$normalized]
+    # Max volume-label length per filesystem (real Format-Volume limits). exFAT's volume label is 11
+    # characters, like FAT and FAT32 (the 15 this table carried until 2026-10-16 would have passed a label
+    # the live Format-Volume rejects); the shipped labels (INPUT, OUTPUT, CIDATA, VERDICT, VSD plus an
+    # 8-character data-disk name) all fit.
+    $maxLabel = @{ exFAT = 11; FAT32 = 11; NTFS = 32; FAT = 11 }[$normalized]
     $labelLen = if ($null -ne $Label) { ([string]$Label).Length } else { 0 }
     if ($labelLen -gt $maxLabel) {
         throw ("NewOutputVhdx: Label '$Label' is $labelLen chars, exceeding the " +
@@ -782,9 +814,10 @@ function Get-FileSha256 {
 
 .DESCRIPTION
     Used by the REAL ReadVhdxRawRegion before it parses an untrusted guest VHDX. Fails closed
-    (throws) if: qemu-img is not found on PATH; its reported version is below -MinVersion (a
-    patch-currency floor — see the file-level comment above this function, NOT a CVE-derived
-    gate); or -PinnedSha256 is supplied and the resolved binary's SHA-256 does not match it.
+    (throws) if: qemu-img is not found on PATH; it resolves to a .cmd/.bat shim instead of a binary;
+    -PinnedSha256 is supplied and the resolved binary's SHA-256 does not match it (checked before the
+    binary is run at all); or its reported version is below -MinVersion (a patch-currency floor, see
+    the file-level comment above this function, NOT a CVE-derived gate).
     Returns the resolved qemu-img path on success.
 #>
 function Resolve-QemuImg {
@@ -795,17 +828,27 @@ function Resolve-QemuImg {
     )
     $path = Get-QemuImgPath
     if (-not $path) {
-        throw "Resolve-QemuImg: qemu-img not found on PATH — the user-space read needs qemu-img (host attach of an untrusted disk is FORBIDDEN). Failing closed."
+        throw "Resolve-QemuImg: qemu-img not found on PATH, the user-space read needs qemu-img (host attach of an untrusted disk is FORBIDDEN). Failing closed."
     }
-    $ver = Get-QemuImgVersion -Path $path
-    if ([version]$ver -lt [version]$MinVersion) {
-        throw "Resolve-QemuImg: qemu-img $ver is below the required floor $MinVersion (patch-currency: run a currently-patched qemu-img, re-resolved at ship time — not a specific-CVE gate). Failing closed."
+    # Only a real binary is accepted (the rule Resolve-PythonExe applies): a .cmd/.bat shim runs through
+    # cmd.exe, which re-parses the arguments, including the path of the untrusted disk; on Windows the
+    # extension must be .exe, elsewhere an extensionless executable is the norm.
+    $ext = [System.IO.Path]::GetExtension([string]$path)
+    $isRealBinary = ($ext -ieq '.exe') -or (-not $IsWindows -and [string]::IsNullOrEmpty($ext))
+    if (-not $isRealBinary) {
+        throw "Resolve-QemuImg: qemu-img resolved to '$path', a script shim rather than a binary (a shim runs through cmd.exe and can rewrite its arguments); put the real qemu-img executable on PATH. Failing closed."
     }
+    # The pin is compared BEFORE the binary runs: `--version` executes the file, and an unpinned or
+    # substituted binary must not run at all, not even to report its version.
     if ($PinnedSha256) {
         $actual = Get-FileSha256 -Path $path
         if ($actual -ne $PinnedSha256.ToLowerInvariant()) {
-            throw "Resolve-QemuImg: qemu-img SHA-256 hash mismatch (got $actual, pinned $PinnedSha256) — refusing an unpinned/substituted parser binary. Failing closed."
+            throw "Resolve-QemuImg: qemu-img SHA-256 hash mismatch (got $actual, pinned $PinnedSha256), refusing an unpinned/substituted parser binary. Failing closed."
         }
+    }
+    $ver = Get-QemuImgVersion -Path $path
+    if ([version]$ver -lt [version]$MinVersion) {
+        throw "Resolve-QemuImg: qemu-img $ver is below the required floor $MinVersion (patch-currency: run a currently-patched qemu-img, re-resolved at ship time, not a specific-CVE gate). Failing closed."
     }
     return $path
 }
@@ -1473,7 +1516,9 @@ function New-RealHyperVBackend {
         $inner = & $AssertArg $P 'InnerPath' 'WriteVhdxFile'
         $content = & $AssertArg $P 'Content' 'WriteVhdxFile'
         & $InvokeOp {
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            # RC8: the first Mount-VHD after a detach can hit the settle-lag sharing violation too, so the
+            # mount rides the same lock-retry as the file copies and the hash (added 2026-10-16).
+            $img = & $LockRetry -Context 'WriteVhdxFile' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'WriteVhdxFile'
                 Set-Content -LiteralPath ("{0}:\{1}" -f $letter, $inner) -Value $content -NoNewline -Encoding utf8 -ErrorAction Stop
@@ -1509,7 +1554,7 @@ function New-RealHyperVBackend {
             }
             $srcArg = [System.IO.Path]::GetFullPath($src).TrimEnd('\', '/')
             if ($srcArg -match '^[A-Za-z]:$') { $srcArg = "$srcArg\." }
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            $img = & $LockRetry -Context 'CopyDirectoryToVhdx' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'CopyDirectoryToVhdx'
                 $dest = "{0}:\" -f $letter
@@ -1621,7 +1666,7 @@ function New-RealHyperVBackend {
         $path = & $AssertArg $P 'Path' 'ReadVhdxFile'
         $inner = & $AssertArg $P 'InnerPath' 'ReadVhdxFile'
         & $InvokeOp {
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            $img = & $LockRetry -Context 'ReadVhdxFile' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'ReadVhdxFile'
                 $fp = "{0}:\{1}" -f $letter, $inner
@@ -1648,7 +1693,7 @@ function New-RealHyperVBackend {
         $inner = & $AssertArg $P 'InnerPath' 'WriteVhdxFileBytes'
         $bytes = [byte[]](& $AssertArg $P 'Bytes' 'WriteVhdxFileBytes')
         & $InvokeOp {
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            $img = & $LockRetry -Context 'WriteVhdxFileBytes' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'WriteVhdxFileBytes'
                 [System.IO.File]::WriteAllBytes(("{0}:\{1}" -f $letter, $inner), $bytes)   # raw bytes, NO utf8 recode
@@ -1676,7 +1721,7 @@ function New-RealHyperVBackend {
         $path  = & $AssertArg $P 'Path' 'ReadVhdxFileBytes'
         $inner = & $AssertArg $P 'InnerPath' 'ReadVhdxFileBytes'
         & $InvokeOp {
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            $img = & $LockRetry -Context 'ReadVhdxFileBytes' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'ReadVhdxFileBytes'
                 $fp = "{0}:\{1}" -f $letter, $inner
@@ -2882,6 +2927,10 @@ function New-FakeHyperVBackend {
             Generation                     = (& $GetArg $P 'Generation' 2)
             State                          = 'Off'
             MemoryStartupBytes             = (& $GetArg $P 'MemoryStartupBytes')
+            # New-VM -Path (the configuration folder) and -NoVHD, recorded so the fake reads every key the
+            # manifest documents (a key a factory never reads is silently dropped; the parity test checks).
+            Path                           = (& $GetArg $P 'Path')
+            NoVHD                          = [bool](& $GetArg $P 'NoVHD' $false)
             DynamicMemoryEnabled           = $false
             ProcessorCount                 = 1
             ExposeVirtualizationExtensions = $false
@@ -3070,9 +3119,11 @@ function New-FakeHyperVBackend {
 
     $b.RemoveVM = {
         param([System.Collections.IDictionary] $P)
-        $name = & $AssertArg $P 'Name' 'RemoveVM'
+        $name  = & $AssertArg $P 'Name' 'RemoveVM'
+        $force = [bool](& $GetArg $P 'Force' $true)
         [void](& $requireVM $name 'RemoveVM')
-        # Unregister the VM only. Its VHDX records persist in $state.VHDs — mirroring
+        $state.CallLog.Add(@{ Op = 'RemoveVM'; Path = $null; VMName = $name; Force = $force })
+        # Unregister the VM only. Its VHDX records persist in $state.VHDs, mirroring
         # Hyper-V (Remove-VM leaves disks); explicit cleanup is the caller's step.
         $state.VMs.Remove($name) | Out-Null
     }.GetNewClosure()
@@ -3105,6 +3156,9 @@ function New-FakeHyperVBackend {
         $vm = & $requireVM (& $GetArg $P 'VMName') 'SetMemory'
         $s = & $GetArg $P 'StartupBytes'; if ($null -ne $s) { $vm.MemoryStartupBytes = $s }
         $d = & $GetArg $P 'DynamicMemoryEnabled'; if ($null -ne $d) { $vm.DynamicMemoryEnabled = [bool]$d }
+        # The dynamic-memory bounds, recorded like the real Set-VMMemory -MinimumBytes / -MaximumBytes.
+        $mn = & $GetArg $P 'MinimumBytes'; if ($null -ne $mn) { $vm['MemoryMinimumBytes'] = $mn }
+        $mx = & $GetArg $P 'MaximumBytes'; if ($null -ne $mx) { $vm['MemoryMaximumBytes'] = $mx }
     }.GetNewClosure()
 
     $b.SetFirmware = {
@@ -3112,6 +3166,9 @@ function New-FakeHyperVBackend {
         $vm = & $requireVM (& $GetArg $P 'VMName') 'SetFirmware'
         $sb = & $GetArg $P 'EnableSecureBoot'; if ($null -ne $sb) { $vm.SecureBootEnabled = [bool]$sb }
         $tmpl = & $GetArg $P 'SecureBootTemplate'; if ($null -ne $tmpl) { $vm.SecureBootTemplate = $tmpl }
+        # BootOrder is array-typed, so it is read off $P directly (not through $GetArg, whose single
+        # `&` boundary unrolls an array; see the F2 note on $script:SbGetArg) and stored as an array.
+        if ($P.Contains('BootOrder') -and $null -ne $P['BootOrder']) { $vm['BootOrder'] = @($P['BootOrder']) }
     }.GetNewClosure()
 
     # RC7: the fake's analogue of Set-VM -AutomaticCheckpointsEnabled — flip the recorded flag on the VM
@@ -3241,6 +3298,8 @@ function New-FakeHyperVBackend {
             SizeBytes    = (& $GetArg $P 'SizeBytes')
             Differencing = $diff
             ParentPath   = (& $GetArg $P 'ParentPath')
+            # Dynamic (the default) or fixed, as the real New-VHD -Dynamic / -Fixed choice records.
+            Dynamic      = [bool](& $GetArg $P 'Dynamic' $true)
         }
         if ($diff -and [string]::IsNullOrWhiteSpace([string]$rec.ParentPath)) {
             throw "HyperVBackend(fake).NewVHD: -Differencing requires a ParentPath."
@@ -3750,7 +3809,13 @@ function New-FakeHyperVBackend {
         if (@('Internal', 'Private', 'External') -notcontains $type) {
             throw "HyperVBackend(fake).NewSwitch: SwitchType '$type' must be Internal, Private, or External."
         }
-        $state.Switches[$name] = @{ Name = $name; SwitchType = $type }
+        # An External switch binds a host adapter: real New-VMSwitch requires -NetAdapterName for it, and the
+        # real body asserts the key before the cmdlet. Mirror that (until 2026-10-16 the fake accepted an
+        # External switch without one), and record the adapter on the switch.
+        $adapter = $null
+        if ($type -eq 'External') { $adapter = & $AssertArg $P 'NetAdapterName' 'NewSwitch(External)' }
+        else { $adapter = & $GetArg $P 'NetAdapterName' }
+        $state.Switches[$name] = @{ Name = $name; SwitchType = $type; NetAdapterName = $adapter }
     }.GetNewClosure()
 
     $b.GetSwitch = {
@@ -4068,6 +4133,7 @@ function New-FakeHyperVBackend {
         $script = [string](& $AssertArg $P 'ScriptPath' 'StartEgressProxy')
         $ready  = [string](& $AssertArg $P 'ReadyFile' 'StartEgressProxy')
         $argv   = @(@(& $GetArg $P 'Arguments' @()) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        $readyTimeout = [double](& $GetArg $P 'ReadyTimeoutSeconds' 30)
         $state.CallLog.Add(@{ Op = 'StartEgressProxy'; Path = $script; VMName = $null })
         & $egressFail 'StartEgressProxy'
         if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
@@ -4077,15 +4143,18 @@ function New-FakeHyperVBackend {
         $state.NextProcId[0] = $procId + 1
         $start = [datetime]::new(2026, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc).AddSeconds($procId).ToString('o')
         $cmd = (@($py, $script) + $argv | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
-        $state.EgressProcs[$procId] = @{ ProcessId = $procId; StartTime = $start; Arguments = $argv; ReadyFile = $ready; Running = $true }
+        $state.EgressProcs[$procId] = @{ ProcessId = $procId; StartTime = $start; Arguments = $argv; ReadyFile = $ready; ReadyTimeoutSeconds = $readyTimeout; Running = $true }
         return @{ ProcessId = $procId; StartTime = $start; CommandLine = $cmd }
     }.GetNewClosure()
 
     $b.StopEgressProxy = {
         param([System.Collections.IDictionary] $P)
-        $procId = [int](& $AssertArg $P 'ProcessId' 'StopEgressProxy')
-        $start  = [string](& $GetArg $P 'StartTime')
-        $state.CallLog.Add(@{ Op = 'StopEgressProxy'; Path = [string]$procId; VMName = $null })
+        $procId  = [int](& $AssertArg $P 'ProcessId' 'StopEgressProxy')
+        $start   = [string](& $GetArg $P 'StartTime')
+        # The stop file and the timeout the real body uses, recorded on the process for a test to read.
+        $stop    = [string](& $GetArg $P 'StopFile')
+        $timeout = [int](& $GetArg $P 'TimeoutSeconds' 10)
+        $state.CallLog.Add(@{ Op = 'StopEgressProxy'; Path = [string]$procId; VMName = $null; StopFile = $stop; TimeoutSeconds = $timeout })
         & $egressFail 'StopEgressProxy'
         if (-not $state.EgressProcs.ContainsKey($procId) -or -not $state.EgressProcs[$procId].Running) {
             return @{ Stopped = $true; Killed = $false; AlreadyGone = $true }
@@ -4141,6 +4210,26 @@ function New-FakeHyperVBackend {
         foreach ($c in $vm.Checkpoints) { if ($c.Name -ne $snap) { $kept.Add($c) } }
         $vm.Checkpoints = $kept
     }.GetNewClosure()
+
+    # Every method call is also recorded with the argument keys it received (Op='Call', with Method,
+    # Keys and Args), so the parity test can prove the fake was handed exactly the manifest's keys and a
+    # consumer test can see what was passed. The wrapper keeps every return shape intact: it captures
+    # the inner result and re-wraps it once, because crossing its own `&` boundary unrolls one level
+    # (the same trap the single-comma returns above guard), and it emits nothing when the method emitted
+    # nothing, so an effect-only call still leaves the output stream clean.
+    foreach ($methodName in @($b.Keys)) {
+        if ($b[$methodName] -isnot [scriptblock]) { continue }
+        $inner = $b[$methodName]
+        $b[$methodName] = {
+            param([System.Collections.IDictionary] $P)
+            $keys = @()
+            if ($null -ne $P) { $keys = @($P.Keys | ForEach-Object { [string]$_ } | Sort-Object) }
+            # Path and VMName are present (null) like every other entry, so a filter on them stays StrictMode-safe.
+            $state.CallLog.Add(@{ Op = 'Call'; Method = $methodName; Keys = $keys; Args = $P; Path = $null; VMName = $null })
+            $r = & $inner $P
+            if ($null -ne $r) { return ,$r }
+        }.GetNewClosure()
+    }
 
     # TEST-ONLY introspection seam (NOT a backend method): expose the cross-cutting CALL LOG as a
     # NON-scriptblock key so the interface-parity test (which compares only scriptblock-valued keys)

@@ -97,6 +97,28 @@ Describe 'Get-VoidsealGoldenImage orchestration (fail-closed seams)' {
         # Hyper-V rejects a sparse differencing parent — the sparse flag MUST be cleared on the output.
         Should -Invoke Clear-SparseFlag -Times 1 -Exactly -ParameterFilter { $Path -like '*b.vhdx' }
     }
+
+    It 'removes the converted file when the sparse flag cannot be cleared, so the next run does not skip the fetch and reuse a sparse image' {
+        # Invoke-ConfinedQemu is mocked to produce the partial file the real convert would; Move-Item then
+        # really moves it into place, and Clear-SparseFlag fails as it would on a flag fsutil cannot clear.
+        Mock Invoke-ConfinedQemu { Set-Content -LiteralPath $Arguments[-1] -Value 'vhdx-bytes' -NoNewline; $global:LASTEXITCODE = 0 }
+        Mock Clear-SparseFlag { throw 'Get-VoidsealGoldenImage: could not clear the NTFS sparse flag (stub). Failing closed.' }
+        $out = Join-Path $TestDrive 'sparse-stuck.vhdx'
+        { Convert-QcowToVhdx -QcowPath (Join-Path $TestDrive 'a.qcow2') -OutputPath $out -QemuPath 'qemu-img' 6>$null } |
+            Should -Throw -ExpectedMessage '*could not clear the NTFS sparse flag*The converted file was removed*'
+        Test-Path -LiteralPath $out | Should -BeFalse -Because 'a sparse file left at the output path would be reused by the next run'
+        Test-GoldenImagePresent -OutputPath $out -Force:$false | Should -BeFalse -Because 'the next run must fetch and convert again'
+    }
+
+    It 'keeps the converted file when the sparse flag clears' {
+        Mock Invoke-ConfinedQemu { Set-Content -LiteralPath $Arguments[-1] -Value 'vhdx-bytes' -NoNewline; $global:LASTEXITCODE = 0 }
+        Mock Clear-SparseFlag {}
+        $out = Join-Path $TestDrive 'sparse-ok.vhdx'
+        Convert-QcowToVhdx -QcowPath (Join-Path $TestDrive 'a.qcow2') -OutputPath $out -QemuPath 'qemu-img' 6>$null | Should -Be $out
+        Test-Path -LiteralPath $out | Should -BeTrue
+        Should -Invoke Clear-SparseFlag -Times 1 -Exactly -ParameterFilter { $Path -eq $out }
+    }
+
     It 'fails closed on a non-zero convert exit code — no move, no sparse-clear' {
         Mock Invoke-ConfinedQemu { $global:LASTEXITCODE = 1 }
         Mock Move-Item {}

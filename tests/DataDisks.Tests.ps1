@@ -444,7 +444,8 @@ Describe 'Invoke-Voidseal data-disk preflight (refused before anything is provis
         { Invoke-Voidseal -Tier 0 -Profile $serial -Workload @{ DataDisks = @(& $script:Decl 'corpus') } `
             -Name 'sbx-dd-serial' -Backend $b } | Should -Throw -ExpectedMessage '*Serial*'
         (& $b.GetVM @{ Name = 'sbx-dd-serial' }) | Should -BeNullOrEmpty
-        @($b.FakeCallLog).Count | Should -Be 0 -Because 'nothing touched the backend'
+        @($b.FakeCallLog | Where-Object { $_.Op -ne 'Call' }).Count | Should -Be 0 -Because 'nothing changed on the backend'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'Call' -and $_.Method -notmatch '^(Get|Test)' }).Count | Should -Be 0 -Because 'only reads may precede the refusal'
     }
 
     It 'refuses an invalid -Workload.DataDisks declaration before any VM exists' {

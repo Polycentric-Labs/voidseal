@@ -229,6 +229,41 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
         }
     }
 
+    It 'BOTH factories name every documented arg key inside the method body (a key a body never names is silently dropped; AST-pinned)' {
+        # Until 2026-10-16 the fake accepted and dropped NewVM Path/NoVHD, StopVM TurnOff/Force, RemoveVM
+        # Force, SetMemory MinimumBytes/MaximumBytes, SetFirmware BootOrder, NewVHD Dynamic, NewSwitch
+        # NetAdapterName, StartEgressProxy ReadyTimeoutSeconds and StopEgressProxy StopFile/TimeoutSeconds.
+        $fakeFactoryAst = $script:RealFactoryAst.Parent.Parent.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'New-FakeHyperVBackend'
+        }, $true) | Select-Object -First 1
+        $fakeFactoryAst | Should -Not -BeNullOrEmpty
+        foreach ($factory in @(@{ Label = 'real'; Ast = $script:RealFactoryAst }, @{ Label = 'fake'; Ast = $fakeFactoryAst })) {
+            foreach ($name in $script:ExpectedMethods.Keys) {
+                $assign = $factory.Ast.FindAll({
+                    param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$b.' + $name)
+                }, $true) | Select-Object -First 1
+                $assign | Should -Not -BeNullOrEmpty -Because "the $($factory.Label) factory must define $name"
+                $literals = @($assign.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+                foreach ($key in @($script:ExpectedMethods[$name])) {
+                    $literals | Should -Contain $key -Because "the $($factory.Label) $name must read its documented arg '$key' (as `$GetArg/`$AssertArg/`$P lookups name it)"
+                }
+            }
+        }
+    }
+
+    It 'the FAKE records every passed key per call (Op=Call), and a call carrying the full manifest key set records exactly that set' {
+        $fake = New-FakeHyperVBackend
+        foreach ($name in $script:ExpectedMethods.Keys) {
+            $keys = @($script:ExpectedMethods[$name])
+            $allArgs = @{}
+            foreach ($k in $keys) { $allArgs[$k] = 'x' }
+            try { $null = & $fake[$name] $allArgs } catch { }   # the call may refuse the dummy values; the record precedes the body
+            $entry = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'Call' -and $_.Method -eq $name }) | Select-Object -Last 1
+            $entry | Should -Not -BeNullOrEmpty -Because "every $name call is recorded"
+            (@($entry.Keys) -join ',') | Should -Be (@($keys | Sort-Object) -join ',') -Because "$name recorded exactly the keys it was passed"
+        }
+    }
+
     It 'the FAKE actually consumes each method''s documented primary-identifier arg key (omitting it throws)' {
         # Arg-key drift guard with teeth: for every method, the manifest documents a
         # primary identifier ('Name' for VM/switch/VHD lifecycle, 'VMName' for ops on an
@@ -1369,10 +1404,20 @@ Describe 'Fake backend — disk operations' {
         { & $b.NewOutputVhdx @{ Path='C:\t\x.vhdx'; Label='OUTPUT'; FileSystem='ext4'; SizeBytes=64MB } } |
             Should -Throw -ExpectedMessage '*FileSystem*'
     }
-    It 'NewOutputVhdx (fake) rejects an over-length exFAT label (>15)' {
+    It 'NewOutputVhdx (fake) rejects an over-length exFAT label (>11, the real exFAT volume-label limit)' {
         $b = New-FakeHyperVBackend
-        { & $b.NewOutputVhdx @{ Path='C:\t\y.vhdx'; Label='THIS_LABEL_IS_WAY_TOO_LONG'; FileSystem='exFAT'; SizeBytes=64MB } } |
-            Should -Throw -ExpectedMessage '*abel*'
+        { & $b.NewOutputVhdx @{ Path='C:\t\y.vhdx'; Label='TWELVE_CHARS'; FileSystem='exFAT'; SizeBytes=64MB } } |
+            Should -Throw -ExpectedMessage '*Label*12 chars*exFAT maximum of 11*' -Because 'exFAT labels are 11 characters; the 15 the table once carried would pass a label live Format-Volume rejects'
+    }
+    It 'NewOutputVhdx (fake) accepts an 11-character exFAT label: VSD plus an 8-character data-disk name' {
+        $b = New-FakeHyperVBackend
+        $label = 'VSD' + 'abcdefgh'
+        $label.Length | Should -Be 11
+        { & $b.NewOutputVhdx @{ Path='C:\t\vsd.vhdx'; Label=$label; FileSystem='exFAT'; SizeBytes=64MB } } | Should -Not -Throw
+        (& $b.GetVHDInfo @{ Path='C:\t\vsd.vhdx' }).Label | Should -Be $label
+        foreach ($shipped in 'INPUT', 'OUTPUT', 'CIDATA', 'VERDICT') {
+            (& $script:SbValidateVhdxFormat 'exFAT' $shipped) | Should -Be 'exFAT' -Because "the shipped label $shipped must still fit"
+        }
     }
     It 'NewOutputVhdx (fake) accepts a valid lowercase exfat (normalized)' {
         $b = New-FakeHyperVBackend
@@ -1824,10 +1869,33 @@ namespace Microsoft.HyperV.PowerShell {
         (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
     }
 
-    It 'still classifies generic permission phrasing from any exception layer as unavailable (existing behavior preserved)' {
+    It 'still classifies generic permission phrasing that names Hyper-V as unavailable (existing behavior preserved)' {
         $ex = New-Object System.Exception('Access is denied. Run as Administrator or join Hyper-V Administrators.')
         $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
         (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
+    }
+
+    It 'classifies "Access is denied" from a Hyper-V-shaped cmdlet as unavailable, but NOT the same words from a plain file operation' {
+        function Get-VMDeniedZz9 {
+            [CmdletBinding()] param()
+            $PSCmdlet.ThrowTerminatingError([System.Management.Automation.ErrorRecord]::new(
+                [System.UnauthorizedAccessException]::new('Access is denied.'), 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null))
+        }
+        function Copy-ThingZz9 {
+            [CmdletBinding()] param()
+            $PSCmdlet.ThrowTerminatingError([System.Management.Automation.ErrorRecord]::new(
+                [System.UnauthorizedAccessException]::new("Access to the path 'C:\s\deps.vhdx' is denied."), 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null))
+        }
+        $fromHyperV = $null; $fromFileOp = $null
+        try { Get-VMDeniedZz9 } catch { $fromHyperV = $_ }
+        try { Copy-ThingZz9 } catch { $fromFileOp = $_ }
+        $fromHyperV.InvocationInfo.MyCommand.Name | Should -Be 'Get-VMDeniedZz9'
+        (& $script:SbIsUnavailableError $fromHyperV) | Should -BeTrue -Because 'a Hyper-V cmdlet refusing for permissions is the elevation / Hyper-V Administrators case'
+        (& $script:SbIsUnavailableError $fromFileOp) | Should -BeFalse -Because 'an ACL problem on a file must keep its own message, not become the "run elevated or join Hyper-V Administrators" advice'
+        # A plain string throw (no command behind it) with the same words is not rebranded either.
+        $plain = $null
+        try { throw 'GetVhdxImageHash: access denied ("Access to the path is denied."). Failing closed.' } catch { $plain = $_ }
+        (& $script:SbIsUnavailableError $plain) | Should -BeFalse
     }
 
     It 'still returns $false for an arbitrary unrelated exception (existing behavior preserved)' {
@@ -1862,6 +1930,35 @@ Describe 'Fake backend — switch + network adapter' {
         # Capture outside Should -Not -Throw (child-scope assignment caveat).
         $sw = & $script:B.GetSwitch @{ Name = 'ghost' }
         $sw | Should -BeNullOrEmpty
+    }
+
+    It 'NewSwitch External REQUIRES NetAdapterName like the real body, and records it; Internal does not need one' {
+        { & $script:B.NewSwitch @{ Name = 'ext-none'; SwitchType = 'External' } } |
+            Should -Throw -ExpectedMessage "*NewSwitch(External): required argument 'NetAdapterName' is missing*"
+        (& $script:B.GetSwitch @{ Name = 'ext-none' }) | Should -BeNullOrEmpty -Because 'the refused switch was not recorded'
+        & $script:B.NewSwitch @{ Name = 'ext-ok'; SwitchType = 'External'; NetAdapterName = 'Ethernet' }
+        (& $script:B.GetSwitch @{ Name = 'ext-ok' }).NetAdapterName | Should -Be 'Ethernet'
+        & $script:B.NewSwitch @{ Name = 'int-ok'; SwitchType = 'Internal' }
+        (& $script:B.GetSwitch @{ Name = 'int-ok' }).NetAdapterName | Should -BeNullOrEmpty
+    }
+
+    It 'the fake records the keys the other once-dropped args arrive with: NewVM Path/NoVHD, SetMemory bounds, SetFirmware BootOrder, NewVHD Dynamic, StopEgressProxy StopFile/TimeoutSeconds' {
+        & $script:B.NewVM @{ Name = 'vm2'; Generation = 2; Path = 'C:\vms'; NoVHD = $true }
+        $vm2 = & $script:B.GetVM @{ Name = 'vm2' }
+        $vm2.Path  | Should -Be 'C:\vms'
+        $vm2.NoVHD | Should -BeTrue
+        & $script:B.SetMemory @{ VMName = 'vm2'; StartupBytes = 2GB; DynamicMemoryEnabled = $true; MinimumBytes = 1GB; MaximumBytes = 4GB }
+        $vm2.MemoryMinimumBytes | Should -Be 1GB
+        $vm2.MemoryMaximumBytes | Should -Be 4GB
+        & $script:B.SetFirmware @{ VMName = 'vm2'; EnableSecureBoot = $true; BootOrder = @('disk', 'net') }
+        @($vm2.BootOrder) | Should -Be @('disk', 'net')
+        & $script:B.NewVHD @{ Path = 'C:\vhd\fixed.vhdx'; SizeBytes = 1GB; Dynamic = $false }
+        $rec = & $script:B.GetVHDInfo @{ Path = 'C:\vhd\fixed.vhdx' }
+        $rec | Should -Not -BeNullOrEmpty
+        $removed = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'Call' -and $_.Method -eq 'NewVHD' })
+        $removed[-1].Keys | Should -Contain 'Dynamic'
+        & $script:B.RemoveVM @{ Name = 'vm2'; Force = $false }
+        (@($script:B.FakeCallLog | Where-Object { $_.Op -eq 'RemoveVM' })[-1]).Force | Should -BeFalse
     }
 
     It 'NewVM without a SwitchName still creates ONE unconnected adapter (real New-VM always does)' {
@@ -2632,6 +2729,41 @@ Describe 'Real backend — ReadVhdxRawRegion rides out a transient detach settle
             Should -Throw -ExpectedMessage '*malformed image*'
         $script:lockCalls | Should -Be 1 -Because 'a malformed-image error is not transient; retrying would mask the real cause'
     }
+
+    It 'does NOT retry an access-denied error: it fails at once with a permissions message, never "still locked"' -ForEach @(
+        @{ Msg = 'Access to the path ''C:\s\out.vhdx'' is denied.' }
+        @{ Msg = 'qemu-img: Could not open ''C:\s\out.vhdx'': Permission denied' }
+        @{ Msg = 'Access is denied.' }
+    ) {
+        $script:lockCalls = 0
+        $script:deniedMsg = $Msg   # script-scoped: a closure would carry its own module scope for $script: (the I5a lesson)
+        $op = { $script:lockCalls++; throw $script:deniedMsg }
+        $err = $null
+        try { & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 5 -DelayMilliseconds 1 -Context 'GetVhdxImageHash' } catch { $err = $_.Exception.Message }
+        $script:lockCalls | Should -Be 1 -Because 'an ACL problem does not clear with time; five retries would only delay the real cause'
+        $err | Should -Match '^GetVhdxImageHash: access denied'
+        $err | Should -Match 'not a transient lock'
+        $err | Should -Not -Match 'still locked'
+    }
+
+    It 'the five Mount-VHD sites ride the lock-retry too (WriteVhdxFile, ReadVhdxFile, WriteVhdxFileBytes, ReadVhdxFileBytes, CopyDirectoryToVhdx; AST-pinned)' {
+        foreach ($method in 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'CopyDirectoryToVhdx') {
+            $assign = & $script:GetRealBackendAssign $method
+            $assign | Should -Not -BeNullOrEmpty
+            $mounts = @(& $script:PinFindCommand $assign 'Mount-VHD')
+            $mounts.Count | Should -Be 1 -Because "$method mounts the VHDX exactly once"
+            # Walk up from the Mount-VHD call: an ancestor must be `& $LockRetry ... -Operation { ... }`.
+            $node = $mounts[0].Parent
+            $wrapped = $false
+            while ($null -ne $node) {
+                if ($node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                    $node.CommandElements[0].VariablePath.UserPath -eq 'LockRetry') { $wrapped = $true; break }
+                $node = $node.Parent
+            }
+            $wrapped | Should -BeTrue -Because "$method's first Mount-VHD after a detach can hit the RC8 settle-lag sharing violation like the copies and the hash do"
+        }
+    }
 }
 
 # ===========================================================================
@@ -3231,6 +3363,29 @@ Describe 'Resolve-QemuImg (I5 version-floor + SHA-256 pin)' {
         Mock Get-FileSha256     { 'should-not-be-called' }
         Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
         Should -Invoke Get-FileSha256 -Times 0
+    }
+    It 'refuses a .cmd or .bat shim on PATH without running it (a shim runs through cmd.exe and can rewrite the arguments)' -ForEach @(
+        @{ Shim = 'C:\tools\qemu-img.cmd' }, @{ Shim = 'C:\tools\qemu-img.bat' }, @{ Shim = 'C:\tools\qemu-img.ps1' }
+    ) {
+        Mock Get-QemuImgPath    { $Shim }.GetNewClosure()
+        Mock Get-QemuImgVersion { throw 'the shim must not be executed' }
+        Mock Get-FileSha256     { 'a' * 64 }
+        { Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a' * 64) } | Should -Throw -ExpectedMessage '*script shim rather than a binary*'
+        Should -Invoke Get-QemuImgVersion -Times 0
+    }
+    It 'compares the pin BEFORE running --version: a mismatched binary is never executed' {
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256     { 'deadbeef' }
+        Mock Get-QemuImgVersion { throw 'an unpinned binary must not run, not even for --version' }
+        { Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a' * 64) } | Should -Throw -ExpectedMessage '*hash mismatch*'
+        Should -Invoke Get-QemuImgVersion -Times 0
+        Should -Invoke Get-FileSha256 -Times 1 -Exactly
+    }
+    It 'with a matching pin the version floor is still enforced afterwards' {
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256     { 'a' * 64 }
+        Mock Get-QemuImgVersion { '1.7.0' }
+        { Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a' * 64) } | Should -Throw -ExpectedMessage '*below the required floor*'
     }
 }
 

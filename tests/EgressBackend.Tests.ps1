@@ -169,10 +169,15 @@ Describe 'Host egress backend methods: the fake' {
     }
 
     It 'StartEgressProxy records a running process without starting Python, and StopEgressProxy stops exactly it' {
-        $r = & $script:B.StartEgressProxy @{ PythonExe = 'C:\py\python.exe'; ScriptPath = $script:ProxyScript; Arguments = @('--listen-host', '10.231.0.1', $null); ReadyFile = 'C:\x\ready.json' }
+        $r = & $script:B.StartEgressProxy @{ PythonExe = 'C:\py\python.exe'; ScriptPath = $script:ProxyScript; Arguments = @('--listen-host', '10.231.0.1', $null); ReadyFile = 'C:\x\ready.json'; ReadyTimeoutSeconds = 7 }
         $r.ProcessId | Should -BeGreaterThan 0
         $r.CommandLine | Should -Be ('"C:\py\python.exe" "' + $script:ProxyScript + '" "--listen-host" "10.231.0.1"')
         $script:B.FakeEgressProcesses[$r.ProcessId].Running | Should -BeTrue
+        $script:B.FakeEgressProcesses[$r.ProcessId].ReadyTimeoutSeconds | Should -Be 7 -Because 'the fake reads the ready timeout like the real body'
+        $null = & $script:B.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = 'not-it'; StopFile = 'C:\x\stop'; TimeoutSeconds = 3 }
+        $stopEntry = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'StopEgressProxy' })[-1]
+        $stopEntry.StopFile       | Should -Be 'C:\x\stop'
+        $stopEntry.TimeoutSeconds | Should -Be 3
         (& $script:B.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = 'not-it' }).AlreadyGone | Should -BeTrue
         $script:B.FakeEgressProcesses[$r.ProcessId].Running | Should -BeTrue -Because 'a start-time mismatch means the id is not ours'
         (& $script:B.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = $r.StartTime }).AlreadyGone | Should -BeFalse
