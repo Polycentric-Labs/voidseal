@@ -491,7 +491,9 @@ function Dismount-SandboxAsset {
          a defensive detach of whatever DVD the host actually shows attached),
       2. detach every transfer VHD recorded on the descriptor (scripted — NOT inherently one-way),
       3. for a NoAdapter VM (Tier 0, Tier >= 2, any processor; Get-SealNicPolicy): RemoveNetworkAdapter
-         (remove, not disconnect; real New-VM always creates one adapter, so there is always one to remove),
+         (remove, not disconnect; real New-VM always creates one adapter, so there is always one to remove);
+         for an IsolatedInternalSwitch VM: SetNetworkAdapterGuards on the kept adapter (MAC address
+         spoofing Off, DHCP guard On, router guard On), which Assert-Sealed reads back,
       4. turn OFF every host<->guest channel (clipboard / shares / guest-services / enhanced-session /
          time sync / key-value exchange / backup / heartbeat),
       5. set the descriptor State = 'Sealed'.
@@ -581,6 +583,15 @@ function Lock-Sandbox {
         $null = & $Backend.RemoveNetworkAdapter @{ VMName = $vmName }
     }
 
+    # --- 3a. IsolatedInternalSwitch: guard the kept adapter ----------------
+    # MAC address spoofing Off, DHCP guard On, router guard On (Set-VMNetworkAdapter, through the seam). The
+    # guest then cannot change its source MAC, answer DHCP or advertise routes on the switch: defense in depth
+    # under the host enforcement installed next, and gate-verified (Assert-Sealed reads all three back).
+    # Only the IsolatedInternalSwitch VM has an adapter left to guard.
+    if ($lockNicPolicy -eq 'IsolatedInternalSwitch') {
+        $null = & $Backend.SetNetworkAdapterGuards @{ VMName = $vmName; MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = 'On' }
+    }
+
     # --- 3b. HostProxy: install the host side of egress before the gate reads it ---
     # A VM that keeps its NIC and records EgressMode='HostProxy' gets its gateway address, host firewall
     # rules and port ACL now (Install-SandboxEgressNetwork, HostEgress.ps1), each recorded on the
@@ -634,7 +645,9 @@ function Lock-Sandbox {
         closes that gap (SHIPPED, mock-green). The name match is English-locale only; a GUID-based
         refusal that also covers LOCALIZED (non-English) Default-Switch names is Phase-6-live (see
         SECURITY.md). This is a switch-ISOLATION guarantee only — egress FILTERING is a separate,
-        still-Phase-6-live layer.
+        still-Phase-6-live layer. The kept adapter's guards are read back too (GetNetworkAdapterGuards):
+        MacAddressSpoofing must be Off, DhcpGuard On and RouterGuard On, exactly; a read that throws
+        (including an adapter count other than one) refuses.
       * NO passthrough device at any tier: GetGpuPartitionAdapters and GetAssignableDevices must both
         report none (a read that throws or returns no collection is a refusal).
       * NO path on COM2 at any tier (GetComPort Number=2). Voidseal wires only COM1; a read that throws
@@ -858,6 +871,29 @@ function Assert-Sealed {
                 throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because its NIC is on switch " +
                        "'$switchName', not this VM's own recorded switch '$recordedSwitch'. An Internal switch built " +
                        "for another sandbox, or one the host routes or NATs, is not this VM's isolated switch. Fail closed.")
+            }
+        }
+
+        # The kept adapter's guards, read back from the host (Lock-Sandbox set them): MAC address spoofing
+        # Off, DHCP guard On, router guard On, exactly. A read that throws, a read that returns nothing and
+        # any other value refuse; the guards were set outside the tool or the set did not take.
+        $guards = $null
+        try { $guards = & $Backend.GetNetworkAdapterGuards @{ VMName = $vmName } }
+        catch {
+            throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because its network adapter guards " +
+                   "could not be read ($($_.Exception.Message)). Fail closed.")
+        }
+        if ($null -eq $guards) {
+            throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because the network adapter guard " +
+                   "read returned nothing. Fail closed.")
+        }
+        foreach ($want in @(@{ Name = 'MacAddressSpoofing'; Value = 'Off' }, @{ Name = 'DhcpGuard'; Value = 'On' }, @{ Name = 'RouterGuard'; Value = 'On' })) {
+            $got = [string](Get-DescriptorField -Descriptor $guards -Name $want.Name -Default '')
+            if ($got -cne $want.Value) {
+                $shownGuard = if ([string]::IsNullOrWhiteSpace($got)) { '(unreadable)' } else { $got }
+                throw ("Assert-Sealed: REFUSING to certify Tier-1 VM '$vmName' SEALED because its network adapter reports " +
+                       "$($want.Name)='$shownGuard', not '$($want.Value)'. Lock-Sandbox sets MAC address spoofing Off, DHCP guard On " +
+                       "and router guard On on the kept adapter; this value was changed outside the tool or the set did not take. Fail closed.")
             }
         }
 

@@ -318,6 +318,15 @@ function Get-HyperVBackendMethodManifest {
         ConnectNetworkAdapter= @('VMName', 'SwitchName')
         RemoveNetworkAdapter = @('VMName')                         # the SEAL operation
         GetNetworkAdapter    = @('VMName')                         # -> @() of NIC records
+        # Guards on the kept adapter (2026-10-16): Set-VMNetworkAdapter -MacAddressSpoofing / -DhcpGuard /
+        # -RouterGuard. Lock-Sandbox sets Off / On / On for an IsolatedInternalSwitch VM and Assert-Sealed
+        # reads them back, so the guest cannot change its source MAC, answer DHCP or advertise routes on
+        # the switch (defense in depth under the host egress enforcement). Values are the strings 'On'
+        # and 'Off', as the cmdlet's OnOffState enum renders; both factories reject anything else. The
+        # read throws unless the VM has exactly one adapter, so the gate never certifies an ambiguous
+        # read. Both real bodies are pinned out of process by Invoke-RealSealDeviceCapture.ps1.
+        SetNetworkAdapterGuards = @('VMName', 'MacAddressSpoofing', 'DhcpGuard', 'RouterGuard')
+        GetNetworkAdapterGuards = @('VMName')                      # -> @{ MacAddressSpoofing; DhcpGuard; RouterGuard } ('On'|'Off')
 
         # ---- passthrough devices (SEAL/GATE surface) ----
         # Host-TRUTH reads of devices that bypass the virtual NIC entirely: GPU partition adapters
@@ -588,6 +597,19 @@ $script:SbInvokeWithLockRetry = {
     }
 }
 
+# Validate the three adapter-guard values EARLY and IDENTICALLY in BOTH factories: real
+# Set-VMNetworkAdapter binds them to its OnOffState enum, which accepts exactly 'On' and 'Off', so a
+# fake that recorded any other text would pass a value the live cmdlet rejects.
+$script:SbAssertGuardValues = {
+    param([System.Collections.IDictionary] $Values, [string] $Method)
+    foreach ($guard in 'MacAddressSpoofing', 'DhcpGuard', 'RouterGuard') {
+        $v = [string]$Values[$guard]
+        if ($v -cne 'On' -and $v -cne 'Off') {
+            throw "${Method}: $guard must be 'On' or 'Off' (got '$v'); real Set-VMNetworkAdapter accepts nothing else."
+        }
+    }
+}
+
 # Validate a NewOutputVhdx FileSystem + Label EARLY and IDENTICALLY in BOTH factories
 # (the fake≠real divergence guard). A bad FileSystem (e.g. 'ext4') or an over-length Label
 # is recorded VERBATIM by the fake (test green) yet FAILS live on Format-Volume — so both
@@ -842,6 +864,7 @@ function New-RealHyperVBackend {
     $ResolveVol    = $script:SbResolveVolumeLetter
     $FirmwareRetry = $script:SbInvokeFirmwareWithRetry   # RC5: Secure-Boot template-enumeration retry
     $LockRetry     = $script:SbInvokeWithLockRetry       # RC8: detach settle-lag sharing-violation retry
+    $GuardValues   = $script:SbAssertGuardValues         # adapter guards: 'On' / 'Off' only, in both factories
     $unavailPrefix = $script:HyperVUnavailablePrefix
     # I5a fix: same closure-capture rule as every other value here — a $script: READ inside a
     # .GetNewClosure()'d body does NOT resolve to the top-level script scope (it comes back empty/
@@ -1958,6 +1981,44 @@ function New-RealHyperVBackend {
         return ,@(& $InvokeOp { Get-VMNetworkAdapter -VMName $vm -ErrorAction Stop })
     }.GetNewClosure()
 
+    # Guards on the VM's adapter(s): Set-VMNetworkAdapter -VMName applies to every adapter the VM has
+    # (production has exactly one). The three values are validated here, before the cmdlet, with the same
+    # rule the fake applies, so a value the OnOffState enum would reject fails identically on both.
+    $b.SetNetworkAdapterGuards = {
+        param([System.Collections.IDictionary] $P)
+        $vm    = & $AssertArg $P 'VMName'             'SetNetworkAdapterGuards'
+        $spoof = [string](& $AssertArg $P 'MacAddressSpoofing' 'SetNetworkAdapterGuards')
+        $dhcp  = [string](& $AssertArg $P 'DhcpGuard'          'SetNetworkAdapterGuards')
+        $rtr   = [string](& $AssertArg $P 'RouterGuard'        'SetNetworkAdapterGuards')
+        & $GuardValues @{ MacAddressSpoofing = $spoof; DhcpGuard = $dhcp; RouterGuard = $rtr } 'HyperVBackend.SetNetworkAdapterGuards'
+        & $InvokeOp {
+            Set-VMNetworkAdapter -VMName $vm -MacAddressSpoofing $spoof -DhcpGuard $dhcp -RouterGuard $rtr -ErrorAction Stop
+        }
+    }.GetNewClosure()
+
+    # Host-truth read of the guards for the seal gate. FAIL-CLOSED: an adapter count other than one throws
+    # (the gate must not pick one of several), and a guard the adapter does not report, or reports blank,
+    # throws rather than reading as Off. Each value is the OnOffState enum rendered as text ('On' / 'Off').
+    $b.GetNetworkAdapterGuards = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $AssertArg $P 'VMName' 'GetNetworkAdapterGuards'
+        & $InvokeOp {
+            $nics = @(Get-VMNetworkAdapter -VMName $vm -ErrorAction Stop)
+            if ($nics.Count -ne 1) {
+                throw "HyperVBackend.GetNetworkAdapterGuards: expected exactly one network adapter on '$vm', found $($nics.Count). Fail closed."
+            }
+            $out = @{}
+            foreach ($guard in 'MacAddressSpoofing', 'DhcpGuard', 'RouterGuard') {
+                $prop = $nics[0].PSObject.Properties[$guard]
+                if ($null -eq $prop -or [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+                    throw "HyperVBackend.GetNetworkAdapterGuards: the adapter on '$vm' reports no $guard value. Fail closed."
+                }
+                $out[$guard] = [string]$prop.Value
+            }
+            $out
+        }
+    }.GetNewClosure()
+
     # ---- passthrough devices (SEAL/GATE surface) -------------------------
     # Host-truth reads for Assert-Sealed's passthrough refusal. Unary-comma wrap at the OUTERMOST return
     # (see GetNetworkAdapter) so a single device keeps .Count = 1. The gate reads ONLY .Count, never the
@@ -2389,6 +2450,11 @@ $script:SbCopyFakeVM = {
     A named-pipe path NewVM records on every new VM's COM2, modeling a second serial channel wired
     outside the tool. Default: none, matching real Hyper-V, where a new Gen2 VM's COM2 has an empty path
     (GetComPort then returns $null).
+.PARAMETER SimulateAdapterGuardsStuck
+    Make SetNetworkAdapterGuards a no-op: the adapter keeps the guard values it had (Hyper-V's defaults
+    on a new adapter are MacAddressSpoofing Off, DhcpGuard Off, RouterGuard Off), so GetNetworkAdapterGuards
+    still reads them after Lock-Sandbox. Models a Set-VMNetworkAdapter that failed quietly or was undone
+    outside the tool, so a test can prove Assert-Sealed reads host truth instead of trusting the seal's call.
 .PARAMETER SimulateAutomaticCheckpointsStuckOn
     Make SetAutomaticCheckpoints with Enabled=$false a no-op, so the Hyper-V default (ON) survives the
     Provisioner's RC7 call and GetAutomaticCheckpoints still reads $true. Models a setting that did not
@@ -2538,6 +2604,7 @@ function New-FakeHyperVBackend {
         [switch] $SimulateChannelReadError,
         [string[]] $SimulateChannelStuckOn = @(),
         [string] $SimulateCom2Path,
+        [switch] $SimulateAdapterGuardsStuck,
         [switch] $SimulateAutomaticCheckpointsStuckOn,
         [switch] $SimulateCheckpointPresent,
         [switch] $SimulateGuestCommandFailure,
@@ -2579,7 +2646,15 @@ function New-FakeHyperVBackend {
     $AssertArg    = $script:SbAssertArg
     $CopyVM       = $script:SbCopyFakeVM
     $ValidateFmt  = $script:SbValidateVhdxFormat
+    $GuardValues  = $script:SbAssertGuardValues
     $channelNames = $script:HostChannelNames
+    # Captured by the SetNetworkAdapterGuards closure: the set does not take (see param help).
+    $guardsStuck  = $SimulateAdapterGuardsStuck.IsPresent
+    # Hyper-V's defaults for a new adapter's guards; every adapter record the fake creates starts here.
+    $newAdapter = {
+        param([string] $SwitchName)
+        return @{ SwitchName = $SwitchName; Name = 'Network Adapter'; MacAddressSpoofing = 'Off'; DhcpGuard = 'Off'; RouterGuard = 'Off' }
+    }
     # Captured by the GetHostChannels closure to simulate an unreadable channel (see param help).
     $channelReadThrows = $SimulateChannelReadError.IsPresent
     # Captured by the SetHostChannel closure: channels whose disable does not take (see param help).
@@ -2791,7 +2866,7 @@ function New-FakeHyperVBackend {
         # adapter without a SwitchName, so a Tier-0 VM had zero NICs here and one on real Hyper-V, and every
         # no-NIC seal check passed on the fake alone.
         $sw = & $GetArg $P 'SwitchName'
-        $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
+        $vm.NetworkAdapters.Add((& $newAdapter $sw))
         if (-not [string]::IsNullOrWhiteSpace($com2Seed)) { $vm.ComPorts[2] = $com2Seed }
         if ($seedCheckpoint) { $vm.Checkpoints.Add(@{ Name = 'external-checkpoint'; Snapshot = (& $CopyVM $vm) }) }
         $state.VMs[$name] = $vm
@@ -3644,7 +3719,7 @@ function New-FakeHyperVBackend {
             foreach ($nic in $vm.NetworkAdapters) { $nic['SwitchName'] = $sw }
         }
         else {
-            $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
+            $vm.NetworkAdapters.Add((& $newAdapter $sw))
         }
     }.GetNewClosure()
 
@@ -3670,6 +3745,42 @@ function New-FakeHyperVBackend {
         # VM has exactly one NIC (and to $null when empty), so an unwrapped caller's `.Count`
         # would read the hashtable's key-count (or fail on $null). `,@(...)` keeps it an array.
         return ,@($vm.NetworkAdapters)
+    }.GetNewClosure()
+
+    # Guards on every adapter of the VM (real Set-VMNetworkAdapter -VMName does the same). Validated with
+    # the shared helper BEFORE any record changes, so a rejected call leaves the adapters untouched; a VM
+    # with no adapter is a no-op, as the real cmdlet has nothing to set. -SimulateAdapterGuardsStuck
+    # leaves the recorded values alone, so the gate's host-truth read can be proven to catch it.
+    $b.SetNetworkAdapterGuards = {
+        param([System.Collections.IDictionary] $P)
+        $vm    = & $requireVM (& $GetArg $P 'VMName') 'SetNetworkAdapterGuards'
+        $spoof = [string](& $AssertArg $P 'MacAddressSpoofing' 'SetNetworkAdapterGuards')
+        $dhcp  = [string](& $AssertArg $P 'DhcpGuard'          'SetNetworkAdapterGuards')
+        $rtr   = [string](& $AssertArg $P 'RouterGuard'        'SetNetworkAdapterGuards')
+        & $GuardValues @{ MacAddressSpoofing = $spoof; DhcpGuard = $dhcp; RouterGuard = $rtr } 'HyperVBackend(fake).SetNetworkAdapterGuards'
+        $state.CallLog.Add(@{ Op = 'SetNetworkAdapterGuards'; Path = "$spoof/$dhcp/$rtr"; VMName = $vm.Name })
+        if ($guardsStuck) { return }
+        foreach ($nic in $vm.NetworkAdapters) {
+            $nic['MacAddressSpoofing'] = $spoof; $nic['DhcpGuard'] = $dhcp; $nic['RouterGuard'] = $rtr
+        }
+    }.GetNewClosure()
+
+    # The guards of the VM's one adapter, as the real read returns them. An adapter a test added by hand
+    # (without guard keys) reads Hyper-V's defaults, Off for all three, exactly as a real adapter added
+    # outside the tool would. Zero or several adapters throw, like the real body.
+    $b.GetNetworkAdapterGuards = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $requireVM (& $GetArg $P 'VMName') 'GetNetworkAdapterGuards'
+        $state.CallLog.Add(@{ Op = 'GetNetworkAdapterGuards'; Path = $null; VMName = $vm.Name })
+        if ($vm.NetworkAdapters.Count -ne 1) {
+            throw "HyperVBackend(fake).GetNetworkAdapterGuards: expected exactly one network adapter on '$($vm.Name)', found $($vm.NetworkAdapters.Count). Fail closed."
+        }
+        $nic = $vm.NetworkAdapters[0]
+        $out = @{}
+        foreach ($guard in 'MacAddressSpoofing', 'DhcpGuard', 'RouterGuard') {
+            $out[$guard] = if ($nic.Contains($guard)) { [string]$nic[$guard] } else { 'Off' }
+        }
+        return $out
     }.GetNewClosure()
 
     # ---- passthrough devices (SEAL/GATE surface) ----

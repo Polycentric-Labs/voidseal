@@ -317,6 +317,26 @@ Describe 'Lock-Sandbox — a Tier-1 net-restricted seal keeps the NIC but still 
         (& $script:B.GetHostChannels @{ VMName = 'sbx-seal1' }).EnhancedSession | Should -BeFalse
         $script:Desc.State | Should -Be 'Sealed'
     }
+
+    It 'guards the kept adapter: MAC address spoofing Off, DHCP guard On, router guard On (host-readable after the seal)' {
+        $before = & $script:B.GetNetworkAdapterGuards @{ VMName = 'sbx-seal1' }
+        $before.DhcpGuard | Should -Be 'Off' -Because 'precondition: a new adapter carries Hyper-V defaults, all Off'
+        Lock-Sandbox -Descriptor $script:Desc -Backend $script:B
+        $g = & $script:B.GetNetworkAdapterGuards @{ VMName = 'sbx-seal1' }
+        $g.MacAddressSpoofing | Should -Be 'Off'
+        $g.DhcpGuard          | Should -Be 'On'
+        $g.RouterGuard        | Should -Be 'On'
+        $set = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'SetNetworkAdapterGuards' })
+        $set.Count | Should -Be 1
+        $set[0].Path | Should -Be 'Off/On/On'
+    }
+
+    It 'does NOT set adapter guards for a NoAdapter VM (Tier 2 removes the adapter instead)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier2 -Name 'sbx-seal2-noguard'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'SetNetworkAdapterGuards' }).Count | Should -Be 0 -Because 'there is no adapter left to guard'
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' }).Count | Should -Be 1
+    }
 }
 
 # ===========================================================================
@@ -1781,5 +1801,64 @@ Describe 'Assert-Sealed: refuses a VM that is not Off at gate time' {
         & $sb.Backend.StartVM @{ Name = 'sbx-state-order' }
         $sb.Desc.Network = ''   # would refuse with the no-posture message if it were reached first
         { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } | Should -Throw -ExpectedMessage "*State is 'Running', not Off*"
+    }
+}
+
+# ===========================================================================
+#  Assert-Sealed reads the kept adapter's guards back (IsolatedInternalSwitch only)
+# ===========================================================================
+Describe 'Assert-Sealed: the Tier-1 adapter guards are host-verified (MacAddressSpoofing Off, DhcpGuard On, RouterGuard On)' {
+
+    It 'certifies when the guards read exactly Off / On / On, and reads them through the backend' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-guard-ok'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'GetNetworkAdapterGuards' }).Count | Should -BeGreaterOrEqual 1
+    }
+
+    It 'REFUSES when the seal''s set did not take (host truth, not the seal''s own call)' {
+        $b = New-FakeHyperVBackend -SimulateAdapterGuardsStuck
+        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-guard-stuck' -Backend $b
+        Lock-Sandbox -Descriptor $d -Backend $b
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'SetNetworkAdapterGuards' }).Count | Should -Be 1 -Because 'the seal did call the set'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*'sbx-guard-stuck' SEALED because its network adapter reports DhcpGuard='Off', not 'On'*"
+    }
+
+    It 'REFUSES each guard changed after the seal' -ForEach @(
+        @{ Guards = @{ MacAddressSpoofing = 'On';  DhcpGuard = 'On';  RouterGuard = 'On' };  Expect = "MacAddressSpoofing='On', not 'Off'" }
+        @{ Guards = @{ MacAddressSpoofing = 'Off'; DhcpGuard = 'Off'; RouterGuard = 'On' };  Expect = "DhcpGuard='Off', not 'On'" }
+        @{ Guards = @{ MacAddressSpoofing = 'Off'; DhcpGuard = 'On';  RouterGuard = 'Off' }; Expect = "RouterGuard='Off', not 'On'" }
+    ) {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-guard-changed'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $args = @{ VMName = 'sbx-guard-changed' } + $Guards
+        & $sb.Backend.SetNetworkAdapterGuards $args
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } | Should -Throw -ExpectedMessage "*$Expect*"
+    }
+
+    It 'REFUSES when the guard read throws or returns nothing' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-guard-read'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $b2 = $sb.Backend.Clone(); $b2.GetNetworkAdapterGuards = { param($P) throw 'stub: adapter query failed' }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $b2 } |
+            Should -Throw -ExpectedMessage "*network adapter guards could not be read (stub: adapter query failed)*"
+        $b3 = $sb.Backend.Clone(); $b3.GetNetworkAdapterGuards = { param($P) $null }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $b3 } |
+            Should -Throw -ExpectedMessage '*network adapter guard read returned nothing*'
+    }
+
+    It 'REFUSES a guard value the read cannot interpret (a blank), naming it unreadable' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-guard-blank'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $b2 = $sb.Backend.Clone(); $b2.GetNetworkAdapterGuards = { param($P) @{ MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = '' } }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $b2 } | Should -Throw -ExpectedMessage "*RouterGuard='(unreadable)', not 'On'*"
+    }
+
+    It 'does not read adapter guards for a NoAdapter VM (nothing to read; the adapter is gone)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier2 -Name 'sbx-guard-t2'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'GetNetworkAdapterGuards' }).Count | Should -Be 0
     }
 }

@@ -137,6 +137,8 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'ReadVhdxRawRegion', 'GetVhdxImageHash', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
             # switch / network
             'NewSwitch', 'GetSwitch', 'RemoveSwitch', 'ConnectNetworkAdapter', 'RemoveNetworkAdapter', 'GetNetworkAdapter'
+            # adapter guards (the Tier-1 seal sets them, the gate reads them back)
+            'SetNetworkAdapterGuards', 'GetNetworkAdapterGuards'
             # passthrough devices (the seal gate's passthrough refusal)
             'GetGpuPartitionAdapters', 'GetAssignableDevices'
             # checkpoint
@@ -248,6 +250,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             AddHardDiskDrive = 'VMName'; RemoveHardDiskDrive = 'VMName'; SetDvdDrive = 'VMName'; RemoveDvdDrive = 'VMName'; GetDvdDrives = 'VMName'
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
+            SetNetworkAdapterGuards = 'VMName'; GetNetworkAdapterGuards = 'VMName'
             GetGpuPartitionAdapters = 'VMName'; GetAssignableDevices = 'VMName'
             AddSwitchHostIPAddress = 'SwitchName'; RemoveSwitchHostIPAddress = 'SwitchName'
             NewHostFirewallRule = 'Name'; GetHostFirewallRule = 'Name'; RemoveHostFirewallRule = 'Name'; GetHostFirewallRuleNames = 'NamePrefix'
@@ -1911,6 +1914,55 @@ Describe 'Fake backend — switch + network adapter' {
         & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
         (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' }).Count | Should -Be 0 -Because 'sealing a Tier2/3 VM removes all NICs; Assert-Sealed verifies this from the host'
     }
+
+    # ---- adapter guards (SetNetworkAdapterGuards / GetNetworkAdapterGuards) ----
+    It 'a new VM''s adapter carries Hyper-V''s guard defaults: MacAddressSpoofing, DhcpGuard and RouterGuard all Off' {
+        $g = & $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' }
+        $g.MacAddressSpoofing | Should -Be 'Off'
+        $g.DhcpGuard          | Should -Be 'Off'
+        $g.RouterGuard        | Should -Be 'Off'
+    }
+
+    It 'SetNetworkAdapterGuards records the three values and GetNetworkAdapterGuards reads them back' {
+        & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = 'On' }
+        $g = & $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' }
+        $g.MacAddressSpoofing | Should -Be 'Off'
+        $g.DhcpGuard          | Should -Be 'On'
+        $g.RouterGuard        | Should -Be 'On'
+        # An adapter added by hand (no guard keys) reads the defaults, like a real adapter added outside the tool.
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        (& $script:B.GetVM @{ Name = 'vm1' }).NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter' })
+        (& $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' }).DhcpGuard | Should -Be 'Off'
+    }
+
+    It 'SetNetworkAdapterGuards rejects anything but ''On'' / ''Off'' (what the OnOffState enum accepts), leaving the adapter untouched, and requires all three' {
+        { & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'Off'; DhcpGuard = 'Yes'; RouterGuard = 'On' } } |
+            Should -Throw -ExpectedMessage "*DhcpGuard must be 'On' or 'Off' (got 'Yes')*"
+        { & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'off'; DhcpGuard = 'On'; RouterGuard = 'On' } } |
+            Should -Throw -ExpectedMessage "*MacAddressSpoofing must be 'On' or 'Off'*" -Because 'the compare is exact; the enum renders On and Off'
+        (& $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' }).RouterGuard | Should -Be 'Off' -Because 'a rejected call changes nothing'
+        { & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'Off'; DhcpGuard = 'On' } } |
+            Should -Throw -ExpectedMessage "*required argument 'RouterGuard'*"
+    }
+
+    It 'GetNetworkAdapterGuards THROWS when the VM has zero or two adapters (the gate must never pick one)' {
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        { & $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' } } | Should -Throw -ExpectedMessage '*expected exactly one network adapter*found 0*'
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter' })
+        $vm.NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter 2' })
+        { & $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' } } | Should -Throw -ExpectedMessage '*found 2*'
+    }
+
+    It 'SetNetworkAdapterGuards on a VM with no adapter is a no-op (nothing to set), and -SimulateAdapterGuardsStuck leaves the values as they were' {
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        { & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = 'On' } } | Should -Not -Throw
+        $stuck = New-FakeHyperVBackend -SimulateAdapterGuardsStuck
+        & $stuck.NewVM @{ Name = 'vm2'; Generation = 2 }
+        & $stuck.SetNetworkAdapterGuards @{ VMName = 'vm2'; MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = 'On' }
+        (& $stuck.GetNetworkAdapterGuards @{ VMName = 'vm2' }).DhcpGuard | Should -Be 'Off' -Because 'the set did not take'
+        @($stuck.FakeCallLog | Where-Object { $_.Op -eq 'SetNetworkAdapterGuards' }).Count | Should -Be 1 -Because 'the attempt is still logged'
+    }
 }
 
 # ===========================================================================
@@ -2168,6 +2220,34 @@ Describe 'Seal-device methods: the REAL bodies, executed out of process against 
     It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal)' {
         $script:SealDevCap.Gpu_Throw.err | Should -Match 'simulated Get-VMGpuPartitionAdapter failure'
         $script:SealDevCap.Gpu_Throw.queriedVM | Should -Be 'vm1' -Because 'the throwing cmdlet was still asked about the right VM'
+    }
+
+    It 'SetNetworkAdapterGuards passes the VM name and the three values through to Set-VMNetworkAdapter, and refuses a value the enum would reject before calling it' {
+        $c = $script:SealDevCap.Guards_Set
+        $c.err | Should -BeNullOrEmpty
+        $c.call.VMName             | Should -Be 'vm1'
+        $c.call.MacAddressSpoofing | Should -Be 'Off'
+        $c.call.DhcpGuard          | Should -Be 'On'
+        $c.call.RouterGuard        | Should -Be 'On'
+        $script:SealDevCap.Guards_SetBad.err    | Should -Match "RouterGuard must be 'On' or 'Off'"
+        $script:SealDevCap.Guards_SetBad.called | Should -BeFalse -Because 'the value is refused before the cmdlet runs'
+    }
+
+    It 'GetNetworkAdapterGuards reads the one adapter''s guards as On/Off text off the enum properties' {
+        $c = $script:SealDevCap.Guards_GetOne
+        $c.err | Should -BeNullOrEmpty
+        $c.queriedVM | Should -Be 'vm1'
+        $c.result.MacAddressSpoofing | Should -Be 'Off'
+        $c.result.DhcpGuard          | Should -Be 'On'
+        $c.result.RouterGuard        | Should -Be 'On'
+        $c.types | Should -Be 'String,String,String' -Because 'the enum values are rendered as text for the gate to compare exactly'
+    }
+
+    It 'GetNetworkAdapterGuards THROWS for zero or two adapters, for an adapter without a guard property, and for a failing enumeration' {
+        $script:SealDevCap.Guards_GetNone.err   | Should -BeLike '*expected exactly one network adapter*found 0*'
+        $script:SealDevCap.Guards_GetTwo.err    | Should -BeLike '*expected exactly one network adapter*found 2*'
+        $script:SealDevCap.Guards_GetNoProp.err | Should -BeLike '*reports no RouterGuard value*'
+        $script:SealDevCap.Guards_GetFail.err   | Should -Match 'simulated Get-VMNetworkAdapter failure'
     }
 }
 

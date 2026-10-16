@@ -39,14 +39,27 @@ Set-StrictMode -Version Latest
 # --- Recording stubs (top-level script scope, defined BEFORE the dot-source so the closures resolve
 #     their cmdlet calls to these) --------------------------------------------------------------
 $script:stubNics    = @()
+$script:stubNicFail = $false
 $script:capGetNicVM = $null
 $script:capRemove   = [System.Collections.Generic.List[object]]::new()
+
+# The OnOffState enum the real adapter object carries for MacAddressSpoofing, DhcpGuard and RouterGuard.
+enum StubOnOff { Off = 0; On = 1 }
 
 function Get-VMNetworkAdapter {
     [CmdletBinding()]
     param([string[]] $VMName)
     $script:capGetNicVM = $VMName
+    if ($script:stubNicFail) { throw 'stub: simulated Get-VMNetworkAdapter failure' }
     foreach ($n in $script:stubNics) { $n }
+}
+
+# Set-VMNetworkAdapter stub for SetNetworkAdapterGuards: records the parameters it received.
+$script:capSetNic = $null
+function Set-VMNetworkAdapter {
+    [CmdletBinding()]
+    param([string[]] $VMName, [string] $MacAddressSpoofing, [string] $DhcpGuard, [string] $RouterGuard)
+    $script:capSetNic = [ordered]@{ VMName = (@($VMName) -join ','); MacAddressSpoofing = $MacAddressSpoofing; DhcpGuard = $DhcpGuard; RouterGuard = $RouterGuard }
 }
 
 function Remove-VMNetworkAdapter {
@@ -156,8 +169,41 @@ function Get-VMSnapshot {
 $b = New-RealHyperVBackend
 
 function New-StubAdapter {
-    param([string] $Id)
-    [pscustomobject]@{ Id = $Id; Name = 'Network Adapter'; SwitchName = $null }
+    param([string] $Id, [switch] $Guarded, [switch] $NoRouterGuard)
+    $nic = [ordered]@{ Id = $Id; Name = 'Network Adapter'; SwitchName = $null }
+    if ($Guarded) {
+        $nic.MacAddressSpoofing = [StubOnOff]::Off
+        $nic.DhcpGuard          = [StubOnOff]::On
+        if (-not $NoRouterGuard) { $nic.RouterGuard = [StubOnOff]::On }
+    }
+    [pscustomobject]$nic
+}
+
+# Run the real SetNetworkAdapterGuards; report the error and what Set-VMNetworkAdapter received.
+function Invoke-GuardSetScenario {
+    param([string] $Spoof, [string] $Dhcp, [string] $Router)
+    $script:capSetNic = $null
+    $err = $null
+    try { & $b.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = $Spoof; DhcpGuard = $Dhcp; RouterGuard = $Router } | Out-Null }
+    catch { $err = $_.Exception.Message }
+    return [ordered]@{ err = $err; called = ($null -ne $script:capSetNic); call = $script:capSetNic }
+}
+
+# Run the real GetNetworkAdapterGuards against the given stub adapters; report the record (and its value
+# types) or the error.
+function Invoke-GuardGetScenario {
+    param([object[]] $Adapters, [switch] $Fail)
+    $script:stubNics    = $Adapters
+    $script:stubNicFail = $Fail.IsPresent
+    $script:capGetNicVM = $null
+    $err = $null; $r = $null
+    try { $r = & $b.GetNetworkAdapterGuards @{ VMName = 'vm1' } } catch { $err = $_.Exception.Message }
+    $script:stubNicFail = $false
+    $types = $null
+    if ($r -is [System.Collections.IDictionary]) {
+        $types = @('MacAddressSpoofing', 'DhcpGuard', 'RouterGuard' | ForEach-Object { $r[$_].GetType().Name }) -join ','
+    }
+    return [ordered]@{ err = $err; queriedVM = (@($script:capGetNicVM) -join ','); result = $r; types = $types }
 }
 
 # Run the real RemoveNetworkAdapter with the given stub adapters; report the error, which VM the
@@ -260,6 +306,13 @@ $out = [ordered]@{
     Gpu_One   = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @([pscustomobject]@{ Id = 'gpu-p-0' })
     Gpu_Two   = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @([pscustomobject]@{ Id = 'gpu-p-0' }, [pscustomobject]@{ Id = 'gpu-p-1' })
     Gpu_Throw = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @() -Throw
+    Guards_Set       = Invoke-GuardSetScenario -Spoof 'Off' -Dhcp 'On' -Router 'On'
+    Guards_SetBad    = Invoke-GuardSetScenario -Spoof 'Off' -Dhcp 'On' -Router 'Maybe'
+    Guards_GetOne    = Invoke-GuardGetScenario -Adapters @((New-StubAdapter 'nic-0' -Guarded))
+    Guards_GetNone   = Invoke-GuardGetScenario -Adapters @()
+    Guards_GetTwo    = Invoke-GuardGetScenario -Adapters @((New-StubAdapter 'nic-0' -Guarded), (New-StubAdapter 'nic-1' -Guarded))
+    Guards_GetNoProp = Invoke-GuardGetScenario -Adapters @((New-StubAdapter 'nic-0' -Guarded -NoRouterGuard))
+    Guards_GetFail   = Invoke-GuardGetScenario -Adapters @() -Fail
     Dda_None  = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @()
     Dda_One   = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @([pscustomobject]@{ LocationPath = 'PCIROOT(0)#PCI(0300)' })
     Com2_Empty = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '' }
