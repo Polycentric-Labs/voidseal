@@ -148,6 +148,36 @@ function Read-OutboxToGateInput {
 
 <#
 .SYNOPSIS
+    Remove the staged files and the raw outbox a Read-OutboxToGateInput call left under Destination,
+    keeping the two records (verdicts.json, workload.json) for diagnosis.
+.DESCRIPTION
+    Read-OutboxToGateInput unpacks every candidate into <Destination>/gate-input/staging/ and keeps the
+    raw container as <Destination>/outbox.bin before the host has classified the run. When the
+    classification is that nothing is released (a failed workload, an empty or missing result, no
+    exit-code record), a Reason that says so has to be true on disk as well, so both come off the host.
+    The records stay: verdicts.json is the screener's verdict list (or the transport-only placeholder)
+    and workload.json a one-key exit code; neither carries staged content. A removal failure THROWS, so
+    the caller's fail-closed catch records it instead of reporting a clean refusal over files that are
+    still there.
+.PARAMETER Destination
+    The run's host destination directory (holds outbox.bin and gate-input/).
+.PARAMETER GateInput
+    The gate-input directory Read-OutboxToGateInput returned.
+#>
+function Remove-OutboxStagedFiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] [string] $GateInput
+    )
+    $staging = Join-Path $GateInput 'staging'
+    if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction Stop }
+    $blob = Join-Path $Destination 'outbox.bin'
+    if (Test-Path -LiteralPath $blob -PathType Leaf) { Remove-Item -LiteralPath $blob -Force -ErrorAction Stop }
+}
+
+<#
+.SYNOPSIS
     The workload entrypoint's exit code, as the outbox producer recorded it, or $null when it recorded none.
 .DESCRIPTION
     host/read_outbox.py writes <gate-input>/workload.json ({"exit_code": N}) only when the outbox carried a
@@ -173,6 +203,46 @@ function Get-OutboxWorkloadExitCode {
         throw 'outbox read: workload.json is malformed (expected {"exit_code": 0..255}); releasing nothing.'
     }
     return [int]$code
+}
+
+<#
+.SYNOPSIS
+    Is a staged in-guest helper this checkout's guest/<Name>, once line endings and trailing whitespace
+    are set aside?
+.DESCRIPTION
+    The outbox preflight calls this for each helper the effective Inputs carry. The staged content (a
+    string, or the bytes a byte-clean Input holds) and the engine's own file are normalized the same way
+    before the comparison: CRLF and lone CR become LF, whitespace at the end of each line goes, and so do
+    a leading BOM and any trailing whitespace at the end of the text. Those are the differences a
+    Get-Content round-trip, an editor, or another checkout's line-ending setting introduces without
+    changing the Python. Anything else is a different file. THROWS when the engine's own copy is missing:
+    with nothing to compare against the run fails closed rather than trusting the staged content.
+.PARAMETER Name
+    The helper's file name (run_disk_workload.py, outbox.py, screener.py).
+.PARAMETER Content
+    The staged content from Inputs: a string, or a [byte[]] (decoded as UTF-8).
+.PARAMETER GuestDir
+    The engine's guest directory holding the reference copies.
+#>
+function Test-OutboxHelperCurrent {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [AllowNull()] [AllowEmptyString()] $Content,
+        [Parameter(Mandatory)] [string] $GuestDir
+    )
+    $enginePath = Join-Path $GuestDir $Name
+    if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
+        throw ("Invoke-Voidseal: this checkout has no '$enginePath' to compare the staged helper against (the " +
+               "engine's guest directory is incomplete). Fail closed.")
+    }
+    $staged = if ($Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($Content) } else { [string]$Content }
+    $normalize = {
+        param([string] $Text)
+        (($Text.TrimStart([char]0xFEFF) -replace "`r`n?", "`n") -replace "(?m)[ `t]+$", '').TrimEnd()
+    }
+    return ((& $normalize $staged) -ceq (& $normalize ([System.IO.File]::ReadAllText($enginePath))))
 }
 
 # --------------------------------------------------------------------------
@@ -513,7 +583,7 @@ function Invoke-Voidseal {
                "with no NIC (Network='None'). Nothing was provisioned. Fail closed.")
     }
 
-    # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT ---
+    # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT, as this checkout's copies ---
     # Every outbox-transport Disk run (a processor, or a transport-only OutboxOutput profile such as
     # firefox) executes `python3 /mnt/in/run_disk_workload.py` from the INPUT disk, and that script
     # imports outbox.py from its own directory. A processor also runs screener.py beside them. If any
@@ -547,6 +617,27 @@ function Invoke-Voidseal {
                    "in-guest runner executes run_disk_workload.py from the INPUT disk, and that script imports " +
                    "outbox.py beside it. Stage both from the repo's guest/ directory in Inputs (or " +
                    "-Workload.Inputs). Fail closed.")
+        }
+        # Present is not enough: the helpers must be THIS checkout's copies. The seed runner this engine
+        # builds calls the producer with this checkout's command line (SeedBuilder.ps1: --workload-rc, then
+        # --transport-only or --mode), and host/read_outbox.py reads the container guest/outbox.py writes.
+        # A copy staged from another checkout rejects a flag it never had (argparse exits 2), writes no
+        # outbox, and leaves the host with the same "outbox header missing" a missing helper gives; the
+        # producer's CLI last moved on 2026-10-03, after the only live run. The engine never injects the
+        # helpers (the operator stages their content), so compare each one with the engine's own file,
+        # setting line endings and trailing whitespace aside (Test-OutboxHelperCurrent).
+        $guestDir     = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest'
+        $staleHelpers = @($requiredHelpers | Where-Object {
+            -not (Test-OutboxHelperCurrent -Name $_ -Content $effectiveInputs[$_] -GuestDir $guestDir)
+        })
+        if ($staleHelpers.Count -gt 0) {
+            $profileKind = if ($isProcessorShape) { 'processor' } else { 'outbox profile' }
+            throw ("Invoke-Voidseal: REFUSING $profileKind '$Name': the content staged for $($staleHelpers -join ', ') in " +
+                   "Inputs is not this checkout's (compared with the files under '$guestDir', ignoring line endings and " +
+                   "trailing whitespace). The seed runner this engine builds calls the in-guest producer with this " +
+                   "checkout's command line (for example --workload-rc), so a copy from another checkout can exit " +
+                   "before any outbox is written, which the host could only report as 'outbox header missing'. Read " +
+                   "each helper from '$guestDir' (Get-Content -Raw) into Inputs or -Workload.Inputs. Fail closed.")
         }
     }
 
@@ -944,8 +1035,23 @@ function Invoke-Voidseal {
                     $gateVerdicts = Join-Path $gateInput 'verdicts.json'
                     # The entrypoint's exit code, when the in-guest producer recorded one ($null otherwise).
                     $workloadExit = Get-OutboxWorkloadExitCode -GateInput $gateInput
+                    # Set when the run reaches EXTRACTED: a processor whose gate ran (the gate decided the
+                    # release, whatever the exit code), or a transport-only result copied to Destination.
+                    $extracted = $false
 
-                    if ($isProcessorProfile) {
+                    if ($null -eq $workloadExit) {
+                        # A valid outbox with no exit-code record (workload.json). The seed runner this engine
+                        # builds always passes --workload-rc, so the record is absent only when the producer ran
+                        # without it (a hand-built seed or runner) or the outbox is incomplete. Without it the
+                        # host cannot tell a failed workload from a finished one; this used to fall through to
+                        # Success with a null ExitCode. Both profile kinds fail closed here, before the gate or
+                        # the copy: the staged files come off the host and nothing is released.
+                        Remove-OutboxStagedFiles -Destination $Destination -GateInput $gateInput
+                        $report.RunResult = @{ Status = 'Failed'; ExitCode = $null; ArtifactPath = $null;
+                                               Reason = ("the outbox carries no exit-code record (workload.json): the in-guest producer did " +
+                                                         "not run with --workload-rc, or the outbox is incomplete; nothing was released (the " +
+                                                         "staged files and the raw outbox were removed from the destination)") }
+                    } elseif ($isProcessorProfile) {
                         $gateOut   = Join-Path $Destination 'gate'
                         $screenCfg = Resolve-ScreenConfig -Profile $resolved
                         # C2.6 wiring: consult the runs/day rate-cap ledger for a PROCESSOR run only
@@ -967,31 +1073,57 @@ function Invoke-Voidseal {
                         # The gate above decided what is released, exactly as before. A non-zero entrypoint exit
                         # code changes only the reported status: the run is not a success even if the screener
                         # passed whatever the failed workload staged.
-                        if ($null -ne $workloadExit -and $workloadExit -ne 0) {
+                        if ($workloadExit -ne 0) {
                             $report.RunResult = @{ Status = 'WorkloadFailed'; ExitCode = $workloadExit; ArtifactPath = $gateResult.ManifestPath; Reason = "the workload entrypoint exited with code $workloadExit" }
                         } else {
                             $report.RunResult = @{ Status = 'Success'; ExitCode = $workloadExit; ArtifactPath = $gateResult.ManifestPath; Reason = $null }
                         }
-                    } elseif ($null -ne $workloadExit -and $workloadExit -ne 0) {
+                        $extracted = $true
+                    } elseif ($workloadExit -ne 0) {
                         # C1.2 transport-only, failed workload: the entrypoint exited non-zero, so the staged
                         # result is not trusted as a deliverable. Report the code (it used to surface only as
-                        # a missing 'result.html' candidate) and materialize nothing.
-                        $report.RunResult = @{ Status = 'WorkloadFailed'; ExitCode = $workloadExit; ArtifactPath = $null; Reason = "the workload entrypoint exited with code $workloadExit; nothing was released" }
+                        # a missing 'result.html' candidate) and materialize nothing. "Nothing was released"
+                        # has to hold on disk too: Read-OutboxToGateInput unpacked the staged files and kept the
+                        # raw outbox under Destination before the code was known, so remove both and keep only
+                        # the two records (workload.json, verdicts.json), which carry no staged content.
+                        Remove-OutboxStagedFiles -Destination $Destination -GateInput $gateInput
+                        $report.RunResult = @{ Status = 'WorkloadFailed'; ExitCode = $workloadExit; ArtifactPath = $null;
+                                               Reason = ("the workload entrypoint exited with code $workloadExit; nothing was released (the staged " +
+                                                         "files and the raw outbox were removed from the destination; gate-input\workload.json and " +
+                                                         "verdicts.json were kept for diagnosis)") }
                     } else {
-                        # C1.2 transport-only: materialize the outbox's sole candidate verbatim — NOT
+                        # C1.2 transport-only: materialize the outbox's sole candidate verbatim, NOT
                         # screened/Released. LOCKED design (plan Task C1.2): firefox's result rides the
-                        # outbox transport but is never gated through the sensitivity screener.
+                        # outbox transport but is never gated through the sensitivity screener. On this path
+                        # the staged files and the raw outbox stay under Destination only when the result is
+                        # released; every other outcome takes them back off the host (Remove-OutboxStagedFiles).
                         $resultSrc = Join-Path $gateStaging $resultInnerName
                         if (-not (Test-Path -LiteralPath $resultSrc -PathType Leaf)) {
+                            # Whatever else the entrypoint staged is not a deliverable without the result.
+                            Remove-OutboxStagedFiles -Destination $Destination -GateInput $gateInput
                             throw "outbox read: transport-only outbox has no '$resultInnerName' candidate."
                         }
-                        $artifact = Join-Path $Destination $resultInnerName
-                        Copy-Item -LiteralPath $resultSrc -Destination $artifact -Force
-                        $report.ExtractedArtifact = $artifact
-                        $report.RunResult = @{ Status = 'Success'; ExitCode = $workloadExit; ArtifactPath = $artifact; Reason = $null }
+                        # A present but empty (or whitespace-only) result is not a deliverable either; this is
+                        # the same guard Read-WorkloadResult applies on the legacy exFAT path. An organizer that
+                        # printed to stdout instead of writing --out leaves exactly this (a 0-byte file, rc 0).
+                        # Copy nothing; the empty file carries nothing worth keeping.
+                        if ([string]::IsNullOrWhiteSpace([System.IO.File]::ReadAllText($resultSrc))) {
+                            Remove-OutboxStagedFiles -Destination $Destination -GateInput $gateInput
+                            $report.RunResult = @{ Status = 'Failed'; ExitCode = $workloadExit; ArtifactPath = $null;
+                                                   Reason = ("result '$resultInnerName' is empty (workload produced no usable output); nothing was " +
+                                                             "released (the staged files and the raw outbox were removed from the destination)") }
+                        } else {
+                            $artifact = Join-Path $Destination $resultInnerName
+                            Copy-Item -LiteralPath $resultSrc -Destination $artifact -Force
+                            $report.ExtractedArtifact = $artifact
+                            $report.RunResult = @{ Status = 'Success'; ExitCode = $workloadExit; ArtifactPath = $artifact; Reason = $null }
+                            $extracted = $true
+                        }
                     }
-                    # Nothing was extracted when a transport-only workload failed, so EXTRACTED is not traversed.
-                    if ($isProcessorProfile -or $report.RunResult.Status -ne 'WorkloadFailed') { $states.Add('EXTRACTED') }
+                    # EXTRACTED only when something was: a processor's gate ran, or a transport-only result was
+                    # copied out. A failed workload, an empty or missing result, or a missing exit-code record
+                    # never traverses it.
+                    if ($extracted) { $states.Add('EXTRACTED') }
                 }
                 catch {
                     # Fail-closed like the seal gate: record + let teardown run. APPEND (do not clobber a

@@ -1042,6 +1042,32 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         $report.RunResult.ExitCode | Should -Be 0
     }
 
+    It 'a processor outbox with no recorded exit code is Failed before the gate runs, and releases nothing' {
+        $blobFile = Join-Path $script:TmpRoot ("outbox-norc-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile')"
+        $LASTEXITCODE | Should -Be 0
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob ([System.IO.File]::ReadAllBytes($blobFile))
+        & $b.NewVHD @{ Path = $script:DepsDisk; SizeBytes = 1GB; Differencing = $false; Dynamic = $true }
+        $depsHash = [string](& $b.GetVhdxImageHash @{ Path = $script:DepsDisk })
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:Proc `
+            -Workload @{ WorkloadMode = 'Disk'; DepsDiskPath = $script:DepsDisk; DepsImageHash = $depsHash } `
+            -Name 'sbx-proc-norc' -ArtifactRoot $script:ProcArt -Destination $script:ProcDest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger -WarningAction SilentlyContinue
+        $report.RunResult.Status   | Should -Be 'Failed'
+        $report.RunResult.ExitCode | Should -BeNullOrEmpty
+        $report.RunResult.Reason   | Should -Match 'no exit-code record'
+        $report.Released           | Should -BeNullOrEmpty -Because 'the gate never ran'
+        $report.Held               | Should -BeNullOrEmpty
+        $report.SensitivityReport  | Should -BeNullOrEmpty
+        $gateRanField = $report.Descriptor.PSObject.Properties['GateRan']
+        ($null -eq $gateRanField -or -not [bool]$gateRanField.Value) | Should -BeTrue -Because 'GateRan is stamped only when the gate partitions'
+        Test-Path -LiteralPath (Join-Path $script:ProcDest 'gate')               | Should -BeFalse -Because 'no gate output exists'
+        Test-Path -LiteralPath (Join-Path $script:ProcDest 'gate-input\staging') | Should -BeFalse -Because 'the unpacked candidates come off the host'
+        Test-Path -LiteralPath (Join-Path $script:ProcDest 'outbox.bin')         | Should -BeFalse
+        @($report.States) | Should -Not -Contain 'EXTRACTED'
+        $report.Error | Should -BeNullOrEmpty
+    }
+
     It 'DENY-on-tamper: a corrupted OUTPUT outbox -> read_outbox.py exits non-zero -> gate releases NOTHING' {
         $blobFile = Join-Path $script:TmpRoot ("outbox-bad-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
         & python -c "import sys; sys.path.insert(0, 'guest'); import outbox; outbox.write_outbox_from_dir(r'$script:GateStaging', r'$script:GateVerdicts', r'$blobFile', workload_rc=0)"
@@ -1691,6 +1717,22 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         (& $b.GetVM @{ Name = 'sbx-proc-nohelpers' }) | Should -BeNullOrEmpty -Because 'the refusal comes before provisioning, so no VM is created'
     }
 
+    It 'REFUSES a processor whose staged screener.py is not this checkout''s copy, naming it, before anything is provisioned' {
+        # The same freshness check the transport-only preflight applies, extended to the screener a
+        # processor also runs from INPUT (run_disk_workload.py invokes it with this checkout's flags).
+        $stale = @{} + $script:Proc
+        $stale['Inputs'] = @{} + $script:Proc['Inputs']
+        $stale['Inputs']['screener.py'] = ([string]$stale['Inputs']['screener.py']) + "`nprint('staged from another checkout')`n"
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $err = { Invoke-Voidseal -Tier 0 -Profile $stale -Name 'sbx-proc-stale' -ArtifactRoot $script:ProcArt `
+                    -Destination $script:ProcDest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -RateLedgerPath $script:ProcLedger } |
+                Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike '*processor*screener.py*'
+        $err.Exception.Message | Should -Not -BeLike '*outbox.py*' -Because 'the helpers that match must not be reported'
+        $err.Exception.Message | Should -Not -BeLike '*run_disk_workload.py*'
+        (& $b.GetVM @{ Name = 'sbx-proc-stale' }) | Should -BeNullOrEmpty -Because 'the refusal comes before provisioning, so no VM is created'
+    }
+
     It 'the processor preflight honors -Workload.Inputs (the same override the Disk branch folds in)' {
         $bare = @{} + $script:Proc
         $bare['Inputs'] = @{}
@@ -1828,6 +1870,70 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
         $err.Exception.Message | Should -Not -BeLike '*run_disk_workload.py,*' -Because 'the helper that is present must not be reported missing'
     }
 
+    # A helper that is present but STALE fails the same way a missing one does: the seed runner's producer
+    # line gained --workload-rc on 2026-10-03 (after the only live run), and a copy staged from an older
+    # checkout rejects the flag (argparse exit 2), writes no outbox, and leaves the host reporting "outbox
+    # header missing". The preflight compares each staged helper with this checkout's guest/ copy.
+    Context 'the staged helpers must be this checkout''s guest/ copies' {
+        It 'REFUSES a stale helper, naming only the one that differs and pointing at the guest directory, before anything is provisioned' {
+            # One semantic drift per helper: a producer with a different CLI, an outbox module with a different magic.
+            $drift = @{
+                'run_disk_workload.py' = @{ From = '--workload-rc'; To = '--workload-exit' }
+                'outbox.py'            = @{ From = 'VSOUTBX1';      To = 'VSOUTBX0' }
+            }
+            foreach ($helper in @($drift.Keys)) {
+                $stale = @{} + $script:Fx
+                $stale['Inputs'] = script:New-OutboxHelperInputs
+                $current = [string]$stale['Inputs'][$helper]
+                $stale['Inputs'][$helper] = $current.Replace($drift[$helper].From, $drift[$helper].To)
+                $stale['Inputs'][$helper] | Should -Not -Be $current -Because 'the fixture must really differ from the checkout copy'
+                $other = @($drift.Keys | Where-Object { $_ -ne $helper })[0]
+                $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+                $err = { Invoke-Voidseal -Tier 0 -Profile $stale -Name 'sbx-fx-stale' -ArtifactRoot $script:FxArt `
+                            -Destination $script:FxDest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+                        Should -Throw -PassThru
+                $err.Exception.Message | Should -BeLike "*$helper*" -Because 'the operator needs to know which helper is stale'
+                $err.Exception.Message | Should -Not -BeLike "*$other*" -Because 'the helper that matches must not be reported'
+                $err.Exception.Message | Should -BeLike '*guest*' -Because 'the message says where the current copy lives'
+                $err.Exception.Message | Should -Not -BeLike '*lack*' -Because 'a stale helper is a different refusal from a missing one'
+                (& $b.GetVM @{ Name = 'sbx-fx-stale' }) | Should -BeNullOrEmpty -Because 'the refusal comes before provisioning, so no VM is created'
+            }
+        }
+
+        It 'ACCEPTS the current helpers whatever their line endings, trailing whitespace or final newline' {
+            $variants = [ordered]@{
+                'CRLF'                = { param($s) ($s -replace "`r?`n", "`r`n") }
+                'LF'                  = { param($s) ($s -replace "`r`n", "`n") }
+                'trailing whitespace' = { param($s) (($s -replace "`r?`n", " `t`r`n").TrimEnd()) }
+            }
+            foreach ($form in @($variants.Keys)) {
+                $p = @{} + $script:Fx
+                $p['Inputs'] = script:New-OutboxHelperInputs
+                foreach ($helper in @($p['Inputs'].Keys)) { $p['Inputs'][$helper] = & $variants[$form] ([string]$p['Inputs'][$helper]) }
+                $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+                $dest = Join-Path $script:TmpRoot ("dest-fx-eol-{0}" -f ([guid]::NewGuid().ToString('N')))
+                $report = Invoke-Voidseal -Tier 0 -Profile $p -Workload @{ WorkloadMode = 'Disk' } `
+                    -Name 'sbx-fx-eol' -ArtifactRoot $script:FxArt -Destination $dest `
+                    -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+                $report.Error            | Should -BeNullOrEmpty -Because "a $form copy of the current helper is the same file"
+                $report.RunResult.Status | Should -Be 'Success'
+            }
+        }
+
+        It 'ACCEPTS a current helper staged as bytes (the byte-clean Inputs path)' {
+            $p = @{} + $script:Fx
+            $p['Inputs'] = script:New-OutboxHelperInputs
+            $p['Inputs']['outbox.py'] = [System.Text.Encoding]::UTF8.GetBytes([string]$p['Inputs']['outbox.py'])
+            $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:FxBlob
+            $dest = Join-Path $script:TmpRoot ("dest-fx-bytes-{0}" -f ([guid]::NewGuid().ToString('N')))
+            $report = Invoke-Voidseal -Tier 0 -Profile $p -Workload @{ WorkloadMode = 'Disk' } `
+                -Name 'sbx-fx-bytes' -ArtifactRoot $script:FxArt -Destination $dest `
+                -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+            $report.Error            | Should -BeNullOrEmpty
+            $report.RunResult.Status | Should -Be 'Success'
+        }
+    }
+
     It 'the transport-only preflight honors -Workload.Inputs (a shipped-firefox-shaped profile with empty Inputs runs once the helpers arrive that way)' {
         $emptyInputs = @{} + $script:Fx
         $emptyInputs['Inputs'] = @{}
@@ -1885,6 +1991,14 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
             $r.RunResult.Reason       | Should -Match 'code 3'
             $r.ExtractedArtifact      | Should -BeNullOrEmpty -Because 'a failed workload is not a deliverable'
             Test-Path -LiteralPath (Join-Path $run.Dest 'result.html') | Should -BeFalse -Because 'nothing is copied to the destination'
+            # "Nothing was released" holds on disk: the unpacked staging dir and the raw outbox are gone, the
+            # two records stay for diagnosis, and the Reason says so.
+            Test-Path -LiteralPath (Join-Path $run.Dest 'gate-input\staging')       | Should -BeFalse -Because 'the staged result.html must not sit under the destination'
+            Test-Path -LiteralPath (Join-Path $run.Dest 'outbox.bin')               | Should -BeFalse -Because 'the raw outbox holds the same staged bytes'
+            Test-Path -LiteralPath (Join-Path $run.Dest 'gate-input\workload.json') | Should -BeTrue  -Because 'the exit-code record is kept for diagnosis'
+            Test-Path -LiteralPath (Join-Path $run.Dest 'gate-input\verdicts.json') | Should -BeTrue  -Because 'the verdict record is kept for diagnosis'
+            $r.RunResult.Reason | Should -Match 'removed from the destination'
+            $r.RunResult.Reason | Should -Match 'workload\.json'
             @($r.States) | Should -Not -Contain 'EXTRACTED'
             $r.Error | Should -BeNullOrEmpty -Because 'a failed workload is not a lifecycle failure; teardown still completes'
             @($r.States) | Should -Contain 'DESTROYED'
@@ -1906,13 +2020,51 @@ Describe 'Invoke-Voidseal — non-processor OutboxOutput read-path (C1.2, user-s
             $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc 2 -Files @{ 'result.html' = $secret }) -Name 'sbx-fxrc-secret'
             ($run.Report.RunResult | ConvertTo-Json -Depth 4) | Should -Not -Match $secret
             [string]$run.Report.Error | Should -Not -Match $secret
+            # Nor does any file left under the destination.
+            foreach ($f in @(Get-ChildItem -LiteralPath $run.Dest -Recurse -File)) {
+                [System.IO.File]::ReadAllText($f.FullName) | Should -Not -Match $secret -Because "$($f.Name) stays on the host after a failed run"
+            }
         }
 
-        It 'an outbox with no recorded exit code keeps the old success behavior and reports ExitCode as null' {
+        It 'a 0-byte result.html with exit code 0 is Failed with the legacy empty-result wording, and nothing is copied or kept' {
+            $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc 0 -Files @{ 'result.html' = '' }) -Name 'sbx-fxrc-0byte'
+            $r = $run.Report
+            $r.RunResult.Status       | Should -Be 'Failed'
+            $r.RunResult.ExitCode     | Should -Be 0
+            $r.RunResult.Reason       | Should -Match "result 'result.html' is empty \(workload produced no usable output\)" -Because 'the wording mirrors Read-WorkloadResult on the legacy exFAT path'
+            $r.RunResult.ArtifactPath | Should -BeNullOrEmpty
+            $r.ExtractedArtifact      | Should -BeNullOrEmpty
+            Test-Path -LiteralPath (Join-Path $run.Dest 'result.html')        | Should -BeFalse -Because 'an empty result is not copied'
+            Test-Path -LiteralPath (Join-Path $run.Dest 'gate-input\staging') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $run.Dest 'outbox.bin')         | Should -BeFalse
+            @($r.States) | Should -Not -Contain 'EXTRACTED'
+            $r.Error | Should -BeNullOrEmpty -Because 'an empty result is a classified run outcome, not a lifecycle failure'
+            @($r.States) | Should -Contain 'DESTROYED'
+        }
+
+        It 'a whitespace-only result.html is empty too' {
+            $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc 0 -Files @{ 'result.html' = "  `r`n`t`n" }) -Name 'sbx-fxrc-blank'
+            $run.Report.RunResult.Status  | Should -Be 'Failed'
+            $run.Report.RunResult.Reason  | Should -Match 'is empty'
+            $run.Report.ExtractedArtifact | Should -BeNullOrEmpty
+        }
+
+        It 'an outbox with no recorded exit code is Failed (no exit-code record) and releases nothing' {
+            # The seed runner always passes --workload-rc, so a valid outbox without workload.json means the
+            # producer ran without it or the container is incomplete; the host cannot tell a failed workload
+            # from a finished one and used to report Success with a null ExitCode.
             $run = script:Invoke-FxRun -Blob (script:New-FxOutbox -Rc $null) -Name 'sbx-fxrc-none'
-            $run.Report.RunResult.Status | Should -Be 'Success'
-            $run.Report.RunResult.ExitCode | Should -BeNullOrEmpty
-            $run.Report.ExtractedArtifact | Should -Not -BeNullOrEmpty
+            $r = $run.Report
+            $r.RunResult.Status   | Should -Be 'Failed'
+            $r.RunResult.ExitCode | Should -BeNullOrEmpty
+            $r.RunResult.Reason   | Should -Match 'no exit-code record'
+            $r.RunResult.Reason   | Should -Match 'workload-rc'
+            $r.ExtractedArtifact  | Should -BeNullOrEmpty
+            Test-Path -LiteralPath (Join-Path $run.Dest 'result.html')        | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $run.Dest 'gate-input\staging') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $run.Dest 'outbox.bin')         | Should -BeFalse
+            @($r.States) | Should -Not -Contain 'EXTRACTED'
+            $r.Error | Should -BeNullOrEmpty -Because 'a classified run outcome, not a lifecycle failure; teardown still completes'
         }
 
         It 'a malformed workload.json entry fails the outbox read closed and releases nothing' {
