@@ -383,7 +383,9 @@ function New-SandboxDescriptor {
     Tier, Substrate, GuestImage, Memory, Cpu, NestedVirt, SecureBootTemplate,
     ManagementChannel, Network, etc.
 .PARAMETER Name
-    The VM name (also the sandbox id + storage subdir).
+    The VM name (also the sandbox id + storage subdir). Must start with a letter or digit and contain only
+    letters, digits, '.', '_' and '-', 64 characters at most: Get-VM -Name and Get-VMSwitch -Name treat
+    * ? [ ] as wildcards, and the name also becomes a folder, a pipe name and firewall rule names.
 .PARAMETER ParentDiskPath
     (Optional) A base/golden image .vhdx. When supplied, the system disk is a DIFFERENCING
     disk off this parent (fast, copy-on-write). When omitted, a fresh dynamic disk is created.
@@ -411,7 +413,7 @@ function New-SandboxVM {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)] [AllowNull()] $Profile,
-        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Name,
+        [Parameter(Mandatory)] [AllowEmptyString()] [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')] [string] $Name,
         [string] $ParentDiskPath,
         [long]   $SystemDiskSizeBytes = 40GB,
         [string] $StorageRoot,
@@ -643,14 +645,21 @@ function New-SandboxVM {
         # vSwitch and a connected NIC. A NoAdapter VM (Tier 0, Tier >= 2, any processor) gets NO switch:
         # the default adapter real New-VM creates stays unconnected until Lock-Sandbox removes it.
         # Create the switch FIRST (the backend rejects connecting a NIC to a non-existent switch, as
-        # real Hyper-V does).
+        # real Hyper-V does). A switch of that name that already exists is REFUSED, not reused (until
+        # 2026-10-16 the provision connected to it): another run or something outside the tool owns it,
+        # and the gate's isolation checks assume the switch is the one this provision built. The throw
+        # lands in the rollback below, which removes the VM and leaves the foreign switch alone (it was
+        # never added to $createdSwitches).
         if ($Profile['Substrate'] -eq 'HyperV-Gen2' -and $nicPolicy -eq 'IsolatedInternalSwitch') {
             $switchType = 'Internal'
             $switchName = "{0}-int" -f $Name
-            if ($null -eq (& $Backend.GetSwitch @{ Name = $switchName })) {
-                $null = & $Backend.NewSwitch @{ Name = $switchName; SwitchType = $switchType }
-                $createdSwitches.Add($switchName)   # only track switches WE created (don't reap a pre-existing one)
+            if ($null -ne (& $Backend.GetSwitch @{ Name = $switchName })) {
+                throw ("New-SandboxVM: a vSwitch named '$switchName' already exists; refusing to reuse it. Another run or " +
+                       "something outside the tool owns it, and a switch this provision did not build cannot be assumed " +
+                       "isolated. Remove it (Remove-VMSwitch -Name '$switchName') or choose another sandbox name. Fail closed.")
             }
+            $null = & $Backend.NewSwitch @{ Name = $switchName; SwitchType = $switchType }
+            $createdSwitches.Add($switchName)   # the switch this provision built; rollback and teardown reap exactly these
             $null = & $Backend.ConnectNetworkAdapter @{ VMName = $Name; SwitchName = $switchName }
         }
 
@@ -719,8 +728,8 @@ function New-SandboxVM {
             catch { Write-Warning "New-SandboxVM rollback: failed to delete created disks: $($_.Exception.Message)" }
         }
 
-        # Remove every switch THIS provision created (a pre-existing switch was NOT tracked,
-        # so a shared switch is never reaped). RemoveSwitch is idempotent + best-effort.
+        # Remove every switch THIS provision created (a pre-existing switch of the same name is refused
+        # before anything is built, and is never tracked here). RemoveSwitch is idempotent + best-effort.
         foreach ($sw in @($createdSwitches)) {
             try { $null = & $Backend.RemoveSwitch @{ Name = $sw } }
             catch { Write-Warning "New-SandboxVM rollback: failed to remove switch '$sw': $($_.Exception.Message)" }
@@ -795,8 +804,9 @@ function Restore-Sandbox {
     SWITCHES: with a -Descriptor, the per-VM switches recorded on its CreatedSwitches are removed
     after the VM is gone, whether or not -DeleteDisks is set (a disk can be worth keeping for
     inspection; a switch whose only VM is gone serves nothing). Only switches New-SandboxVM itself
-    created are listed there, so a pre-existing or shared switch it reused is never reaped. Without
-    a -Descriptor no switch is touched, because ownership cannot be established from a name alone.
+    created are listed there (it refuses a pre-existing switch of its name rather than reuse it), so a
+    switch another run or the operator owns is never reaped. Without a -Descriptor no switch is
+    touched, because ownership cannot be established from a name alone.
 .PARAMETER Name
     The VM name.
 .PARAMETER DeleteDisks

@@ -309,7 +309,10 @@ function Get-WorkloadField {
         WorkloadMode='Disk'). The ResultInnerName/SentinelInnerName default to the cloud-init runner's
         emitted names (result.html / result.exitcode).
 .PARAMETER Name
-    (Optional) the VM name. Defaults to a unique 'sbx-<tier>-<rand>'.
+    (Optional) the VM name. Defaults to a unique 'sbx-<tier>-<rand>'. A supplied name must start with a
+    letter or digit and contain only letters, digits, '.', '_' and '-', 64 characters at most: it names
+    the VM, its switch, its storage folder, its COM1 pipe and its firewall rules, and Get-VM -Name treats
+    * ? [ ] as wildcards.
 .PARAMETER ArtifactRoot
     (Optional) host-side dir for the Runner's capture artifact. Defaults under the system temp path.
 .PARAMETER Destination
@@ -376,7 +379,7 @@ function Invoke-Voidseal {
         [Parameter(Mandatory)] [int] $Tier,
         [Parameter(Mandatory)] [AllowNull()] $Profile,
         $Workload,
-        [string] $Name,
+        [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')] [string] $Name,
         [string] $ArtifactRoot,
         [string] $Destination,
         [string] $ParentDiskPath,

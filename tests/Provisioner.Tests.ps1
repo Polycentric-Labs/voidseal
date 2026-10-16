@@ -746,12 +746,15 @@ Describe 'Reaper — Remove-Sandbox' {
         (& $script:B.GetSwitch @{ Name = 'sbx-rm-int' }) | Should -BeNullOrEmpty -Because 'a re-run teardown must converge; the descriptor still says which switch this sandbox owns'
     }
 
-    It 'leaves a PRE-EXISTING switch the provision did not create (the same ownership rule the rollback follows)' {
+    It 'REFUSES a PRE-EXISTING switch of the VM''s name instead of reusing it, rolls the VM back and leaves the switch alone' {
         $b = New-FakeHyperVBackend
         & $b.NewSwitch @{ Name = 'sbx-shared-int'; SwitchType = 'Internal' }   # exists before the provision
-        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-shared' -Backend $b
-        Remove-Sandbox -Name 'sbx-shared' -DeleteDisks -Descriptor $d -Backend $b
-        (& $b.GetSwitch @{ Name = 'sbx-shared-int' }) | Should -Not -BeNullOrEmpty -Because 'the provision reused a switch it did not create, so teardown must not reap it'
+        { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-shared' -Backend $b } |
+            Should -Throw -ExpectedMessage "New-SandboxVM: a vSwitch named 'sbx-shared-int' already exists; refusing to reuse it.*Remove-VMSwitch -Name 'sbx-shared-int'*Fail closed."
+        (& $b.GetVM @{ Name = 'sbx-shared' }) | Should -BeNullOrEmpty -Because 'the mid-provision rollback removes the VM'
+        (& $b.GetSwitch @{ Name = 'sbx-shared-int' }) | Should -Not -BeNullOrEmpty -Because 'the provision did not create the switch, so neither rollback nor teardown may reap it'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveSwitch' }).Count | Should -Be 0
+        (& $b.GetVHDInfo @{ Path = 'C:\ProgramData\Voidseal\sandboxes\sbx-shared\sbx-shared-system.vhdx' }) | Should -BeNullOrEmpty -Because 'the created system disk is rolled back too'
     }
 }
 
@@ -768,6 +771,23 @@ Describe 'New-SandboxVM — input validation' {
     It 'throws on a blank VM name' {
         $b = New-FakeHyperVBackend
         { New-SandboxVM -Profile $script:Tier1 -Name '   ' -Backend $b } | Should -Throw
+    }
+
+    It 'refuses a VM name with a wildcard, a space or a leading hyphen at the parameter, before any backend call' -ForEach @(
+        @{ Bad = 'sbx*' }, @{ Bad = 'sbx?1' }, @{ Bad = 'sbx[1]' }, @{ Bad = 'a b' }, @{ Bad = '-sbx' }, @{ Bad = 'x;reboot' }, @{ Bad = ('a' * 65) }
+    ) {
+        $b = New-FakeHyperVBackend
+        { New-SandboxVM -Profile $script:Tier1 -Name $Bad -Backend $b } |
+            Should -Throw -ExpectedMessage '*does not match*' -Because 'Get-VM -Name treats * ? [ ] as wildcards; the name also becomes a folder, a pipe and firewall rule names'
+        @($b.FakeCallLog).Count | Should -Be 0 -Because 'parameter validation refuses before the body runs'
+    }
+
+    It 'accepts a name of letters, digits, dot, underscore and hyphen up to 64 characters' {
+        $b = New-FakeHyperVBackend
+        $name = 'Sbx-1.a_b' + ('x' * 55)
+        $name.Length | Should -Be 64
+        $d = New-SandboxVM -Profile $script:Tier1 -Name $name -Backend $b
+        $d.Name | Should -Be $name
     }
 }
 

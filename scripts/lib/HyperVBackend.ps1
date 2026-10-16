@@ -597,6 +597,24 @@ $script:SbInvokeWithLockRetry = {
     }
 }
 
+# Pick the ONE object whose Name is exactly $Name out of what Get-VM -Name or Get-VMSwitch -Name
+# returned. Both cmdlets treat * ? [ ] in -Name as wildcards, and Hyper-V allows several VMs with the
+# same name, so a by-name read can hand back objects the caller never asked for, or several of the one it
+# did. The compare is exact and case-sensitive. Zero exact matches is $null (no such object), one is the
+# object, more than one THROWS: the caller must never act on an ambiguous name (Remove-Sandbox would stop
+# and unregister whichever came first). The fake resolves exact dictionary keys and needs no filter.
+$script:SbSelectExactName = {
+    param([object[]] $Items, [string] $Name, [string] $Method)
+    $exact = @($Items | Where-Object {
+        $null -ne $_ -and $null -ne $_.PSObject.Properties['Name'] -and ([string]$_.Name) -ceq $Name
+    })
+    if ($exact.Count -gt 1) {
+        throw "HyperVBackend.${Method}: $($exact.Count) objects are named exactly '$Name'; refusing to pick one. Fail closed."
+    }
+    if ($exact.Count -eq 0) { return $null }
+    return $exact[0]
+}
+
 # Validate the three adapter-guard values EARLY and IDENTICALLY in BOTH factories: real
 # Set-VMNetworkAdapter binds them to its OnOffState enum, which accepts exactly 'On' and 'Off', so a
 # fake that recorded any other text would pass a value the live cmdlet rejects.
@@ -865,6 +883,7 @@ function New-RealHyperVBackend {
     $FirmwareRetry = $script:SbInvokeFirmwareWithRetry   # RC5: Secure-Boot template-enumeration retry
     $LockRetry     = $script:SbInvokeWithLockRetry       # RC8: detach settle-lag sharing-violation retry
     $GuardValues   = $script:SbAssertGuardValues         # adapter guards: 'On' / 'Off' only, in both factories
+    $SelectExact   = $script:SbSelectExactName           # exact-name pick for the by-name Get-VM / Get-VMSwitch reads
     $unavailPrefix = $script:HyperVUnavailablePrefix
     # I5a fix: same closure-capture rule as every other value here — a $script: READ inside a
     # .GetNewClosure()'d body does NOT resolve to the top-level script scope (it comes back empty/
@@ -936,7 +955,11 @@ function New-RealHyperVBackend {
             # A missing VM is NOT an error to us: return $null. But we must distinguish
             # "no such VM" (fine) from "can't talk to Hyper-V" (fail closed). Probe first.
             Get-VM -ErrorAction Stop | Out-Null            # raises the permission/availability error if unreachable
-            Get-VM -Name $name -ErrorAction SilentlyContinue
+            # Get-VM -Name treats * ? [ ] as wildcards and Hyper-V allows duplicate VM names, so the by-name
+            # read can return objects other than the one asked for, or several of it. Keep the exact name
+            # only; two or more exact matches throw ($script:SbSelectExactName).
+            $found = @(Get-VM -Name $name -ErrorAction SilentlyContinue)
+            & $SelectExact $found $name 'GetVM'
         }
     }.GetNewClosure()
 
@@ -1928,7 +1951,9 @@ function New-RealHyperVBackend {
         $name = & $AssertArg $P 'Name' 'GetSwitch'
         & $InvokeOp {
             Get-VMSwitch -ErrorAction Stop | Out-Null     # availability probe
-            Get-VMSwitch -Name $name -ErrorAction SilentlyContinue
+            # Same wildcard and duplicate hazard as GetVM: keep the exact name only (see SbSelectExactName).
+            $found = @(Get-VMSwitch -Name $name -ErrorAction SilentlyContinue)
+            & $SelectExact $found $name 'GetSwitch'
         }
     }.GetNewClosure()
 

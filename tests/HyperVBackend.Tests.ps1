@@ -3269,3 +3269,56 @@ Describe 'Real backend - SetProcessor caps and GetHostMemory (out-of-process cap
         $script:Cap2.GetHostMemory_Empty.err | Should -Match 'HyperVBackend\.GetHostMemory'
     }
 }
+
+# ===========================================================================
+#  REAL GetVM / GetSwitch: exact-name selection out of a wildcard by-name read
+# ===========================================================================
+#  Get-VM -Name and Get-VMSwitch -Name treat * ? [ ] as wildcards and Hyper-V allows duplicate VM names,
+#  so the by-name read can return objects the caller never named, or several of the one it did. The real
+#  bodies route the result through $script:SbSelectExactName; the helper is unit-tested here and the two
+#  bodies are pinned to call it.
+Describe '$script:SbSelectExactName: the exact-name pick behind the real GetVM and GetSwitch' {
+
+    It 'returns $null for no exact match (including a wildcard hit on another name) and the one object for a single exact match' {
+        (& $script:SbSelectExactName @() 'vm1' 'GetVM') | Should -BeNullOrEmpty
+        $other = [pscustomobject]@{ Name = 'vm10'; State = 'Off' }
+        (& $script:SbSelectExactName @($other) 'vm1' 'GetVM') | Should -BeNullOrEmpty -Because 'Get-VM -Name vm1* would return vm10; it is not vm1'
+        $one = [pscustomobject]@{ Name = 'vm1'; State = 'Off' }
+        $picked = & $script:SbSelectExactName @($other, $one) 'vm1' 'GetVM'
+        $picked.Name | Should -Be 'vm1'
+        $picked.State | Should -Be 'Off'
+    }
+
+    It 'compares case-sensitively and ignores an object without a Name' {
+        (& $script:SbSelectExactName @([pscustomobject]@{ Name = 'VM1' }) 'vm1' 'GetVM') | Should -BeNullOrEmpty
+        (& $script:SbSelectExactName @([pscustomobject]@{ VMName = 'vm1' }) 'vm1' 'GetVM') | Should -BeNullOrEmpty
+    }
+
+    It 'THROWS when more than one object carries exactly the name (a duplicate VM name is never resolved by picking the first)' {
+        $dup = @([pscustomobject]@{ Name = 'vm1' }, [pscustomobject]@{ Name = 'vm1' })
+        { & $script:SbSelectExactName $dup 'vm1' 'GetVM' } |
+            Should -Throw -ExpectedMessage "HyperVBackend.GetVM: 2 objects are named exactly 'vm1'; refusing to pick one. Fail closed."
+    }
+
+    It 'the real GetVM and GetSwitch route their by-name read through the helper (AST-pinned)' {
+        foreach ($method in 'GetVM', 'GetSwitch') {
+            $assign = & $script:GetRealBackendAssign $method
+            $assign | Should -Not -BeNullOrEmpty
+            $calls = @($assign.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                          $n.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                          $n.CommandElements[0].VariablePath.UserPath -eq 'SelectExact'
+            }, $true))
+            $calls.Count | Should -Be 1 -Because "$method must hand the by-name read to the exact-name pick"
+            # The by-name read is collected into an array first, so a single object is never unrolled away.
+            $byName = @($assign.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                          $n.GetCommandName() -in @('Get-VM', 'Get-VMSwitch') -and
+                          @($n.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Name' }).Count -gt 0
+            }, $true))
+            $byName.Count | Should -Be 1
+            # @( Get-VM ... ) parses as ArrayExpression > StatementBlock > Pipeline > Command.
+            $byName[0].Parent.Parent.Parent | Should -BeOfType [System.Management.Automation.Language.ArrayExpressionAst] -Because "$method wraps the by-name read in @()"
+        }
+    }
+}

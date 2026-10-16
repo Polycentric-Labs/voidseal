@@ -2650,3 +2650,31 @@ Describe 'Invoke-Voidseal: unknown profile keys and ResultInnerName layering' {
             Should -Throw -ExpectedMessage '*ResultInnerName*'
     }
 }
+
+# ===========================================================================
+#  -Name is validated at the parameter: wildcards, spaces and over-long names never reach the backend
+# ===========================================================================
+Describe 'Invoke-Voidseal: -Name is refused at the parameter when it could act as a wildcard or an unsafe path or rule name' {
+
+    It 'refuses a name with a wildcard character, a space or a leading hyphen before any backend call' -ForEach @(
+        @{ Bad = 'sbx*' }, @{ Bad = 'sbx?' }, @{ Bad = 'sbx[0]' }, @{ Bad = 'sbx run' }, @{ Bad = '-sbx' }, @{ Bad = ('s' * 65) }
+    ) {
+        $b = New-FakeHyperVBackend
+        { Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name $Bad -Backend $b } |
+            Should -Throw -ExpectedMessage '*does not match*' -Because 'Get-VM -Name treats * ? [ ] as wildcards and the name becomes a folder, a pipe and firewall rule names'
+        @($b.FakeCallLog).Count | Should -Be 0 -Because 'parameter validation refuses before the body runs, so nothing is provisioned and nothing torn down'
+    }
+
+    It 'still accepts a well-formed name and still generates one when -Name is omitted' {
+        $b = New-FakeHyperVBackend
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'Sbx-1.ok_name' -Backend $b `
+            -ArtifactRoot (Join-Path $script:TmpRoot ("art-name-{0}" -f ([guid]::NewGuid().ToString('N'))))
+        $report.Error | Should -BeNullOrEmpty
+        $report.Descriptor.Name | Should -Be 'Sbx-1.ok_name'
+        $b2 = New-FakeHyperVBackend
+        $report2 = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Backend $b2 `
+            -ArtifactRoot (Join-Path $script:TmpRoot ("art-name-{0}" -f ([guid]::NewGuid().ToString('N'))))
+        $report2.Error | Should -BeNullOrEmpty
+        $report2.Descriptor.Name | Should -Match '^sbx-1-[0-9a-f]{8}$'
+    }
+}
