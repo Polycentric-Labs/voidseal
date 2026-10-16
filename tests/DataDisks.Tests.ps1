@@ -965,7 +965,11 @@ Describe 'Guest runners mount each data disk read-only and fail closed' {
 
     It 'the builder and Serial seeds refuse data disks instead of ignoring them' {
         $dd = @(@{ Name = 'corpus'; Path = 'D:\vs\corpus.vhdx'; ImageHash = ('a' * 64) })
-        { New-CidataUserData -Profile @{ WorkloadMode = 'Disk'; EgressMode = 'SquidSniProxy'; Entrypoint = 'python3 /mnt/in/f.py'; EgressAllowlist = @('pypi.org'); DataDisks = $dd } } |
+        # A builder is a Tier-1 kept-NIC HostProxy profile with a DepsSpec; its seed needs the address plan.
+        $builder = @{ Tier = 1; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'; WorkloadMode = 'Disk'
+                      DepsSpec = @{ Pip = @{ Packages = @('urllib3') } }; Entrypoint = 'python3 /mnt/in/f.py'
+                      EgressAllowlist = @('pypi.org', 'files.pythonhosted.org'); DataDisks = $dd }
+        { New-CidataUserData -Profile $builder -Egress (Get-EgressAddressPlan -VMName 'sbx-dd-bld' -SwitchName 'sbx-dd-bld-int') } |
             Should -Throw -ExpectedMessage '*builder*'
         { New-CidataUserData -Profile @{ WorkloadMode = 'Serial'; Entrypoint = 'bash run.sh'; DataDisks = $dd } } |
             Should -Throw -ExpectedMessage '*Serial*'

@@ -758,13 +758,13 @@ Describe 'Invoke-Voidseal: Serial mode seeds the guest on a CIDATA data disk tha
             Should -Be 1 -Because 'NoCloud needs meta-data next to user-data'
     }
 
-    It 'a Tier-1 profile set to InGuestSquid still gets the in-guest egress layer built from the merged allowlist' {
-        $script:SerialProfile['EgressMode'] = 'InGuestSquid'
-        $report = Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
-            -Name 'sbx-serialseed-egress' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB
-        $ud = script:Get-SeedUserData -Backend $script:SerialB -SeedPath ([string]$report.Descriptor.SeedDiskPath)
-        $ud | Should -Match 'acl allowed_domains dstdomain .*api\.anthropic\.com' -Because 'the Squid ACL is rendered from the merged EgressAllowlist'
-        $ud | Should -Match 'iptables -P OUTPUT DROP' -Because 'the in-guest layer is default-DROP'
+    It 'a Tier-1 Serial profile set to EgressMode None is refused at load (a kept NIC must use HostProxy), before anything is provisioned' {
+        $script:SerialProfile['EgressMode']      = 'None'
+        $script:SerialProfile['EgressAllowlist'] = @()
+        { Invoke-Voidseal -Tier 1 -Profile $script:SerialProfile -Workload $script:SerialWl `
+            -Name 'sbx-serialseed-none' -ArtifactRoot $script:SerialArt -Destination $script:SerialDest -Backend $script:SerialB } |
+            Should -Throw -ExpectedMessage "*Kept-NIC rule*MUST use EgressMode='HostProxy'*"
+        (& $script:SerialB.GetVM @{ Name = 'sbx-serialseed-none' }) | Should -BeNullOrEmpty -Because 'the loader refuses before New-SandboxVM'
     }
 
     It 'a Tier-0 Serial profile (HostProxy) gets the autologin seed without the egress layer' {
@@ -774,7 +774,7 @@ Describe 'Invoke-Voidseal: Serial mode seeds the guest on a CIDATA data disk tha
         $report.Error | Should -BeNullOrEmpty
         $ud = script:Get-SeedUserData -Backend $script:SerialB -SeedPath ([string]$report.Descriptor.SeedDiskPath)
         $ud | Should -Match '--autologin sandbox' -Because 'every Serial run with an entrypoint gets the seed, with or without a SeedIso'
-        $ud | Should -Not -Match 'iptables -P OUTPUT DROP' -Because 'only an InGuestSquid profile gets the egress layer'
+        $ud | Should -Not -Match 'voidseal-egress|HTTPS_PROXY|OUTPUT DROP' -Because 'a Tier-0 VM seals with no adapter, so its seed stays offline'
     }
 
     It 'a SeedIso that points at a missing file does not stop the run (Invoke-Voidseal no longer reads it)' {
@@ -1244,7 +1244,7 @@ Describe 'Invoke-Voidseal — processor (gate) wiring' {
         (& $b.GetVM @{ Name = 'sbx-nonproc' }) | Should -BeNullOrEmpty -Because 'the refusal must happen before any provisioning — never a create-then-abort'
     }
 
-    It 'D (no builder exemption): a builder-shaped profile (EgressMode=SquidSniProxy) MISROUTED directly into Invoke-Voidseal is REFUSED with the same host-mount message (its real entry point is Invoke-BuilderVM, which never reaches this code at all)' {
+    It 'D (no builder exemption): the builder profile (the one with a DepsSpec) MISROUTED directly into Invoke-Voidseal is REFUSED with the same host-mount message (its real entry point is Invoke-BuilderVM, which never reaches this code at all)' {
         # A future caller could mistakenly pass the builder profile straight to Invoke-Voidseal instead
         # of Invoke-BuilderVM (its real, hash-verified entry point). The builder is a
         # Disk-mode profile that is neither a processor nor OutboxOutput, so it gets NO special
@@ -2656,9 +2656,12 @@ Describe 'Get-OutboxWorkloadExitCode' {
 # ===========================================================================
 #  Profile key strictness + ResultInnerName layering (hashtable -Profile path)
 # ===========================================================================
-Describe 'Invoke-Voidseal: a Disk-mode workload under HostProxy is refused before anything is provisioned' {
+Describe 'Invoke-Voidseal: a Disk-mode workload on a Tier-1 HostProxy VM runs behind the host proxy' {
 
     BeforeAll {
+        # A networked Tier-1 HostProxy Disk (OutboxOutput) profile: the shape the engine refused before the
+        # Disk runners learned the proxy. The in-guest helpers are this checkout's copies (the outbox
+        # preflight compares them).
         $t1 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier1.psd1')
         $p  = @{} + $t1
         $p['Name']         = 'hp-disk'
@@ -2667,7 +2670,29 @@ Describe 'Invoke-Voidseal: a Disk-mode workload under HostProxy is refused befor
         $p['FileSystem']   = 'exFAT'
         $p['OutboxOutput'] = $true
         $p['Entrypoint']   = 'python3 /mnt/in/work.py --out /run/staging/result.html'
+        Assert-TierProfileValid -Profile $p -Context 'TEST Tier-1 HostProxy Disk fixture'
         $script:HpDiskProfile = $p
+
+        # A clean transport-only outbox, so the run classifies Success and the whole lifecycle runs.
+        $staging = Join-Path $script:TmpRoot ("hp-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $staging 'result.html'), [System.Text.Encoding]::UTF8.GetBytes('<!DOCTYPE NETSCAPE-Bookmark-file-1><DL></DL>'))
+        $verdicts = Join-Path $script:TmpRoot ("hp-verdicts-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        '[]' | Set-Content -LiteralPath $verdicts -Encoding utf8 -NoNewline
+        $blobFile = Join-Path $script:TmpRoot ("hp-outbox-{0}.bin" -f ([guid]::NewGuid().ToString('N')))
+        $py = Resolve-PythonExe
+        $guestDir = (Join-Path $script:SkillRoot 'guest') -replace '\\', '/'
+        & $py -c "import sys; sys.path.insert(0, r'$guestDir'); import outbox; outbox.write_outbox_from_dir(r'$staging', r'$verdicts', r'$blobFile', workload_rc=0)"
+        $LASTEXITCODE | Should -Be 0 -Because 'the outbox fixture must pack cleanly'
+        $script:HpDiskBlob = [System.IO.File]::ReadAllBytes($blobFile)
+
+        $script:NewHpRun = {
+            param([string] $Tag)
+            @{
+                Art  = Join-Path $script:TmpRoot ("art-$Tag-{0}"  -f ([guid]::NewGuid().ToString('N')))
+                Dest = Join-Path $script:TmpRoot ("dest-$Tag-{0}" -f ([guid]::NewGuid().ToString('N')))
+            }
+        }
     }
 
     It 'the fixture really is a networked Tier-1 HostProxy Disk profile' {
@@ -2675,24 +2700,71 @@ Describe 'Invoke-Voidseal: a Disk-mode workload under HostProxy is refused befor
         (Get-SealNicPolicy -Tier ([int]$script:HpDiskProfile['Tier']) -Network ([string]$script:HpDiskProfile['Network'])) | Should -Be 'IsolatedInternalSwitch'
     }
 
-    It 'refuses up front, naming HostProxy and Disk mode, and creates no VM, switch or disk' {
-        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
-        $made = [System.Collections.Generic.List[string]]::new()
-        foreach ($m in @('NewVHD', 'NewOutputVhdx', 'CopyVhdxFile', 'NewSwitch', 'NewVM')) {
-            $orig = $b[$m]; $name = $m
-            $b[$m] = { param([System.Collections.IDictionary] $P) $made.Add($name); & $orig $P }.GetNewClosure()
-        }
-        { Invoke-Voidseal -Tier 1 -Profile $script:HpDiskProfile -Name 'sbx-hp-disk' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
-            Should -Throw -ExpectedMessage "*Disk-mode workload*EgressMode='HostProxy'*"
-        (& $b.GetVM @{ Name = 'sbx-hp-disk' }) | Should -BeNullOrEmpty
-        (& $b.GetSwitch @{ Name = 'sbx-hp-disk-int' }) | Should -BeNullOrEmpty
-        @($b.FakeCallLog | Where-Object { $_.Op -in @('StartVM', 'AddSwitchHostIPAddress', 'NewHostFirewallRule', 'WriteVhdxFile', 'WriteVhdxFileBytes') }).Count | Should -Be 0
-        $made.Count | Should -Be 0 -Because 'nothing (no VM, switch, disk or copy) was created before the refusal'
+    It 'runs the whole lifecycle: the plan is recorded, the seal installs host egress, the gate reads it back, the proxy starts after the gate and before the guest, and teardown stops it' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:HpDiskBlob
+        $ruleReads = [System.Collections.Generic.List[string]]::new()
+        $innerRule = $b.GetHostFirewallRule
+        $b.GetHostFirewallRule = { param($P) $ruleReads.Add([string]$P.Name); & $innerRule $P }.GetNewClosure()
+        $paths = & $script:NewHpRun -Tag 'hp-disk'
+
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:HpDiskProfile -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-hp-disk' -ArtifactRoot $paths.Art -Destination $paths.Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+
+        $report.Error | Should -BeNullOrEmpty
+        @($report.States) | Should -Contain 'SEALED'
+        @($report.States) | Should -Contain 'RUNNING'
+        @($report.States) | Should -Contain 'CAPTURED'
+        @($report.States) | Should -Contain 'DESTROYED'
+        [array]::IndexOf(@($report.States), 'SEALED') | Should -BeLessThan ([array]::IndexOf(@($report.States), 'RUNNING'))
+        $report.SealVerdict | Should -BeTrue
+        $report.RunResult.Status | Should -Be 'Success' -Because 'the clean outbox classifies, so the run reached the read'
+        $report.Descriptor.Network    | Should -Be 'Internal+Allowlist'
+        $report.Descriptor.EgressMode | Should -Be 'HostProxy'
+        $report.Descriptor.Egress.Subnet | Should -Be (Get-EgressAddressPlan -VMName 'sbx-hp-disk' -SwitchName 'sbx-hp-disk-int').Subnet
+        @($ruleReads | Sort-Object -Unique).Count | Should -Be 7 -Because 'Assert-Sealed read back every recorded firewall rule'
+        $ops = @($b.FakeCallLog | Where-Object { $_.Op -in @('AddSwitchHostIPAddress', 'StartEgressProxy', 'StartVM', 'StopEgressProxy') } | ForEach-Object { $_.Op })
+        $ops | Should -Be @('AddSwitchHostIPAddress', 'StartEgressProxy', 'StartVM', 'StopEgressProxy') -Because 'the seal installs host egress, the proxy starts after the gate and before the guest boots, and teardown stops it'
+        $report.EgressProxyLog | Should -BeLike '*egress-proxy.log'
+        (& $b.GetVM @{ Name = 'sbx-hp-disk' }) | Should -BeNullOrEmpty -Because 'teardown removed the VM'
+        (& $b.GetSwitch @{ Name = 'sbx-hp-disk-int' }) | Should -BeNullOrEmpty -Because 'teardown removed the switch'
     }
 
-    It 'a Disk-mode Tier-0 outbox profile (no NIC) is not affected' {
+    It 'the seed the run wrote points the guest at the proxy, carries the lockdown and the package stage, and comes with a network-config' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateOutboxBlob $script:HpDiskBlob
+        $paths = & $script:NewHpRun -Tag 'hp-disk-seed'
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:HpDiskProfile -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-hp-seed' -ArtifactRoot $paths.Art -Destination $paths.Dest `
+            -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b -WarningAction SilentlyContinue
+        $report.Error | Should -BeNullOrEmpty
+        $seed = [string]$report.Descriptor.SeedDiskPath
+        $seed | Should -Not -BeNullOrEmpty
+        $write = @($b.FakeCallLog | Where-Object { $_.Op -eq 'WriteVhdxFile' -and $_.Path -eq $seed -and $_.InnerPath -eq 'user-data' })
+        $write.Count | Should -Be 1
+        $ud = [string]$write[0].Content
+        $gw = [string]$report.Descriptor.Egress.GatewayIP
+        $ud | Should -Match ([regex]::Escape("https_proxy=http://$($gw):13128"))
+        $ud | Should -Match ([regex]::Escape("Acquire::https::Proxy `"http://$($gw):13128/`";"))
+        $ud | Should -Match 'voidseal-egress-lockdown'
+        $ud | Should -Match '(?m)^packages:'
+        $ud | Should -Not -Match 'network: \{config: disabled\}'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'WriteVhdxFile' -and $_.Path -eq $seed -and $_.InnerPath -eq 'network-config' }).Count |
+            Should -Be 1 -Because 'the guest gets its one static address from the seed'
+    }
+
+    It 'a Tier-1 kept-NIC Disk profile set to EgressMode None is refused at load, before anything is provisioned' {
+        $bad = @{} + $script:HpDiskProfile; $bad['EgressMode'] = 'None'; $bad['EgressAllowlist'] = @()
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        { Invoke-Voidseal -Tier 1 -Profile $bad -Name 'sbx-hp-none' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
+            Should -Throw -ExpectedMessage "*Kept-NIC rule*MUST use EgressMode='HostProxy'*"
+        (& $b.GetVM @{ Name = 'sbx-hp-none' }) | Should -BeNullOrEmpty
+        @($b.FakeCallLog | Where-Object { $_.Op -in @('StartVM', 'AddSwitchHostIPAddress', 'NewHostFirewallRule', 'WriteVhdxFile') }).Count |
+            Should -Be 0 -Because 'nothing was created before the refusal'
+    }
+
+    It 'a Disk-mode Tier-0 outbox profile (no NIC) is not a HostProxy run: it seals with no adapter' {
         $t0 = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
-        $t0['EgressMode'] | Should -Not -Be 'InGuestSquid'
+        $t0['EgressMode'] | Should -Be 'HostProxy' -Because 'tier0 declares the mode; without an adapter it is moot'
         (Get-SealNicPolicy -Tier ([int]$t0['Tier']) -Network ([string]$t0['Network'])) | Should -Be 'NoAdapter'
     }
 }

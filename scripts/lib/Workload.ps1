@@ -303,8 +303,8 @@ function New-WorkloadDisks {
 .PARAMETER Profile
     The resolved profile. New-CidataUserData picks the user-data from it: in Disk mode the runner with
     the Entrypoint substituted (so a non-blank Entrypoint is required); in Serial mode the serial-getty
-    autologin baseline, plus the in-guest egress layer for EgressMode='InGuestSquid', or, when the
-    descriptor records EgressMode='HostProxy' with an address plan, the host-proxy settings plus a
+    autologin baseline. When the descriptor records EgressMode='HostProxy' with an address plan (a VM
+    that keeps its NIC), either mode also gets the host-proxy settings, the in-guest lockdown and a
     third document, `network-config` (one static address, no route, no resolver). A Serial
     Entrypoint is not part of the seed; the Runner delivers it over COM1. (Serial mode joined RC6 on
     2026-10-03: its DVD seed had been ejected by the seal before the guest's only boot, too.)

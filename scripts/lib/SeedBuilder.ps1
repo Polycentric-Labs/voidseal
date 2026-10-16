@@ -7,19 +7,27 @@
     FIRST boot. Invoke-Voidseal (both modes) and Invoke-BuilderVM write them onto a recorded CIDATA
     data disk (New-WorkloadSeedDisk, RC6). New-CidataSeed packs the same two documents into an ISO for
     hand use only: the seal ejects every DVD before the guest's only boot, so the engine attaches none.
-    Three shapes, selected by the profile's `WorkloadMode` (+ `EgressMode` for the builder variant):
+    Four shapes, selected by the profile's `WorkloadMode`, by `DepsSpec` (the builder) and by whether
+    the VM keeps its NIC (Get-SealNicPolicy, together with `EgressMode='HostProxy'`):
 
-      * DISK-OFFLINE — the disk-passing workload runner (guest-images/debian-12-cloud.md §2a). A
+      * DISK-OFFLINE: the disk-passing workload runner (guest-images/debian-12-cloud.md §2a). A
         systemd oneshot mounts the host-pre-formatted exFAT data disks by LABEL (INPUT ro -> /mnt/in,
         OUTPUT rw -> /mnt/out), runs the profile's `Entrypoint` as the non-root `sandbox` user,
         writes `result.html` + the `result.exitcode` sentinel onto OUTPUT, flushes, and self-powers
         off. The seed builder substitutes the profile's `Entrypoint` for the `__ENTRYPOINT__` token.
-      * DISK-BUILDER (`WorkloadMode='Disk'` + `EgressMode='SquidSniProxy'`) — the Tier-1 net-restricted
-        builder variant: same disk-passing runner PLUS a transparent Squid SNI domain-ACL proxy that
-        gatekeeps the guest's 80/443 egress to the `EgressAllowlist` only (substituted into the Squid
-        `dstdomain` ACL). Fetches deps over Squid into /mnt/out, writes a manifest, self-powers-off.
-      * SERIAL (default) — the §2 baseline: serial-getty AUTOLOGIN on ttyS0 (the Runner's command
-        seam, which does NOT authenticate), a non-root run-user, and bubblewrap.
+        The OutboxOutput variant packs a staging dir into the raw OUTPUT disk instead.
+      * DISK-HOSTPROXY: either Disk runner on a Tier-1 VM that keeps its NIC. The network stays
+        enabled (the seed's network-config gives eth0 one static address, no route, no resolver), the
+        proxy environment and apt setting point every client at the host's CONNECT proxy on the
+        gateway, nftables is installed through that proxy in the package stage, and an in-guest
+        default-DROP that allows only the proxy port is applied before the workload runs (defense in
+        depth; the host firewall rules and port ACL the seal installed are the boundary).
+      * BUILDER (`WorkloadMode='Disk'` + `DepsSpec`): the Tier-1 builder, always DISK-HOSTPROXY shaped,
+        with the dep-fetch runner: fetches over the host proxy into /mnt/out (the exFAT deps disk),
+        writes a manifest, packs its verdict into a raw verdict disk, self-powers-off.
+      * SERIAL (default): the §2 baseline: serial-getty AUTOLOGIN on ttyS0 (the Runner's command
+        seam, which does NOT authenticate), a non-root run-user, and bubblewrap; on a VM that keeps
+        its NIC, the same proxy settings, network-config and lockdown files.
 
     WHY THIS EXISTS: before this builder there was no code that emitted the disk-mode seed, so the
     on-disk `cidata-seed.iso` was the OLD serial seed — a disk-mode live run would boot to an idle
@@ -71,9 +79,11 @@ function Get-SeedProfileField {
 # --------------------------------------------------------------------------
 $script:CidataDiskRunnerTemplate = @'
 #cloud-config
-network: {config: disabled}
-# Voidseal disk-mode workload seed. NO apt / no network — sealed, offline guest. The image already
-# contains the runtime (e.g. python3). The workload + its inputs arrive on the INPUT data disk;
+__NETWORK_STANZA__
+# Voidseal disk-mode workload seed. Offline unless the VM keeps its NIC (Tier 1, EgressMode 'HostProxy'),
+# in which case the host's CONNECT proxy on the gateway is the only way out and the HostProxy fragments
+# below point the guest at it. The image already contains the runtime (e.g. python3). The workload + its
+# inputs arrive on the INPUT data disk;
 # results go to the OUTPUT data disk; the guest self-powers-off and the host reads the result.
 
 # RC2 (2026-06-24 live): the golden image has NO 'sandbox' user and the disk seed never created one,
@@ -104,6 +114,7 @@ users:
 # golden image, so it needs its own thinking about what the helper's SHA-512 pin still attests to.
 bootcmd:
   - [ systemctl, mask, --now, systemd-networkd-wait-online.service ]
+__HOSTPROXY_BOOTCMD__
 
 write_files:
   - path: /usr/local/sbin/vmdep-workload
@@ -147,6 +158,7 @@ write_files:
       # Declared DATA DISKS: each mounts read-only by LABEL=VSD<NAME> at /mnt/data/<name>; a disk that
       # does not mount, or mounts writable, records rc 71 and powers off (no run on missing inputs).
       __DATA_DISK_MOUNTS__
+__HOSTPROXY_RUNNER_ENV__
       # Run the workload ONCE. Prefer the unprivileged 'sandbox' user, but ONLY when OUTPUT is
       # sandbox-OWNED (the uid/gid mount won) AND the user exists — otherwise a non-root run could not
       # write to a root-owned plain-mounted /mnt/out. Fall back to root in every other case (v1: the VM
@@ -181,8 +193,12 @@ write_files:
       TimeoutStartSec=infinity
       [Install]
       WantedBy=multi-user.target
+__HOSTPROXY_FILES__
+
+__HOSTPROXY_PACKAGES__
 
 runcmd:
+__HOSTPROXY_RUNCMD__
   - [ systemctl, daemon-reload ]
   # --no-block is LOAD-BEARING: a blocking start would make cloud-final WAIT on a oneshot that ends
   # in poweroff (SIGTERM-ing the very cloud-final blocked on it, racing the result flush). --no-block
@@ -229,8 +245,10 @@ runcmd:
 # --------------------------------------------------------------------------
 $script:CidataOutboxDiskRunnerTemplate = @'
 #cloud-config
-network: {config: disabled}
-# Voidseal OutboxOutput disk-mode seed (C1.3). NO apt / no network — sealed, offline guest. The
+__NETWORK_STANZA__
+# Voidseal OutboxOutput disk-mode seed (C1.3). Offline unless the VM keeps its NIC (Tier 1, EgressMode
+# 'HostProxy'), in which case the host's CONNECT proxy on the gateway is the only way out and the
+# HostProxy fragments below point the guest at it. The
 # workload's inputs (+ the shared outbox-producer template) arrive on the INPUT data disk; the
 # result is packed into a memory-safe outbox and written to the raw OUTPUT data disk (no filesystem);
 # the guest self-powers-off and the host reads the outbox user-space (never Mount-VHD).
@@ -242,11 +260,13 @@ users:
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
     lock_passwd: true          # no password login anywhere; this is a sealed offline guest
 
-# Network stays disabled. This mask is INEFFECTIVE for the current boot (same as the exFAT offline
-# runner - see its RC3 note: bootcmd runs in a stage ordered AFTER wait-online, and a sandbox boots
-# only once), so expect ~120s of wait-online dead time until the golden image masks it at image-prep.
+# This mask is INEFFECTIVE for the current boot (same as the exFAT offline runner - see its RC3 note:
+# bootcmd runs in a stage ordered AFTER wait-online, and a sandbox boots only once), so an offline guest
+# spends ~120s of wait-online dead time until the golden image masks it at image-prep. A HostProxy guest
+# gets a static address from the seed's network-config; how long wait-online takes there is a live question.
 bootcmd:
   - [ systemctl, mask, --now, systemd-networkd-wait-online.service ]
+__HOSTPROXY_BOOTCMD__
 
 write_files:
   - path: /usr/local/sbin/vmdep-workload
@@ -335,6 +355,7 @@ write_files:
       if [ "$#" -ne 1 ]; then diag "ABORT output-candidates-not-1 (need exactly one RAW disk - no partitions, no filesystem; got $#: [$OUT_CANDIDATES])"; poweroff; exit 0; fi
       OUTPUT_DEV="/dev/$1"
       diag "output_dev=$OUTPUT_DEV"
+__HOSTPROXY_RUNNER_ENV__
       # Run the workload ONCE, into staging (not directly onto OUTPUT — there is no OUTPUT mount).
       # NOTE: run via sh -c '<entrypoint>', so the entrypoint must contain no single quote.
       if id -u sandbox >/dev/null 2>&1; then
@@ -379,8 +400,12 @@ write_files:
       TimeoutStartSec=infinity
       [Install]
       WantedBy=multi-user.target
+__HOSTPROXY_FILES__
+
+__HOSTPROXY_PACKAGES__
 
 runcmd:
+__HOSTPROXY_RUNCMD__
   - [ systemctl, daemon-reload ]
   # --no-block is LOAD-BEARING: a blocking start would make cloud-final WAIT on a oneshot that ends
   # in poweroff (SIGTERM-ing the very cloud-final blocked on it, racing the result flush). --no-block
@@ -388,24 +413,179 @@ runcmd:
   - [ systemctl, start, --no-block, vmdep-workload.service ]
 '@
 
+
 # --------------------------------------------------------------------------
-# The BUILDER disk-mode runner user-data — Tier-1 builder VM with a transparent Squid SNI proxy.
-# LIVE-only (Phase 6) validates the real network config + ssl_bump/SNI peek + CDN-rotation; the mock
-# asserts SHAPE only (the Squid ACL contains each allowlist domain + http_access deny all).
-# Single-quoted here-string: NOTHING is interpolated by PowerShell. Two placeholders are substituted:
-#   __SQUID_ALLOWLIST_ACL__  -> space-joined EgressAllowlist (dstdomain entries)
-#   __ENTRYPOINT__           -> the profile Entrypoint (same sh -c guard as the offline runner)
-# Squid dstdomain semantics MATCH Test-AllowlistCoversHost: a bare entry (huggingface.co) matches
-# exactly; a dotted entry (.hf.co) matches subdomains — the merged allowlist maps 1:1 onto dstdomain.
+# HostProxy guest fragments, shared by every seed of a VM that keeps its NIC (Tier 1 with
+# EgressMode='HostProxy'): the three Disk runners (the two above and the builder below) and the Serial
+# seed further down. Expand-HostProxySeedTokens substitutes them for the column-0 tokens the Disk
+# templates carry (__NETWORK_STANZA__, __HOSTPROXY_BOOTCMD__, __HOSTPROXY_FILES__, __HOSTPROXY_PACKAGES__,
+# __HOSTPROXY_RUNCMD__, __HOSTPROXY_RUNNER_ENV__), or for a one-line comment when the VM has no adapter.
+# Single-quoted here-strings; __GATEWAY_IP__, __PROXY_PORT__ and __GUEST_CIDR__ are substituted last, from
+# the descriptor's validated address plan (Get-HostProxySeedValues), so only dotted IPv4 text and a port
+# number ever reach the shell. The lockdown is ONE block, carried by every HostProxy seed, not a copy per seed.
+# --------------------------------------------------------------------------
+
+# The in-guest lockdown: IPv6 off, and a default-DROP that allows loopback, established traffic and TCP
+# to the proxy port on the gateway. Defense in depth only (root in the guest can undo it; the host
+# enforces). nftables first (one inet table covers IPv4 and IPv6), iptables as a fallback, a structural
+# [voidseal-diag] marker either way. The unit re-applies it on any later boot.
+$script:CidataHostProxyLockdownFiles = @'
+  - path: /etc/sysctl.d/99-voidseal-noipv6.conf
+    permissions: '0644'
+    content: |
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv6.conf.default.disable_ipv6 = 1
+
+  # In-guest default-DROP, defense in depth only (root in the guest can undo it; the host enforces).
+  # Allows loopback, established traffic, and TCP to the proxy port on the gateway. nftables first
+  # (one inet table covers IPv4 and IPv6), iptables as a fallback, a structural marker either way.
+  - path: /usr/local/sbin/voidseal-egress-lockdown
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set +e
+      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
+      diag "egress-lockdown start mode=hostproxy"
+      if command -v nft >/dev/null 2>&1; then
+        nft delete table inet voidseal 2>/dev/null
+        printf '%s\n' \
+          'table inet voidseal {' \
+          '  chain output {' \
+          '    type filter hook output priority 0; policy drop;' \
+          '    oif "lo" accept' \
+          '    ct state established,related accept' \
+          '    ip daddr __GATEWAY_IP__ tcp dport __PROXY_PORT__ accept' \
+          '  }' \
+          '}' | nft -f -
+        diag "egress_lockdown=hostproxy-applied tool=nft rc=$?"
+      elif command -v iptables >/dev/null 2>&1; then
+        iptables -F OUTPUT 2>/dev/null
+        iptables -P OUTPUT DROP
+        iptables -A OUTPUT -o lo -j ACCEPT
+        iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        iptables -A OUTPUT -p tcp -d __GATEWAY_IP__ --dport __PROXY_PORT__ -j ACCEPT
+        r=$?
+        if command -v ip6tables >/dev/null 2>&1; then ip6tables -P OUTPUT DROP; fi
+        diag "egress_lockdown=hostproxy-applied tool=iptables rc=$r"
+      else
+        diag "egress_lockdown=skipped (no nft or iptables binary; the host still enforces)"
+      fi
+
+  - path: /etc/systemd/system/voidseal-egress.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Voidseal Tier-1 in-guest egress lockdown for HostProxy (defense in depth, NOT a boundary)
+      DefaultDependencies=no
+      Before=network-pre.target
+      Wants=network-pre.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/voidseal-egress-lockdown
+      [Install]
+      WantedBy=multi-user.target
+'@
+
+# The host proxy for the Disk runners, for every client that honors the proxy variables (pip, Hugging
+# Face clients, curl), plus apt through its own setting. Both spellings and both schemes: pip and curl
+# read the lowercase names, some tools only the uppercase ones, and a plain-http client is pointed at the
+# proxy too, so its refusal (the proxy tunnels only CONNECT to 443 and answers 405 otherwise) lands in
+# the proxy log instead of a bare route error. Loopback stays direct. The runner sources the profile
+# script before the entrypoint, because a oneshot unit reads neither /etc/environment nor a login
+# profile. The Serial seed keeps its own, narrower pair (HTTPS only, NO_PROXY empty).
+$script:CidataHostProxyDiskFiles = @'
+  - path: /etc/environment
+    append: true
+    content: |
+      http_proxy=http://__GATEWAY_IP__:__PROXY_PORT__
+      https_proxy=http://__GATEWAY_IP__:__PROXY_PORT__
+      HTTP_PROXY=http://__GATEWAY_IP__:__PROXY_PORT__
+      HTTPS_PROXY=http://__GATEWAY_IP__:__PROXY_PORT__
+      no_proxy=localhost,127.0.0.1
+      NO_PROXY=localhost,127.0.0.1
+  - path: /etc/profile.d/voidseal-egress-proxy.sh
+    permissions: '0644'
+    content: |
+      export http_proxy=http://__GATEWAY_IP__:__PROXY_PORT__
+      export https_proxy=http://__GATEWAY_IP__:__PROXY_PORT__
+      export HTTP_PROXY=http://__GATEWAY_IP__:__PROXY_PORT__
+      export HTTPS_PROXY=http://__GATEWAY_IP__:__PROXY_PORT__
+      export no_proxy=localhost,127.0.0.1
+      export NO_PROXY=localhost,127.0.0.1
+  # apt through the same proxy. The host proxy tunnels only CONNECT to port 443 and refuses plain HTTP
+  # with 405, so bootcmd moves the Debian sources to https before the package stage runs. apt still
+  # reaches a mirror only when its name is on the run's EgressAllowlist (the builder lists the Debian
+  # mirrors; tier1 alone does not, so an install there fails and is logged).
+  - path: /etc/apt/apt.conf.d/99voidseal-proxy
+    permissions: '0644'
+    content: |
+      Acquire::http::Proxy "http://__GATEWAY_IP__:__PROXY_PORT__/";
+      Acquire::https::Proxy "http://__GATEWAY_IP__:__PROXY_PORT__/";
+'@
+
+# bootcmd entries: IPv6 off as early as cloud-init runs anything (bootcmd is the first module of the
+# network stage; the host side blocks IPv6 too, so this only keeps the guest from trying), and the
+# Debian sources moved to https before the package stage, because the proxy refuses plain HTTP.
+$script:CidataHostProxyDiskBootcmd = @'
+  - [ sysctl, -w, 'net.ipv6.conf.all.disable_ipv6=1' ]
+  - [ sysctl, -w, 'net.ipv6.conf.default.disable_ipv6=1' ]
+  - [ sh, -c, "sed -i 's#http://deb.debian.org#https://deb.debian.org#g; s#http://security.debian.org#https://security.debian.org#g' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null; true" ]
+'@
+
+# The package stage: nftables carries the in-guest lockdown, and guest-images/debian-12-cloud.md does not
+# say the Debian 12 genericcloud image ships it (or iptables), so cloud-init installs it through the
+# proxy here, after write_files has put the apt proxy setting in place and before runcmd applies the
+# lockdown. The install needs the Debian mirrors on the run's allowlist; when it fails, cloud-init logs
+# it and the lockdown script falls back to iptables, then to a skip marker (the host still enforces).
+$script:CidataHostProxyDiskPackages = @'
+packages:
+  - nftables
+'@
+
+# runcmd entries, placed before the workload unit starts: apply the lockdown now, on this first and only
+# boot, and on any later boot via the unit.
+$script:CidataHostProxyDiskRuncmd = @'
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, voidseal-egress.service ]
+'@
+
+# Runner lines (six-space indented, inside the runner script): export the proxy settings for the
+# entrypoint (runuser keeps the environment) and narrate the egress facts structurally: the proxy
+# address, route and resolver counts, the IPv6 flag, the lockdown unit, whether nft arrived, and a TCP
+# connect to the proxy port. The exFAT runner has no diag(), so it gets the export alone.
+$script:CidataHostProxyDiskRunnerEnv = @'
+      # --- Host proxy (EgressMode='HostProxy'): the gateway proxy is this guest's only way out ---
+      # A oneshot unit reads neither /etc/environment nor a login profile, so export the proxy settings
+      # here for the entrypoint (runuser keeps the environment). The lockdown ran from its own unit.
+      . /etc/profile.d/voidseal-egress-proxy.sh
+      diag "egress_mode=hostproxy proxy=$HTTPS_PROXY default_routes=$(ip -4 route show default 2>/dev/null | wc -l) nameservers=$(grep -c '^nameserver' /etc/resolv.conf 2>/dev/null) ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)"
+      diag "egress_unit_enabled=$(systemctl is-enabled voidseal-egress.service 2>/dev/null) nft_present=$(command -v nft >/dev/null 2>&1 && echo yes || echo no) proxy_reachable=$(timeout 5 bash -c 'exec 3<>/dev/tcp/__GATEWAY_IP__/__PROXY_PORT__' >/dev/null 2>&1 && echo yes || echo no)"
+'@
+$script:CidataHostProxyDiskRunnerEnvQuiet = @'
+      # Host proxy (EgressMode='HostProxy'): export the proxy settings for the entrypoint; a oneshot
+      # unit reads neither /etc/environment nor a login profile (runuser keeps the environment).
+      . /etc/profile.d/voidseal-egress-proxy.sh
+'@
+
+# --------------------------------------------------------------------------
+# The BUILDER disk-mode runner user-data: the Tier-1 builder VM, always on a kept NIC behind the host
+# proxy. It carries the HostProxy fragments above through the same tokens as the other Disk runners, so
+# the builder's egress is the host's CONNECT proxy and nothing else: no in-guest proxy, no redirect
+# rules, no package beyond nftables. The mock asserts the seed's SHAPE (the proxy environment, the
+# lockdown, the markers); the first live run is the first live Tier-1 egress. Single-quoted
+# here-string: NOTHING is interpolated by PowerShell. __ENTRYPOINT__ is the profile Entrypoint (same
+# sh -c guard as the other runners).
 # --------------------------------------------------------------------------
 $script:CidataBuilderRunnerTemplate = @'
 #cloud-config
-# Voidseal builder disk-mode seed — Tier-1 net-restricted builder VM (Phase 2.2).
-# Network is ENABLED; a transparent Squid SNI proxy gatekeeps 80/443 to the EgressAllowlist only
-# (default-deny). The workload fetches deps over Squid into /mnt/out (the exFAT deps disk, which the host
-# never mounts), writes a manifest there, and then packs its verdict (the exit code and a copy of the
-# manifest) into a small RAW verdict disk with the shared outbox producer and powers off. The host reads
-# the verdict from that raw disk in user space.
+__NETWORK_STANZA__
+# Voidseal builder disk-mode seed: the Tier-1 builder VM. The guest keeps its NIC, and its only way out
+# is the host's CONNECT allowlist proxy on the gateway of its own /30 (EgressMode='HostProxy'): the host
+# firewall rules and port ACL the seal installed admit nothing else, the guest has no route and no
+# resolver, and the proxy settings below point every fetcher at it. The workload fetches deps into
+# /mnt/out (the exFAT deps disk, which the host never mounts), writes a manifest there, then packs its
+# verdict (the exit code and a copy of the manifest) into a small RAW verdict disk with the shared
+# outbox producer and powers off. The host reads the verdict from that raw disk in user space.
 
 # RC2: create the non-root sandbox user (identically to the serial baseline + offline disk runner).
 users:
@@ -415,117 +595,34 @@ users:
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
     lock_passwd: true          # no password login anywhere; this is a sealed builder guest
 
-# SEC-2/C3: disable IPv6 BEFORE the network comes up. bootcmd runs on every boot, earlier than
-# runcmd/network-config — SLAAC/DHCPv6 (both on-by-default on Debian cloud images) never gets a
-# chance to bring up a usable IPv6 route, so there is nothing for a malicious dependency to route
-# over. This is the PRIMARY control; the ip6tables default-DROP below is belt-and-braces in case
-# disable_ipv6 is ever bypassed or a kernel/module quirk re-enables it.
 bootcmd:
-  - [ sysctl, -w, 'net.ipv6.conf.all.disable_ipv6=1' ]
-  - [ sysctl, -w, 'net.ipv6.conf.default.disable_ipv6=1' ]
+__HOSTPROXY_BOOTCMD__
 
 write_files:
-  - path: /etc/sysctl.d/99-voidseal-noipv6.conf
-    permissions: '0644'
-    content: |
-      # SEC-2/C3: IPv6 disabled for this Tier-1 builder guest. Debian cloud images bring IPv6 up by
-      # default (SLAAC/DHCPv6); the egress lockdown below is otherwise IPv4-only and a malicious
-      # dependency could egress over IPv6 entirely unfiltered. bootcmd applies this at boot (before
-      # network-config); this file makes the setting persist/re-apply across `sysctl --system`.
-      net.ipv6.conf.all.disable_ipv6 = 1
-      net.ipv6.conf.default.disable_ipv6 = 1
-
-  - path: /etc/squid/squid.conf
-    permissions: '0644'
-    content: |
-      # Voidseal Tier-1 builder Squid SNI proxy — transparent intercept on 3129 (HTTP) + 3130 (HTTPS).
-      # LIVE-only (Phase 6): real ssl_bump/SNI peek + CDN-rotation resilience unproven in mock tests.
-      http_port 3129 intercept
-      https_port 3130 intercept ssl-bump
-      acl allowed_domains dstdomain __SQUID_ALLOWLIST_ACL__
-      ssl_bump peek all
-      ssl_bump splice allowed_domains
-      ssl_bump terminate all
-      http_access allow allowed_domains
-      http_access deny all
-
   - path: /usr/local/sbin/vmdep-builder
     permissions: '0755'
     content: |
       #!/bin/sh
-      # Voidseal builder runner: bring up Squid SNI proxy, mount the data disks, pick out the raw verdict
-      # disk, run the dep-fetch entrypoint as the non-root 'sandbox' user (deps land on the exFAT OUTPUT
-      # disk), pack the verdict into the raw verdict disk, power off.
+      # Voidseal builder runner: mount the data disks, pick out the raw verdict disk, export the host
+      # proxy settings, run the dep-fetch entrypoint as the non-root 'sandbox' user (deps land on the
+      # exFAT OUTPUT disk), pack the verdict into the raw verdict disk, power off.
       set +e
-      # SERIAL DIAGNOSTICS (Phase-6 live-debug observability — the same discipline whose markers
+      # SERIAL DIAGNOSTICS (Phase-6 live-debug observability: the same discipline whose markers
       # pinned BOTH Tier-0 live root causes in the OutboxOutput runner). Phase 6 is the FIRST live
-      # egress: a failed fetch must be attributable to squid-down vs REDIRECT-not-applied vs
+      # egress: a failed fetch must be attributable to proxy-unreachable vs lockdown-not-applied vs
       # mount-failure vs the fetch itself. Invoke-BuilderVM reads result.exitcode and deps-manifest.json
       # out of the raw verdict disk (the shared outbox container, user space, no host mount) and reports
       # Success only for an exit code of exactly 0 with the manifest present, else FetchFailed with the
       # reason; a failed run's disks are then deleted, so this console narration is the second source and
       # the only one that says WHERE the guest stopped.
-      # STRUCTURAL ONLY: liveness, rc values, file COUNTS, manifest presence — NEVER fetched-artifact
+      # STRUCTURAL ONLY: liveness, rc values, file COUNTS, manifest presence, never fetched-artifact
       # bytes (contract-consistency with the shared outbox runner; serial stays a control-flow record,
       # not a payload mirror). Never alters control flow: runs under `set +e`, writes to /dev/console
       # (always present) and swallows any error.
       diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
       diag "builder-runner start"
 
-      # --- Squid transparent proxy setup ---
-      systemctl restart squid 2>/dev/null || true
-      # A dead Squid turns every fetch into an opaque connection failure (the REDIRECTs below would
-      # route 80/443 into a closed port) — put its liveness on serial BEFORE anything depends on it.
-      diag "squid_active=$(systemctl is-active squid 2>/dev/null)"
-      # --- Egress lockdown: DEFAULT-DROP OUTPUT + a minimal allow-list (SEC-2) ---
-      # tier1 BlockProtocols (QUIC/UDP-443, DoH, DoT) is enforced BY CONSTRUCTION: only the flows below are
-      # permitted, so QUIC/UDP-443 and DoT/853 are dropped, and DoH (443) hits Squid's domain-ACL (a DoH
-      # resolver isn't in the deps allowlist -> denied). DNS/53 is allowed broadly (UDP+TCP): the transparent
-      # proxy needs it to resolve the allowlist domains, and the builder carries ZERO personal data (two-VM
-      # split) so DNS-tunnel exfil is a non-threat; the Squid domain-ACL is the real fetch control. Squid was
-      # started above (network still open); its own egress (uid proxy) to upstream:80/443 rides the 80/443
-      # ACCEPTs, and a REDIRECT'd client connection rides '-o lo'. FAIL-CLOSED: if this setup errors partway,
-      # the OUTPUT policy stays DROP -> no egress -> the fetch fails cleanly. IPv6 is disabled at boot
-      # (bootcmd, pre-network) AND ip6tables default-DROPs below — this lockdown is no longer IPv4-only
-      # (SEC-2/C3: an unfiltered IPv6 route was a complete bypass of both this DROP and the Squid ACL).
-      # LIVE-ONLY (Phase 6): real packet-drop is unproven in mock - the seed asserts SHAPE only.
-      iptables -F OUTPUT 2>/dev/null
-      iptables -P OUTPUT DROP
-      iptables -A OUTPUT -o lo -j ACCEPT
-      iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-      iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-      iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-      iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
-      iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
-      # Transparent-proxy REDIRECT of outbound 80/443 through Squid (domain-ACL gatekeeps the fetch); the
-      # owner-exclusion keeps Squid's OWN upstream egress from being re-redirected.
-      iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
-      r80=$?
-      iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
-      r443=$?
-      # An unapplied REDIRECT silently bypasses the Squid domain-ACL for that protocol (traffic rides
-      # the raw 80/443 ACCEPTs above) — each rule's rc must be visible so a live capture can rule
-      # this layer in or out without guessing.
-      diag "egress_lockdown=v4-applied redirect80_rc=$r80 redirect443_rc=$r443"
-      # --- IPv6 belt-and-braces (SEC-2/C3): default-DROP OUTPUT over ip6tables too. disable_ipv6 above
-      # is the primary control (no IPv6 route should exist at all); this guards the case where it is
-      # somehow bypassed. Guarded on `command -v` so a missing ip6tables binary cannot abort this
-      # `set +e` script — fail-closed intent: if IPv6 is disabled there is nothing to route anyway, and
-      # NO IPv6 egress ACCEPT is opened for 53/80/443 (the builder fetch is IPv4-only through Squid).
-      if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -F OUTPUT 2>/dev/null
-        ip6tables -P OUTPUT DROP
-        ip6tables -A OUTPUT -o lo -j ACCEPT
-        ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        diag "ip6_lockdown=applied"
-      else
-        # Fail-closed posture is unchanged (disable_ipv6 ran at bootcmd; no v6 ACCEPT exists anywhere)
-        # but the skip must be visible: a missing binary is exactly the kind of quiet divergence a
-        # live capture needs to see rather than infer.
-        diag "ip6_lockdown=skipped (no ip6tables binary)"
-      fi
-
-      # --- Mount data disks (same robust pattern as the offline runner) ---
+      # --- Mount data disks (the same mount pattern as the offline runner) ---
       SBX_UID=$(id -u sandbox 2>/dev/null || echo 0)
       SBX_GID=$(id -g sandbox 2>/dev/null || echo 0)
       modprobe exfat 2>/dev/null
@@ -575,7 +672,11 @@ write_files:
       diag "verdict_dev=$VERDICT_DEV"
       mkdir -p /run/vstaging
 
+__HOSTPROXY_RUNNER_ENV__
+
       # --- Run the dep-fetch entrypoint ---
+      # pip download, apt-get download and huggingface-cli all honor the proxy variables exported above
+      # (fetch_deps.py runs them with the inherited environment), and apt reads its own proxy setting.
       diag "entrypoint start"
       if [ "$OUT_SANDBOX_OWNED" = "1" ] && id -u sandbox >/dev/null 2>&1; then
         runuser -u sandbox -- /bin/sh -c '__ENTRYPOINT__' > /mnt/out/stdout.log 2> /mnt/out/stderr.txt
@@ -615,7 +716,7 @@ write_files:
     content: |
       [Unit]
       Description=Voidseal builder dep-fetch workload
-      After=network-online.target squid.service
+      After=network-online.target voidseal-egress.service
       Wants=network-online.target
       [Service]
       Type=oneshot
@@ -623,11 +724,13 @@ write_files:
       TimeoutStartSec=infinity
       [Install]
       WantedBy=multi-user.target
+__HOSTPROXY_FILES__
+
+__HOSTPROXY_PACKAGES__
 
 runcmd:
-  - [ apt-get, install, -y, squid, iptables ]
+__HOSTPROXY_RUNCMD__
   - [ systemctl, daemon-reload ]
-  - [ systemctl, enable, squid.service ]
   - [ systemctl, start, --no-block, vmdep-builder.service ]
 '@
 
@@ -694,201 +797,14 @@ runcmd:
 '@
 
 # --------------------------------------------------------------------------
-# The SERIAL + InGuestSquid egress user-data (EG-2, ralph in-guest egress Option A). The serial-getty
-# AUTOLOGIN baseline (CidataSerialBaselineTemplate, above — ralph's ttyS0 command channel is
-# unchanged) COMPOSED WITH the builder's proven egress fragment (CidataBuilderRunnerTemplate, above:
-# IPv6-disable + Squid transparent domain-ACL + iptables default-DROP), ported for a Serial-mode
-# profile that declares EgressMode='InGuestSquid'. Single-quoted here-string: nothing is interpolated
-# by PowerShell ($TERM in the serial-getty line stays literal, same as the baseline). Only
-# __SQUID_ALLOWLIST_ACL__ is substituted (space-joined merged EgressAllowlist).
-#
-# THIS IS DEFENSE-IN-DEPTH, NOT A BOUNDARY (Pass A / Pass 5): a compromised/root guest can disable its
-# own iptables or kill its own Squid. This is the in-guest fallback mode; the tier1 default is
-# EgressMode='HostProxy', where the host enforces egress (host CONNECT proxy, host firewall rules and port
-# ACL, gate-verified, mock-green, never run live; docs/phase-6-live-runbook.md section 2). The mock
-# asserts SHAPE only (Squid ACL contains each allowlist domain; http_access deny all; iptables
-# default-DROP; IPv6 disabled) — real packet-drop is a Phase-6 live-validation item, same posture the
-# builder's own egress fragment already carries.
-# --------------------------------------------------------------------------
-$script:CidataSerialEgressTemplate = @'
-#cloud-config
-# Voidseal Tier-1 (ralph) serial-mode seed WITH in-guest egress (EG-2, Option A). Brings up the same
-# COM1 serial command channel as the bare serial baseline (AUTOLOGIN on ttyS0 — the Runner's serial
-# client does NOT authenticate) PLUS an in-guest iptables default-DROP + transparent Squid domain-ACL
-# over the profile's merged EgressAllowlist, ported from the builder's SquidSniProxy mechanism.
-#
-# DEFENSE-IN-DEPTH, NOT A BOUNDARY: a compromised/root guest can disable this. This is the InGuestSquid
-# fallback; the tier1 default, EgressMode='HostProxy', is host-enforced. See docs/tier-reference.md.
-
-users:
-  - name: sandbox
-    groups: [sudo]
-    shell: /bin/bash
-    sudo: ['ALL=(ALL) NOPASSWD:ALL']
-    lock_passwd: true          # no password login anywhere; serial console + key only
-
-# SEC-2/C3: disable IPv6 BEFORE the network comes up (bootcmd runs earlier than runcmd/network-config)
-# — ported verbatim from the builder's egress fragment. Primary control; the ip6tables default-DROP
-# in the lockdown script below is belt-and-braces.
-bootcmd:
-  - [ sysctl, -w, 'net.ipv6.conf.all.disable_ipv6=1' ]
-  - [ sysctl, -w, 'net.ipv6.conf.default.disable_ipv6=1' ]
-
-write_files:
-  # Serial console params so the kernel + grub talk over ttyS0 (the host pipe). (baseline)
-  - path: /etc/default/grub.d/99-serial.cfg
-    content: |
-      GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
-      GRUB_TERMINAL="console serial"
-      GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
-  # AUTOLOGIN on ttyS0 — the Runner expects an already-logged-in shell (no prompt). (baseline)
-  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
-    content: |
-      [Service]
-      ExecStart=
-      ExecStart=-/sbin/agetty --autologin sandbox --keep-baud 115200,38400,9600 ttyS0 $TERM
-
-  - path: /etc/sysctl.d/99-voidseal-noipv6.conf
-    permissions: '0644'
-    content: |
-      # SEC-2/C3: IPv6 disabled for this Tier-1 in-guest egress control. Debian cloud images bring
-      # IPv6 up by default (SLAAC/DHCPv6); the lockdown below is otherwise IPv4-only and a semi-
-      # trusted agent could egress over IPv6 entirely unfiltered. bootcmd applies this at boot
-      # (before network-config); this file makes the setting persist/re-apply across `sysctl --system`.
-      net.ipv6.conf.all.disable_ipv6 = 1
-      net.ipv6.conf.default.disable_ipv6 = 1
-
-  - path: /etc/squid/squid.conf
-    permissions: '0644'
-    content: |
-      # Voidseal Tier-1 in-guest transparent Squid proxy — intercept on 3129 (HTTP) + 3130 (HTTPS).
-      # DEFENSE-IN-DEPTH, NOT A BOUNDARY: a root guest can stop this service. LIVE-only (Phase 6):
-      # real ssl_bump/SNI peek + CDN-rotation resilience is unproven in mock tests.
-      http_port 3129 intercept
-      https_port 3130 intercept ssl-bump
-      acl allowed_domains dstdomain __SQUID_ALLOWLIST_ACL__
-      ssl_bump peek all
-      ssl_bump splice allowed_domains
-      ssl_bump terminate all
-      http_access allow allowed_domains
-      http_access deny all
-
-  # LIVE-ONLY (Phase 6): activation ORDERING vs pre-seal staging is unproven in mock. The lockdown
-  # must activate AFTER in-guest package install (deb.debian.org is intentionally NOT in the
-  # allowlist) and stay active through the sealed run. The mock asserts SHAPE only; the live
-  # ordering + real packet-drop are Phase-6 live-validation items (same posture as the builder runner).
-  - path: /usr/local/sbin/voidseal-egress-lockdown
-    permissions: '0755'
-    content: |
-      #!/bin/sh
-      # Voidseal Tier-1 (ralph) in-guest egress lockdown: iptables default-DROP OUTPUT with a minimal
-      # allow-list (loopback, established, DNS, HTTP/HTTPS transparently redirected to Squid's
-      # domain-ACL), ported verbatim from the builder's proven mechanism (SeedBuilder.ps1). Defense-
-      # in-depth only: a root guest can flush/disable this. FAIL-CLOSED: if this script errors
-      # partway, the OUTPUT policy stays DROP -> no egress -> fails closed, not open.
-      set +e
-      # Structural-only serial markers, the same helper shape and marker names as the builder runner:
-      # liveness, rc values, yes/no outcomes, never any content. Writes to /dev/console, swallows errors.
-      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
-      diag "egress-lockdown start"
-      # Belt-and-braces (mirrors the builder runner): ensure Squid is up before the REDIRECT rules
-      # point 80/443 at its ports. The unit's After=squid.service already orders this; the restart
-      # guards a squid that failed its own start. `|| true` keeps the fail-closed DROP path intact.
-      systemctl restart squid 2>/dev/null || true
-      diag "squid_active=$(systemctl is-active squid 2>/dev/null)"
-      iptables -F OUTPUT 2>/dev/null
-      iptables -P OUTPUT DROP
-      iptables -A OUTPUT -o lo -j ACCEPT
-      iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-      iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-      iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-      iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
-      iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
-      # Transparent-proxy REDIRECT of outbound 80/443 through Squid (domain-ACL gatekeeps the fetch);
-      # the owner-exclusion keeps Squid's OWN upstream egress from being re-redirected.
-      iptables -t nat -A OUTPUT -p tcp --dport 80  -m owner ! --uid-owner proxy -j REDIRECT --to-port 3129
-      r80=$?
-      iptables -t nat -A OUTPUT -p tcp --dport 443 -m owner ! --uid-owner proxy -j REDIRECT --to-port 3130
-      r443=$?
-      # An unapplied REDIRECT silently bypasses the domain-ACL for that protocol: show each rule's rc.
-      diag "egress_lockdown=v4-applied redirect80_rc=$r80 redirect443_rc=$r443"
-      # IPv6 belt-and-braces: default-DROP OUTPUT over ip6tables too, guarded so a missing binary
-      # cannot abort this `set +e` script. No IPv6 egress ACCEPT is opened for 53/80/443.
-      if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -F OUTPUT 2>/dev/null
-        ip6tables -P OUTPUT DROP
-        ip6tables -A OUTPUT -o lo -j ACCEPT
-        ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        diag "ip6_lockdown=applied"
-      else
-        diag "ip6_lockdown=skipped (no ip6tables binary)"
-      fi
-
-  # SERIAL DIAGNOSTICS for the seed itself (the lockdown script above narrates its own run): structural
-  # facts only, the same helper shape as the builder runner. Run once at the end of runcmd, while the
-  # lockdown is enabled but not yet applied, so it reads as "what the seed installed and enabled".
-  - path: /usr/local/sbin/voidseal-serial-diag
-    permissions: '0755'
-    content: |
-      #!/bin/sh
-      set +e
-      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
-      diag "serial-seed start"
-      diag "block_devices=$(lsblk -dn -o NAME 2>/dev/null | wc -l) device_mounts=$(grep -c '^/dev/' /proc/mounts 2>/dev/null) cidata_labeled=$(blkid -L CIDATA >/dev/null 2>&1 && echo yes || echo no)"
-      diag "sandbox_user=$(id -u sandbox >/dev/null 2>&1 && echo yes || echo no)"
-      diag "serial_getty_active=$(systemctl is-active serial-getty@ttyS0.service 2>/dev/null) autologin_dropin=$([ -f /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf ] && echo yes || echo no)"
-      diag "grub_ttyS0_lines=$(grep -c ttyS0 /boot/grub/grub.cfg 2>/dev/null) cmdline_ttyS0=$(grep -c 'console=ttyS0' /proc/cmdline 2>/dev/null)"
-      diag "bwrap_present=$(command -v bwrap >/dev/null 2>&1 && echo yes || echo no) ca_certificates=$(dpkg -s ca-certificates >/dev/null 2>&1 && echo yes || echo no)"
-      diag "squid_present=$(command -v squid >/dev/null 2>&1 && echo yes || echo no) squid_active=$(systemctl is-active squid 2>/dev/null) egress_unit_enabled=$(systemctl is-enabled voidseal-egress.service 2>/dev/null)"
-      diag "ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) output_policy=$(iptables -S OUTPUT 2>/dev/null | sed -n 1p | cut -d ' ' -f 3)"
-      diag "failed_units=$(systemctl --failed --no-legend 2>/dev/null | wc -l)"
-      diag "serial-seed done"
-
-  - path: /etc/systemd/system/voidseal-egress.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Voidseal Tier-1 in-guest egress lockdown (defense-in-depth, NOT a boundary)
-      # Match the builder unit's ordering: pull network-online into the boot transaction (After alone
-      # does NOT), and order AFTER squid.service so the REDIRECT-to-3129/3130 never goes live before
-      # Squid binds those ports (a too-early REDIRECT hits a closed port -> connection refused -> still
-      # fail-closed, but ordering after squid avoids the spurious refusal). Mirrors the builder unit.
-      After=network-online.target squid.service
-      Wants=network-online.target
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/sbin/voidseal-egress-lockdown
-      [Install]
-      WantedBy=multi-user.target
-
-runcmd:
-  - update-grub
-  - systemctl daemon-reload
-  - systemctl enable  serial-getty@ttyS0.service
-  - systemctl restart serial-getty@ttyS0.service
-  - [ apt-get, update ]
-  - [ apt-get, install, -y, squid, iptables ]
-  - [ apt-get, install, -y, bubblewrap, ca-certificates ]
-  - systemctl enable squid.service
-  - systemctl enable voidseal-egress.service
-  - [ /usr/local/sbin/voidseal-serial-diag ]
-
-# LIVE-ONLY (Phase 6): voidseal-egress.service is ENABLED here (applies on the NEXT boot / at the
-# sealed-run point) but deliberately NOT started inline in runcmd, so the default-DROP does not block
-# this guest's OWN pre-seal package install above (deb.debian.org is intentionally NOT in the
-# EgressAllowlist). The precise live activation trigger is a Phase-6 live-validation detail; the mock
-# asserts the seed SHAPE only.
-'@
-
-# --------------------------------------------------------------------------
 # The SERIAL + HostProxy user-data (EgressMode='HostProxy', docs/phase-6-live-runbook.md section 2).
 # The guest gets NO route and NO resolver: cloud-init's network-config (New-CidataNetworkConfig) gives
 # eth0 one static address in the VM's /30 and nothing else. The only way out is the HOST's CONNECT
 # proxy on the gateway address, which the host firewall and the port ACL leave open and the host
 # enforces. This seed points every client at it (HTTPS_PROXY / https_proxy in /etc/environment and a
 # login profile script, NO_PROXY empty, apt's proxy setting), and keeps an in-guest default-DROP as
-# defense in depth that allows only TCP to the proxy port on the gateway. Unlike the InGuestSquid seed,
-# that lockdown runs before networking on the guest's only boot (it needs no package install first).
+# defense in depth that allows only TCP to the proxy port on the gateway: the lockdown files are the
+# shared $script:CidataHostProxyLockdownFiles fragment the Disk-mode HostProxy seeds carry too.
 # Single-quoted here-string; New-CidataUserData substitutes __GATEWAY_IP__, __PROXY_PORT__ and
 # __GUEST_CIDR__ from the descriptor's address plan, so only validated dotted IPv4 text and a port
 # number ever reach the shell.
@@ -926,12 +842,6 @@ write_files:
       ExecStart=
       ExecStart=-/sbin/agetty --autologin sandbox --keep-baud 115200,38400,9600 ttyS0 $TERM
 
-  - path: /etc/sysctl.d/99-voidseal-noipv6.conf
-    permissions: '0644'
-    content: |
-      net.ipv6.conf.all.disable_ipv6 = 1
-      net.ipv6.conf.default.disable_ipv6 = 1
-
   # The host proxy, for every client that honors the proxy variables (pip, the Claude CLI, Hugging Face
   # clients, curl). pam_env reads /etc/environment at login (the serial autologin shell included); the
   # profile script covers shells that skip pam_env. NO_PROXY is empty on purpose: nothing is direct.
@@ -958,40 +868,7 @@ write_files:
       Acquire::https::Proxy "http://__GATEWAY_IP__:__PROXY_PORT__/";
       Acquire::http::Proxy "http://__GATEWAY_IP__:__PROXY_PORT__/";
 
-  # In-guest default-DROP, defense in depth only (root in the guest can undo it; the host enforces).
-  # Allows loopback, established traffic, and TCP to the proxy port on the gateway. nftables first
-  # (one inet table covers IPv4 and IPv6), iptables as a fallback, a structural marker either way.
-  - path: /usr/local/sbin/voidseal-egress-lockdown
-    permissions: '0755'
-    content: |
-      #!/bin/sh
-      set +e
-      diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }
-      diag "egress-lockdown start mode=hostproxy"
-      if command -v nft >/dev/null 2>&1; then
-        nft delete table inet voidseal 2>/dev/null
-        printf '%s\n' \
-          'table inet voidseal {' \
-          '  chain output {' \
-          '    type filter hook output priority 0; policy drop;' \
-          '    oif "lo" accept' \
-          '    ct state established,related accept' \
-          '    ip daddr __GATEWAY_IP__ tcp dport __PROXY_PORT__ accept' \
-          '  }' \
-          '}' | nft -f -
-        diag "egress_lockdown=hostproxy-applied tool=nft rc=$?"
-      elif command -v iptables >/dev/null 2>&1; then
-        iptables -F OUTPUT 2>/dev/null
-        iptables -P OUTPUT DROP
-        iptables -A OUTPUT -o lo -j ACCEPT
-        iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        iptables -A OUTPUT -p tcp -d __GATEWAY_IP__ --dport __PROXY_PORT__ -j ACCEPT
-        r=$?
-        if command -v ip6tables >/dev/null 2>&1; then ip6tables -P OUTPUT DROP; fi
-        diag "egress_lockdown=hostproxy-applied tool=iptables rc=$r"
-      else
-        diag "egress_lockdown=skipped (no nft or iptables binary; the host still enforces)"
-      fi
+__HOSTPROXY_LOCKDOWN_FILES__
 
   - path: /usr/local/sbin/voidseal-serial-diag
     permissions: '0755'
@@ -1009,20 +886,6 @@ write_files:
       diag "egress_unit_enabled=$(systemctl is-enabled voidseal-egress.service 2>/dev/null) ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) proxy_reachable=$(timeout 5 bash -c 'exec 3<>/dev/tcp/__GATEWAY_IP__/__PROXY_PORT__' >/dev/null 2>&1 && echo yes || echo no)"
       diag "failed_units=$(systemctl --failed --no-legend 2>/dev/null | wc -l)"
       diag "serial-seed done"
-
-  - path: /etc/systemd/system/voidseal-egress.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Voidseal Tier-1 in-guest egress lockdown for HostProxy (defense in depth, NOT a boundary)
-      DefaultDependencies=no
-      Before=network-pre.target
-      Wants=network-pre.target
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/sbin/voidseal-egress-lockdown
-      [Install]
-      WantedBy=multi-user.target
 
 runcmd:
   - systemctl daemon-reload
@@ -1093,74 +956,50 @@ function New-DataDiskMountLines {
 
 <#
 .SYNOPSIS
-    Build the cloud-init `user-data` string for a profile (Disk-mode runner or Serial baseline).
+    Build the cloud-init `user-data` string for a profile: a Disk-mode runner (offline, HostProxy or the
+    builder) or the Serial baseline (offline or HostProxy).
+.DESCRIPTION
+    `WorkloadMode='Disk'` selects a disk-mode runner and substitutes the profile's `Entrypoint` for
+    __ENTRYPOINT__: the builder runner when the profile declares DepsSpec, the OutboxOutput runner when
+    Test-UsesOutboxTransport says so, else the legacy exFAT runner. Anything else is the Serial baseline.
+    A VM that keeps its NIC (Get-SealNicPolicy 'IsolatedInternalSwitch' with EgressMode='HostProxy')
+    gets the HostProxy guest fragments in either mode: the proxy settings, the apt setting, the in-guest
+    lockdown and, for the Disk runners, the nftables package stage and the runner's proxy export. That
+    needs the VM's address plan (-Egress) and a non-empty allowlist; both are refused when missing. Tier 0
+    declares HostProxy too but seals with no adapter, so its seeds stay offline.
 .PARAMETER Profile
-    The resolved profile (hashtable). `WorkloadMode='Disk'` selects the disk-mode runner (and the
-    profile's `Entrypoint` is substituted for __ENTRYPOINT__); anything else -> the serial baseline.
+    The resolved profile (hashtable).
+.PARAMETER Egress
+    The VM's address plan (HostEgress.ps1 Get-EgressAddressPlan), which New-WorkloadSeedDisk takes from
+    the descriptor. Required for every seed of a VM that keeps its NIC.
 #>
 function New-CidataUserData {
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [Parameter(Mandatory)] $Profile,
-        # EgressMode='HostProxy' only: the VM's address plan (HostEgress.ps1 Get-EgressAddressPlan), which
-        # New-WorkloadSeedDisk takes from the descriptor. Required for a Serial HostProxy seed.
         [System.Collections.IDictionary] $Egress
     )
 
-    $mode       = [string](Get-SeedProfileField -Profile $Profile -Name 'WorkloadMode'  -Default 'Serial')
-    $egressMode = [string](Get-SeedProfileField -Profile $Profile -Name 'EgressMode'    -Default '')
+    $mode        = [string](Get-SeedProfileField -Profile $Profile -Name 'WorkloadMode' -Default 'Serial')
+    $egressMode  = [string](Get-SeedProfileField -Profile $Profile -Name 'EgressMode'   -Default '')
+    $seedTier    = [int](Get-SeedProfileField -Profile $Profile -Name 'Tier' -Default 0)
+    $seedNetwork = [string](Get-SeedProfileField -Profile $Profile -Name 'Network' -Default '')
 
-    # FAIL-CLOSED: 'InGuestSquid' is the SERIAL-seed's in-guest egress fragment (below); the Disk-mode
-    # branches below it have no idea EgressMode exists and would otherwise silently fall through to a
-    # plain disk runner with ZERO egress content for a profile that declared one — the exact
-    # "declared but unwired" class this batch retires. Refuse it explicitly instead.
-    # 'HostProxy' means something only for a VM that keeps a NIC (Tier 1, Network 'Internal+Allowlist').
-    # Tier 0 also declares it, but a Tier-0 VM is sealed with no adapter, so its seed stays offline.
+    # Does this VM keep a NIC? Then its seed carries the host-proxy settings, whatever the mode. The
+    # predicate is the Provisioner's and the seal's (SealPolicy.ps1), so the seed agrees with both.
+    # 'HostProxy' means something only for a kept NIC: Tier 0 declares it too, but a Tier-0 VM is sealed
+    # with no adapter, so its seed stays offline.
     $hostProxyNic = $false
     if ($egressMode -eq 'HostProxy') {
-        $seedTier    = [int](Get-SeedProfileField -Profile $Profile -Name 'Tier' -Default 0)
-        $seedNetwork = [string](Get-SeedProfileField -Profile $Profile -Name 'Network' -Default '')
         $hostProxyNic = ((Get-SealNicPolicy -Tier $seedTier -Network $seedNetwork) -eq 'IsolatedInternalSwitch')
     }
-    if ($mode -eq 'Disk' -and $hostProxyNic) {
-        throw "New-CidataUserData: 'HostProxy' is wired for SERIAL-mode Tier-1 seeds; no Disk-mode runner points its workload at the host proxy (the builder uses 'SquidSniProxy'). Fail closed."
-    }
-    if ($mode -eq 'Disk' -and $egressMode -eq 'InGuestSquid') {
-        throw "New-CidataUserData: 'InGuestSquid' is the SERIAL-seed in-guest egress; a Disk-mode egress profile uses the builder's 'SquidSniProxy' (which carries its DepsSpec rule)."
-    }
-
-    if ($mode -eq 'Disk' -and $egressMode -eq 'SquidSniProxy') {
-        # Builder path: network-enabled disk-mode seed with a transparent Squid SNI domain-ACL proxy.
-        if (@(ConvertTo-DataDiskList -Value (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Context 'New-CidataUserData').Count -gt 0) {
-            throw "New-CidataUserData: the builder runner does not mount data disks; a builder profile must not declare DataDisks (fail-closed)."
-        }
-        $entrypoint = [string](Get-SeedProfileField -Profile $Profile -Name 'Entrypoint' -Default '')
-        # FAIL-CLOSED: same sh -c guard as the offline runner (single quote / newline / blank are refused).
-        if ([string]::IsNullOrWhiteSpace($entrypoint)) {
-            throw "New-CidataUserData: a builder Disk+SquidSniProxy profile must declare a non-blank Entrypoint."
-        }
-        if ($entrypoint.Contains("'")) {
-            throw "New-CidataUserData: the builder Entrypoint contains a single quote, which would escape the runner's sh -c '...' wrapper. Refuse it."
-        }
-        if ($entrypoint -match "[\r\n]") {
-            throw "New-CidataUserData: the builder Entrypoint is multi-line; the runner invokes it on a single sh -c line. Refuse it."
-        }
-        $allowlist = Get-SeedProfileField -Profile $Profile -Name 'EgressAllowlist' -Default @()
-        if ($null -eq $allowlist -or @($allowlist).Count -eq 0) {
-            throw "New-CidataUserData: a builder Disk+SquidSniProxy profile must have a non-empty EgressAllowlist (allowlist is empty — fail-closed)."
-        }
-        # SEC-1: each allowlist entry's charset (no whitespace/newline/quote) is validated at LOAD time
-        # in Assert-TierProfileValid (ProfileLoader.ps1) before it ever reaches here, so a newline-bearing
-        # entry cannot inject a directive (e.g. `http_access allow all`) into the dstdomain ACL below.
-        $aclLine = ($allowlist -join ' ')
-        $ud = $script:CidataBuilderRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__SQUID_ALLOWLIST_ACL__', $aclLine)
-        return (ConvertTo-LfText -Text $ud)
-    }
+    # DepsSpec is what makes a profile a builder (the loader's builder rule, Invoke-BuilderVM's guard).
+    $isBuilder = $null -ne (Get-SeedProfileField -Profile $Profile -Name 'DepsSpec')
 
     if ($mode -eq 'Disk') {
         $entrypoint = [string](Get-SeedProfileField -Profile $Profile -Name 'Entrypoint' -Default '')
-        # FAIL-CLOSED: the runner invokes the entrypoint as  sh -c '<entrypoint>'  on a single line.
+        # FAIL-CLOSED: every Disk runner invokes the entrypoint as  sh -c '<entrypoint>'  on a single line.
         if ([string]::IsNullOrWhiteSpace($entrypoint)) {
             throw "New-CidataUserData: a Disk-mode profile must declare a non-blank Entrypoint (the disk runner has nothing to run without it)."
         }
@@ -1170,18 +1009,45 @@ function New-CidataUserData {
         if ($entrypoint -match "[\r\n]") {
             throw "New-CidataUserData: the Disk-mode Entrypoint is multi-line; the runner invokes it on a single sh -c line. Refuse it."
         }
-        # C1.3: a profile that opts into the user-space outbox transport (OutboxOutput=$true — same
+
+        # The HostProxy guest side for a VM that keeps its NIC: the address plan the descriptor carries
+        # (every value re-validated as dotted IPv4 text or a port number before it lands in shell or
+        # YAML) and a non-empty allowlist (a proxy that admits no name is a run that can fetch nothing).
+        $hp = $null
+        if ($hostProxyNic) {
+            $allowlist = Get-SeedProfileField -Profile $Profile -Name 'EgressAllowlist' -Default @()
+            if ($null -eq $allowlist -or @($allowlist).Count -eq 0) {
+                throw "New-CidataUserData: a Disk+HostProxy profile must have a non-empty EgressAllowlist (fail-closed)."
+            }
+            $hp = Get-HostProxySeedValues -Egress $Egress
+        }
+
+        if ($isBuilder) {
+            # The builder fetches over the host proxy, so it is the kept-NIC HostProxy shape or nothing.
+            if (-not $hostProxyNic) {
+                throw ("New-CidataUserData: a builder profile (DepsSpec) fetches over the host proxy, so it must be a Tier-1 " +
+                       "'Internal+Allowlist' profile with EgressMode='HostProxy'; this one is Tier $seedTier, Network='$seedNetwork', " +
+                       "EgressMode='$egressMode'. Fail closed.")
+            }
+            if (@(ConvertTo-DataDiskList -Value (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Context 'New-CidataUserData').Count -gt 0) {
+                throw "New-CidataUserData: the builder runner does not mount data disks; a builder profile must not declare DataDisks (fail-closed)."
+            }
+            $ud = Expand-HostProxySeedTokens -Template $script:CidataBuilderRunnerTemplate -Values $hp -Diag $true
+            return (ConvertTo-LfText -Text $ud.Replace('__ENTRYPOINT__', $entrypoint))
+        }
+
+        # C1.3: a profile that opts into the user-space outbox transport (OutboxOutput=$true, the same
         # predicate as Workload.ps1's Raw-OUTPUT selection) gets the OutboxOutput runner: the OUTPUT
         # disk is Raw (no filesystem), so the entrypoint runs into a staging dir and the shared
         # outbox-producer template (run_disk_workload.py) packs + writes the outbox.
         # Everything else (legacy non-outbox Disk profiles) keeps the direct exFAT result.html runner.
         # Test-UsesOutboxTransport (ProfileLoader.ps1) is the SINGLE source of this truth, shared with
         # Workload.ps1's Raw-OUTPUT selection and Invoke-Voidseal's structural validator. It is TRUE for
-        # a PROCESSOR (Network='None' + ScreenConfig) as well as an explicit OutboxOutput=$true — this
+        # a PROCESSOR (Network='None' + ScreenConfig) as well as an explicit OutboxOutput=$true; this
         # used to key on OutboxOutput ALONE, which handed a processor a Raw OUTPUT disk AND the exFAT
         # runner (see that function's predicate-drift note).
         if (Test-UsesOutboxTransport -Profile $Profile) {
-            # FAIL-CLOSED (live 2026-07-21): the outbox runner creates ONLY /mnt/in and /run/staging —
+            # FAIL-CLOSED (live 2026-07-21): the outbox runner creates ONLY /mnt/in and /run/staging;
             # OUTPUT is Raw and is never mounted. An entrypoint aimed at /mnt/out cannot write its
             # result, and fails in the worst possible way: rc=1 with EMPTY staging, so a structurally
             # VALID but empty outbox ships and the failure reads as a transport fault rather than a
@@ -1203,59 +1069,86 @@ function New-CidataUserData {
             if (Test-IsProcessorProfile -Profile $Profile) {
                 $screen  = Resolve-ScreenConfig -Profile @{ ScreenConfig = (Get-SeedProfileField -Profile $Profile -Name 'ScreenConfig') }
                 $rawMode = [string]$screen['mode']
-                $mode    = $rawMode.Trim().ToLowerInvariant()
-                if ($mode -cnotin @('aggressive', 'moderate')) {
+                $screenMode = $rawMode.Trim().ToLowerInvariant()
+                if ($screenMode -cnotin @('aggressive', 'moderate')) {
                     throw ("New-CidataUserData: processor ScreenConfig.mode '$rawMode' is not a screener mode. Use 'aggressive' " +
                            "or 'moderate'; the value is passed to the in-guest screener on the runner's shell line. Fail closed.")
                 }
-                $screenArgs = "--mode $mode"
+                $screenArgs = "--mode $screenMode"
             }
             $mounts = New-DataDiskMountLines -DataDisks (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Diag $true
-            $ud = $script:CidataOutboxDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__PRODUCER_SCREEN_ARGS__', $screenArgs).Replace('__DATA_DISK_MOUNTS__', $mounts)
+            $ud = Expand-HostProxySeedTokens -Template $script:CidataOutboxDiskRunnerTemplate -Values $hp -Diag $true
+            $ud = $ud.Replace('__ENTRYPOINT__', $entrypoint).Replace('__PRODUCER_SCREEN_ARGS__', $screenArgs).Replace('__DATA_DISK_MOUNTS__', $mounts)
             return (ConvertTo-LfText -Text $ud)
         }
         $mounts = New-DataDiskMountLines -DataDisks (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Diag $false
-        $ud = $script:CidataDiskRunnerTemplate.Replace('__ENTRYPOINT__', $entrypoint).Replace('__DATA_DISK_MOUNTS__', $mounts)
+        $ud = Expand-HostProxySeedTokens -Template $script:CidataDiskRunnerTemplate -Values $hp -Diag $false
+        $ud = $ud.Replace('__ENTRYPOINT__', $entrypoint).Replace('__DATA_DISK_MOUNTS__', $mounts)
         return (ConvertTo-LfText -Text $ud)
     }
 
-    # Only the two Disk-mode runners mount data disks; a Serial seed would leave them attached and
+    # Only the Disk-mode runners mount data disks; a Serial seed would leave them attached and
     # unmounted, so refuse rather than emit a seed that silently ignores them.
     if (@(ConvertTo-DataDiskList -Value (Get-SeedProfileField -Profile $Profile -Name 'DataDisks') -Context 'New-CidataUserData').Count -gt 0) {
         throw "New-CidataUserData: data disks are mounted only by the Disk-mode runners; a Serial-mode profile must not declare DataDisks (fail-closed)."
     }
 
-    # EG-2 (ralph in-guest egress, Option A): a Serial-mode profile that declares EgressMode=
-    # 'InGuestSquid' gets the serial baseline COMPOSED WITH the builder's proven egress fragment
-    # (iptables default-DROP + transparent Squid domain-ACL over EgressAllowlist). Defense-in-depth
-    # only — see CidataSerialEgressTemplate's header comment. Fail-closed on an empty allowlist,
-    # mirroring the builder's own SquidSniProxy refusal above.
-    if ($mode -ne 'Disk' -and $egressMode -eq 'InGuestSquid') {
-        $allowlist = Get-SeedProfileField -Profile $Profile -Name 'EgressAllowlist' -Default @()
-        if ($null -eq $allowlist -or @($allowlist).Count -eq 0) {
-            throw "New-CidataUserData: a Serial+InGuestSquid profile must have a non-empty EgressAllowlist (fail-closed)."
-        }
-        # SEC-1: each allowlist entry's charset is validated at LOAD time in Assert-TierProfileValid
-        # (ProfileLoader.ps1) before it ever reaches here — same discipline as the builder branch above.
-        $aclLine = (@($allowlist) -join ' ')
-        $ud = $script:CidataSerialEgressTemplate.Replace('__SQUID_ALLOWLIST_ACL__', $aclLine)
-        return (ConvertTo-LfText -Text $ud)
-    }
-
-    # EgressMode='HostProxy': no route, no resolver, the host's CONNECT proxy as the only way out. The
-    # address plan comes from the descriptor (New-SandboxVM made and checked it). Every value that lands
-    # in shell or YAML text is re-validated here as a dotted IPv4 address or a port number.
-    if ($mode -ne 'Disk' -and $hostProxyNic) {
+    # Serial on a VM that keeps its NIC: no route, no resolver, the host's CONNECT proxy as the only way
+    # out. The address plan comes from the descriptor (New-SandboxVM made and checked it). Every value
+    # that lands in shell or YAML text is re-validated here as a dotted IPv4 address or a port number.
+    # The lockdown files are the shared fragment the Disk-mode HostProxy seeds carry.
+    if ($hostProxyNic) {
         $allowlist = Get-SeedProfileField -Profile $Profile -Name 'EgressAllowlist' -Default @()
         if ($null -eq $allowlist -or @($allowlist).Count -eq 0) {
             throw "New-CidataUserData: a Serial+HostProxy profile must have a non-empty EgressAllowlist (fail-closed)."
         }
         $values = Get-HostProxySeedValues -Egress $Egress
-        $ud = $script:CidataSerialHostProxyTemplate.Replace('__GATEWAY_IP__', $values.GatewayIP).Replace('__PROXY_PORT__', $values.ProxyPort).Replace('__GUEST_CIDR__', $values.GuestCidr)
+        $ud = $script:CidataSerialHostProxyTemplate.Replace('__HOSTPROXY_LOCKDOWN_FILES__', $script:CidataHostProxyLockdownFiles)
+        $ud = $ud.Replace('__GATEWAY_IP__', $values.GatewayIP).Replace('__PROXY_PORT__', $values.ProxyPort).Replace('__GUEST_CIDR__', $values.GuestCidr)
         return (ConvertTo-LfText -Text $ud)
     }
 
     return (ConvertTo-LfText -Text $script:CidataSerialBaselineTemplate)
+}
+
+<#
+.SYNOPSIS
+    Substitute the HostProxy guest fragments (or their no-adapter comments) into a Disk runner template.
+.DESCRIPTION
+    -Values is the validated plan from Get-HostProxySeedValues for a VM that keeps its NIC, or $null for
+    a VM with no adapter. With a plan, the network stanza becomes a comment (cloud-init applies the
+    seed's network-config), bootcmd disables IPv6 and moves the Debian sources to https, write_files
+    gains the lockdown files and the proxy settings, the package stage installs nftables, runcmd applies
+    the lockdown before the workload unit, and the runner exports the proxy settings before the
+    entrypoint (-Diag adds the egress markers; the exFAT runner has no diag()). Without a plan every
+    token becomes a one-line comment and the network stays disabled: the offline seed the Tier-0 live
+    runs used. The plan's values are substituted last, so they reach the fragments too.
+#>
+function Expand-HostProxySeedTokens {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string] $Template,
+        [AllowNull()] [hashtable] $Values,
+        [bool] $Diag
+    )
+    if ($null -eq $Values) {
+        return $Template.Replace('__NETWORK_STANZA__', 'network: {config: disabled}').
+            Replace('__HOSTPROXY_BOOTCMD__', '  # (no network adapter: nothing to lock down; IPv6 stays as the image ships it)').
+            Replace('__HOSTPROXY_FILES__', '  # (no network adapter: no proxy settings or lockdown to write)').
+            Replace('__HOSTPROXY_PACKAGES__', '# (no network adapter: nothing is installed; the guest runs offline)').
+            Replace('__HOSTPROXY_RUNCMD__', '  # (no network adapter: no lockdown unit to start)').
+            Replace('__HOSTPROXY_RUNNER_ENV__', '      # (no network adapter: no proxy environment to export)')
+    }
+    $files = $script:CidataHostProxyLockdownFiles + "`n" + $script:CidataHostProxyDiskFiles
+    $runnerEnv = if ($Diag) { $script:CidataHostProxyDiskRunnerEnv } else { $script:CidataHostProxyDiskRunnerEnvQuiet }
+    $out = $Template.Replace('__NETWORK_STANZA__', '# network: applied from the seed network-config (one static address, no route, no resolver)').
+        Replace('__HOSTPROXY_BOOTCMD__', $script:CidataHostProxyDiskBootcmd).
+        Replace('__HOSTPROXY_FILES__', $files).
+        Replace('__HOSTPROXY_PACKAGES__', $script:CidataHostProxyDiskPackages).
+        Replace('__HOSTPROXY_RUNCMD__', $script:CidataHostProxyDiskRuncmd).
+        Replace('__HOSTPROXY_RUNNER_ENV__', $runnerEnv)
+    return $out.Replace('__GATEWAY_IP__', $Values.GatewayIP).Replace('__PROXY_PORT__', $Values.ProxyPort).Replace('__GUEST_CIDR__', $Values.GuestCidr)
 }
 
 <#
@@ -1270,7 +1163,7 @@ function Get-HostProxySeedValues {
     [CmdletBinding()]
     param([AllowNull()] [System.Collections.IDictionary] $Egress)
     if ($null -eq $Egress) {
-        throw "New-CidataUserData: a Serial+HostProxy seed needs the VM's egress address plan (-Egress, from the descriptor); none was given. Fail closed."
+        throw "New-CidataUserData: a HostProxy seed (a VM that keeps its NIC) needs the VM's egress address plan (-Egress, from the descriptor); none was given. Fail closed."
     }
     $ipRe = '^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$'
     $gw    = [string]$Egress['GatewayIP']

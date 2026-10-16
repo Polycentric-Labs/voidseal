@@ -186,9 +186,12 @@ Describe 'New-CidataUserData: INPUT stays read-only on every mount arm of every 
     It '<Runner>: every mount of LABEL=INPUT passes ro, the RC4 fallback arm included' -ForEach @(
         @{ Runner = 'exFAT disk runner';  SeedProfile = @{ WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/job.py --out /mnt/out/result.html' } }
         @{ Runner = 'outbox disk runner'; SeedProfile = @{ WorkloadMode = 'Disk'; OutboxOutput = $true; Entrypoint = 'python3 /mnt/in/job.py --out /run/staging/result.html' } }
-        @{ Runner = 'builder runner';     SeedProfile = @{ WorkloadMode = 'Disk'; EgressMode = 'SquidSniProxy'; Entrypoint = 'python3 /mnt/in/fetch_deps.py --out /mnt/out'; EgressAllowlist = @('pypi.org') } }
+        @{ Runner = 'builder runner';     SeedProfile = @{ Tier = 1; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'; WorkloadMode = 'Disk'; DepsSpec = @{ Pip = @{ Packages = @('urllib3') } }; Entrypoint = 'python3 /mnt/in/fetch_deps.py --out /mnt/out'; EgressAllowlist = @('pypi.org', 'files.pythonhosted.org') } }
     ) {
-        $ud     = New-CidataUserData -Profile $SeedProfile
+        # The builder seed needs the VM's address plan (it rides the host proxy); the offline runners do not.
+        $udArgs = @{ Profile = $SeedProfile }
+        if ($SeedProfile.ContainsKey('DepsSpec')) { $udArgs.Egress = Get-EgressAddressPlan -VMName 'sbx-ro' -SwitchName 'sbx-ro-int' }
+        $ud     = New-CidataUserData @udArgs
         $mounts = @(Get-InputMountCommand -UserData $ud)
         $mounts.Count | Should -BeGreaterOrEqual 2 -Because 'RC4: the uid/gid INPUT mount keeps a fallback arm (a plain mount worked live where the uid/gid form failed)'
         foreach ($m in $mounts) {
@@ -452,71 +455,6 @@ Describe 'New-CidataUserData — serial-mode baseline (no regression for ralph)'
     }
 }
 
-Describe 'New-CidataUserData — serial + InGuestSquid egress' {
-    BeforeAll {
-        # ralph-shaped Serial profile opting into the in-guest egress control (EG-2, Option A):
-        # WorkloadMode='Serial' (unchanged — ralph keeps its ttyS0 command channel) + EgressMode=
-        # 'InGuestSquid' + a representative merged EgressAllowlist (tier1 base + a stand-in for
-        # ExtraAllowlist domains).
-        $script:SerialEgressProfile = $script:SerialProfile.Clone()
-        $script:SerialEgressProfile['EgressMode']      = 'InGuestSquid'
-        $script:SerialEgressProfile['EgressAllowlist'] = @('api.anthropic.com', 'github.com', 'claude.ai', 'storage.googleapis.com')
-    }
-
-    It 'emits BOTH the serial-getty command channel AND the Squid egress fragment' {
-        $ud = New-CidataUserData -Profile $script:SerialEgressProfile
-        $ud | Should -BeLike '*serial-getty@ttyS0*' -Because 'ralph keeps its ttyS0 command channel even with in-guest egress'
-        $ud | Should -BeLike '*squid.conf*'         -Because 'InGuestSquid must ship the transparent Squid domain-ACL'
-        $ud | Should -Match 'http_access deny all'  -Because 'default-deny is the whole point of the domain-ACL'
-    }
-
-    It 'templates every merged allowlist domain into the Squid dstdomain ACL' {
-        $ud = New-CidataUserData -Profile $script:SerialEgressProfile
-        # Assert the domains land on the `acl allowed_domains dstdomain` line specifically (not merely
-        # somewhere in the seed) — so a future template edit that echoed a domain elsewhere can't make
-        # a missing-from-the-ACL regression pass silently.
-        $dstdomainLine = ($ud -split "`r?`n") | Where-Object { $_.Trim() -match '^acl allowed_domains dstdomain\b' }
-        $dstdomainLine | Should -Not -BeNullOrEmpty -Because 'the seed must carry the dstdomain ACL line'
-        foreach ($d in $script:SerialEgressProfile.EgressAllowlist) {
-            $dstdomainLine | Should -BeLike "*$d*" -Because "the dstdomain ACL line must carry allowlist domain '$d'"
-        }
-    }
-
-    It 'carries the iptables default-DROP + IPv6-disable + transparent-proxy REDIRECT shape' {
-        $ud = New-CidataUserData -Profile $script:SerialEgressProfile
-        $ud | Should -Match 'iptables -P OUTPUT DROP'      -Because 'default-DROP OUTPUT is the egress-lockdown control'
-        $ud | Should -Match 'disable_ipv6'                 -Because 'IPv6 must be disabled — the lockdown is otherwise IPv4-only'
-        $ud | Should -Match 'REDIRECT --to-port 3129'      -Because 'HTTP must be transparently redirected to Squid'
-        $ud | Should -Match 'REDIRECT --to-port 3130'      -Because 'HTTPS must be transparently redirected to Squid'
-    }
-
-    It 'fully substitutes __SQUID_ALLOWLIST_ACL__ (no unsubstituted token remains)' {
-        $ud = New-CidataUserData -Profile $script:SerialEgressProfile
-        $ud | Should -Not -BeLike '*__SQUID_ALLOWLIST_ACL__*' -Because 'an unsubstituted placeholder means the ACL is malformed/empty'
-    }
-
-    It 'FAILS CLOSED on InGuestSquid with an empty EgressAllowlist' {
-        $bad = $script:SerialEgressProfile.Clone(); $bad['EgressAllowlist'] = @()
-        { New-CidataUserData -Profile $bad } | Should -Throw -Because 'InGuestSquid with nothing to allow must refuse, not silently ship a useless/broken ACL'
-    }
-
-    It 'FAILS CLOSED on a Disk-mode profile declaring EgressMode=InGuestSquid (that combo is undefined)' {
-        $bad = $script:DiskProfile.Clone(); $bad['EgressMode'] = 'InGuestSquid'
-        { New-CidataUserData -Profile $bad } | Should -Throw -Because 'InGuestSquid is the SERIAL-seed in-guest egress; a Disk-mode egress profile must declare SquidSniProxy (the builder egress, which carries its DepsSpec rule) instead of silently falling through to the plain disk runner with no egress content'
-    }
-
-    It 'REGRESSION: a plain serial profile (no InGuestSquid) still emits the bare baseline only' {
-        # The existing 'serial-mode baseline (no regression for ralph)' Describe covers the core
-        # baseline assertions; this adds the explicit negative checks for the egress fragment so a
-        # future change to the dispatch cannot silently leak the egress fragment onto every serial
-        # profile regardless of EgressMode.
-        $ud = New-CidataUserData -Profile $script:SerialProfile
-        $ud | Should -BeLike '*serial-getty@ttyS0*' -Because 'the bare serial baseline must still bring up the command channel'
-        $ud | Should -Not -BeLike '*squid.conf*'    -Because 'a plain serial profile must not get the egress fragment'
-        $ud | Should -Not -Match 'OUTPUT DROP'      -Because 'a plain serial profile must not get the iptables lockdown'
-    }
-}
-
 Describe 'New-CidataMetaData' {
     It 'emits instance-id and local-hostname' {
         $md = New-CidataMetaData
@@ -574,241 +512,175 @@ Describe 'New-CidataSeed — assembles meta-data + user-data and drives the (inj
     }
 }
 
-Describe 'Builder CIDATA seed — Squid SNI egress (Phase 2.2)' {
+Describe 'Builder CIDATA seed: the dep fetch rides the host proxy (no in-guest proxy, no redirect rules)' {
     BeforeAll {
+        # The builder is the kept-NIC HostProxy shape with a DepsSpec; its seed needs the VM's address plan.
         $script:builderProfile = @{
-            WorkloadMode = 'Disk'; EgressMode = 'SquidSniProxy'
+            Tier = 1; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'; WorkloadMode = 'Disk'
+            DepsSpec = @{ Pip = @{ Packages = @('urllib3') }; Apt = @{ Packages = @('jq') }; HuggingFace = @{ Models = @('org/model') } }
             Entrypoint = 'python3 /mnt/in/fetch_deps.py --spec /mnt/in/deps-spec.json --out /mnt/out'
             EgressAllowlist = @('pypi.org','files.pythonhosted.org','deb.debian.org','security.debian.org','huggingface.co','.hf.co')
         }
-    }
-    It 'Disk + SquidSniProxy selects the builder seed and templates every allowlist domain into the Squid dstdomain ACL (default-deny)' {
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        $ud | Should -Match 'https_port 3130 intercept ssl-bump'
-        foreach ($d in $script:builderProfile.EgressAllowlist) { $ud | Should -BeLike "*$d*" }
-        $ud | Should -Match 'http_access deny all'
-        $ud | Should -Match ([regex]::Escape($script:builderProfile.Entrypoint))
-        $ud | Should -Not -Match '__SQUID_ALLOWLIST_ACL__'   # placeholder fully substituted
-        $ud | Should -Not -Match '__ENTRYPOINT__'
-    }
-    It 'a Disk profile WITHOUT SquidSniProxy still gets the OFFLINE disk seed (network disabled, no squid)' {
-        $ud = New-CidataUserData -Profile @{ WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/x.py' }
-        $ud | Should -Match 'network: \{config: disabled\}'
-        $ud | Should -Not -Match '(?i)squid'
-    }
-    It 'a SquidSniProxy builder profile with an EMPTY allowlist is refused (fail-closed)' {
-        { New-CidataUserData -Profile @{ WorkloadMode='Disk'; EgressMode='SquidSniProxy'; Entrypoint='python3 x'; EgressAllowlist=@() } } |
-            Should -Throw -ExpectedMessage '*allowlist*'
-    }
-    It 'a builder entrypoint containing a single quote is refused (same sh -c guard as the offline runner)' {
-        { New-CidataUserData -Profile @{ WorkloadMode='Disk'; EgressMode='SquidSniProxy'; Entrypoint="python3 'x'"; EgressAllowlist=@('pypi.org') } } |
-            Should -Throw
-    }
-    It 'SEC-2: builder egress is DEFAULT-DROP + a minimal allow-list (BlockProtocols enforced by construction)' {
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        # Default-drop egress policy + the minimal allow-list (loopback, established, DNS 53, TCP 80/443).
-        $ud | Should -Match 'iptables -P OUTPUT DROP'
-        $ud | Should -Match 'iptables -A OUTPUT -o lo -j ACCEPT'
-        $ud | Should -Match 'ESTABLISHED,RELATED -j ACCEPT'
-        $ud | Should -Match 'iptables -A OUTPUT -p udp --dport 53 -j ACCEPT'
-        $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT'
-        $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT'
-        $ud | Should -Match 'iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT'
+        $script:builderPlan  = Get-EgressAddressPlan -VMName 'sbx-bld-seed' -SwitchName 'sbx-bld-seed-int'
+        $script:builderProxy = "http://$($script:builderPlan.GatewayIP):13128"
+        $script:builderUd    = New-CidataUserData -Profile $script:builderProfile -Egress $script:builderPlan
 
-        # --- SEC-2 / Named-Risk-2 hardening: STRUCTURAL allow-list assertion -------------------------
-        # The two guards this replaces (`Should -Not -Match 'udp --dport 443'` / `'dport 853'`) are
-        # literal-string matches: a differently-worded hole (e.g. `-m multiport --dports 443,853`)
-        # matches NEITHER string and would pass the old test vacuously. Instead, extract every
-        # `iptables -A OUTPUT ... -j ACCEPT` rule the seed actually emits and assert the SET is
-        # exactly the intended minimal allow-list — 6 rules, nothing else. A 7th rule, a reworded
-        # rule, a multiport rule, or any extra/renamed port/proto opens the count or the set and
-        # fails this test, regardless of how the hole is spelled.
-        # TABLE-AGNOSTIC anchor (whole-branch-review Fix C): iptables accepts an optional explicit
-        # `-t <table>` token before the chain op (e.g. `iptables -t filter -A OUTPUT ...`) — `filter`
-        # is the implicit default table, so `-t filter -A OUTPUT ... -j ACCEPT` is FUNCTIONALLY
-        # IDENTICAL to the un-qualified spelling this seed emits. The prior anchor
-        # ('^\s*iptables\s+-A\s+OUTPUT\b...') required the un-qualified spelling immediately after
-        # `iptables`, so a `-t filter`-qualified rule (e.g. a QUIC/UDP-443 hole spelled
-        # `iptables -t filter -A OUTPUT -p udp --dport 443 -j ACCEPT`) matched NEITHER this
-        # extraction NOR the udp/443 belt-and-braces guard below — an evasion that passed this test
-        # GREEN while opening a real hole. The optional `(\s+-t\s+\S+)?` group closes that gap; it is
-        # non-capturing on the table name itself (any table spelling is still caught), so a `-t nat`
-        # rule (the REDIRECTs, which end in `-j REDIRECT`, not `-j ACCEPT`) is correctly excluded by
-        # the trailing `-j\s+ACCEPT\s*$` the same as before.
-        $acceptRuleAnchor = '^\s*iptables(\s+-t\s+\S+)?\s+-A\s+OUTPUT\b.*-j\s+ACCEPT\s*$'
-        $outputLines  = $ud -split "`r?`n"
-        $acceptRules  = $outputLines | Where-Object { $_ -match $acceptRuleAnchor } | ForEach-Object { $_.Trim() }
-
-        $acceptRules.Count | Should -Be 6 -Because 'the builder OUTPUT allow-list must contain EXACTLY the 6 intended rules (lo, established/related, dns udp/tcp, http, https) — any extra ACCEPT rule (a 7th rule, a widened/renamed port, a multiport rule, or a -t-table-qualified duplicate) must fail this test even if it does not match the literal strings "udp --dport 443" or "dport 853"'
-
-        # Per-expected-rule presence within the extracted set (order-independent).
-        $expectedRules = @(
-            'iptables -A OUTPUT -o lo -j ACCEPT'
-            'iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT'
-            'iptables -A OUTPUT -p udp --dport 53 -j ACCEPT'
-            'iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT'
-            'iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT'
-            'iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT'
-        )
-        foreach ($rule in $expectedRules) {
-            $acceptRules | Should -Contain $rule -Because "the minimal allow-list must contain '$rule'"
-        }
-        # And the reverse: every extracted rule must be one of the expected 6 (closes the set both ways —
-        # count-equality alone would not catch a rule that REPLACES an expected one with a different hole
-        # while another expected rule is duplicated).
-        foreach ($rule in $acceptRules) {
-            $expectedRules | Should -Contain $rule -Because "found an OUTPUT ACCEPT rule not in the intended minimal allow-list: '$rule' — this is exactly the drift SEC-2 guards against"
-        }
-
-        # Structural port/proto extraction: for every ACCEPT rule that carries a proto+dport, assert the
-        # (proto, dport) set is exactly {(udp,53), (tcp,53), (tcp,80), (tcp,443)}. This is a second,
-        # independent lens on the same rules (parsed rather than string-compared) so a rule that is
-        # byte-identical to an expected one except for a transposed proto/port still gets caught.
-        $portRulePattern = '-p\s+(?<proto>udp|tcp)\s+--dport\s+(?<port>\d+)\s+-j\s+ACCEPT'
-        $portRules = @()
-        foreach ($rule in $acceptRules) {
-            if ($rule -match $portRulePattern) {
-                $portRules += [pscustomobject]@{ Proto = $Matches['proto']; Port = $Matches['port'] }
+        # The content block of one write_files entry, dedented.
+        function script:Get-BuilderSeedFile {
+            param([string] $UserData, [string] $Path)
+            $lines = $UserData -split "`n"
+            $start = [array]::IndexOf($lines, "  - path: $Path")
+            $start | Should -BeGreaterOrEqual 0 -Because "the seed must write $Path"
+            $i = $start + 1
+            while ($i -lt $lines.Count -and $lines[$i] -notmatch '^    content: \|') { $i++ }
+            $body = [System.Collections.Generic.List[string]]::new()
+            for ($i = $i + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - path: ' -or $lines[$i] -match '^  #' -or $lines[$i] -match '^\S') { break }
+                $body.Add(($lines[$i] -replace '^      ', ''))
             }
+            return ($body -join "`n").TrimEnd()
         }
-        $portRules.Count | Should -Be 4 -Because 'exactly 4 of the 6 ACCEPT rules carry an explicit proto+dport (dns udp/tcp, http, https); lo and established/related do not'
-        $portSet = $portRules | ForEach-Object { "$($_.Proto):$($_.Port)" } | Sort-Object -Unique
-        ($portSet -join ',') | Should -Be 'tcp:443,tcp:53,tcp:80,udp:53' -Because 'the (proto,port) set of every dport-bearing ACCEPT rule must be EXACTLY {udp/53, tcp/53, tcp/80, tcp/443} — no udp/443 (QUIC), no port 853 (DoT), no additional port under any proto'
-
-        # --- Belt-and-braces (defense in depth; the set-equality above is the primary guard) -----------
-        # BlockProtocols enforced BY CONSTRUCTION: no rule anywhere opens QUIC/UDP-443 or DoT/853, and no
-        # ACCEPT rule combines udp with 443 in any form (covers e.g. a stray `-m multiport --dports 443,853`
-        # that the structural extraction above wouldn't even classify as a plain port rule). Scoped to
-        # non-comment lines only — the seed's own honesty comment legitimately DISCUSSES "DoT/853" in prose
-        # to explain why it's dropped, so a raw whole-`$ud` substring match would false-positive on that
-        # comment; a real rule/directive line never starts with '#'.
-        $nonCommentLines = $outputLines | Where-Object { $_.Trim() -notmatch '^#' -and $_.Trim() -ne '' }
-        ($nonCommentLines | Where-Object { $_ -match '853' }) |
-            Should -BeNullOrEmpty -Because 'DoT (853) must never appear in any non-comment (rule/config) line of the builder seed'
-        # Table-agnostic here too (mirrors the extraction anchor above): 'iptables\s+-A\s+OUTPUT'
-        # alone does NOT match a `-t <table>`-qualified rule (e.g. `iptables -t filter -A OUTPUT -p
-        # udp --dport 443 -j ACCEPT`), which is functionally identical to the un-qualified spelling
-        # since 'filter' is the implicit default table. Without the optional -t group this belt-and-
-        # braces guard silently no-ops against exactly that spelling of a QUIC/UDP-443 hole.
-        ($outputLines | Where-Object { $_ -match 'iptables(\s+-t\s+\S+)?\s+-A\s+OUTPUT' -and $_ -match '-j\s+ACCEPT' -and $_ -match 'udp' -and $_ -match '443' }) |
-            Should -BeNullOrEmpty -Because 'no OUTPUT ACCEPT rule may combine udp with port 443 (QUIC/HTTP-3), in any spelling (plain --dport, -m multiport --dports, or -t filter -A ...)'
-
-        # The transparent-proxy REDIRECTs still gatekeep 80/443 to Squid.
-        $ud | Should -Match 'REDIRECT --to-port 3129'
-        $ud | Should -Match 'REDIRECT --to-port 3130'
+        function script:Get-BuilderRunCmd {
+            param([string] $UserData)
+            $lines = $UserData -split "`n"
+            $at = [array]::IndexOf($lines, 'runcmd:')
+            $at | Should -BeGreaterOrEqual 0
+            $out = [System.Collections.Generic.List[string]]::new()
+            for ($i = $at + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - ') { $out.Add($lines[$i].Trim()) } elseif ($lines[$i] -match '^\S') { break }
+            }
+            return @($out)
+        }
     }
-
-    It 'SEC-2 (MINOR): the Squid ACL http_access ordering is deny-all-last, with no shadowing allow-all above it' {
-        # The iptables allow-list above is the primary control, but Squid's OWN domain ACL
-        # (acl allowed_domains dstdomain ... / http_access allow allowed_domains / http_access deny
-        # all) is the actual per-FQDN fetch gate. Ordering matters for squid.conf: http_access rules
-        # are evaluated FIRST-MATCH-WINS, so an `http_access allow all` (or any unconditional allow)
-        # ABOVE the `deny all` would shadow it and defeat the domain restriction even though `deny
-        # all` still appears later in the file. Assert structurally: extract every ordered
-        # `http_access` line from the seed and check (a) the LAST one is exactly `deny all`, and (b)
-        # no EARLIER line is an unconditional allow (i.e. `http_access allow all` or a bare
-        # `http_access allow` with no ACL name).
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        $outputLines = $ud -split "`r?`n"
-
-        $httpAccessLines = $outputLines | Where-Object { $_.Trim() -match '^http_access\b' } | ForEach-Object { $_.Trim() }
-        $httpAccessLines.Count | Should -BeGreaterOrEqual 2 -Because 'the seed must carry at least an allow (scoped to allowed_domains) and a final deny'
-
-        $httpAccessLines[-1] | Should -Be 'http_access deny all' -Because 'the LAST http_access rule must be the unconditional deny — Squid is first-match-wins, so anything reachable after an allow-all would still be reachable if deny-all is not last'
-
-        $earlierLines = $httpAccessLines[0..($httpAccessLines.Count - 2)]
-        $shadowingAllowAll = $earlierLines | Where-Object { $_ -match '^http_access\s+allow\s+all\s*$' -or $_ -match '^http_access\s+allow\s*$' }
-        $shadowingAllowAll | Should -BeNullOrEmpty -Because 'an unconditional allow ABOVE the final deny would shadow it (first-match-wins) and defeat the allowed_domains restriction regardless of what the deny line says'
+    It 'DepsSpec selects the builder runner; the seed carries no in-guest proxy, no redirect rules and no unsubstituted token' {
+        $script:builderUd | Should -Match 'vmdep-builder'
+        $script:builderUd | Should -Match ([regex]::Escape($script:builderProfile.Entrypoint))
+        $script:builderUd | Should -Not -Match '(?i)squid'
+        $script:builderUd | Should -Not -Match 'REDIRECT|intercept|ssl-bump|dstdomain|--to-port'
+        $script:builderUd | Should -Not -Match '__[A-Z_]+__' -Because 'every token is substituted'
+        $script:builderUd | Should -Not -Match 'network: \{config: disabled\}' -Because 'the builder keeps its NIC; the seed network-config gives it its static address'
+        $script:builderUd | Should -Match '(?m)^# network: applied from the seed network-config'
     }
-
-    It 'SEC-2/C3: IPv6 is disabled pre-network (bootcmd) AND ip6tables default-DROPs, closing the IPv4-only egress bypass' {
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        $outputLines = $ud -split "`r?`n"
-
-        # --- Primary: IPv6 disabled via sysctl, applied EARLY (bootcmd runs before network-config) ---
-        $ud | Should -Match 'net\.ipv6\.conf\.all\.disable_ipv6\s*=\s*1' -Because 'SLAAC/DHCPv6 must never bring up a usable IPv6 route on the builder'
-        $ud | Should -Match 'net\.ipv6\.conf\.default\.disable_ipv6\s*=\s*1' -Because 'new interfaces must also come up with IPv6 disabled'
-
-        $bootcmdIdx = ($outputLines | Select-String -Pattern '^bootcmd:' -SimpleMatch:$false | Select-Object -First 1).LineNumber
-        $bootcmdIdx | Should -Not -BeNullOrEmpty -Because 'the builder seed must have a bootcmd: section (runs before network-config, unlike runcmd)'
-        # bootcmd is a YAML list; find the next top-level (non-indented, non-comment, non-blank) key after
-        # it to bound the section, then assert a sysctl invocation disabling ipv6 appears inside that bound.
-        $afterBootcmd = $outputLines[$bootcmdIdx..($outputLines.Count - 1)]
-        $nextTopLevelOffset = ($afterBootcmd | Select-Object -Skip 1 | Select-String -Pattern '^[A-Za-z_][A-Za-z0-9_]*:' | Select-Object -First 1).LineNumber
-        if ($nextTopLevelOffset) { $bootcmdSection = $afterBootcmd[0..$nextTopLevelOffset] } else { $bootcmdSection = $afterBootcmd }
-        ($bootcmdSection -join "`n") | Should -Match 'sysctl' -Because 'IPv6 must be disabled inside bootcmd (pre-network), not only via a dropped-in sysctl.d file that a later stage applies'
-        ($bootcmdSection -join "`n") | Should -Match 'disable_ipv6' -Because 'the bootcmd sysctl invocation must reference disable_ipv6, not some unrelated sysctl'
-
-        # --- Belt-and-braces: ip6tables default-DROP, guarded so a missing binary cannot abort the script ---
-        $ud | Should -Match 'ip6tables -P OUTPUT DROP' -Because 'IPv6 egress must default-DROP even if disable_ipv6 somehow fails to take effect'
-        $ud | Should -Match 'ip6tables -A OUTPUT -o lo -j ACCEPT'
-        $ud | Should -Match 'ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT'
-        $ud | Should -Match 'command -v ip6tables' -Because 'a missing ip6tables binary must not abort the set +e egress-lockdown script; guard the whole ip6tables block'
-
-        # --- No IPv6 egress ACCEPT is ever opened for 53/80/443 — IPv6 stays fully dropped ---
-        $ip6Lines = $outputLines | Where-Object { $_ -match 'ip6tables' }
-        ($ip6Lines | Where-Object { $_ -match '-A\s+OUTPUT' -and $_ -match '-j\s+ACCEPT' -and $_ -match '--dport\s+(53|80|443)\b' }) |
-            Should -BeNullOrEmpty -Because 'the builder fetch is IPv4-only through Squid; no ip6tables rule may ACCEPT egress on 53/80/443'
+    It 'points every fetcher at the host proxy: the proxy environment (both spellings, both schemes), the login profile and the apt setting' {
+        $env = script:Get-BuilderSeedFile $script:builderUd '/etc/environment'
+        @($env -split "`n") | Should -Be @("http_proxy=$($script:builderProxy)", "https_proxy=$($script:builderProxy)", "HTTP_PROXY=$($script:builderProxy)", "HTTPS_PROXY=$($script:builderProxy)", 'no_proxy=localhost,127.0.0.1', 'NO_PROXY=localhost,127.0.0.1')
+        $prof = script:Get-BuilderSeedFile $script:builderUd '/etc/profile.d/voidseal-egress-proxy.sh'
+        $prof | Should -Match ([regex]::Escape("export https_proxy=$($script:builderProxy)"))
+        $prof | Should -Match ([regex]::Escape("export HTTPS_PROXY=$($script:builderProxy)"))
+        $apt = script:Get-BuilderSeedFile $script:builderUd '/etc/apt/apt.conf.d/99voidseal-proxy'
+        $apt | Should -Match ([regex]::Escape("Acquire::http::Proxy `"$($script:builderProxy)/`";"))
+        $apt | Should -Match ([regex]::Escape("Acquire::https::Proxy `"$($script:builderProxy)/`";"))
     }
-
-    It 'the OFFLINE (non-builder) disk seed is unaffected by the IPv6 lockdown (network is disabled entirely, no iptables/ip6tables at all)' {
-        $ud = New-CidataUserData -Profile @{ WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/x.py' }
-        $ud | Should -Not -Match '(?i)ip6tables'
-        $ud | Should -Not -Match '(?i)disable_ipv6'
-        $ud | Should -Match 'network: \{config: disabled\}'
+    It 'the runner exports the proxy settings after the verdict disk is chosen and before the entrypoint runs (a oneshot unit reads no login profile)' {
+        $runner = script:Get-BuilderSeedFile $script:builderUd '/usr/local/sbin/vmdep-builder'
+        $lines  = $runner -split "`n"
+        $export = [array]::IndexOf($lines, '. /etc/profile.d/voidseal-egress-proxy.sh')
+        $pick   = [array]::IndexOf($lines, 'VERDICT_DEV="/dev/$1"')
+        $run    = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -like "*runuser -u sandbox -- /bin/sh -c '*" })[0]
+        $export | Should -BeGreaterThan 0
+        $pick   | Should -BeLessThan $export -Because 'a run that cannot report a verdict stops before anything else'
+        $export | Should -BeLessThan $run -Because 'the fetchers inherit the environment the runner exports'
     }
-
-    # --- serial diagnostics (Phase-6 live-debug observability; structural facts ONLY) -------------
-    # The builder runner had ZERO serial markers, while the OutboxOutput runner's diag lines are what
-    # pinned BOTH Tier-0 live root causes (D4-D). Phase 6 is the project's FIRST live egress: a failed
-    # fetch must be attributable to squid-down vs REDIRECT-not-applied vs mount-failure vs the fetch
-    # itself. Invoke-BuilderVM now reads the exit code and manifest out of a raw verdict disk for its
-    # verdict (Success or FetchFailed), but a failed run's disks are then DELETED, so the serial console
-    # is the second source and the only one that says where the guest stopped. Same
-    # discipline as the outbox runner: STRUCTURAL ONLY — liveness, rc values, file COUNTS, manifest
-    # presence; never fetched-artifact bytes.
+    It 'the in-guest lockdown is the shared HostProxy block: default-DROP allowing only TCP to the gateway proxy port, nft first, iptables fallback, no DNS or direct web egress, identical to the Serial seed' {
+        $lock = script:Get-BuilderSeedFile $script:builderUd '/usr/local/sbin/voidseal-egress-lockdown'
+        $lock | Should -Match 'policy drop;'
+        $lock | Should -Match ([regex]::Escape("ip daddr $($script:builderPlan.GatewayIP) tcp dport 13128 accept"))
+        $lock | Should -Match ([regex]::Escape("iptables -A OUTPUT -p tcp -d $($script:builderPlan.GatewayIP) --dport 13128 -j ACCEPT"))
+        $lock | Should -Match 'iptables -P OUTPUT DROP'
+        $lock | Should -Not -Match 'dport 53|dport 80\b|dport 443|REDIRECT' -Because 'no DNS and no direct web egress: the proxy resolves and dials'
+        $serial = New-CidataUserData -Profile @{ Tier = 1; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'; WorkloadMode = 'Serial'; EgressAllowlist = @('pypi.org'); Entrypoint = 'bash run.sh' } -Egress $script:builderPlan
+        (script:Get-BuilderSeedFile $serial '/usr/local/sbin/voidseal-egress-lockdown') | Should -Be $lock -Because 'one lockdown block, carried by every HostProxy seed'
+    }
+    It 'IPv6 is disabled in bootcmd and persisted through sysctl.d; the Debian sources move to https there too, before the package stage' {
+        $script:builderUd | Should -Match "(?m)^  - \[ sysctl, -w, 'net\.ipv6\.conf\.all\.disable_ipv6=1' \]"
+        $script:builderUd | Should -Match "(?m)^  - \[ sysctl, -w, 'net\.ipv6\.conf\.default\.disable_ipv6=1' \]"
+        (script:Get-BuilderSeedFile $script:builderUd '/etc/sysctl.d/99-voidseal-noipv6.conf') | Should -Match 'net\.ipv6\.conf\.all\.disable_ipv6 = 1'
+        $lines = $script:builderUd -split "`n"
+        $boot  = [array]::IndexOf($lines, 'bootcmd:')
+        $files = [array]::IndexOf($lines, 'write_files:')
+        $sed   = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -match 'http://deb\.debian\.org#https://deb\.debian\.org' })[0]
+        $boot | Should -BeGreaterOrEqual 0
+        $sed  | Should -BeGreaterThan $boot
+        $sed  | Should -BeLessThan $files -Because 'the sources move inside bootcmd, before the package stage can read them'
+    }
+    It 'nftables is installed through the proxy in the package stage, and runcmd applies the lockdown before the builder unit starts' {
+        $script:builderUd | Should -Match "(?m)^packages:\n  - nftables"
+        $cmds   = script:Get-BuilderRunCmd $script:builderUd
+        $iLock  = [array]::IndexOf($cmds, '- [ systemctl, enable, --now, voidseal-egress.service ]')
+        $iStart = [array]::IndexOf($cmds, '- [ systemctl, start, --no-block, vmdep-builder.service ]')
+        $iLock  | Should -BeGreaterOrEqual 0
+        $iStart | Should -BeGreaterThan $iLock
+        $cmds | Should -Not -Contain '- [ apt-get, install, -y, squid, iptables ]'
+        $script:builderUd | Should -Match 'After=network-online\.target voidseal-egress\.service'
+    }
     It 'emits structural [voidseal-diag] serial markers (the silent-runner class already cost two live debug rounds)' {
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        $ud | Should -Match '\[voidseal-diag\]' -Because 'a fail-closed poweroff must narrate WHY to the serial console, not vanish silently'
+        $script:builderUd | Should -Match '\[voidseal-diag\]' -Because 'a fail-closed poweroff must narrate WHY to the serial console, not vanish silently'
     }
-
-    It 'narrates the egress bring-up: squid liveness + per-REDIRECT rc (the first layer a failed live fetch must rule out)' {
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        $ud | Should -Match 'diag "squid_active='   -Because 'a dead Squid turns every fetch into an opaque connection failure; its liveness must be on serial before the entrypoint runs'
-        $ud | Should -Match 'diag "egress_lockdown' -Because 'the lockdown/REDIRECT application must be narrated so a no-egress failure is attributable to THIS layer, not guessed'
-        $ud | Should -Match 'redirect80_rc='        -Because 'an unapplied 80-REDIRECT silently bypasses the Squid ACL for HTTP — its rc must be visible'
-        $ud | Should -Match 'redirect443_rc='       -Because 'an unapplied 443-REDIRECT silently bypasses the Squid ACL for HTTPS — its rc must be visible'
-        $ud | Should -Match 'diag "ip6_lockdown'    -Because 'the IPv6 belt-and-braces outcome (applied vs no-binary skip) must be visible live'
+    It 'narrates the egress bring-up: the proxy address, routes and resolver counts, the IPv6 flag, the lockdown unit, nft presence and a TCP connect to the proxy' {
+        foreach ($m in 'diag "egress_mode=hostproxy proxy=', 'default_routes=', 'nameservers=', 'ipv6_disabled=', 'diag "egress_unit_enabled=', 'nft_present=', 'proxy_reachable=') {
+            $script:builderUd | Should -BeLike "*$m*" -Because "a failed live fetch must be attributable from $m"
+        }
+        $script:builderUd | Should -Match ([regex]::Escape("/dev/tcp/$($script:builderPlan.GatewayIP)/13128"))
     }
-
     It 'narrates mounts, entrypoint rc, per-fetcher artifact counts, and manifest presence (the host verdict is the exit code and manifest; serial says where the guest stopped)' {
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        $ud | Should -Match 'diag "input_mounted='  -Because 'a failed INPUT mount means the runner + DepsSpec never reached the guest'
-        $ud | Should -Match 'diag "output_mounted=' -Because 'a failed OUTPUT mount means nothing can be staged — and which owner it mounted under decides who may write'
-        $ud | Should -Match 'diag "entrypoint_rc='  -Because 'fetch_deps.py exits 2 on any failed fetcher; the host reads that rc as the verdict, and serial says where it came from'
-        $ud | Should -Match 'fetched pip='          -Because 'a per-fetcher artifact COUNT attributes an empty deps disk to the fetcher that produced nothing'
-        $ud | Should -Match 'apt='                  -Because 'apt artifacts land under /mnt/out/apt — its count must be narrated separately'
-        $ud | Should -Match 'hf='                   -Because 'HF artifacts land under /mnt/out/hf — its count must be narrated separately'
-        $ud | Should -Match 'manifest_present='     -Because 'write_manifest only runs after ALL fetchers succeed; its presence is the single yes/no of a fully-green fetch'
+        $script:builderUd | Should -Match 'diag "input_mounted='  -Because 'a failed INPUT mount means the runner + DepsSpec never reached the guest'
+        $script:builderUd | Should -Match 'diag "output_mounted=' -Because 'a failed OUTPUT mount means nothing can be staged, and which owner it mounted under decides who may write'
+        $script:builderUd | Should -Match 'diag "entrypoint_rc='  -Because 'fetch_deps.py exits 2 on any failed fetcher; the host reads that rc as the verdict, and serial says where it came from'
+        $script:builderUd | Should -Match 'fetched pip='          -Because 'a per-fetcher artifact COUNT attributes an empty deps disk to the fetcher that produced nothing'
+        $script:builderUd | Should -Match 'apt='                  -Because 'apt artifacts land under /mnt/out/apt; its count must be narrated separately'
+        $script:builderUd | Should -Match 'hf='                   -Because 'HF artifacts land under /mnt/out/hf; its count must be narrated separately'
+        $script:builderUd | Should -Match 'manifest_present='     -Because 'write_manifest only runs after ALL fetchers succeed; its presence is the single yes/no of a fully-green fetch'
     }
-
     It 'echoes a DISTINCT ABORT reason before each of the fail-closed poweroffs (no-OUTPUT, no-INPUT, no single raw verdict disk)' {
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        $ud | Should -Match 'diag "ABORT output-not-mounted' -Because 'the no-OUTPUT branch powers off before any verdict can be packed; only serial can say why'
-        $ud | Should -Match 'diag "ABORT input-not-mounted'  -Because 'the no-INPUT branch has no producer to pack a verdict with, so the host reads a missing verdict; serial must name the branch'
-        $ud | Should -Match 'diag "ABORT verdict-candidates-not-1' -Because 'the raw verdict disk could not be told apart from the others'
+        $script:builderUd | Should -Match 'diag "ABORT output-not-mounted' -Because 'the no-OUTPUT branch powers off before any verdict can be packed; only serial can say why'
+        $script:builderUd | Should -Match 'diag "ABORT input-not-mounted'  -Because 'the no-INPUT branch has no producer to pack a verdict with, so the host reads a missing verdict; serial must name the branch'
+        $script:builderUd | Should -Match 'diag "ABORT verdict-candidates-not-1' -Because 'the raw verdict disk could not be told apart from the others'
     }
-
-    It 'builder diag markers are STRUCTURAL only — no fetched-artifact bytes on the serial console (same contract as the outbox runner)' {
-        $ud = New-CidataUserData -Profile $script:builderProfile
-        $diagLines = @(($ud -split "`r?`n") | Where-Object { $_ -match 'diag "' })
-        $diagLines.Count | Should -BeGreaterThan 6 -Because 'every decision point (squid, lockdown/redirects, ip6, both mounts, entrypoint, fetch counts, manifest, poweroff) must be narrated'
-        # A diag line must never dump dependency-payload bytes to the console: counts/presence/rc are
-        # structural and allowed; catting fetched files is not. (The builder carries zero personal data —
-        # this is contract-consistency with the shared outbox runner, and it keeps the serial capture a
-        # control-flow record rather than a payload mirror.)
+    It 'builder diag markers are STRUCTURAL only: no fetched-artifact bytes on the serial console (same contract as the outbox runner)' {
+        $diagLines = @(($script:builderUd -split "`r?`n") | Where-Object { $_ -match 'diag "' })
+        $diagLines.Count | Should -BeGreaterThan 6 -Because 'every decision point (mounts, verdict disk, proxy, entrypoint, fetch counts, manifest, poweroff) must be narrated'
         $leaky = @($diagLines | Where-Object { $_ -match '/mnt/out' -and $_ -match '\b(cat|head|tail|od|xxd|hexdump|dd|strings)\b' })
         $leaky | Should -BeNullOrEmpty -Because 'serial narrates structure (liveness/rc/counts/presence), never dependency payload bytes'
+    }
+    It 'the OFFLINE (non-builder) disk seed is unaffected: network disabled, no proxy files, no lockdown, no package stage' {
+        $ud = New-CidataUserData -Profile @{ WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/x.py' }
+        $ud | Should -Match 'network: \{config: disabled\}'
+        $ud | Should -Not -Match '(?i)squid|nftables|disable_ipv6|HTTPS_PROXY|voidseal-egress'
+        $ud | Should -Not -Match '__[A-Z_]+__'
+    }
+    It 'a builder profile with an EMPTY allowlist is refused (fail-closed)' {
+        $empty = $script:builderProfile.Clone(); $empty['EgressAllowlist'] = @()
+        { New-CidataUserData -Profile $empty -Egress $script:builderPlan } | Should -Throw -ExpectedMessage '*allowlist*'
+    }
+    It 'a builder entrypoint containing a single quote is refused (same sh -c guard as the other runners)' {
+        $quoted = $script:builderProfile.Clone(); $quoted['Entrypoint'] = "python3 'x'"
+        { New-CidataUserData -Profile $quoted -Egress $script:builderPlan } | Should -Throw
+    }
+    It 'a builder profile that does not keep a NIC (Tier 0, or a processor) is refused: it fetches over the host proxy or not at all' {
+        $t0 = $script:builderProfile.Clone(); $t0['Tier'] = 0
+        { New-CidataUserData -Profile $t0 -Egress $script:builderPlan } | Should -Throw "New-CidataUserData: a builder profile (DepsSpec) fetches over the host proxy, so it must be a Tier-1 'Internal+Allowlist' profile with EgressMode='HostProxy'; this one is Tier 0, Network='Internal+Allowlist', EgressMode='HostProxy'. Fail closed."
+        $proc = $script:builderProfile.Clone(); $proc['Network'] = 'None'; $proc['EgressMode'] = 'None'
+        { New-CidataUserData -Profile $proc -Egress $script:builderPlan } | Should -Throw '*builder profile (DepsSpec) fetches over the host proxy*'
+    }
+    It 'a builder seed without the address plan is refused' {
+        { New-CidataUserData -Profile $script:builderProfile } | Should -Throw "New-CidataUserData: a HostProxy seed (a VM that keeps its NIC) needs the VM's egress address plan (-Egress, from the descriptor); none was given. Fail closed."
+    }
+    It 'the user-data parses as YAML with the proxy files, the package stage and the bootcmd (when PyYAML is available)' {
+        $py = $null
+        try { $py = Resolve-PythonExe } catch { $py = $null }
+        if (-not $py) { Set-ItResult -Skipped -Because 'no host Python'; return }
+        & $py -c 'import yaml' 2>$null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'PyYAML is not installed'; return }
+        $f = Join-Path $TestDrive 'builder-ud.yaml'
+        [System.IO.File]::WriteAllText($f, $script:builderUd, [System.Text.UTF8Encoding]::new($false))
+        $out = & $py -c 'import sys,yaml,json; print(json.dumps(yaml.safe_load(open(sys.argv[1],encoding="utf-8"))))' $f 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because "YAML parse reported: $out"
+        $doc = ($out | Out-String) | ConvertFrom-Json
+        @($doc.packages) | Should -Be @('nftables')
+        @($doc.write_files | ForEach-Object { $_.path }) | Should -Contain '/etc/apt/apt.conf.d/99voidseal-proxy'
+        @($doc.write_files | ForEach-Object { $_.path }) | Should -Contain '/usr/local/sbin/voidseal-egress-lockdown'
+        @($doc.bootcmd).Count | Should -Be 3
+        $doc.PSObject.Properties.Name | Should -Not -Contain 'network'
     }
 }
 
@@ -816,11 +688,12 @@ Describe 'Builder runner - the verdict goes to a raw verdict disk, packed with t
 
     BeforeAll {
         $script:BvProfile = @{
-            WorkloadMode = 'Disk'; EgressMode = 'SquidSniProxy'
+            Tier = 1; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'; WorkloadMode = 'Disk'
+            DepsSpec = @{ Pip = @{ Packages = @('urllib3') } }
             Entrypoint = 'python3 /mnt/in/fetch_deps.py --spec /mnt/in/deps-spec.json --out /mnt/out'
             EgressAllowlist = @('pypi.org', 'files.pythonhosted.org')
         }
-        $script:BvUd = New-CidataUserData -Profile $script:BvProfile
+        $script:BvUd = New-CidataUserData -Profile $script:BvProfile -Egress (Get-EgressAddressPlan -VMName 'sbx-bv' -SwitchName 'sbx-bv-int')
 
         # The content block of the builder runner script embedded in the user-data, dedented.
         $lines = $script:BvUd -split "`n"
@@ -1062,17 +935,13 @@ Describe 'Write-Iso9660Image — REAL IMAPI2 round-trip (gated on IMAPI availabi
 }
 
 # ===========================================================================
-#  Serial templates carry the same structural [voidseal-diag] markers as the disk runners (E7)
+#  The Serial baseline carries the same structural [voidseal-diag] markers as the disk runners (E7)
 # ===========================================================================
-Describe 'New-CidataUserData - the serial baseline and serial egress seeds narrate structure on the serial console (E7)' {
+Describe 'New-CidataUserData - the serial baseline seed narrates structure on the serial console (E7)' {
 
     BeforeAll {
         $script:DiagLineShape = 'diag() { echo "[voidseal-diag] $*" > /dev/console 2>/dev/null; }'
         $script:SerialUd = New-CidataUserData -Profile $script:SerialProfile
-        $egress = $script:SerialProfile.Clone()
-        $egress['EgressMode']      = 'InGuestSquid'
-        $egress['EgressAllowlist'] = @('api.example.com', '.example.org')
-        $script:SerialEgressUd = New-CidataUserData -Profile $egress
 
         # The content block of one write_files entry, dedented (same extraction the data-disk tests use).
         function script:Get-SeedFile {
@@ -1099,11 +968,7 @@ Describe 'New-CidataUserData - the serial baseline and serial egress seeds narra
             }
             return @($out)
         }
-        $script:Diag = @{
-            Serial = (script:Get-SeedFile $script:SerialUd '/usr/local/sbin/voidseal-serial-diag')
-            Egress = (script:Get-SeedFile $script:SerialEgressUd '/usr/local/sbin/voidseal-serial-diag')
-            Lock   = (script:Get-SeedFile $script:SerialEgressUd '/usr/local/sbin/voidseal-egress-lockdown')
-        }
+        $script:Diag = @{ Serial = (script:Get-SeedFile $script:SerialUd '/usr/local/sbin/voidseal-serial-diag') }
 
         $script:PosixSh2 = $null
         if ($IsWindows) {
@@ -1125,21 +990,17 @@ Describe 'New-CidataUserData - the serial baseline and serial egress seeds narra
         }
     }
 
-    It 'both seeds write the diag script and run it as the last runcmd entry' -ForEach @(
-        @{ Seed = 'baseline'; Var = 'SerialUd' }, @{ Seed = 'egress'; Var = 'SerialEgressUd' }
-    ) {
-        $ud = Get-Variable -Scope Script -Name $Var -ValueOnly
-        $ud | Should -BeLike '*- path: /usr/local/sbin/voidseal-serial-diag*'
-        $cmds = @(script:Get-RunCmd $ud)
+    It 'the baseline seed writes the diag script and runs it as the last runcmd entry' {
+        $script:SerialUd | Should -BeLike '*- path: /usr/local/sbin/voidseal-serial-diag*'
+        $cmds = @(script:Get-RunCmd $script:SerialUd)
         $cmds[-1] | Should -Be '- [ /usr/local/sbin/voidseal-serial-diag ]' -Because 'it runs after the installs, so it reports what they left'
     }
 
     It 'uses the same diag helper shape as the outbox and builder runners, and the same marker prefix' {
-        $builder = New-CidataUserData -Profile (Import-WorkloadProfile -Path (Join-Path $script:SkillRoot 'profiles/builder.psd1') -TierProfileDir (Join-Path $script:SkillRoot 'tier-profiles'))
+        $builderProfile = Import-WorkloadProfile -Path (Join-Path $script:SkillRoot 'profiles/builder.psd1') -TierProfileDir (Join-Path $script:SkillRoot 'tier-profiles')
+        $builder = New-CidataUserData -Profile $builderProfile -Egress (Get-EgressAddressPlan -VMName 'sbx-e7' -SwitchName 'sbx-e7-int')
         $builder.Contains($script:DiagLineShape)             | Should -BeTrue -Because 'the builder runner is the reference shape'
         $script:Diag.Serial.Contains($script:DiagLineShape) | Should -BeTrue
-        $script:Diag.Egress.Contains($script:DiagLineShape) | Should -BeTrue
-        $script:Diag.Lock.Contains($script:DiagLineShape)   | Should -BeTrue
     }
 
     It 'the baseline script narrates device, mount, user, serial-getty and package facts' {
@@ -1150,21 +1011,8 @@ Describe 'New-CidataUserData - the serial baseline and serial egress seeds narra
         }
     }
 
-    It 'the egress seed adds the squid, unit, IPv6 and OUTPUT-policy facts, and its lockdown script narrates its own run' {
-        foreach ($marker in 'squid_present=', 'squid_active=', 'egress_unit_enabled=', 'ipv6_disabled=', 'output_policy=') {
-            $script:Diag.Egress | Should -BeLike "*diag `"*$marker*" -Because "the egress seed must narrate $marker"
-        }
-        $script:Diag.Lock | Should -Match 'diag "squid_active='
-        $script:Diag.Lock | Should -Match 'diag "egress_lockdown=v4-applied redirect80_rc=\$r80 redirect443_rc=\$r443"'
-        $script:Diag.Lock | Should -Match 'diag "ip6_lockdown=applied"'
-        $script:Diag.Lock | Should -Match 'diag "ip6_lockdown=skipped'
-        $script:Diag.Lock | Should -Match 'r80=\$\?' -Because 'each REDIRECT rc is captured right after its rule'
-    }
-
-    It 'the markers are structural only: no content tools, and only fixed system paths are read' -ForEach @(
-        @{ Which = 'Serial' }, @{ Which = 'Egress' }, @{ Which = 'Lock' }
-    ) {
-        $diagLines = @(($script:Diag[$Which] -split "`n") | Where-Object { $_ -match '^\s*diag "' })
+    It 'the markers are structural only: no content tools, and only fixed system paths are read' {
+        $diagLines = @(($script:Diag.Serial -split "`n") | Where-Object { $_ -match '^\s*diag "' })
         $diagLines.Count | Should -BeGreaterThan 1
         foreach ($l in $diagLines) {
             $l | Should -Not -Match '\b(ls|find|head|tail|od|xxd|hexdump|strings|dd|journalctl|dmesg|tee)\b' -Because "'$l' would put names or bytes on the console"
@@ -1180,27 +1028,23 @@ Describe 'New-CidataUserData - the serial baseline and serial egress seeds narra
         }
     }
 
-    It 'the diag scripts and the lockdown script parse as POSIX sh (sh -n)' -ForEach @(
-        @{ Which = 'Serial' }, @{ Which = 'Egress' }, @{ Which = 'Lock' }
-    ) {
+    It 'the diag script parses as POSIX sh (sh -n)' {
         if (-not $script:PosixSh2) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
-        $f = Join-Path $TestDrive "diag-$Which.sh"
-        [System.IO.File]::WriteAllText($f, $script:Diag[$Which], [System.Text.UTF8Encoding]::new($false))
+        $f = Join-Path $TestDrive 'diag-Serial.sh'
+        [System.IO.File]::WriteAllText($f, $script:Diag.Serial, [System.Text.UTF8Encoding]::new($false))
         $out = & $script:PosixSh2 -n $f 2>&1
         $LASTEXITCODE | Should -Be 0 -Because "sh -n reported: $out"
     }
 
     It 'a diag failure cannot change control flow: set +e, output to /dev/console, errors swallowed' {
-        foreach ($w in 'Serial', 'Egress') {
-            $script:Diag[$w] | Should -Match '(?m)^set \+e$'
-            $script:Diag[$w] | Should -Not -Match '(?m)^\s*(exit|poweroff|reboot|shutdown)\b'
-        }
+        $script:Diag.Serial | Should -Match '(?m)^set \+e$'
+        $script:Diag.Serial | Should -Not -Match '(?m)^\s*(exit|poweroff|reboot|shutdown)\b'
     }
 
-    It 'the bare baseline still carries no egress content, and the egress seed still carries the lockdown' {
-        $script:SerialUd | Should -Not -BeLike '*squid_active*'
+    It 'the bare baseline carries no egress content' {
+        $script:SerialUd | Should -Not -BeLike '*voidseal-egress-lockdown*'
         $script:SerialUd | Should -Not -BeLike '*egress_lockdown*'
-        $script:SerialEgressUd | Should -BeLike '*iptables -P OUTPUT DROP*'
+        $script:SerialUd | Should -Not -BeLike '*HTTPS_PROXY*'
     }
 }
 
@@ -1357,7 +1201,7 @@ Describe 'New-CidataUserData and New-CidataNetworkConfig - Serial + HostProxy' {
     }
 
     It 'FAILS CLOSED without a plan, with a malformed plan, or with an empty allowlist' {
-        { New-CidataUserData -Profile $script:HPProfile } | Should -Throw "New-CidataUserData: a Serial+HostProxy seed needs the VM's egress address plan (-Egress, from the descriptor); none was given. Fail closed."
+        { New-CidataUserData -Profile $script:HPProfile } | Should -Throw "New-CidataUserData: a HostProxy seed (a VM that keeps its NIC) needs the VM's egress address plan (-Egress, from the descriptor); none was given. Fail closed."
         $bad = @{} + $script:HPPlan; $bad['GatewayIP'] = "10.231.0.1'; reboot; '"
         { New-CidataUserData -Profile $script:HPProfile -Egress $bad } | Should -Throw 'New-CidataUserData: the egress address plan is malformed*'
         $far = @{} + $script:HPPlan; $far['GuestIP'] = '192.168.7.2'
@@ -1366,9 +1210,11 @@ Describe 'New-CidataUserData and New-CidataNetworkConfig - Serial + HostProxy' {
         { New-CidataUserData -Profile $empty -Egress $script:HPPlan } | Should -Throw 'New-CidataUserData: a Serial+HostProxy profile must have a non-empty EgressAllowlist (fail-closed).'
     }
 
-    It 'FAILS CLOSED for a Disk-mode Tier-1 HostProxy profile (no Disk runner uses the host proxy)' {
-        $disk = $script:HPProfile.Clone(); $disk['WorkloadMode'] = 'Disk'; $disk['Entrypoint'] = 'python3 /mnt/in/x.py'
-        { New-CidataUserData -Profile $disk -Egress $script:HPPlan } | Should -Throw "New-CidataUserData: 'HostProxy' is wired for SERIAL-mode Tier-1 seeds*"
+    It 'a Disk-mode Tier-1 HostProxy profile gets the proxy settings and the same lockdown block (the Disk runners learned the proxy)' {
+        $disk = $script:HPProfile.Clone(); $disk['WorkloadMode'] = 'Disk'; $disk['OutboxOutput'] = $true; $disk['Entrypoint'] = 'python3 /mnt/in/x.py --out /run/staging/result.html'
+        $ud = New-CidataUserData -Profile $disk -Egress $script:HPPlan
+        $ud | Should -Match ([regex]::Escape("https_proxy=$($script:HPProxy)"))
+        (script:Get-HPSeedFile $ud '/usr/local/sbin/voidseal-egress-lockdown') | Should -Be (script:Get-HPSeedFile $script:HPUd '/usr/local/sbin/voidseal-egress-lockdown')
     }
 
     It 'a Tier-0 HostProxy profile (sealed with no adapter) keeps the offline seed' {
@@ -1376,5 +1222,181 @@ Describe 'New-CidataUserData and New-CidataNetworkConfig - Serial + HostProxy' {
         New-CidataUserData -Profile $t0 | Should -Not -Match 'HTTPS_PROXY|voidseal-egress'
         $disk0 = $script:DiskProfile.Clone(); $disk0['EgressMode'] = 'HostProxy'
         New-CidataUserData -Profile $disk0 | Should -Not -Match 'HTTPS_PROXY'
+    }
+}
+
+# ===========================================================================
+#  Disk + HostProxy: the Disk runners learn the proxy (a kept NIC in Disk mode)
+# ===========================================================================
+Describe 'New-CidataUserData - Disk + HostProxy: the outbox and exFAT runners carry the proxy settings and the lockdown' {
+
+    BeforeAll {
+        $script:DhPlan   = Get-EgressAddressPlan -VMName 'sbx-dh' -SwitchName 'sbx-dh-int'
+        $script:DhProxy  = "http://$($script:DhPlan.GatewayIP):13128"
+        $script:DhOutbox = @{ Tier = 1; Name = 'hp-disk'; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'; WorkloadMode = 'Disk'; OutboxOutput = $true
+                              EgressAllowlist = @('api.example.com'); Entrypoint = 'python3 /mnt/in/work.py --out /run/staging/result.html' }
+        $script:DhExfat  = @{ Tier = 1; Name = 'hp-exfat'; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'; WorkloadMode = 'Disk'
+                              EgressAllowlist = @('api.example.com'); Entrypoint = 'python3 /mnt/in/work.py --out /mnt/out/result.html' }
+        $script:DhOutboxUd = New-CidataUserData -Profile $script:DhOutbox -Egress $script:DhPlan
+        $script:DhExfatUd  = New-CidataUserData -Profile $script:DhExfat  -Egress $script:DhPlan
+        $script:DhSerialUd = New-CidataUserData -Profile @{ Tier = 1; WorkloadMode = 'Serial'; Network = 'Internal+Allowlist'; EgressMode = 'HostProxy'; EgressAllowlist = @('api.example.com'); Entrypoint = 'bash run.sh' } -Egress $script:DhPlan
+
+        function script:Get-DhSeedFile {
+            param([string] $UserData, [string] $Path)
+            $lines = $UserData -split "`n"
+            $start = [array]::IndexOf($lines, "  - path: $Path")
+            $start | Should -BeGreaterOrEqual 0 -Because "the seed must write $Path"
+            $i = $start + 1
+            while ($i -lt $lines.Count -and $lines[$i] -notmatch '^    content: \|') { $i++ }
+            $body = [System.Collections.Generic.List[string]]::new()
+            for ($i = $i + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - path: ' -or $lines[$i] -match '^  #' -or $lines[$i] -match '^\S') { break }
+                $body.Add(($lines[$i] -replace '^      ', ''))
+            }
+            return ($body -join "`n").TrimEnd()
+        }
+        function script:Get-DhRunCmd {
+            param([string] $UserData)
+            $lines = $UserData -split "`n"
+            $at = [array]::IndexOf($lines, 'runcmd:')
+            $out = [System.Collections.Generic.List[string]]::new()
+            for ($i = $at + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^  - ') { $out.Add($lines[$i].Trim()) } elseif ($lines[$i] -match '^\S') { break }
+            }
+            return @($out)
+        }
+        $script:DhPosixSh = $null
+        if ($IsWindows) {
+            foreach ($git in @(Get-Command git -CommandType Application -All -ErrorAction SilentlyContinue)) {
+                $dir = Split-Path -Parent $git.Source
+                for ($up = 0; $up -lt 3 -and -not $script:DhPosixSh -and $dir; $up++) {
+                    $dir = Split-Path -Parent $dir
+                    foreach ($c in 'usr\bin\dash.exe', 'usr\bin\sh.exe') {
+                        $cand = Join-Path $dir $c
+                        if (Test-Path -LiteralPath $cand) { $script:DhPosixSh = $cand; break }
+                    }
+                }
+                if ($script:DhPosixSh) { break }
+            }
+        }
+        else {
+            $sh = Get-Command dash, sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sh) { $script:DhPosixSh = $sh.Source }
+        }
+    }
+
+    It '<Runner>: the network stays enabled, every token is substituted, and the proxy settings, apt setting and lockdown files are written' -ForEach @(
+        @{ Runner = 'outbox'; Var = 'DhOutboxUd' }, @{ Runner = 'exFAT'; Var = 'DhExfatUd' }
+    ) {
+        $ud = Get-Variable -Scope Script -Name $Var -ValueOnly
+        $ud | Should -Not -Match '__[A-Z_]+__' -Because 'an unsubstituted token would ship a broken seed'
+        $ud | Should -Not -Match 'network: \{config: disabled\}' -Because 'the VM keeps its NIC; the seed network-config gives it its static address'
+        $ud | Should -Match '(?m)^# network: applied from the seed network-config'
+        foreach ($p in '/etc/environment', '/etc/profile.d/voidseal-egress-proxy.sh', '/etc/apt/apt.conf.d/99voidseal-proxy',
+                       '/etc/sysctl.d/99-voidseal-noipv6.conf', '/usr/local/sbin/voidseal-egress-lockdown', '/etc/systemd/system/voidseal-egress.service') {
+            $ud | Should -BeLike "*- path: $p*" -Because "the seed must write $p"
+        }
+        $env = script:Get-DhSeedFile $ud '/etc/environment'
+        @($env -split "`n") | Should -Be @("http_proxy=$($script:DhProxy)", "https_proxy=$($script:DhProxy)", "HTTP_PROXY=$($script:DhProxy)", "HTTPS_PROXY=$($script:DhProxy)", 'no_proxy=localhost,127.0.0.1', 'NO_PROXY=localhost,127.0.0.1')
+        $ud | Should -Match '(?m)^    append: true$' -Because '/etc/environment is appended to, not replaced'
+        $apt = script:Get-DhSeedFile $ud '/etc/apt/apt.conf.d/99voidseal-proxy'
+        $apt | Should -Match ([regex]::Escape("Acquire::http::Proxy `"$($script:DhProxy)/`";"))
+        $apt | Should -Match ([regex]::Escape("Acquire::https::Proxy `"$($script:DhProxy)/`";"))
+    }
+
+    It '<Runner>: bootcmd disables IPv6 and moves the Debian sources to https, the package stage installs nftables, and runcmd applies the lockdown before the workload unit starts' -ForEach @(
+        @{ Runner = 'outbox'; Var = 'DhOutboxUd' }, @{ Runner = 'exFAT'; Var = 'DhExfatUd' }
+    ) {
+        $ud = Get-Variable -Scope Script -Name $Var -ValueOnly
+        $ud | Should -Match "(?m)^  - \[ sysctl, -w, 'net\.ipv6\.conf\.all\.disable_ipv6=1' \]"
+        $ud | Should -Match 'http://deb\.debian\.org#https://deb\.debian\.org'
+        $ud | Should -Match "(?m)^packages:\n  - nftables"
+        $cmds   = script:Get-DhRunCmd $ud
+        $iLock  = [array]::IndexOf($cmds, '- [ systemctl, enable, --now, voidseal-egress.service ]')
+        $iStart = [array]::IndexOf($cmds, '- [ systemctl, start, --no-block, vmdep-workload.service ]')
+        $iLock  | Should -BeGreaterOrEqual 0
+        $iStart | Should -BeGreaterThan $iLock -Because 'the lockdown is in place before the workload runs'
+        $ud | Should -Match 'Before=network-pre\.target' -Because 'the unit re-applies the lockdown on any later boot'
+    }
+
+    It 'the lockdown is the one shared block: identical in the outbox, exFAT and Serial HostProxy seeds, nft first with an iptables fallback, no DNS or direct web egress' {
+        $a = script:Get-DhSeedFile $script:DhOutboxUd '/usr/local/sbin/voidseal-egress-lockdown'
+        $b = script:Get-DhSeedFile $script:DhExfatUd  '/usr/local/sbin/voidseal-egress-lockdown'
+        $c = script:Get-DhSeedFile $script:DhSerialUd '/usr/local/sbin/voidseal-egress-lockdown'
+        $a | Should -Be $b
+        $a | Should -Be $c
+        $a | Should -Match 'policy drop;'
+        $a | Should -Match ([regex]::Escape("ip daddr $($script:DhPlan.GatewayIP) tcp dport 13128 accept"))
+        $a | Should -Match ([regex]::Escape("iptables -A OUTPUT -p tcp -d $($script:DhPlan.GatewayIP) --dport 13128 -j ACCEPT"))
+        $a | Should -Match 'iptables -P OUTPUT DROP'
+        $a | Should -Not -Match 'dport 53|dport 80\b|dport 443|REDIRECT' -Because 'no DNS and no direct web egress in HostProxy mode'
+    }
+
+    It 'the outbox runner exports the proxy before the entrypoint and narrates the egress facts; the exFAT runner (no diag) exports it alone' {
+        $runner = script:Get-DhSeedFile $script:DhOutboxUd '/usr/local/sbin/vmdep-workload'
+        $lines  = $runner -split "`n"
+        $export = [array]::IndexOf($lines, '. /etc/profile.d/voidseal-egress-proxy.sh')
+        $run    = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -like "*runuser -u sandbox -- /bin/sh -c '*" })[0]
+        $export | Should -BeGreaterThan 0
+        $export | Should -BeLessThan $run -Because 'the entrypoint inherits the environment the runner exports'
+        foreach ($m in 'egress_mode=hostproxy', 'proxy_reachable=', 'egress_unit_enabled=', 'nft_present=', 'ipv6_disabled=', 'default_routes=', 'nameservers=') {
+            $runner | Should -BeLike "*$m*" -Because "a live run must be able to attribute a failed fetch from $m"
+        }
+        $ex = script:Get-DhSeedFile $script:DhExfatUd '/usr/local/sbin/vmdep-workload'
+        $ex | Should -Match '(?m)^\. /etc/profile\.d/voidseal-egress-proxy\.sh$'
+        $ex | Should -Not -Match 'diag' -Because 'the exFAT runner defines no diag()'
+    }
+
+    It 'the <Which> runner and the lockdown script parse as POSIX sh (sh -n)' -ForEach @(
+        @{ Which = 'outbox'; Var = 'DhOutboxUd' }, @{ Which = 'exFAT'; Var = 'DhExfatUd' }
+    ) {
+        if (-not $script:DhPosixSh) { Set-ItResult -Skipped -Because 'no POSIX sh (dash) available on this host'; return }
+        $ud = Get-Variable -Scope Script -Name $Var -ValueOnly
+        foreach ($path in '/usr/local/sbin/vmdep-workload', '/usr/local/sbin/voidseal-egress-lockdown') {
+            $f = Join-Path $TestDrive ("dh-$Which-" + (Split-Path -Leaf $path) + '.sh')
+            [System.IO.File]::WriteAllText($f, (script:Get-DhSeedFile $ud $path) + "`n", [System.Text.UTF8Encoding]::new($false))
+            $out = & $script:DhPosixSh -n $f 2>&1
+            $LASTEXITCODE | Should -Be 0 -Because "sh -n on $path reported: $out"
+        }
+    }
+
+    It 'the user-data parses as YAML with the proxy files, the package stage and the bootcmd (when PyYAML is available)' {
+        $py = $null
+        try { $py = Resolve-PythonExe } catch { $py = $null }
+        if (-not $py) { Set-ItResult -Skipped -Because 'no host Python'; return }
+        & $py -c 'import yaml' 2>$null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'PyYAML is not installed'; return }
+        foreach ($doc in @(@{ Name = 'outbox'; Text = $script:DhOutboxUd }, @{ Name = 'exfat'; Text = $script:DhExfatUd })) {
+            $f = Join-Path $TestDrive "dh-$($doc.Name).yaml"
+            [System.IO.File]::WriteAllText($f, $doc.Text, [System.Text.UTF8Encoding]::new($false))
+            $out = & $py -c 'import sys,yaml,json; print(json.dumps(yaml.safe_load(open(sys.argv[1],encoding="utf-8"))))' $f 2>&1
+            $LASTEXITCODE | Should -Be 0 -Because "YAML parse of $($doc.Name) reported: $out"
+            $parsed = ($out | Out-String) | ConvertFrom-Json
+            @($parsed.packages) | Should -Be @('nftables')
+            @($parsed.bootcmd).Count | Should -Be 4 -Because 'the wait-online mask, two sysctl entries and the sources move'
+            @($parsed.write_files | ForEach-Object { $_.path }) | Should -Contain '/etc/profile.d/voidseal-egress-proxy.sh'
+            $parsed.PSObject.Properties.Name | Should -Not -Contain 'network'
+        }
+    }
+
+    It 'FAILS CLOSED without a plan or with an empty allowlist' {
+        { New-CidataUserData -Profile $script:DhOutbox } | Should -Throw "New-CidataUserData: a HostProxy seed (a VM that keeps its NIC) needs the VM's egress address plan (-Egress, from the descriptor); none was given. Fail closed."
+        $empty = $script:DhOutbox.Clone(); $empty['EgressAllowlist'] = @()
+        { New-CidataUserData -Profile $empty -Egress $script:DhPlan } | Should -Throw 'New-CidataUserData: a Disk+HostProxy profile must have a non-empty EgressAllowlist (fail-closed).'
+    }
+
+    It 'a Disk profile with no NIC keeps the offline seed: network disabled, every token a comment, no proxy or lockdown content' {
+        $noNic = @(
+            @{ Tier = 0; WorkloadMode = 'Disk'; OutboxOutput = $true; EgressMode = 'HostProxy'; Entrypoint = 'python3 /mnt/in/x.py --out /run/staging/result.html' }
+            @{ Tier = 1; Network = 'None'; EgressMode = 'None'; WorkloadMode = 'Disk'; ScreenConfig = @{ mode = 'aggressive' }; Entrypoint = 'python3 /mnt/in/x.py --out /run/staging/result.html' }
+            @{ Tier = 0; WorkloadMode = 'Disk'; Entrypoint = 'python3 /mnt/in/x.py --out /mnt/out/result.html' }
+        )
+        foreach ($p in $noNic) {
+            $ud = New-CidataUserData -Profile $p
+            $ud | Should -Match 'network: \{config: disabled\}'
+            $ud | Should -Not -Match '__[A-Z_]+__'
+            $ud | Should -Not -Match 'HTTPS_PROXY|voidseal-egress|nftables|disable_ipv6'
+            $ud | Should -Match '\(no network adapter' -Because 'each HostProxy token resolves to a comment that says why nothing is there'
+        }
     }
 }
