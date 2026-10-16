@@ -1463,7 +1463,7 @@ function New-RealHyperVBackend {
             # idempotent, so a later rollback delete of an already-gone path is a harmless no-op.)
             $null = New-VHD -Path $path -Dynamic -SizeBytes $size -ErrorAction Stop
             try {
-                $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+                $img = & $LockRetry -Context 'NewOutputVhdx' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
                 try {
                     # On live Hyper-V `$img | Get-Disk` can transiently return $null during the
                     # mount-settle lag, so $disk.Number would throw under StrictMode. Poll briefly.

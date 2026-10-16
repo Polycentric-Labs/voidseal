@@ -118,6 +118,17 @@ Describe 'Invoke-BuilderVM — teardown removes the VM (no orphan), on success a
         $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-teardown' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-td.vhdx')
         $r.Status | Should -Be 'Success'
         (& $fake.GetVM @{ Name = 'bld-teardown' }) | Should -BeNullOrEmpty -Because 'the builder VM is removed at teardown'
+        $r.TeardownStatus | Should -BeLike 'OK*' -Because 'a clean teardown is reported on the result, as Invoke-Voidseal reports it'
+    }
+
+    It 'a teardown that cannot remove a host egress object is reported as FAILED on the result (the proxy survived its kill)' {
+        $blob = [byte[]](1..16)
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateVerdictBlob $script:BuilderOkBlob -SimulateDepsImageBlob $blob -SimulateEgressProxyUnkillable
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-td-fail' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-tdf.vhdx') -WarningVariable wv -WarningAction SilentlyContinue
+        $r.TeardownStatus | Should -BeLike 'FAILED:*'
+        $r.TeardownStatus | Should -Match 'egress' -Because 'the message names what was left behind'
+        (@($wv) -join "`n") | Should -Match 'teardown of ''bld-td-fail'' failed'
+        (& $fake.GetVM @{ Name = 'bld-td-fail' }) | Should -BeNullOrEmpty -Because 'every other removal is still attempted'
     }
 
     It 'the VM is removed after a timed-out builder run (no orphan)' {

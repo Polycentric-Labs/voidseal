@@ -212,10 +212,11 @@ places where a check is an argument rather than a measurement.
   before it starts; the in-guest Squid variants (`InGuestSquid`, `SquidSniProxy`) are removed.
   `tier1.psd1` drops the unwired `SnapshotRevert` lifecycle (the seal refuses checkpoints). Not yet run
   live.
-- The gate also reads the three Windows Firewall profiles (enabled, inbound default Block), the vEthernet
-  interface's IPv4 and IPv6 forwarding (both off), the VM's power state (Off at gate time) and, for the
-  kept Tier-1 adapter, MAC address spoofing (off), DHCP guard and router guard (on), which `Lock-Sandbox`
-  sets; any other value, or an answer the host cannot give, refuses the seal. The host proxy accepts
+- The gate also reads the VM's power state at every tier (Off at gate time) and, on a VM that keeps its
+  NIC, the three Windows Firewall profiles (enabled, inbound default Block), the vEthernet interface's
+  IPv4 and IPv6 forwarding (both off) and the adapter's MAC address spoofing (off), DHCP guard and router
+  guard (on), which `Lock-Sandbox` sets; any other value, or an answer the host cannot give, refuses the
+  seal. The host proxy accepts
   connections only from the guest's own address, and a proxy process that survives its kill is reported
   as a teardown failure. The Guest Service Interface is matched by component GUID like the other
   integration services, and the seal verdict must be a boolean true, not merely truthy.
@@ -230,10 +231,12 @@ places where a check is an argument rather than a measurement.
   the binary, a failed sparse-flag clear removes the half-made golden image, and access-denied errors are
   reported as such instead of retried or rebranded as a Hyper-V failure.
 - Disk-mode results: a staged in-guest helper (`run_disk_workload.py`, `outbox.py`, `screener.py`) whose
-  content differs from the engine's own `guest/` copy is refused before provisioning; an outbox run that
-  is not a success releases nothing on disk (a non-zero exit code, a missing exit-code record and an
-  empty result file each report a failure and remove the staged files, keeping `workload.json` and
-  `verdicts.json` for diagnosis). The live docs and the `firefox` profile read the helpers from the
+  content differs from the engine's own `guest/` copy is refused before provisioning; a transport-only
+  outbox run that is not a success releases nothing on disk (a non-zero exit code, a missing exit-code
+  record and an empty result file each report a failure and remove the staged files, keeping
+  `workload.json` and `verdicts.json` for diagnosis); a processor run with a non-zero exit code still
+  reports `WorkloadFailed` and releases only what its screener passed, as before, and one with no
+  exit-code record releases nothing. The live docs and the `firefox` profile read the helpers from the
   engine checkout rather than an operator staging folder.
 - Documentation aligned with the code: Tier 0 is live-proven and Tier 1 and the builder are mock-proven;
   the Tier-1 token path is declared, not wired; the gate reads one of the four host channels and treats

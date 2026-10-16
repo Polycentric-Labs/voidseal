@@ -2758,8 +2758,8 @@ Describe 'Real backend — ReadVhdxRawRegion rides out a transient detach settle
         $err | Should -Not -Match 'still locked'
     }
 
-    It 'the five Mount-VHD sites ride the lock-retry too (WriteVhdxFile, ReadVhdxFile, WriteVhdxFileBytes, ReadVhdxFileBytes, CopyDirectoryToVhdx; AST-pinned)' {
-        foreach ($method in 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'CopyDirectoryToVhdx') {
+    It 'the six Mount-VHD sites ride the lock-retry too (NewOutputVhdx, WriteVhdxFile, ReadVhdxFile, WriteVhdxFileBytes, ReadVhdxFileBytes, CopyDirectoryToVhdx; AST-pinned)' {
+        foreach ($method in 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'CopyDirectoryToVhdx') {
             $assign = & $script:GetRealBackendAssign $method
             $assign | Should -Not -BeNullOrEmpty
             $mounts = @(& $script:PinFindCommand $assign 'Mount-VHD')

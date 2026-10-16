@@ -483,6 +483,7 @@ function Invoke-BuilderVM {
         SealVerdict    = $false
         EgressProxyLog = $null
         States         = @()
+        TeardownStatus = $null
     }
 
     $descriptor = $null
@@ -663,9 +664,13 @@ function Invoke-BuilderVM {
                 Remove-Sandbox -Name $Name -Backend $Backend
             }
             if ($null -eq $result.Error) { $states.Add('DESTROYED') }
+            $result.TeardownStatus = 'OK (VM removed, created disks deleted)'
         }
         catch {
+            # The builder now installs a gateway address, firewall rules, a port ACL and a proxy process, so a
+            # teardown that leaves any of them behind must be visible in the result, not only as a warning.
             Write-Warning "Invoke-BuilderVM: teardown of '$Name' failed: $($_.Exception.Message)"
+            $result.TeardownStatus = "FAILED: $($_.Exception.Message)"
         }
         $result.States = $states.ToArray()
     }
