@@ -4,7 +4,7 @@
 
 Every Hyper-V call goes through one seam with a real factory and a fake factory that share a
 manifest-enforced method set, so the whole engine is unit-tested with no elevation and no real VM
-(1653 Pester tests (1651 passed, 2 skipped), plus 194 pytest tests for the guest and host helpers). The recurring failure mode
+(1654 Pester tests (1652 passed, 2 skipped), plus 194 pytest tests for the guest and host helpers). The recurring failure mode
 that design guards against, a fake that accepts what real Hyper-V rejects, is treated as the first
 bug class to rule out.
 
