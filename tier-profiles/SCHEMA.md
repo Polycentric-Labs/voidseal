@@ -15,8 +15,8 @@ constants (`Get-ProfileSchemaKeys` in `scripts/lib/ProfileLoader.ps1`), and a dr
 file and the loader disagree in either direction. Where a key may appear:
 
 * a **workload profile** may carry the keys in the workload table (plus `BaseTier` and `Name`). A
-  tier-owned key such as `Credentials`, `Substrate` or `Extraction` is refused there rather than
-  dropped, because it was never layered onto the merge;
+  tier-owned key such as `Credentials`, `Substrate`, `Extraction` or `EgressMode` is refused there
+  rather than dropped, because it was never layered onto the merge;
 * a **tier file** or a **`-Profile` hashtable** (a resolved profile) may carry the tier keys and the
   workload keys the engine reads off a resolved profile. `ExtraAllowlist` and `InputFiles` are
   workload-file keys and do not exist on a resolved profile.
@@ -27,8 +27,8 @@ file and the loader disagree in either direction. Where a key may appear:
 | `Tier` | int 0–3 | risk tier |
 | `Description` | string | human summary |
 | `Substrate` | `'Container'` \| `'HyperV-Gen2'` | what hosts the workload |
-| `Network` | string | network posture label |
-| `EgressMode` | `'HostProxy'`\|`'InGuestSquid'`\|`'HostEnvoy'`(Phase-1B)\|`'SquidSniProxy'`(builder)\|`'None'` | egress enforcement mechanism. `'HostProxy'` (tier1's value) is host-enforced and acts only on a VM that keeps a NIC (Tier 1, `Network='Internal+Allowlist'`): `New-SandboxVM` gives it a /30 in `10.231.0.0/16` from its name and refuses a host address or NAT that overlaps it; `Lock-Sandbox` installs the gateway address, host firewall rules and a port ACL; `Assert-Sealed` reads them back (see invariant 6); `Invoke-Voidseal` starts the host CONNECT proxy (`scripts/egress/voidseal_egress_proxy.py`) after the gate; teardown removes what was recorded. Serial mode only: `Invoke-Voidseal` refuses a Disk-mode workload on a VM that keeps its NIC under `'HostProxy'` before it provisions anything (the seed builder refuses it too, as a backstop). On a VM sealed with no adapter (Tier 0) it is moot. `'InGuestSquid'` is an in-guest layer only (defense in depth) |
+| `Network` | string | network posture label. With `Tier` it decides whether the VM keeps a NIC (`Get-SealNicPolicy`: only Tier 1 with `'Internal+Allowlist'` does; `'None'` is a processor at any tier). A kept NIC requires `EgressMode='HostProxy'` (the kept-NIC rule); `'None'` requires `EgressMode='None'` and an empty allowlist (the processor rule); a Tier-1 label the predicate does not recognize is refused at load |
+| `EgressMode` | `'HostProxy'`\|`'None'` | the egress model. **Tier-owned**: a workload file that sets it is refused with the tier-owned hint, so every workload inherits its tier's value (the builder inherits tier1's `'HostProxy'`). `'HostProxy'` is the one model for a VM that keeps a NIC (Tier 1, `Network='Internal+Allowlist'`) and is required there: `New-SandboxVM` gives the VM a /30 in `10.231.0.0/16` from its name and refuses a host address or NAT that overlaps it; `Lock-Sandbox` installs the gateway address, host firewall rules and a port ACL; `Assert-Sealed` refuses the VM unless its descriptor records `'HostProxy'` with that plan, then reads every object back (invariant 6); `Invoke-Voidseal` and `Invoke-BuilderVM` start the host CONNECT proxy (`scripts/egress/voidseal_egress_proxy.py`) after the gate and before the guest boots; teardown removes what was recorded. Both seed shapes carry the guest side: the Serial seed its proxy variables, apt setting, `network-config` and in-guest default-DROP; the Disk runners (outbox, legacy exFAT and builder) the proxy environment, an apt proxy setting, the same `network-config` and the same in-guest lockdown. `'None'` is for a VM that seals with no adapter (Tier >= 2 and `Network='None'` must set it). `tier0.psd1` still declares `'HostProxy'`: moot there, because a Tier-0 VM seals with no adapter. Mock-green only; no Tier-1 run has gone live |
 | `EgressAllowlist` | string[] | FQDNs permitted (empty = none). A leading dot (`.example.org`) means the domain and its subdomains; under `HostProxy` it becomes the proxy rules `example.org` and `*.example.org`. The merged list (tier plus workload `ExtraAllowlist`) is what the proxy enforces |
 | `BlockProtocols` | string[] | (opt) protocols force-blocked (QUIC/DoH/DoT) |
 | `Credentials` | `'None'`\|`'ScopedOnDemand'` | credential posture. **MUST be `'None'` for Tier ≥ 2** |
@@ -37,12 +37,13 @@ file and the loader disagree in either direction. Where a key may appear:
 | `Memory`/`Cpu` | string/int | hardware. Bounded at load, for a tier and for a merged workload alike: `Memory` is a size string such as `'4GB'` (or a byte count) from `512MB` to `64GB`; `Cpu` is an integer from 1 to 32. A workload profile may set both (see the workload table) |
 | `CpuMaximumPercent` | int 1–100 | (opt) cap on the share of each virtual processor the guest may use (`Set-VMProcessor -Maximum`). Absent = Hyper-V's default, so no cap |
 | `CpuRelativeWeight` | int 1–10000 | (opt) scheduling weight against the other VMs on the host (`Set-VMProcessor -RelativeWeight`). Absent = Hyper-V's default |
+| `WorkloadTimeoutSeconds` | int 60 to 86400 | (opt) the run deadline, accepted on a tier file as well as a workload (the workload table has the precedence). Bounded at load for a tier and a merged workload alike |
 | `NestedVirt` | bool | (opt) expose virt extensions |
 | `ManagementChannel` | `'Com1Serial'`\|`'PSDirect'` | how the host drives the guest. Linux ⇒ `Com1Serial` (PS Direct is Windows-guest-only) |
 | `HostChannels` | hashtable | clipboard/shares/guest-services/enhanced-session toggles (all `$false` for VM tiers) |
 | `Capture` | hashtable | logging mode + OTLP flag |
 | `Extraction` | `'HostReadResultDir'`\|`'ColdVHDX-Quarantine-CDR'` | artifact-exit pattern. **MUST be cold-VHDX for Tier ≥ 2** |
-| `Lifecycle` | `'Ephemeral'`\|`'SnapshotRevert'`\|`'CreateDestroy'`\|`'DetonateWipe'` | teardown model |
+| `Lifecycle` | `'Ephemeral'`\|`'SnapshotRevert'`\|`'CreateDestroy'`\|`'DetonateWipe'` | teardown model. Declared, not wired: no engine code reads it, teardown always destroys the VM and the disks it created, and `'SnapshotRevert'` would need a checkpoint the seal refuses (`Assert-Sealed` fails a VM with automatic checkpoints on or any checkpoint present), so `tier1.psd1` ships `'Ephemeral'`. The enum value stays accepted |
 | `Controls` | string[] | cross-cutting controls applied in guest bootstrap |
 
 ## Workload-profile keys
@@ -60,7 +61,7 @@ file and the loader disagree in either direction. Where a key may appear:
 | `FileSystem` | string | (opt, Disk mode, default `'exFAT'`) the data-disk filesystem: `exFAT`, `FAT32`, `NTFS` or `FAT`. `Raw` is reserved for the engine's outbox OUTPUT disk and is not for a profile to set |
 | `InputLabel` / `OutputLabel` | string | (opt, Disk mode, defaults `'INPUT'` / `'OUTPUT'`) data-disk volume labels |
 | `InputDiskSizeBytes` / `OutputDiskSizeBytes` | int bytes, 64MB to 2TB | (opt, Disk mode, default 1GB each) the size of the INPUT and OUTPUT data disks `New-WorkloadDisks` creates. A true integer from 64MB to 2TB inclusive (64MB is the smallest volume the engine creates; a decimal, a string such as `'1GB'` or a bool is refused). Layers like `Entrypoint`. The host free-space preflight sums both sizes with a fixed 1GB of headroom, so a size the volume cannot hold fails before either disk is created |
-| `DepsSpec` | hashtable | (required when `EgressMode` is `'SquidSniProxy'`, else opt) per-fetcher dependency spec (`Pip`, `Apt`, `HuggingFace`, `Github`) the builder fetches over its Squid SNI egress. The merged `EgressAllowlist` must cover every declared fetcher's representative hosts (the builder rule) |
+| `DepsSpec` | hashtable | (opt; declaring it makes the profile a **builder**) per-fetcher dependency spec (`Pip`, `Apt`, `HuggingFace`, `Github`) the builder fetches over the host proxy. The builder rule: a profile with `DepsSpec` must be Tier 1 with `Network='Internal+Allowlist'` and `EgressMode='HostProxy'` (what `BaseTier = 1` gives `profiles/builder.psd1`), the value must be a non-empty hashtable of known fetchers, and the merged `EgressAllowlist` must cover every declared fetcher's representative hosts |
 | `ScreenConfig` | hashtable | (opt, processor only) `mode` (`'aggressive'` default, or `'moderate'`) and `categories` (default none), routing the post-detach Sensitivity Gate. A processor is `Network = 'None'` plus a `ScreenConfig` |
 | `DepsImageHash` | string | (opt, processor runs with a deps disk) the whole-image SHA-256 the deps disk must hash to before it is attached: exactly 64 hex characters, either case. `-Workload.DepsImageHash` wins when both are given; with neither, a deps disk is refused. Layers like `Entrypoint` |
 | `DepsDiskPath` | string | (opt) host path to a pre-built `deps.vhdx` a processor run attaches, usually supplied as a `-Workload` override |
@@ -71,7 +72,7 @@ file and the loader disagree in either direction. Where a key may appear:
 | `WorkloadTimeoutSeconds` | int 60–86400 | (opt) the overall deadline for the workload run, after which the guest is force-stopped and the run reports Failed. `Invoke-Voidseal -WorkloadTimeoutSeconds` wins only when it is explicitly passed; otherwise this key; otherwise 600. The same precedence applies to `Invoke-BuilderVM`. The bounds are checked at load |
 | `ExtraAllowlist` | string[] | (opt) additional FQDNs unioned onto the tier allowlist |
 | `StageAssets` | hashtable | (opt) host source path → a free-text pin note (for example a commit SHA; no hash is checked on this path). `Invoke-Voidseal` attaches each key as a read-only ISO before the seal (`Import-SandboxAsset -As Iso`, which fails closed on a missing file), and the seal ejects it before the guest's only boot, so nothing in it reaches a running workload; use Disk-mode `Inputs` for that. Its source keys are still screened by invariant 1 below |
-| `SeedIso` | string | (opt) **not read by `Invoke-Voidseal`.** Only `New-CidataSeed` uses it, as the default output path for a `CIDATA` seed ISO built by hand. The engine builds the cloud-init seed itself from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (`New-WorkloadSeedDisk`), for every run that boots a guest: in Serial mode serial-getty autologin on ttyS0 (the Runner's command channel), the run-user and the seed's packages, plus the in-guest egress layer for an `InGuestSquid` profile, or for a networked `HostProxy` VM the proxy settings, an in-guest default-DROP allowing only the proxy port, and a `network-config` with one static address and no route or resolver; in Disk mode the disk-mode runner. A seed DVD would be ejected by the seal before the guest's only boot. |
+| `SeedIso` | string | (opt) **not read by `Invoke-Voidseal`.** Only `New-CidataSeed` uses it, as the default output path for a `CIDATA` seed ISO built by hand. The engine builds the cloud-init seed itself from the resolved profile, on a recorded `CIDATA` data disk that survives the seal (`New-WorkloadSeedDisk`), for every run that boots a guest: in Serial mode serial-getty autologin on ttyS0 (the Runner's command channel), the run-user and the seed's packages; in Disk mode the disk-mode runner. A VM that keeps its NIC (`HostProxy`) also gets, in either mode, the proxy settings, an in-guest default-DROP allowing only the proxy port, and a `network-config` with one static address and no route or resolver. A seed DVD would be ejected by the seal before the guest's only boot. |
 
 ## Provision-time resource gate (not a loader rule)
 Before it creates anything, `New-SandboxVM` reads the host's free physical memory (backend method
@@ -104,12 +105,13 @@ at run time, not on the profile alone.
    attached secret-shaped volume, a still-attached import DVD, or any passthrough device (a GPU
    partition adapter or a device assigned by Discrete Device Assignment), at **any** tier. The
    **network-adapter** rule follows one predicate, `Get-SealNicPolicy`: only a Tier-1 VM whose `Network`
-   is set and is not `'None'` may keep a NIC (on an isolated Internal vSwitch, never the Default Switch);
-   Tier 0, Tier >= 2 and every `Network='None'` profile must seal with zero adapters, and a descriptor
-   that records no `Network` is refused. The unrecorded-residual-disk refusal is authoritative at
-   Tier >= 2 and best-effort below it. A Tier-1 VM whose descriptor records `EgressMode='HostProxy'` is
-   also refused unless its gateway address, host firewall rules and port ACL entries are on the host
-   exactly as recorded, the record is the complete set its address plan requires, no other host address
-   overlaps its /30, and no NAT network covers it; a read that fails refuses.
+   is `'Internal+Allowlist'` may keep a NIC (on its own isolated Internal vSwitch, never the Default
+   Switch); Tier 0, Tier >= 2 and every `Network='None'` profile must seal with zero adapters, and a
+   descriptor that records no `Network` is refused. The unrecorded-residual-disk refusal is authoritative
+   at Tier >= 2 and best-effort below it. A Tier-1 VM that keeps its NIC is refused unless its descriptor
+   records `EgressMode='HostProxy'` with an address plan, `Lock-Sandbox` installed the host egress from
+   that plan, and its gateway address, host firewall rules and port ACL entries are on the host exactly
+   as recorded, the record is the complete set the plan requires, no other host address overlaps its
+   /30, and no NAT network covers it; a read that fails refuses.
 
 Validation = a Pester test per invariant; a deliberately-violating fixture profile MUST fail closed.

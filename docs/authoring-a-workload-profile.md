@@ -32,22 +32,22 @@ onto the tier profile** and **re-validates the merged result against every loade
 weakened egress mode — see §2.3).
 
 **Which layer owns which field, precisely:** of all the tier-profile fields, a workload profile
-can influence a short, fixed list. Two of them touch isolation, and only additively/restrictively:
+can influence a short, fixed list. One of them touches isolation, and only additively:
 
 - `EgressAllowlist` — your workload's `ExtraAllowlist` **unions** onto the tier's
   `EgressAllowlist` (deduped, case-insensitive). You can only *add* hosts, never remove one the
   tier already grants.
-- `EgressMode` — a workload MAY override this, but **only** to `'SquidSniProxy'` (the builder
-  egress — strictly stricter than every tier's own mode, so it can only *tighten* isolation,
-  never weaken it). Any other workload-level `EgressMode` is refused at load time (see
-  `profiles/builder.psd1` for the one shipped profile that uses this).
+- `EgressMode` is **not** on the list. It is tier-owned: a workload file that sets it, to any
+  value, is refused at load with the tier-owned hint, exactly like `Credentials`. Every workload
+  inherits its tier's model; `profiles/builder.psd1` gets tier1's `'HostProxy'` through
+  `BaseTier = 1`, and what makes it a builder is its `DepsSpec` (§2.2).
 
 The rest are resource choices, not isolation ones. A workload may set `Memory`, `Cpu`,
 `CpuMaximumPercent` and `CpuRelativeWeight` (and its own run deadline, `WorkloadTimeoutSeconds`, §2.2); each replaces the tier's value (a key the workload
 omits keeps the tier's), and the bounds in §2.1 apply to the merged result, so a workload cannot
 ask for a guest the loader would refuse on a tier.
 
-Every other tier-profile field (`Substrate`, `Network`, `Credentials`, `GuestImage`,
+Every other tier-profile field (`Substrate`, `Network`, `EgressMode`, `Credentials`, `GuestImage`,
 `HostChannels`, `Extraction`, `Lifecycle`, `Controls`, …) is **immutable from the workload
 layer**: `Import-WorkloadProfile` refuses a workload key of that name rather than ignoring it,
 naming the key in the error. If your task needs a different isolation contract, that's a
@@ -72,9 +72,9 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `Tier` | yes | int, 0–3 | the risk tier; gates every invariant below | must be an int in `0..3` |
 | `Description` | yes | string | human summary | presence only |
 | `Substrate` | yes | `'Container'` \| `'HyperV-Gen2'` | what hosts the workload | `HyperV-Gen2` ⇒ every `HostChannels` value must be `$false` (invariant 4) |
-| `Network` | yes | string label | network posture label, recorded on the sandbox descriptor; with `Tier` it decides whether the VM keeps a NIC (`Get-SealNicPolicy`: only Tier 1 with a label other than `'None'` does) | the literal value `'None'` triggers the **no-NIC processor rule**: `EgressMode` must then be `'None'` and `EgressAllowlist` must be empty; at seal time the adapter is removed and the gate host-verifies that none remains, at any tier |
-| `EgressMode` | yes | `'HostProxy'` \| `'InGuestSquid'` \| `'HostEnvoy'` (Phase-1B, unused today) \| `'SquidSniProxy'` (builder) \| `'None'` | egress enforcement mechanism (tier-controlled: a workload may only set `'SquidSniProxy'`). `'HostProxy'` is host-enforced on a Tier-1 Serial VM: the merged allowlist is what the host proxy enforces | `Tier ≥ 2` ⇒ must be `'None'` (invariant 2); `'SquidSniProxy'` ⇒ a non-empty `DepsSpec` is required and the merged allowlist must cover every declared fetcher's hosts (the builder rule) |
-| `EgressAllowlist` | yes (may be `@()`) | string[] | FQDNs permitted | every entry is validated against a strict hostname charset (SEC-1 — blocks Squid ACL-injection via newline/quote/whitespace); `Tier ≥ 2` or `Network='None'` ⇒ must be empty |
+| `Network` | yes | string label | network posture label, recorded on the sandbox descriptor; with `Tier` it decides whether the VM keeps a NIC (`Get-SealNicPolicy`: only Tier 1 with `'Internal+Allowlist'` does) | the literal value `'None'` triggers the **no-NIC processor rule**: `EgressMode` must then be `'None'` and `EgressAllowlist` must be empty; at seal time the adapter is removed and the gate host-verifies that none remains, at any tier. `'Internal+Allowlist'` at Tier 1 triggers the **kept-NIC rule**: `EgressMode` must be `'HostProxy'`. Any other Tier-1 label is refused at load |
+| `EgressMode` | yes | `'HostProxy'` \| `'None'` | the egress model. **Tier-owned**: a workload file may not set it at all (refused with the tier-owned hint); every workload inherits its tier's value. `'HostProxy'` is the one model for a VM that keeps a NIC, in Serial and in Disk mode alike: the host plans the VM's /30, the seal installs the gateway address, firewall rules and port ACL, the gate reads them back, the host CONNECT proxy enforces the merged allowlist, and the seed carries the proxy settings, a static `network-config` and an in-guest default-DROP (defense in depth). Mock-green only | `Tier ≥ 2` ⇒ must be `'None'` (invariant 2); `Network='None'` ⇒ must be `'None'` (processor rule); Tier 1 with `Network='Internal+Allowlist'` ⇒ must be `'HostProxy'` (kept-NIC rule) |
+| `EgressAllowlist` | yes (may be `@()`) | string[] | FQDNs permitted | every entry is validated against a strict hostname charset (SEC-1: a newline, quote or whitespace could reshape the host proxy's allowlist arguments); `Tier ≥ 2` or `Network='None'` ⇒ must be empty |
 | `BlockProtocols` | no | string[] | *documents* protocols meant to be force-blocked (QUIC/UDP-443/DoH/DoT) | **not read or enforced by the loader**: purely declarative; the real blocking is "by construction": under `EgressMode='HostProxy'` the host proxy tunnels only CONNECT to port 443 and the host firewall rules and port ACL drop all UDP, and the seed's in-guest firewall ruleset (`SeedBuilder.ps1`) adds a second layer that is defense in depth only (a root guest can disable it; see [`threat-model.md`](threat-model.md)). Neither layer opens those protocols regardless of what this array says |
 | `Credentials` | yes | `'None'` \| `'ScopedOnDemand'` | credential posture | `Tier ≥ 2` ⇒ must be `'None'` (invariant 2); **not** overridable from a workload profile at all |
 | `GuestImage` | yes | string | base image id | if it matches the Linux regex (`debian\|ubuntu\|alpine\|fedora\|remnux\|linux`) *and* a `ManagementChannel` is declared, that channel must be `'Com1Serial'` (invariant 5 — PowerShell Direct is Windows-guest-only) |
@@ -87,7 +87,7 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `HostChannels` | yes | hashtable | clipboard/shares/guest-services/enhanced-session toggles | must be a hashtable; see `Substrate` row for the HyperV-Gen2 all-`$false` rule |
 | `Capture` | yes | hashtable | logging mode + OTLP flag | presence only |
 | `Extraction` | yes | `'HostReadResultDir'` \| `'ColdVHDX-Quarantine-CDR'` | the artifact-exit pattern | `Tier ≥ 2` ⇒ must be `'ColdVHDX-Quarantine-CDR'` (invariant 3) |
-| `Lifecycle` | yes | `'Ephemeral'` \| `'SnapshotRevert'` \| `'CreateDestroy'` \| `'DetonateWipe'` | the teardown model | enum membership only |
+| `Lifecycle` | yes | `'Ephemeral'` \| `'SnapshotRevert'` \| `'CreateDestroy'` \| `'DetonateWipe'` | the teardown model. Declared, not wired: no engine code reads it and teardown always destroys the VM and its disks. `'SnapshotRevert'` would need a checkpoint, which the seal refuses (`Assert-Sealed` fails a VM with automatic checkpoints on or a checkpoint present), so `tier1.psd1` ships `'Ephemeral'` | enum membership only |
 | `Controls` | yes | string[] | cross-cutting controls applied in guest bootstrap | presence only |
 
 ### 2.2 Workload-profile fields (author these in `profiles/<name>.psd1`)
@@ -111,7 +111,7 @@ Every field below is derived from `scripts/lib/ProfileLoader.ps1` (`$script:Tier
 | `InputFiles` | no (Disk-mode convention) | innerName → **host file path**: a documentation-only convention some Disk-mode profiles use to record where the live-acceptance step should read real file content from | **never layered onto the merged profile**: it is accepted so a profile can carry the record, but it is not in `Import-WorkloadProfile`'s layer list, so nothing reads it at run time. A human (or the live-acceptance script) reads these host files and folds them into `Inputs` manually before deploy; see `firefox.psd1`'s `InputFiles` header comment |
 | `FileSystem` | no (Disk-mode; default `'exFAT'`) | the data disk filesystem | validated against the backend's `NewOutputVhdx`-accepted set (`exFAT`/`FAT32`/`NTFS`/`FAT`; `Raw` is also accepted but is engine-reserved for the raw-OUTPUT outbox path — not for a profile to set) |
 | `InputLabel` / `OutputLabel` | no (Disk-mode; default `'INPUT'`/`'OUTPUT'`) | data-disk volume labels | none |
-| `DepsSpec` | **required iff** `EgressMode='SquidSniProxy'`; otherwise no | per-fetcher (`Pip`/`Apt`/`HuggingFace`/`Github`) dependency spec the **builder** profile fetches over its Squid SNI egress | non-empty hashtable of recognized fetcher names; the merged `EgressAllowlist` must cover every declared fetcher's representative hosts or the loader refuses at load time (the "builder rule") — see `profiles/builder.psd1` |
+| `DepsSpec` | no; declaring it makes the profile a **builder** | per-fetcher (`Pip`/`Apt`/`HuggingFace`/`Github`) dependency spec the builder fetches over the host proxy (`Invoke-BuilderVM`) | the "builder rule": the profile must be Tier 1 with `Network='Internal+Allowlist'` and `EgressMode='HostProxy'` (what `BaseTier = 1` gives it), the value must be a non-empty hashtable of recognized fetcher names, and the merged `EgressAllowlist` must cover every declared fetcher's representative hosts, or the loader refuses at load time; see `profiles/builder.psd1` |
 | `ScreenConfig` | no — **PROCESSOR-only** | `mode` (default `'aggressive'`) + `categories` (default `@()`) that route the post-detach Sensitivity Gate | a "processor" profile is specifically `Network='None'` **plus** a declared `ScreenConfig`; it is never paired with `OutboxOutput=$true` (transport-only profiles are never screened, by design) |
 | `DepsDiskPath` | no | host path to a pre-built `deps.vhdx` a processor run attaches | in practice supplied via a `-Workload` runtime override rather than baked into the `.psd1`, since it's produced by a separate builder run |
 | `OutboxOutput` | no | opts a non-processor Disk-mode workload into the shared user-space outbox transport (Raw OUTPUT disk; the host reads it via `ReadVhdxRawRegion`, **never** `Mount-VHD`) | transport-only — never paired with `ScreenConfig` (see `firefox.psd1`) |
@@ -150,9 +150,10 @@ line, so any other value is refused when the seed is built.
 5. **Linux management** — a Linux `GuestImage` with a declared `ManagementChannel` ⇒ that channel
    is `'Com1Serial'` (PowerShell Direct is Windows-guest-only).
 
-Plus two narrower rules that bind regardless of tier: the **`Network='None'` processor rule**
-(§2.1) and the **builder rule** (`EgressMode='SquidSniProxy'` ⇒ `DepsSpec` + allowlist
-completeness, §2.2). A deliberately-violating fixture is a Pester test in
+Plus three narrower rules that bind regardless of tier: the **`Network='None'` processor rule**
+(§2.1), the **kept-NIC rule** (Tier 1 with `Network='Internal+Allowlist'` ⇒ `EgressMode='HostProxy'`,
+§2.1) and the **builder rule** (`DepsSpec` ⇒ that kept-NIC HostProxy shape + allowlist completeness,
+§2.2). A deliberately-violating fixture is a Pester test in
 `tests/ProfileLoader.Tests.ps1` for every one of these — if you think one is wrong, that's the
 place to add a failing test first.
 
@@ -331,8 +332,8 @@ moving parts than the from-scratch skeleton.
   different `BaseTier` instead.
 - **Misspelling a key, or setting one the engine does not read.** The loader throws on any key
   that is not in `tier-profiles/SCHEMA.md` and names it; it never drops one silently.
-- **Setting `EgressMode` to anything other than `'SquidSniProxy'` in a workload profile.** Every
-  other `EgressMode` is tier-controlled; the loader refuses any other workload-level override.
+- **Setting `EgressMode` in a workload profile at all.** It is tier-owned; the loader refuses it
+  with the tier-owned hint, whatever the value. The builder inherits tier1's `'HostProxy'`.
 - **Mounting a live credential/secret file "just this once."** The loader refuses it by design —
   copy the secret to a non-secret-shaped path first (see §2.3, invariant 1).
 - **Pairing `ScreenConfig` with `OutboxOutput=$true`.** These are two different transport

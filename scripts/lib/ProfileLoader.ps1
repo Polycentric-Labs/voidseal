@@ -20,6 +20,11 @@
       4. VM-tier HostChannels all-false (HyperV-Gen2 => no $true channel)
       5. Linux guests => Com1Serial     (never PSDirect)
       6. Basic schema                   (required keys, Tier 0..3, enum membership)
+    Plus three rules that bind regardless of tier: the processor rule (Network='None' => EgressMode
+    'None', empty allowlist), the kept-NIC rule (a VM that keeps a NIC, Get-SealNicPolicy
+    'IsolatedInternalSwitch', must use EgressMode='HostProxy', the one egress model the seal installs and
+    the gate reads back) and the builder rule (a DepsSpec profile must be that kept-NIC HostProxy shape
+    and its allowlist must cover every declared fetcher's hosts).
 
     The runtime "pre-seal gate" (Assert-Sealed) is invariant #6 in SCHEMA.md's
     numbering and is built later — intentionally not implemented here.
@@ -29,6 +34,10 @@
 #>
 
 Set-StrictMode -Version Latest
+
+# The kept-NIC rule asks the same network-adapter predicate the Provisioner and the Sealer use, so the
+# loader, the seal and the gate cannot disagree about which VM keeps a NIC. Pure logic, safe to load twice.
+. (Join-Path $PSScriptRoot 'SealPolicy.ps1')
 
 # --------------------------------------------------------------------------
 # Schema constants
@@ -44,7 +53,12 @@ $script:TierRequiredKeys = @(
 
 # Enum domains (SCHEMA.md type column).
 $script:Enum_Substrate         = @('Container', 'HyperV-Gen2')
-$script:Enum_EgressMode        = @('HostProxy', 'InGuestSquid', 'HostEnvoy', 'SquidSniProxy', 'None')
+# One egress model: 'HostProxy' for a VM that keeps a NIC (the host plans its /30, the seal installs the
+# gateway address, firewall rules and port ACL, the gate reads them back, the orchestrator runs the
+# CONNECT proxy), 'None' for everything that seals with no adapter. The in-guest Squid modes
+# ('InGuestSquid', 'SquidSniProxy') and the deferred 'HostEnvoy' are retired: a kept NIC behind a
+# guest-side filter was a NIC the host never restricted.
+$script:Enum_EgressMode        = @('HostProxy', 'None')
 $script:Enum_Credentials       = @('None', 'ScopedOnDemand')
 $script:Enum_ManagementChannel = @('Com1Serial', 'PSDirect')
 $script:Enum_Extraction        = @('HostReadResultDir', 'ColdVHDX-Quarantine-CDR')
@@ -56,10 +70,11 @@ $script:Enum_Lifecycle         = @('Ephemeral', 'SnapshotRevert', 'CreateDestroy
 # the loader fails closed here BEFORE provisioning ever reaches Hyper-V.
 $script:Enum_SecureBootTemplate = @('MicrosoftWindows', 'MicrosoftUEFICertificateAuthority', 'OpenSourceShieldedVM')
 
-# Builder (EgressMode='SquidSniProxy') derived-per-fetcher required hosts (Pass-5 §B). The
-# completeness check requires, for EACH fetcher the DepsSpec declares, that the merged
-# EgressAllowlist COVERS every representative host below (exact OR domain-suffix — the Squid
-# domain-ACL model). Rotating CDN/LFS hostnames are covered by a suffix entry (e.g. '.hf.co').
+# Builder (a profile that declares DepsSpec) derived-per-fetcher required hosts. The completeness check
+# requires, for EACH fetcher the DepsSpec declares, that the merged EgressAllowlist COVERS every
+# representative host below (exact OR domain-suffix, the same rule the host proxy applies: a leading-dot
+# entry covers the domain and its subdomains). Rotating CDN/LFS hostnames are covered by a suffix entry
+# (e.g. '.hf.co').
 $script:BuilderRequiredHostsByFetcher = @{
     Pip         = @('pypi.org', 'files.pythonhosted.org')
     Apt         = @('deb.debian.org', 'security.debian.org')
@@ -68,7 +83,7 @@ $script:BuilderRequiredHostsByFetcher = @{
                     'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
 }
 
-# A Squid domain-ACL "covers" a host if:
+# An allowlist entry "covers" a host if:
 #   - the entry is an exact match (e.g. 'pypi.org' covers 'pypi.org'), OR
 #   - the entry starts with a leading dot (suffix entry) and the host ends with that suffix
 #     (e.g. '.hf.co' covers 'cas-bridge.xethub.hf.co').
@@ -119,13 +134,17 @@ $script:WorkloadRequiredKeys = @('BaseTier', 'Name', 'Entrypoint')
 # size the INPUT / OUTPUT data disks (New-WorkloadDisks, default 1GB each) and DepsImageHash is the
 # whole-image SHA-256 a processor run checks its deps disk against when -Workload supplies none
 # (Invoke-Voidseal); the engine reads all three from the resolved profile, so the loader owns them.
+# EgressMode is NOT here on purpose: it is tier-owned. A workload file that sets it is refused by the
+# unknown-key check with the tier-owned hint, the same way Credentials or Substrate would be, so the
+# isolation contract can only be chosen by picking a BaseTier. (The builder used to override it to its
+# own in-guest mode; it now inherits tier1's 'HostProxy' like every other Tier-1 workload.)
 #
 # This is also the SCHEMA KEY LIST for the unknown-key refusal (Assert-KnownProfileKeys): a key that
 # is in no list in this file is refused at load rather than silently ignored.
 $script:WorkloadLayeredKeys = @(
     'Packages', 'Mounts', 'Entrypoint', 'StageAssets', 'SeedIso',
     'WorkloadMode', 'Inputs', 'FileSystem', 'InputLabel', 'OutputLabel',
-    'EgressMode', 'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput',
+    'DepsSpec', 'ScreenConfig', 'DepsDiskPath', 'OutboxOutput',
     'Memory', 'Cpu', 'CpuMaximumPercent', 'CpuRelativeWeight', 'WorkloadTimeoutSeconds',
     'DataDisks', 'ResultInnerName', 'InputDiskSizeBytes', 'OutputDiskSizeBytes', 'DepsImageHash'
 )
@@ -748,21 +767,21 @@ function Assert-TierProfileValid {
     # EgressAllowlist must be an array (already normalized by caller, but re-check shape).
     $allowlist = @($Profile['EgressAllowlist'])
 
-    # SEC-1: hostname-charset validation. The builder substitutes ($allowlist -join ' ') straight into
-    # a Squid `dstdomain` ACL (SeedBuilder.ps1) with NO escaping; an entry bearing a newline (or quote/
-    # whitespace) could inject a directive such as `http_access allow all` and defeat the egress ACL.
-    # Validate EACH entry against a strict hostname charset (optional leading dot for a domain-suffix
-    # match; the charset excludes whitespace/newline/quote/slash), failing closed and naming the bad
-    # entry. Runs on bare tiers AND the merged builder, so the allowlist is gatekept before it ever
-    # reaches the Squid seed. (Tier>=2 enforces an EMPTY allowlist below, so this is a no-op there.)
+    # SEC-1: hostname-charset validation. Every entry becomes a `--allow` argument on the host proxy's
+    # command line (HostEgress.ps1 Get-EgressProxyArguments) and is matched by name per CONNECT; an entry
+    # bearing a newline, a quote or whitespace could split or reshape that argument list. Validate EACH
+    # entry against a strict hostname charset (optional leading dot for a domain-suffix match; the
+    # charset excludes whitespace/newline/quote/slash), failing closed and naming the bad entry. Runs on
+    # bare tiers AND the merged workload, so the allowlist is gatekept before it ever reaches the proxy.
+    # (Tier>=2 enforces an EMPTY allowlist below, so this is a no-op there.)
     $hostnameRe = '^(?i)\.?[a-z0-9][a-z0-9.-]*$'
     foreach ($entry in $allowlist) {
         $e = [string]$entry
         if ($e -notmatch $hostnameRe) {
             throw ("Schema validation: '$Context' field 'EgressAllowlist' has an invalid entry '$e' " +
-                   "(must match $hostnameRe — a hostname/domain-suffix, optional leading dot, no whitespace/" +
-                   "newline/quote/slash). An unvalidated entry could inject directives into the builder's " +
-                   "Squid dstdomain ACL. Failing closed.")
+                   "(must match $hostnameRe, a hostname or domain suffix with an optional leading dot and no whitespace, " +
+                   "newline, quote or slash). An unvalidated entry could reshape the host proxy's allowlist " +
+                   "arguments. Failing closed.")
         }
     }
 
@@ -854,23 +873,51 @@ function Assert-TierProfileValid {
         }
     }
 
-    # --- builder rule: EgressMode='SquidSniProxy' => DepsSpec present + derived-per-fetcher
-    # allowlist completeness (D-1 guarded override + D-2 derived check, brainstorm 2026-06-29).
-    # SquidSniProxy is the BUILDER egress (Pass-5: nftables can't runtime-FQDN-filter). A profile
-    # selecting it MUST carry a non-empty DepsSpec, and its (merged) EgressAllowlist MUST COVER
-    # every representative host for each fetcher the DepsSpec declares — else a live builder run
-    # would reach an un-allowlisted host and stall. Fail closed at load, naming the gap.
-    if ($Profile['EgressMode'] -eq 'SquidSniProxy') {
-        if (-not $Profile.ContainsKey('DepsSpec') -or
-            -not ($Profile['DepsSpec'] -is [System.Collections.IDictionary]) -or
+    # --- kept-NIC rule: a VM that keeps a network adapter must point at the host proxy ----------
+    # Get-SealNicPolicy (SealPolicy.ps1) is the one predicate for "does this VM keep a NIC?"; the
+    # Provisioner, Lock-Sandbox and Assert-Sealed all ask it. When it answers IsolatedInternalSwitch
+    # (Tier 1, Network 'Internal+Allowlist') the only egress model is 'HostProxy': New-SandboxVM plans
+    # the /30, Lock-Sandbox installs the host side and Assert-Sealed reads it back. Any other value
+    # would hand the guest a connected adapter that no host object restricts (the host vNIC on that
+    # switch still answers on its link-local and APIPA addresses) and the gate would certify it with
+    # zero egress checks. Refuse at load, naming why. A Tier-1 label the predicate does not recognize
+    # is refused here too: the Provisioner would refuse the same profile, later and with less context.
+    $nicPolicy = $null
+    try {
+        $nicPolicy = Get-SealNicPolicy -Tier $tier -Network ([string]$Profile['Network'])
+    }
+    catch {
+        throw "Kept-NIC rule: '$Context' has a Network label the seal policy cannot place ($($_.Exception.Message))"
+    }
+    if ($nicPolicy -eq 'IsolatedInternalSwitch' -and $Profile['EgressMode'] -cne 'HostProxy') {
+        throw ("Kept-NIC rule: '$Context' keeps a network adapter (Tier $tier, Network='$($Profile['Network'])') but sets " +
+               "EgressMode='$($Profile['EgressMode'])'; a VM that keeps its NIC MUST use EgressMode='HostProxy', the host-enforced " +
+               "proxy the seal installs and the gate reads back, because nothing else restricts a connected adapter. " +
+               "Set EgressMode='HostProxy', or make it a no-NIC profile (Network='None').")
+    }
+
+    # --- builder rule: DepsSpec => the kept-NIC HostProxy shape + derived-per-fetcher allowlist
+    # completeness. DepsSpec is what makes a profile a builder (Invoke-BuilderVM requires it and the seed
+    # builder selects the builder runner on it), and a builder fetches over the host proxy, so it needs
+    # the one networked shape: Tier 1, Network 'Internal+Allowlist', EgressMode 'HostProxy'. Its (merged)
+    # EgressAllowlist MUST COVER every representative host for each fetcher the DepsSpec declares, else a
+    # live builder run would ask the proxy for an un-allowlisted name and be refused. Fail closed at
+    # load, naming the gap.
+    if ($Profile.ContainsKey('DepsSpec')) {
+        if (-not ($Profile['DepsSpec'] -is [System.Collections.IDictionary]) -or
             $Profile['DepsSpec'].Keys.Count -eq 0) {
-            throw "Builder rule (SquidSniProxy): '$Context' sets EgressMode='SquidSniProxy' (the builder egress) but declares no DepsSpec; a builder profile MUST carry a non-empty DepsSpec hashtable."
+            throw "Builder rule (DepsSpec): '$Context' declares DepsSpec but it is not a non-empty hashtable; a builder profile MUST carry a non-empty DepsSpec hashtable."
+        }
+        if ($nicPolicy -ne 'IsolatedInternalSwitch' -or $Profile['EgressMode'] -cne 'HostProxy') {
+            throw ("Builder rule (DepsSpec): '$Context' declares DepsSpec (a builder) but is Tier $tier, Network='$($Profile['Network'])', " +
+                   "EgressMode='$($Profile['EgressMode'])'; a builder fetches over the host proxy, so it MUST be Tier 1 with " +
+                   "Network='Internal+Allowlist' and EgressMode='HostProxy' (BaseTier = 1 on profiles/builder.psd1 gives it that).")
         }
         $missing = [System.Collections.Generic.List[string]]::new()
         foreach ($fetcher in $Profile['DepsSpec'].Keys) {
             $fname = [string]$fetcher
             if (-not $script:BuilderRequiredHostsByFetcher.ContainsKey($fname)) {
-                throw "Builder rule (SquidSniProxy): '$Context' DepsSpec declares unknown fetcher '$fname' (known: $($script:BuilderRequiredHostsByFetcher.Keys -join ', '))."
+                throw "Builder rule (DepsSpec): '$Context' DepsSpec declares unknown fetcher '$fname' (known: $($script:BuilderRequiredHostsByFetcher.Keys -join ', '))."
             }
             foreach ($reqHost in $script:BuilderRequiredHostsByFetcher[$fname]) {
                 if (-not (Test-AllowlistCoversHost -Allowlist $allowlist -HostName $reqHost)) {
@@ -879,7 +926,7 @@ function Assert-TierProfileValid {
             }
         }
         if ($missing.Count -gt 0) {
-            throw "Builder rule (SquidSniProxy): '$Context' EgressAllowlist is INCOMPLETE for its DepsSpec — missing required host(s): $($missing -join '; '). Add them (or a covering domain suffix, e.g. '.hf.co') to the tier EgressAllowlist or the workload ExtraAllowlist."
+            throw "Builder rule (DepsSpec): '$Context' EgressAllowlist is INCOMPLETE for its DepsSpec; missing required host(s): $($missing -join '; '). Add them (or a covering domain suffix, e.g. '.hf.co') to the tier EgressAllowlist or the workload ExtraAllowlist."
         }
     }
 }
@@ -1074,14 +1121,9 @@ function Import-WorkloadProfile {
         $merged['EgressAllowlist'] = $baseAllow
     }
 
-    # D-1 (guarded EgressMode override): a workload may override EgressMode ONLY to 'SquidSniProxy'
-    # (the builder egress — strictly stricter than the tiers' nftables/proxy modes, so it can only
-    # TIGHTEN egress, never weaken it). Any other workload-level EgressMode is refused: weakening
-    # the isolation contract from the workload layer is forbidden (EgressMode is otherwise a tier
-    # property). A workload that omits EgressMode inherits the tier's unchanged (ralph/firefox).
-    if ($raw.ContainsKey('EgressMode') -and ([string]$raw['EgressMode'] -ne 'SquidSniProxy')) {
-        throw "Import-WorkloadProfile: workload '$wlName' sets EgressMode='$($raw['EgressMode'])'; a workload may only override EgressMode to 'SquidSniProxy' (the builder egress). Other egress modes are tier-controlled."
-    }
+    # EgressMode is tier-owned and not a layered key, so a workload file that sets it was already refused
+    # above by Assert-KnownProfileKeys (with the tier-owned hint). Every workload inherits its tier's
+    # mode: the builder gets tier1's 'HostProxy' the same way ralph does.
 
     # --- layer scalar/collection workload keys onto the tier --------------
     $merged['BaseTier'] = $baseTier

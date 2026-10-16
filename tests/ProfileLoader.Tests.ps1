@@ -78,7 +78,7 @@ BeforeAll {
             Description        = 'fixture tier 1'
             Substrate          = 'HyperV-Gen2'
             Network            = 'Internal+Allowlist'
-            EgressMode         = 'InGuestSquid'
+            EgressMode         = 'HostProxy'
             EgressAllowlist    = @('api.anthropic.com', 'github.com')
             BlockProtocols     = @('QUIC')
             Credentials        = 'ScopedOnDemand'
@@ -185,14 +185,25 @@ Describe 'Import-TierProfile — basic schema validation (invariant 6)' {
     }
 
     It 'REJECTS the retired NftablesAllowlist EgressMode (fabricated/never-implemented; pins the retirement)' {
-        # NftablesAllowlist was schema-only and design-invalidated (Pass-5: static nftables can't
-        # runtime-FQDN-filter CDN-fronted hosts). It has been replaced by 'InGuestSquid'
-        # (real in-guest transparent-Squid domain-ACL). Nothing should be able to silently
+        # NftablesAllowlist was schema-only and design-invalidated (a static nftables rule set cannot
+        # follow CDN-fronted hosts whose addresses rotate). Nothing should be able to silently
         # re-introduce the fabricated value via an unknown enum member.
         $h = script:Get-ValidTier1Hashtable
         $h.EgressMode = 'NftablesAllowlist'
         $path = script:New-Psd1File -Data $h
         { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*EgressMode*'
+    }
+
+    It 'REJECTS the retired in-guest modes <Mode> (one egress model remains: HostProxy for a kept NIC, None otherwise)' -ForEach @(
+        @{ Mode = 'InGuestSquid' }, @{ Mode = 'SquidSniProxy' }, @{ Mode = 'HostEnvoy' }
+    ) {
+        # These modes put the egress filter inside the guest, where a root guest could remove it, and
+        # left the kept NIC with no host-side restriction. They are gone from the enum; pin that.
+        $h = script:Get-ValidTier1Hashtable
+        $h.EgressMode = $Mode
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage "*EgressMode*'$Mode'*not one of the allowed values*"
+        @($script:Enum_EgressMode) | Should -Be @('HostProxy', 'None')
     }
 
     It 'throws when an enum field is outside its allowed set (Substrate)' {
@@ -581,7 +592,7 @@ Describe 'Invariant 2 — Tier >= 2 starvation' {
 
     It 'throws if Tier 2 has EgressMode other than None' {
         $h = script:Get-ValidTier2Hashtable
-        $h.EgressMode = 'InGuestSquid'
+        $h.EgressMode = 'HostProxy'
         $path = script:New-Psd1File -Data $h
         { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage '*Egress*'
     }
@@ -805,12 +816,16 @@ Describe 'Processor profile (Network=None) + DepsSpec/ScreenConfig' {
                Controls=@(); ManagementChannel='Com1Serial' }
         }
     }
-    It 'accepts a processor profile with Network=None + DepsSpec + ScreenConfig' {
-        $p = script:New-ProcBase; $p.DepsSpec=@{packages=@('tika')}; $p.ScreenConfig=@{mode='aggressive';categories=@('financial')}
+    It 'accepts a processor profile with Network=None + ScreenConfig' {
+        $p = script:New-ProcBase; $p.ScreenConfig=@{mode='aggressive';categories=@('financial')}
         { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Not -Throw
     }
+    It 'REFUSES a Network=None profile that declares a DepsSpec (a builder keeps a NIC; a processor gets a built deps disk instead)' {
+        $p = script:New-ProcBase; $p.DepsSpec=@{ Pip = @{ Packages = @('tika') } }; $p.ScreenConfig=@{mode='aggressive'}
+        { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Throw -ExpectedMessage "*Builder rule (DepsSpec)*MUST be Tier 1 with Network='Internal+Allowlist'*"
+    }
     It 'REFUSES a Network=None profile that declares egress (EgressMode != None)' {
-        $p = script:New-ProcBase; $p.EgressMode='InGuestSquid'
+        $p = script:New-ProcBase; $p.EgressMode='HostProxy'
         { Assert-TierProfileValid -Profile $p -Context 'test' } | Should -Throw
     }
     It 'REFUSES a Network=None profile with a non-empty EgressAllowlist' {
@@ -836,28 +851,64 @@ Describe 'Processor profile (Network=None) + DepsSpec/ScreenConfig' {
     }
 }
 
-Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
-    It 'the real profiles/builder.psd1 loads green and is SquidSniProxy + Tier-1' {
+Describe 'Kept-NIC rule: a VM that keeps a NIC must use EgressMode HostProxy' {
+    # Get-SealNicPolicy decides which VM keeps a NIC (Tier 1 with Network 'Internal+Allowlist'). Before
+    # this rule a kept-NIC profile could declare any mode and the gate certified it with no host-side
+    # egress check at all; now the loader refuses the shape before anything is provisioned.
+    It 'refuses a Tier-1 Internal+Allowlist profile set to None, naming HostProxy as the only option' {
+        $h = script:Get-ValidTier1Hashtable; $h.EgressMode = 'None'; $h.EgressAllowlist = @()
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } |
+            Should -Throw -ExpectedMessage "*Kept-NIC rule*keeps a network adapter*EgressMode='None'*MUST use EgressMode='HostProxy'*"
+    }
+    It 'refuses a Tier-1 Network label the seal policy does not recognize, at load rather than at provisioning' {
+        $h = script:Get-ValidTier1Hashtable; $h.Network = 'Internal'
+        $path = script:New-Psd1File -Data $h
+        { Import-TierProfile -Path $path } | Should -Throw -ExpectedMessage "*Kept-NIC rule*cannot place*'Internal' is not recognized*"
+    }
+    It 'accepts the kept-NIC HostProxy shape, a Tier-1 processor set to None, and a Tier-0 profile set to None' {
+        { Import-TierProfile -Path (script:New-Psd1File -Data (script:Get-ValidTier1Hashtable)) } | Should -Not -Throw
+        $proc = script:Get-ValidTier1Hashtable; $proc.Network = 'None'; $proc.EgressMode = 'None'; $proc.EgressAllowlist = @()
+        { Import-TierProfile -Path (script:New-Psd1File -Data $proc) } | Should -Not -Throw
+        # A Tier-0 VM seals with no adapter whatever its label says, so either mode is accepted there.
+        $t0 = script:Get-ValidTier1Hashtable; $t0.Tier = 0; $t0.EgressMode = 'None'; $t0.EgressAllowlist = @()
+        { Import-TierProfile -Path (script:New-Psd1File -Data $t0) } | Should -Not -Throw
+    }
+    It 'the shipped tier1.psd1 is the kept-NIC HostProxy shape, and tier0.psd1 seals with no adapter' {
+        $t1 = Import-TierProfile -Path "$PSScriptRoot/../tier-profiles/tier1.psd1"
+        $t1['Network']    | Should -Be 'Internal+Allowlist'
+        $t1['EgressMode'] | Should -Be 'HostProxy'
+        Get-SealNicPolicy -Tier ([int]$t1['Tier']) -Network ([string]$t1['Network']) | Should -Be 'IsolatedInternalSwitch'
+        $t0 = Import-TierProfile -Path "$PSScriptRoot/../tier-profiles/tier0.psd1"
+        Get-SealNicPolicy -Tier ([int]$t0['Tier']) -Network ([string]$t0['Network']) | Should -Be 'NoAdapter'
+    }
+}
+
+Describe 'Builder profile: DepsSpec selects the builder rule (the kept-NIC HostProxy shape + a derived-per-fetcher allowlist)' {
+    It 'the real profiles/builder.psd1 loads green, inherits HostProxy from tier1, and is Tier-1 Internal+Allowlist' {
         $merged = Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/builder.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles"
-        $merged['EgressMode'] | Should -Be 'SquidSniProxy'
+        $merged['EgressMode'] | Should -Be 'HostProxy'
         $merged['Tier']       | Should -Be 1
+        $merged['Network']    | Should -Be 'Internal+Allowlist'
         $merged['DepsSpec'].Keys | Should -Contain 'Pip'
         # merged allowlist must cover apt + HF (unioned from ExtraAllowlist) and pip (from tier1)
         @($merged['EgressAllowlist']) | Should -Contain 'deb.debian.org'
         @($merged['EgressAllowlist']) | Should -Contain 'huggingface.co'
+        (Import-PowerShellDataFile -LiteralPath "$PSScriptRoot/../profiles/builder.psd1").ContainsKey('EgressMode') |
+            Should -BeFalse -Because 'EgressMode is tier-owned; the builder file inherits it rather than setting it'
     }
     It 'Test-AllowlistCoversHost: a domain-suffix entry covers a rotating subdomain' {
         Test-AllowlistCoversHost -Allowlist @('.hf.co') -HostName 'cas-bridge.xethub.hf.co' | Should -BeTrue
         Test-AllowlistCoversHost -Allowlist @('huggingface.co') -HostName 'cdn-lfs.huggingface.co' | Should -BeFalse
         Test-AllowlistCoversHost -Allowlist @('pypi.org') -HostName 'pypi.org' | Should -BeTrue
     }
-    It 'SEC-1: an EgressAllowlist entry bearing a newline (Squid ACL injection) is REFUSED fail-closed, naming the bad entry' {
-        # A newline-bearing entry could inject `http_access allow all` into the builder's Squid dstdomain
-        # ACL (SeedBuilder substitutes ($allowlist -join ' ') with no escaping). The load-time charset
-        # check must reject it before it ever reaches the seed. Direct Assert-TierProfileValid on a
+    It 'SEC-1: an EgressAllowlist entry bearing a newline (proxy argument injection) is REFUSED fail-closed, naming the bad entry' {
+        # Every allowlist entry becomes a --allow argument of the host proxy (Get-EgressProxyArguments);
+        # a newline-bearing entry could reshape that argument list. The load-time charset check must
+        # reject it before it ever reaches the proxy or the seed. Direct Assert-TierProfileValid on a
         # network-tier hashtable (a .psd1 cannot even carry a literal newline-in-a-string cleanly).
         $bad = @{
-            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='InGuestSquid';
+            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal+Allowlist'; EgressMode='HostProxy';
             EgressAllowlist=@("pypi.org`nhttp_access allow all"); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
             HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
             Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
@@ -868,7 +919,7 @@ Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
     }
     It 'SEC-1: a clean hostname AND a leading-dot domain-suffix entry are ACCEPTED (the regex passes real allowlists)' {
         $ok = @{
-            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal'; EgressMode='InGuestSquid';
+            Tier=1; Description='p'; Substrate='HyperV-Gen2'; Network='Internal+Allowlist'; EgressMode='HostProxy';
             EgressAllowlist=@('cas-bridge.xethub.hf.co', '.hf.co', 'pypi.org'); Credentials='None'; GuestImage='debian-12'; Memory=2GB; Cpu=2;
             HostChannels=@{Clipboard=$false;Shares=$false;GuestServices=$false;EnhancedSession=$false};
             Capture='HostReadResultDir'; Extraction='HostReadResultDir'; Lifecycle='CreateDestroy';
@@ -876,42 +927,61 @@ Describe 'Builder profile + SquidSniProxy egress (Phase 2.1)' {
         }
         { Assert-TierProfileValid -Profile $ok -Context 'sec1ok' } | Should -Not -Throw
     }
-    It 'a workload overriding EgressMode to a NON-SquidSniProxy value is REFUSED' {
-        $wl = Join-Path $TestDrive 'bad-egress.psd1'
-        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
-@{ BaseTier = 1; Name = 'bad'; Entrypoint = 'x'; EgressMode = 'HostProxy' }
-'@
+    It 'a workload file that sets EgressMode (to <Mode>) is REFUSED as a tier-owned key' -ForEach @(
+        @{ Mode = 'HostProxy' }, @{ Mode = 'None' }, @{ Mode = 'SquidSniProxy' }
+    ) {
+        $wl = Join-Path $TestDrive "egress-$Mode.psd1"
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value "@{ BaseTier = 1; Name = 'bad'; Entrypoint = 'x'; EgressMode = '$Mode' }"
         { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
-            Should -Throw -ExpectedMessage '*may only override EgressMode to*SquidSniProxy*'
+            Should -Throw -ExpectedMessage "*unknown key 'EgressMode'*'EgressMode' is a tier-owned key*"
     }
-    It 'SquidSniProxy WITHOUT a DepsSpec is REFUSED' {
-        $wl = Join-Path $TestDrive 'no-depsspec.psd1'
+    It 'a DepsSpec that is not a non-empty hashtable is REFUSED' {
+        $wl = Join-Path $TestDrive 'empty-depsspec.psd1'
         Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
-@{ BaseTier = 1; Name = 'nd'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+@{ BaseTier = 1; Name = 'nd'; Entrypoint = 'x'; DepsSpec = @{};
    ExtraAllowlist = @('deb.debian.org','security.debian.org') }
 '@
         { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
-            Should -Throw -ExpectedMessage '*MUST carry a non-empty DepsSpec*'
+            Should -Throw -ExpectedMessage '*Builder rule (DepsSpec)*MUST carry a non-empty DepsSpec*'
     }
-    It 'SquidSniProxy with a declared fetcher but a MISSING required host is REFUSED (derived per-fetcher)' {
+    It 'a DepsSpec on a base tier that seals with no adapter (Tier 0) is REFUSED: a builder must be the kept-NIC HostProxy shape' {
+        $wl = Join-Path $TestDrive 'tier0-depsspec.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 0; Name = 'bld0'; Entrypoint = 'x';
+   ExtraAllowlist = @('pypi.org', 'files.pythonhosted.org');
+   DepsSpec = @{ Pip = @{ Packages = @('urllib3') } } }
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
+            Should -Throw -ExpectedMessage "*Builder rule (DepsSpec)*declares DepsSpec (a builder) but is Tier 0*MUST be Tier 1 with Network='Internal+Allowlist' and EgressMode='HostProxy'*"
+    }
+    It 'a declared fetcher with a MISSING required host is REFUSED (derived per-fetcher)' {
         $wl = Join-Path $TestDrive 'incomplete.psd1'
         Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
-@{ BaseTier = 1; Name = 'inc'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+@{ BaseTier = 1; Name = 'inc'; Entrypoint = 'x';
    ExtraAllowlist = @('deb.debian.org');                      # security.debian.org MISSING
    DepsSpec = @{ Apt = @{ Packages = @('jq') } } }
 '@
         { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
-            Should -Throw -ExpectedMessage '*INCOMPLETE*security.debian.org*'
+            Should -Throw -ExpectedMessage '*Builder rule (DepsSpec)*INCOMPLETE*security.debian.org*'
+    }
+    It 'an unknown fetcher name is REFUSED, naming the known ones' {
+        $wl = Join-Path $TestDrive 'unknown-fetcher.psd1'
+        Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
+@{ BaseTier = 1; Name = 'uf'; Entrypoint = 'x'; DepsSpec = @{ Cargo = @{ Crates = @('serde') } } }
+'@
+        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } |
+            Should -Throw -ExpectedMessage "*Builder rule (DepsSpec)*unknown fetcher 'Cargo'*"
     }
     It 'a pip-ONLY DepsSpec is NOT forced to allowlist apt/HF hosts (derived per-fetcher)' {
         $wl = Join-Path $TestDrive 'pip-only.psd1'
         Set-Content -LiteralPath $wl -Encoding utf8 -Value @'
-@{ BaseTier = 1; Name = 'pip'; Entrypoint = 'x'; EgressMode = 'SquidSniProxy';
+@{ BaseTier = 1; Name = 'pip'; Entrypoint = 'x';
    DepsSpec = @{ Pip = @{ Packages = @('urllib3') } } }   # pypi+pythonhosted already in tier1
 '@
-        { Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
+        $merged = Import-WorkloadProfile -Path $wl -TierProfileDir "$PSScriptRoot/../tier-profiles"
+        $merged['EgressMode'] | Should -Be 'HostProxy' -Because 'a builder inherits the tier mode like any other workload'
     }
-    It 'existing ralph/firefox profiles still load (no EgressMode override -> backward compatible)' {
+    It 'existing ralph/firefox profiles still load (neither sets EgressMode; both inherit their tier)' {
         { Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/ralph.psd1"   -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
         { Import-WorkloadProfile -Path "$PSScriptRoot/../profiles/firefox.psd1" -TierProfileDir "$PSScriptRoot/../tier-profiles" } | Should -Not -Throw
     }
@@ -1225,39 +1295,63 @@ Describe 'Unknown profile keys are refused (fail-closed)' {
         }
     }
 
-    Context 'schema drift (SCHEMA.md and the loader list the same keys)' {
+    Context 'schema drift (SCHEMA.md and the loader list the same keys, table by table)' {
         BeforeAll {
-            # Documented keys: every backticked identifier in the FIRST cell of a table row, between the
-            # tier-key table and the provision-time gate section.
+            # Documented keys: every backticked identifier in the FIRST cell of a table row. The tier table
+            # runs from its heading to the workload heading, the workload table from there to the
+            # provision-time gate section. Each table is compared with ITS OWN loader list, in both
+            # directions. The earlier union comparison let a key documented in the wrong table pass (the
+            # tier-accepted WorkloadTimeoutSeconds was documented only as a workload key).
             $schemaText = Get-Content -LiteralPath (Join-Path $script:TierDir 'SCHEMA.md') -Raw
-            $start = $schemaText.IndexOf('## Tier-profile keys')
-            $end   = $schemaText.IndexOf('## Provision-time resource gate')
-            $start | Should -BeGreaterThan -1
-            $end   | Should -BeGreaterThan $start
-            $keys = [System.Collections.Generic.List[string]]::new()
-            foreach ($line in ($schemaText.Substring($start, $end - $start) -split "`r?`n")) {
-                if ($line -notmatch '^\|\s*(?<cell>[^|]+?)\s*\|') { continue }
-                foreach ($m in [regex]::Matches($Matches['cell'], '`(?<k>[A-Za-z][A-Za-z0-9]*)`')) { $keys.Add($m.Groups['k'].Value) }
+            $tierStart = $schemaText.IndexOf('## Tier-profile keys')
+            $wlStart   = $schemaText.IndexOf('## Workload-profile keys')
+            $end       = $schemaText.IndexOf('## Provision-time resource gate')
+            $tierStart | Should -BeGreaterThan -1
+            $wlStart   | Should -BeGreaterThan $tierStart
+            $end       | Should -BeGreaterThan $wlStart
+            function script:Get-DocumentedKeys {
+                param([string] $Text)
+                $keys = [System.Collections.Generic.List[string]]::new()
+                foreach ($line in ($Text -split "`r?`n")) {
+                    if ($line -notmatch '^\|\s*(?<cell>[^|]+?)\s*\|') { continue }
+                    foreach ($m in [regex]::Matches($Matches['cell'], '`(?<k>[A-Za-z][A-Za-z0-9]*)`')) { $keys.Add($m.Groups['k'].Value) }
+                }
+                return @($keys | Sort-Object -Unique)
             }
-            $script:DocumentedKeys = @($keys | Sort-Object -Unique)
+            $script:DocumentedTierKeys     = @(script:Get-DocumentedKeys -Text $schemaText.Substring($tierStart, $wlStart - $tierStart))
+            $script:DocumentedWorkloadKeys = @(script:Get-DocumentedKeys -Text $schemaText.Substring($wlStart, $end - $wlStart))
         }
 
-        It 'parses a plausible number of documented keys (the parser itself is sound)' {
-            $script:DocumentedKeys | Should -Contain 'Entrypoint'
-            $script:DocumentedKeys | Should -Contain 'CpuMaximumPercent'
-            $script:DocumentedKeys | Should -Contain 'ResultInnerName'
-            $script:DocumentedKeys.Count | Should -BeGreaterThan 30
+        It 'parses a plausible number of documented keys from each table (the parser itself is sound)' {
+            $script:DocumentedTierKeys     | Should -Contain 'EgressMode'
+            $script:DocumentedTierKeys     | Should -Contain 'CpuMaximumPercent'
+            $script:DocumentedWorkloadKeys | Should -Contain 'Entrypoint'
+            $script:DocumentedWorkloadKeys | Should -Contain 'ResultInnerName'
+            $script:DocumentedTierKeys.Count     | Should -BeGreaterThan 15
+            $script:DocumentedWorkloadKeys.Count | Should -BeGreaterThan 20
         }
 
-        It 'every key documented in SCHEMA.md is accepted by the loader' {
-            $accepted = @((Get-ProfileSchemaKeys).All)
-            $notAccepted = @($script:DocumentedKeys | Where-Object { $accepted -notcontains $_ })
-            $notAccepted | Should -BeNullOrEmpty -Because "SCHEMA.md documents these keys but the loader would refuse them: $($notAccepted -join ', ')"
+        It 'the tier table documents exactly the keys the loader accepts on a tier file (both directions)' {
+            $tier = @((Get-ProfileSchemaKeys).Tier)
+            @($script:DocumentedTierKeys | Where-Object { $tier -notcontains $_ }) |
+                Should -BeNullOrEmpty -Because "the tier table documents keys the loader does not accept on a tier: $(@($script:DocumentedTierKeys | Where-Object { $tier -notcontains $_ }) -join ', ')"
+            @($tier | Where-Object { $script:DocumentedTierKeys -notcontains $_ }) |
+                Should -BeNullOrEmpty -Because "the loader accepts tier keys the tier table does not document: $(@($tier | Where-Object { $script:DocumentedTierKeys -notcontains $_ }) -join ', ')"
         }
 
-        It 'every key the loader accepts is documented in SCHEMA.md' {
-            $undocumented = @((Get-ProfileSchemaKeys).All | Where-Object { $script:DocumentedKeys -notcontains $_ })
-            $undocumented | Should -BeNullOrEmpty -Because "the loader accepts these keys but SCHEMA.md does not document them: $($undocumented -join ', ')"
+        It 'the workload table documents exactly the keys the loader accepts in a workload file (both directions)' {
+            $wl = @((Get-ProfileSchemaKeys).Workload)
+            @($script:DocumentedWorkloadKeys | Where-Object { $wl -notcontains $_ }) |
+                Should -BeNullOrEmpty -Because "the workload table documents keys the loader does not accept in a workload file: $(@($script:DocumentedWorkloadKeys | Where-Object { $wl -notcontains $_ }) -join ', ')"
+            @($wl | Where-Object { $script:DocumentedWorkloadKeys -notcontains $_ }) |
+                Should -BeNullOrEmpty -Because "the loader accepts workload keys the workload table does not document: $(@($wl | Where-Object { $script:DocumentedWorkloadKeys -notcontains $_ }) -join ', ')"
+        }
+
+        It 'EgressMode is a tier key only: not in the workload table, not accepted in a workload file' {
+            $script:DocumentedTierKeys     | Should -Contain 'EgressMode'
+            $script:DocumentedWorkloadKeys | Should -Not -Contain 'EgressMode'
+            @((Get-ProfileSchemaKeys).Workload) | Should -Not -Contain 'EgressMode'
+            @((Get-ProfileSchemaKeys).Resolved) | Should -Contain 'EgressMode' -Because 'a resolved profile carries the tier keys'
         }
 
         It 'the accepted lists come from the loader constants, not a second list' {
