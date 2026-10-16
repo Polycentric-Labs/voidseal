@@ -1,6 +1,6 @@
 # C2.6 — runs/day release rate cap (host-enforced, fail-closed backstop).
 #
-# Intent (plan _dev/plans/2026-07-01-pre-phase6-hardening-plan.md, Task C2.6): cap AGGREGATE
+# Intent (the pre-Phase-6 hardening plan in the design record, Task C2.6): cap AGGREGATE
 # leakage (per-run bits x runs/interval), on top of the C2.4 regenerator + C2.5 byte-budget
 # backstops. A host-side JSON ledger, keyed by PROFILE + UTC DAY, tracks how many times a
 # profile's screener has RELEASED (a "release event" = one Invoke-SensitivityGate run whose

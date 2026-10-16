@@ -604,7 +604,7 @@ Describe 'Assert-Sealed — I4: a Tier-1 NIC must be on an isolated Internal vSw
 
     It 'Tier-1: REFUSES when the NIC is on the built-in "Default Switch" (type-Internal but ICS/internet)' {
         # The Default Switch is itself SwitchType=Internal (Hyper-V ICS, confirmed on real hardware —
-        # Pass A Q2), so the SwitchType check alone CERTIFIES it. Model it faithfully: register a switch
+        # see the design notes), so the SwitchType check alone CERTIFIES it. Model it faithfully: register a switch
         # NAMED 'Default Switch' with SwitchType=Internal, connect the NIC to it, and require Assert-Sealed
         # to refuse it by NAME (not by type). A purpose-built isolated Internal switch (real name "<vm>-int")
         # must still certify — covered by the happy-path Tier-1 seal test elsewhere in this file.
