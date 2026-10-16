@@ -2678,3 +2678,52 @@ Describe 'Invoke-Voidseal: -Name is refused at the parameter when it could act a
         $report2.Descriptor.Name | Should -Match '^sbx-1-[0-9a-f]{8}$'
     }
 }
+
+# ===========================================================================
+#  A data disk that is no longer attached when the orchestrator detaches it is a host-side detach failure
+# ===========================================================================
+#  RemoveHardDiskDrive throws when no attached drive has the path (both backends). The orchestrator's
+#  existing detach catch turns that into the documented Failed run: the host read is skipped, nothing is
+#  extracted, and teardown still runs.
+Describe 'Invoke-Voidseal: an OUTPUT disk gone from the VM before the detach is a Failed run with the detach reason, never a read of an unattached disk' {
+
+    BeforeAll {
+        $script:GoneDisk = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $script:GoneDisk = @{} + $script:GoneDisk
+        $script:GoneDisk['Name']         = 'firefox-gone'
+        $script:GoneDisk['WorkloadMode'] = 'Disk'
+        $script:GoneDisk['Inputs']       = script:New-OutboxHelperInputs
+        $script:GoneDisk['FileSystem']   = 'exFAT'
+        $script:GoneDisk['OutboxOutput'] = $true
+        Assert-TierProfileValid -Profile $script:GoneDisk -Context 'TEST Tier-0 Disk-mode fixture (disk gone before detach)'
+    }
+
+    It 'records a Failed run naming the missing drive, skips the host read, and still tears down' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $origStart  = $b.StartVM
+        $origDetach = $b.RemoveHardDiskDrive
+        # While the guest runs, its OUTPUT disk is detached from the VM outside the tool (a hot-detach
+        # by an operator or another process): the orchestrator's own detach then finds nothing to remove.
+        $b.StartVM = {
+            param($P)
+            & $origStart $P
+            $vm = & $b.GetVM @{ Name = $P.Name }
+            foreach ($hd in @($vm.HardDrives)) {
+                $info = & $b.GetVHDInfo @{ Path = $hd }
+                if ($null -ne $info -and [string]$info.Label -eq 'OUTPUT') { & $origDetach @{ VMName = $P.Name; Path = $hd } }
+            }
+        }.GetNewClosure()
+        $art  = Join-Path $script:TmpRoot ("art-gone-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $dest = Join-Path $script:TmpRoot ("dest-gone-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:GoneDisk -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-disk-gone' -ArtifactRoot $art -Destination $dest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        $report.Error            | Should -BeNullOrEmpty -Because 'a detach failure is a reported run outcome, not a lifecycle abort'
+        $report.RunResult.Status | Should -Be 'Failed'
+        $report.RunResult.Reason | Should -Match 'data-disk detach failed'
+        $report.RunResult.Reason | Should -Match 'no hard disk drive on .sbx-disk-gone. has the path' -Because 'the refusal names the host-side cause'
+        @($report.States)        | Should -Not -Contain 'EXTRACTED'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxRawRegion' }).Count | Should -Be 0 -Because 'the host never reads a disk it could not detach itself'
+        @($report.States)        | Should -Contain 'DESTROYED'
+        (& $b.GetVM @{ Name = 'sbx-disk-gone' }) | Should -BeNullOrEmpty
+    }
+}

@@ -1694,7 +1694,10 @@ function New-RealHyperVBackend {
     # VHDX -> logical-block translation (so a logical Offset == the byte offset in the flat raw output);
     # we then seek/read the requested slice. NEVER Mount-VHD: even -ReadOnly host-attach runs partmgr.sys
     # + FS-recognizer parses on attacker bytes (Pass-5, verified). REQUIRES the VHDX DETACHED + the VM Off
-    # (qemu-img cannot open a Hyper-V-locked file) — the orchestrator's $detachOk guard enforces that.
+    # (qemu-img cannot open a Hyper-V-locked file). The orchestrator reads only after Wait-WorkloadComplete
+    # saw the VM Off (or force-stopped it) and after RemoveHardDiskDrive returned for the disk; a detach
+    # that throws, including one for a disk no longer attached, skips the read ($detachOk). The lock-retry
+    # below is the backstop for a handle that is still releasing.
     # LIVE-ONLY-UNPROVEN until Phase 6 (the mock never runs this); re-resolve the exact qemu-img
     # invocation at fire. Fails closed with a clear message if qemu-img is absent or the file is locked.
     # Hoist every $P read into locals BEFORE $InvokeOp (see NewVHD note).
@@ -1777,15 +1780,17 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
-    # Whole-.vhdx-file SHA-256 in USER-SPACE — the supply-chain artifact fingerprint Phase 3 verifies
+    # Whole-.vhdx-file SHA-256 in USER-SPACE, the supply-chain artifact fingerprint Phase 3 verifies
     # before AddHardDiskDrive. NEVER Mount-VHD / attach: an integrity fingerprint needs no FS parse, so
-    # the host kernel never touches attacker bytes (Pass-5). NO qemu (D-3) — we stream the file as-is.
-    # REQUIRES the .vhdx DETACHED + the VM Off (an attached disk is locked) — the orchestrator's
-    # $detachOk guard enforces that. RC8: the FIRST OpenRead after a detach can hit a transient sharing
-    # violation while the Hyper-V worker handle releases; route open+hash through the shared $LockRetry
-    # (a lock-class error rides out, a real failure — e.g. a missing file — rethrows at once, a
-    # persistent lock fails closed clearly with Context='GetVhdxImageHash'). LIVE-ONLY-UNPROVEN until
-    # Phase 6 (the mock never runs this).
+    # the host kernel never touches attacker bytes (Pass-5). NO qemu (D-3), we stream the file as-is.
+    # REQUIRES the .vhdx DETACHED + the VM Off (an attached disk is locked). Its callers hash a disk no
+    # live VM holds: Invoke-Voidseal and the data-disk check hash a working copy before AddHardDiskDrive,
+    # and the builder hashes its deps disk after its own RemoveHardDiskDrive (which throws, rather than
+    # succeeding silently, when the disk is not attached). RC8: the FIRST OpenRead after a detach can hit
+    # a transient sharing violation while the Hyper-V worker handle releases; route open+hash through the
+    # shared $LockRetry (a lock-class error rides out, a real failure, e.g. a missing file, rethrows at
+    # once, a persistent lock fails closed clearly with Context='GetVhdxImageHash'). LIVE-ONLY-UNPROVEN
+    # until Phase 6 (the mock never runs this).
     $b.GetVhdxImageHash = {
         param([System.Collections.IDictionary] $P)
         $path = & $AssertArg $P 'Path' 'GetVhdxImageHash'
@@ -1881,11 +1886,18 @@ function New-RealHyperVBackend {
         $vm   = & $AssertArg $P 'VMName' 'RemoveHardDiskDrive'
         $path = & $AssertArg $P 'Path'   'RemoveHardDiskDrive'
         & $InvokeOp {
-            # Find the controller slot holding this path, then detach (Remove-VMHardDiskDrive
-            # takes controller coords, not a path). Detach only — the VHDX file is left on disk.
+            # Find the controller slot holding this path, then detach (Remove-VMHardDiskDrive takes
+            # controller coords, not a path). Detach only: the VHDX file is left on disk. No attached drive
+            # with that path is a THROW (since 2026-10-16), never a silent success: the orchestrator reads
+            # a data disk only after this returns, so a disk that was never attached, or that something
+            # else detached, must not pass as "detached by us". The orchestrator's catch records it as a
+            # Failed run with the host-side detach reason.
             $drive = Get-VMHardDiskDrive -VMName $vm -ErrorAction Stop |
                      Where-Object { $_.Path -eq $path } | Select-Object -First 1
-            if ($null -ne $drive) { $drive | Remove-VMHardDiskDrive -ErrorAction Stop }
+            if ($null -eq $drive) {
+                throw "HyperVBackend.RemoveHardDiskDrive: no hard disk drive on '$vm' has the path '$path'; nothing was detached. Fail closed."
+            }
+            $drive | Remove-VMHardDiskDrive -ErrorAction Stop
         }
     }.GetNewClosure()
 
@@ -2525,6 +2537,11 @@ $script:SbCopyFakeVM = {
     Wait-WorkloadComplete 'Off' (not-timed-out) branch and the subsequent Read-WorkloadResult host-
     read, so the orchestrator's detach+read+classify wiring is exercisable against the fake (the fake
     guest writes no sentinel, so Read-WorkloadResult honestly classifies Failed — the wiring still runs).
+.PARAMETER SimulateStateAfterStart
+    The State StartVM leaves the VM in when -SimulateSelfPowerOff is not set: 'Running' (the default),
+    'Paused' or 'Saved'. The engine never pauses or saves a VM; the two other values model a pause or a
+    save made outside the tool, so a test can prove teardown turns such a VM off before Remove-VM (a
+    graceful shutdown needs a running guest, and Remove-VM refuses a VM that is not Off).
 .PARAMETER SimulateSecondNewOutputVhdxError
     Make the SECOND NewOutputVhdx call THROW (the first succeeds; the second raises). New-WorkloadDisks
     creates the INPUT disk first (NewOutputVhdx #1) then the OUTPUT disk (NewOutputVhdx #2), so this
@@ -2643,6 +2660,7 @@ function New-FakeHyperVBackend {
         [switch] $SimulateGuestCommandTimeout,
         [switch] $SimulateStartVMError,
         [switch] $SimulateNeverOff,
+        [ValidateSet('Running', 'Paused', 'Saved')] [string] $SimulateStateAfterStart = 'Running',
         [switch] $SimulateSelfPowerOff,
         [switch] $SimulateSecondNewOutputVhdxError,
         [hashtable] $SimulateWorkloadOutput,
@@ -2712,6 +2730,8 @@ function New-FakeHyperVBackend {
     # Captured by the StartVM closure: model a guest that boots, runs, and self-powers-off before the
     # first host poll (the happy completion branch of the Disk-mode model — leaves State Off).
     $selfPowerOff      = $SimulateSelfPowerOff.IsPresent
+    # Captured by the StartVM closure: the state a started VM lands in when it does not self-power-off.
+    $stateAfterStart   = $SimulateStateAfterStart
     # Captured by the NewOutputVhdx closure: throw on the 2nd NewOutputVhdx call (the OUTPUT disk),
     # exercising New-WorkloadDisks's incremental-record orphan-window fix. A mutable single-element
     # array is the counter (a closure can mutate an array element but not rebind a captured [int]).
@@ -3028,16 +3048,24 @@ function New-FakeHyperVBackend {
         }
         # SimulateSelfPowerOff: the guest booted, ran its boot workload, and powered itself off before
         # the host's first completion poll. Leave State Off so Wait-WorkloadComplete reads the happy
-        # (not-timed-out) completion branch on its first poll. Default: the VM is now Running.
-        $vm.State = if ($selfPowerOff) { 'Off' } else { 'Running' }
+        # (not-timed-out) completion branch on its first poll. Default: the VM is now Running (or the
+        # Paused / Saved state -SimulateStateAfterStart asks for).
+        $vm.State = if ($selfPowerOff) { 'Off' } else { $stateAfterStart }
         # The VM has been started at least once: from here on -SimulateNeverOff may override the read.
         $vm['_started'] = $true
     }.GetNewClosure()
 
     $b.StopVM = {
         param([System.Collections.IDictionary] $P)
-        $name = & $AssertArg $P 'Name' 'StopVM'
-        (& $requireVM $name 'StopVM').State = 'Off'
+        $name    = & $AssertArg $P 'Name' 'StopVM'
+        $vm      = & $requireVM $name 'StopVM'
+        $turnOff = [bool](& $GetArg $P 'TurnOff' $false)
+        $force   = [bool](& $GetArg $P 'Force' $false)
+        # Logged with both flags so a test can prove HOW a VM was stopped (teardown turns a Paused or Saved
+        # VM off; a Running one gets the graceful stop the Shutdown integration service serves).
+        $state.CallLog.Add(@{ Op = 'StopVM'; Path = $null; VMName = $name; TurnOff = $turnOff; Force = $force; FromState = [string]$vm.State })
+        # Real Stop-VM ends in Off with or without -TurnOff (the guest shuts down, or is turned off).
+        $vm.State = 'Off'
     }.GetNewClosure()
 
     $b.RemoveVM = {
@@ -3202,6 +3230,11 @@ function New-FakeHyperVBackend {
     $b.NewVHD = {
         param([System.Collections.IDictionary] $P)
         $path = & $AssertArg $P 'Path' 'NewVHD'
+        # Real New-VHD refuses an existing file; until 2026-10-16 the fake overwrote the record, so a test
+        # could create the same path twice where the live run would have failed.
+        if ($state.VHDs.ContainsKey($path)) {
+            throw "HyperVBackend(fake).NewVHD: '$path' already exists (real New-VHD refuses to overwrite a file). Fail closed."
+        }
         $diff = [bool](& $GetArg $P 'Differencing' $false)
         $rec  = @{
             Path         = $path
@@ -3674,9 +3707,14 @@ function New-FakeHyperVBackend {
         # SimulateDetachError: model a transient real-Hyper-V detach failure (throw AFTER logging, so the
         # test can still see the attempt). Exercises the orchestrator's detach try/catch.
         if ($detachThrows) {
-            throw "HyperVBackend(fake).RemoveHardDiskDrive: simulated detach failure for '$path' on '$vmName' (SimulateDetachError) — a transient Remove-VMHardDiskDrive failure right after force-stop."
+            throw "HyperVBackend(fake).RemoveHardDiskDrive: simulated detach failure for '$path' on '$vmName' (SimulateDetachError): a transient Remove-VMHardDiskDrive failure right after force-stop."
         }
-        # Detach only — the VHD record in $state.VHDs is untouched (disk file stays on disk).
+        # No such attached drive is a THROW, as on the real backend: a silent success here would let a disk
+        # that was never attached, or that something else detached, read as "detached by us".
+        if (-not (@($vm.HardDrives) -contains $path)) {
+            throw "HyperVBackend(fake).RemoveHardDiskDrive: no hard disk drive on '$vmName' has the path '$path'; nothing was detached. Fail closed."
+        }
+        # Detach only: the VHD record in $state.VHDs is untouched (disk file stays on disk).
         $kept = [System.Collections.Generic.List[object]]::new()
         foreach ($d in $vm.HardDrives) { if ($d -ne $path) { $kept.Add($d) } }
         $vm.HardDrives = $kept

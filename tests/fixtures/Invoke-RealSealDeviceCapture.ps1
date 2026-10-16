@@ -54,6 +54,20 @@ function Get-VMNetworkAdapter {
     foreach ($n in $script:stubNics) { $n }
 }
 
+# Hard disk drive stubs for RemoveHardDiskDrive: the attached drives and what the removal received.
+$script:stubDrives     = @()
+$script:capRemoveDrive = [System.Collections.Generic.List[string]]::new()
+function Get-VMHardDiskDrive {
+    [CmdletBinding()]
+    param([string[]] $VMName)
+    foreach ($d in $script:stubDrives) { $d }
+}
+function Remove-VMHardDiskDrive {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline)] $VMHardDiskDrive)
+    process { $script:capRemoveDrive.Add([string]$VMHardDiskDrive.Path) }
+}
+
 # Set-VMNetworkAdapter stub for SetNetworkAdapterGuards: records the parameters it received.
 $script:capSetNic = $null
 function Set-VMNetworkAdapter {
@@ -177,6 +191,17 @@ function New-StubAdapter {
         if (-not $NoRouterGuard) { $nic.RouterGuard = [StubOnOff]::On }
     }
     [pscustomobject]$nic
+}
+
+# Run the real RemoveHardDiskDrive against the given attached drive paths; report the error and the paths
+# the removal cmdlet received.
+function Invoke-DetachScenario {
+    param([string[]] $Attached, [string] $Path)
+    $script:stubDrives     = @($Attached | ForEach-Object { [pscustomobject]@{ Path = $_; ControllerNumber = 0; ControllerLocation = 1 } })
+    $script:capRemoveDrive = [System.Collections.Generic.List[string]]::new()
+    $err = $null
+    try { & $b.RemoveHardDiskDrive @{ VMName = 'vm1'; Path = $Path } | Out-Null } catch { $err = $_.Exception.Message }
+    return [ordered]@{ err = $err; removed = @($script:capRemoveDrive) }
 }
 
 # Run the real SetNetworkAdapterGuards; report the error and what Set-VMNetworkAdapter received.
@@ -306,6 +331,9 @@ $out = [ordered]@{
     Gpu_One   = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @([pscustomobject]@{ Id = 'gpu-p-0' })
     Gpu_Two   = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @([pscustomobject]@{ Id = 'gpu-p-0' }, [pscustomobject]@{ Id = 'gpu-p-1' })
     Gpu_Throw = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @() -Throw
+    Detach_Match     = Invoke-DetachScenario -Attached @('C:\s\a.vhdx', 'C:\s\b.vhdx') -Path 'C:\s\b.vhdx'
+    Detach_NoMatch   = Invoke-DetachScenario -Attached @('C:\s\a.vhdx', 'C:\s\b.vhdx') -Path 'C:\s\c.vhdx'
+    Detach_None      = Invoke-DetachScenario -Attached @() -Path 'C:\s\a.vhdx'
     Guards_Set       = Invoke-GuardSetScenario -Spoof 'Off' -Dhcp 'On' -Router 'On'
     Guards_SetBad    = Invoke-GuardSetScenario -Spoof 'Off' -Dhcp 'On' -Router 'Maybe'
     Guards_GetOne    = Invoke-GuardGetScenario -Adapters @((New-StubAdapter 'nic-0' -Guarded))

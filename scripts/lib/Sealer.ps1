@@ -448,8 +448,9 @@ function Import-SandboxAsset {
     Transfer media is NOT inherently one-way: the guest can mount it read-write. The detach
     (`RemoveHardDiskDrive`) MUST be enforced as part of the seal. This removes the ATTACHMENT
     only — the VHDX file is left on disk (it carried data INTO the guest; deleting it is a
-    separate, optional cleanup, and it is never the system disk). Idempotent: detaching a disk
-    that is not attached is a no-op on the fake backend.
+    separate, optional cleanup, and it is never the system disk). A disk that is NOT attached is a
+    THROW on both backends since 2026-10-16 (RemoveHardDiskDrive never succeeds silently), so a
+    recorded transfer disk that has already left the VM surfaces instead of passing as detached.
 .PARAMETER Descriptor
     The sandbox descriptor (its Name identifies the VM; TransferDisks is updated).
 .PARAMETER Path

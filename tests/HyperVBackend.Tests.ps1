@@ -357,6 +357,34 @@ Describe 'Fake backend — VM lifecycle' {
         (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
     }
 
+    It 'StopVM ends in Off with or without TurnOff, and logs both flags and the state it stopped from' {
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $script:B.StartVM @{ Name = 'vm1' }
+        & $script:B.StopVM @{ Name = 'vm1'; Force = $true }
+        (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
+        & $script:B.StartVM @{ Name = 'vm1' }
+        & $script:B.StopVM @{ Name = 'vm1'; TurnOff = $true; Force = $true }
+        (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
+        $stops = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'StopVM' })
+        $stops.Count | Should -Be 2
+        $stops[0].TurnOff | Should -BeFalse
+        $stops[0].Force   | Should -BeTrue
+        $stops[1].TurnOff | Should -BeTrue
+        $stops[1].FromState | Should -Be 'Running'
+    }
+
+    It '-SimulateStateAfterStart leaves a started VM Paused or Saved (a pause or save made outside the tool)' {
+        foreach ($s in 'Paused', 'Saved') {
+            $b = New-FakeHyperVBackend -SimulateStateAfterStart $s
+            & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+            & $b.StartVM @{ Name = 'vm1' }
+            (& $b.GetVM @{ Name = 'vm1' }).State | Should -Be $s
+            & $b.StopVM @{ Name = 'vm1'; TurnOff = $true }
+            (& $b.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
+        }
+        { New-FakeHyperVBackend -SimulateStateAfterStart 'Hibernated' } | Should -Throw
+    }
+
     It 'StartVM logs exactly one Op=StartVM CallLog entry for the started VM (positive control — pins the invocation-was-reached instrumentation used by the I2b lifecycle-abort tests'' zero-StartVM-entries assertions)' {
         & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
         & $script:B.StartVM @{ Name = 'vm1' }
@@ -1582,6 +1610,25 @@ Describe 'Fake backend — disk operations' {
         @($vm.HardDrives) | Should -Not -Contain 'C:\vhd\d.vhdx'
     }
 
+    It 'RemoveHardDiskDrive THROWS when no attached drive has the path (never a silent success), leaving the other disks attached' {
+        & $script:B.NewVHD @{ Path = 'C:\vhd\d1.vhdx'; SizeBytes = 40GB }
+        & $script:B.AddHardDiskDrive @{ VMName = 'vm1'; Path = 'C:\vhd\d1.vhdx' }
+        { & $script:B.RemoveHardDiskDrive @{ VMName = 'vm1'; Path = 'C:\vhd\never-attached.vhdx' } } |
+            Should -Throw -ExpectedMessage "*no hard disk drive on 'vm1' has the path 'C:\vhd\never-attached.vhdx'; nothing was detached*"
+        @((& $script:B.GetVM @{ Name = 'vm1' }).HardDrives) | Should -Be @('C:\vhd\d1.vhdx')
+        # A second detach of the same path is the same refusal: the first one already took it off the VM.
+        & $script:B.RemoveHardDiskDrive @{ VMName = 'vm1'; Path = 'C:\vhd\d1.vhdx' }
+        { & $script:B.RemoveHardDiskDrive @{ VMName = 'vm1'; Path = 'C:\vhd\d1.vhdx' } } | Should -Throw -ExpectedMessage '*nothing was detached*'
+        @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'RemoveHardDiskDrive' }).Count | Should -Be 3 -Because 'every attempt is logged, refused ones included'
+    }
+
+    It 'NewVHD on a path that already exists THROWS (real New-VHD refuses to overwrite) and leaves the existing record as it was' {
+        & $script:B.NewVHD @{ Path = 'C:\vhd\once.vhdx'; SizeBytes = 40GB }
+        { & $script:B.NewVHD @{ Path = 'C:\vhd\once.vhdx'; SizeBytes = 1GB } } |
+            Should -Throw -ExpectedMessage "*'C:\vhd\once.vhdx' already exists*"
+        (& $script:B.GetVHDInfo @{ Path = 'C:\vhd\once.vhdx' }).SizeBytes | Should -Be 40GB
+    }
+
     It 'AddHardDiskDrive on a VHD that was NEVER created throws (real Add-VMHardDiskDrive requires the file to exist)' {
         # Fake≠real fidelity: real Hyper-V errors if the .vhdx path does not exist. The fake
         # must mirror that — otherwise the consumers attach a phantom disk and tests go false-green.
@@ -2220,6 +2267,14 @@ Describe 'Seal-device methods: the REAL bodies, executed out of process against 
     It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal)' {
         $script:SealDevCap.Gpu_Throw.err | Should -Match 'simulated Get-VMGpuPartitionAdapter failure'
         $script:SealDevCap.Gpu_Throw.queriedVM | Should -Be 'vm1' -Because 'the throwing cmdlet was still asked about the right VM'
+    }
+
+    It 'RemoveHardDiskDrive detaches exactly the drive with the path, and THROWS when no attached drive has it' {
+        $script:SealDevCap.Detach_Match.err | Should -BeNullOrEmpty
+        @($script:SealDevCap.Detach_Match.removed) | Should -Be @('C:\s\b.vhdx')
+        $script:SealDevCap.Detach_NoMatch.err | Should -BeLike "*no hard disk drive on 'vm1' has the path 'C:\s\c.vhdx'; nothing was detached*"
+        @($script:SealDevCap.Detach_NoMatch.removed).Count | Should -Be 0
+        $script:SealDevCap.Detach_None.err | Should -BeLike '*nothing was detached*' -Because 'a VM with no drives at all is the same refusal'
     }
 
     It 'SetNetworkAdapterGuards passes the VM name and the three values through to Set-VMNetworkAdapter, and refuses a value the enum would reject before calling it' {
