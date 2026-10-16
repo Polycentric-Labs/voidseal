@@ -350,6 +350,12 @@ function Get-HyperVBackendMethodManifest {
         GetNetworkAdapterAcls   = @('VMName')                      # -> @() of normalized extended-ACL records
         RemoveNetworkAdapterAcl = @('VMName', 'Action', 'Direction', 'Weight')   # idempotent; a VM that is gone is a no-op
         GetNetNats              = @()                              # -> @() of @{ Name; InternalIPInterfaceAddressPrefix }
+        # Two more host reads behind the seal gate (2026-10-16). The rules above are a control only while
+        # Windows Firewall is enforcing them, and the gateway's vEthernet interface must not forward between
+        # the VM subnet and the host's other interfaces. Plain hashtables with string fields, like the other
+        # reads; neither has run on a live host. Both are pinned out of process by the egress capture fixture.
+        GetHostFirewallProfiles = @()                              # -> @() of @{ Name; Enabled = [bool]; DefaultInboundAction = [string] }
+        GetNetIPInterfaceForwarding = @('InterfaceAlias')          # -> @{ IPv4 = 'Enabled'|'Disabled'|'Missing'; IPv6 = the same }
         StartEgressProxy        = @('PythonExe', 'ScriptPath', 'Arguments', 'ReadyFile', 'ReadyTimeoutSeconds')   # -> @{ ProcessId; StartTime; CommandLine }
         StopEgressProxy         = @('ProcessId', 'StartTime', 'StopFile', 'TimeoutSeconds')                   # -> @{ Stopped; Killed; AlreadyGone }
 
@@ -2182,6 +2188,44 @@ function New-RealHyperVBackend {
         })
     }.GetNewClosure()
 
+    # Windows Firewall enforcement per profile, from the active store. Enabled is a GpoBoolean enum whose
+    # 'False' member is truthy under a [bool] cast (the same CIM trap as GetHostFirewallRule), so the text
+    # is compared; DefaultInboundAction is passed through as text for the gate to compare exactly.
+    $b.GetHostFirewallProfiles = {
+        param([System.Collections.IDictionary] $P)
+        return ,@(& $InvokeOp {
+            Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop | ForEach-Object {
+                @{
+                    Name                 = [string]$_.Name
+                    Enabled              = ([string]$_.Enabled -eq 'True')
+                    DefaultInboundAction = [string]$_.DefaultInboundAction
+                }
+            }
+        })
+    }.GetNewClosure()
+
+    # IP forwarding on one host interface, per address family. A family with no row reads 'Missing'; a
+    # family whose rows all read Disabled reads 'Disabled'; any other value is passed through as the text
+    # Windows gave (an empty one as 'Unknown'), so the gate refuses it by name. An alias Windows does not
+    # know is an ObjectNotFound error from the cmdlet, which propagates as a throw.
+    $b.GetNetIPInterfaceForwarding = {
+        param([System.Collections.IDictionary] $P)
+        $alias = & $AssertArg $P 'InterfaceAlias' 'GetNetIPInterfaceForwarding'
+        & $InvokeOp {
+            $rows = @(Get-NetIPInterface -InterfaceAlias $alias -PolicyStore ActiveStore -ErrorAction Stop)
+            $out = @{}
+            foreach ($family in 'IPv4', 'IPv6') {
+                $values = @($rows | Where-Object { [string]$_.AddressFamily -eq $family } | ForEach-Object { [string]$_.Forwarding })
+                if ($values.Count -eq 0) { $out[$family] = 'Missing'; continue }
+                $other = @($values | Where-Object { $_ -ne 'Disabled' })
+                if ($other.Count -eq 0)                                  { $out[$family] = 'Disabled' }
+                elseif ([string]::IsNullOrWhiteSpace([string]$other[0])) { $out[$family] = 'Unknown' }
+                else                                                     { $out[$family] = [string]$other[0] }
+            }
+            $out
+        }
+    }.GetNewClosure()
+
     # Start the proxy as a plain child process (no shell, so no argument re-parsing) and wait for the
     # ready file it writes once it is listening. A process that exits first, or a ready file that never
     # appears, is a throw (the process is killed first), never a half-started proxy.
@@ -2372,11 +2416,14 @@ $script:SbCopyFakeVM = {
     orchestrator's teardown-on-mid-flow-failure path: the VM provisions + seals + passes the gate,
     then the workload-launch (StartVM) throws, so the orchestrator must reap the VM (no orphan).
 .PARAMETER SimulateNeverOff
-    Make GetVM report State='Running' regardless of the VM's recorded state (simulating a guest
-    workload that never powers itself off — a hung guest). The completion model has no live
-    channel: the guest runs at boot then powers ITSELF off, and Wait-WorkloadComplete polls VM
-    State until Off (or a timeout). This seam models the timeout branch — a VM that never reaches
-    Off so the deadline is the only exit, exercising Wait-WorkloadComplete's force-stop teardown.
+    Make GetVM report State='Running' regardless of the VM's recorded state once StartVM has been
+    called on it (simulating a guest workload that never powers itself off, a hung guest). The
+    completion model has no live channel: the guest runs at boot then powers ITSELF off, and
+    Wait-WorkloadComplete polls VM State until Off (or a timeout). This seam models the timeout
+    branch, a VM that never reaches Off so the deadline is the only exit, exercising
+    Wait-WorkloadComplete's force-stop teardown. Before its first StartVM the VM reads its recorded
+    state (Off), because a hung guest presupposes a started one and Assert-Sealed refuses any VM
+    that is not Off (the gate runs before the start).
 .PARAMETER SimulateSelfPowerOff
     Make StartVM leave the VM in State='Off' (instead of 'Running') — modelling a guest that boots,
     runs its boot workload, and SELF-POWERS-OFF before the host's first completion poll. This is the
@@ -2465,11 +2512,23 @@ $script:SbCopyFakeVM = {
     the HostProxy range to drive the provisioner's address-collision refusal.
 .PARAMETER SimulateNetNat
     NAT networks GetNetNats reports, each @{ Name; InternalIPInterfaceAddressPrefix }. Default: none.
+.PARAMETER SimulateFirewallProfile
+    Overrides for the Windows Firewall profiles GetHostFirewallProfiles reports. The default is the
+    three profiles (Domain, Private, Public) all Enabled with DefaultInboundAction 'Block'. Each entry
+    names a profile and changes the keys it carries, for example @{ Name = 'Public'; Enabled = $false } or
+    @{ Name = 'Private'; DefaultInboundAction = 'Allow' }; @{ Name = 'Domain'; Remove = $true } drops the
+    profile from the read, modeling a host whose firewall service reports it missing. An unknown Name
+    throws at construction.
+.PARAMETER SimulateNetIPInterfaceForwarding
+    The forwarding state GetNetIPInterfaceForwarding reports for every host interface, as
+    @{ IPv4 = <text>; IPv6 = <text> }. The default is Disabled for both; pass 'Enabled' or 'Missing' for a
+    family to drive the gate's refusals.
 .PARAMETER SimulateEgressMethodError
     Names of host egress methods (GetHostIPAddresses, AddSwitchHostIPAddress, NewHostFirewallRule,
-    GetHostFirewallRule, GetHostFirewallRuleNames, AddNetworkAdapterAcl, GetNetworkAdapterAcls, GetNetNats, StartEgressProxy,
-    StopEgressProxy and the Remove* methods) that THROW when called, modeling the host cmdlet failing,
-    so a test can drive each fail-closed and rollback path. Default: none.
+    GetHostFirewallRule, GetHostFirewallRuleNames, GetHostFirewallProfiles, GetNetIPInterfaceForwarding,
+    AddNetworkAdapterAcl, GetNetworkAdapterAcls, GetNetNats, StartEgressProxy, StopEgressProxy and the
+    Remove* methods) that THROW when called, modeling the host cmdlet failing, so a test can drive each
+    fail-closed and rollback path. Default: none.
 #>
 function New-FakeHyperVBackend {
     [CmdletBinding()]
@@ -2503,6 +2562,8 @@ function New-FakeHyperVBackend {
         [string[]] $SimulateGuestDiskWrite = @(),
         [hashtable[]] $SimulateHostIPAddresses = @(@{ IPAddress = '192.168.1.20'; PrefixLength = 24; InterfaceAlias = 'Ethernet' }),
         [hashtable[]] $SimulateNetNat = @(),
+        [hashtable[]] $SimulateFirewallProfile = @(),
+        [hashtable] $SimulateNetIPInterfaceForwarding,
         [string[]] $SimulateEgressMethodError = @()
     )
 
@@ -2597,6 +2658,27 @@ function New-FakeHyperVBackend {
     }
     foreach ($natRec in @($SimulateNetNat)) {
         $state.NetNats.Add(@{ Name = [string]$natRec['Name']; InternalIPInterfaceAddressPrefix = [string]$natRec['InternalIPInterfaceAddressPrefix'] })
+    }
+    # Windows Firewall profiles (GetHostFirewallProfiles): the three profiles, enforcing with Block as the
+    # default inbound action, then the per-profile overrides of -SimulateFirewallProfile.
+    $state.FirewallProfiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($pn in 'Domain', 'Private', 'Public') {
+        $state.FirewallProfiles.Add(@{ Name = $pn; Enabled = $true; DefaultInboundAction = 'Block' })
+    }
+    foreach ($ovr in @($SimulateFirewallProfile)) {
+        $pn = [string]$ovr['Name']
+        $target = @($state.FirewallProfiles | Where-Object { $_.Name -eq $pn })
+        if ($target.Count -ne 1) {
+            throw "New-FakeHyperVBackend: -SimulateFirewallProfile names unknown profile '$pn' (expected Domain, Private or Public)."
+        }
+        if ($ovr.Contains('Remove') -and [bool]$ovr['Remove']) { [void]$state.FirewallProfiles.Remove($target[0]); continue }
+        if ($ovr.Contains('Enabled'))              { $target[0].Enabled = [bool]$ovr['Enabled'] }
+        if ($ovr.Contains('DefaultInboundAction')) { $target[0].DefaultInboundAction = [string]$ovr['DefaultInboundAction'] }
+    }
+    # IP forwarding per address family (GetNetIPInterfaceForwarding), the same on every host interface.
+    $state.HostForwarding = @{ IPv4 = 'Disabled'; IPv6 = 'Disabled' }
+    if ($null -ne $SimulateNetIPInterfaceForwarding) {
+        foreach ($fam in @($SimulateNetIPInterfaceForwarding.Keys)) { $state.HostForwarding[[string]$fam] = [string]$SimulateNetIPInterfaceForwarding[$fam] }
     }
     # Captured by the egress methods: the named methods throw (a host cmdlet failing), so a test can drive
     # every fail-closed and rollback path.
@@ -2724,7 +2806,7 @@ function New-FakeHyperVBackend {
             # self-powers-off). Return a shallow CLONE with State overridden so the underlying
             # record is untouched — StopVM's timeout force-stop can still flip the real record to
             # Off (the force-stop is host-truth; the poll read is what stays "Running").
-            if ($neverOff) {
+            if ($neverOff -and $vm.ContainsKey('_started') -and [bool]$vm['_started']) {
                 $clone = @{}
                 foreach ($k in @($vm.Keys)) { $clone[$k] = $vm[$k] }
                 $clone['State'] = 'Running'
@@ -2835,9 +2917,11 @@ function New-FakeHyperVBackend {
             }
         }
         # SimulateSelfPowerOff: the guest booted, ran its boot workload, and powered itself off before
-        # the host's first completion poll — leave State Off so Wait-WorkloadComplete reads the happy
+        # the host's first completion poll. Leave State Off so Wait-WorkloadComplete reads the happy
         # (not-timed-out) completion branch on its first poll. Default: the VM is now Running.
         $vm.State = if ($selfPowerOff) { 'Off' } else { 'Running' }
+        # The VM has been started at least once: from here on -SimulateNeverOff may override the read.
+        $vm['_started'] = $true
     }.GetNewClosure()
 
     $b.StopVM = {
@@ -3769,6 +3853,27 @@ function New-FakeHyperVBackend {
         param([System.Collections.IDictionary] $P)
         & $egressFail 'GetNetNats'
         return ,@($state.NetNats | ForEach-Object { @{ Name = $_.Name; InternalIPInterfaceAddressPrefix = $_.InternalIPInterfaceAddressPrefix } })
+    }.GetNewClosure()
+
+    # The firewall profiles as seeded (and overridden by -SimulateFirewallProfile); copies, like every read.
+    $b.GetHostFirewallProfiles = {
+        param([System.Collections.IDictionary] $P)
+        $state.CallLog.Add(@{ Op = 'GetHostFirewallProfiles'; Path = $null; VMName = $null })
+        & $egressFail 'GetHostFirewallProfiles'
+        return ,@($state.FirewallProfiles | ForEach-Object { @{ Name = $_.Name; Enabled = [bool]$_.Enabled; DefaultInboundAction = [string]$_.DefaultInboundAction } })
+    }.GetNewClosure()
+
+    # Forwarding on one host interface. Mirrors the real refusal for an alias the host does not have
+    # (Get-NetIPInterface reports ObjectNotFound); the values come from -SimulateNetIPInterfaceForwarding.
+    $b.GetNetIPInterfaceForwarding = {
+        param([System.Collections.IDictionary] $P)
+        $alias = [string](& $AssertArg $P 'InterfaceAlias' 'GetNetIPInterfaceForwarding')
+        $state.CallLog.Add(@{ Op = 'GetNetIPInterfaceForwarding'; Path = $alias; VMName = $null })
+        & $egressFail 'GetNetIPInterfaceForwarding'
+        if ((& $hostAliases) -notcontains $alias) {
+            throw "HyperVBackend(fake).GetNetIPInterfaceForwarding: no host interface '$alias' (real Get-NetIPInterface finds no MSFT_NetIPInterface for an unknown alias)."
+        }
+        return @{ IPv4 = [string]$state.HostForwarding['IPv4']; IPv6 = [string]$state.HostForwarding['IPv6'] }
     }.GetNewClosure()
 
     # The fake never starts Python. It checks what the real body checks before launching (the script

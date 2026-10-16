@@ -39,6 +39,8 @@ Describe 'Host egress backend methods: the manifest' {
         $m['RemoveNetworkAdapterAcl']   | Should -Be @('VMName', 'Action', 'Direction', 'Weight')
         $m['StartEgressProxy']          | Should -Be @('PythonExe', 'ScriptPath', 'Arguments', 'ReadyFile', 'ReadyTimeoutSeconds')
         $m['StopEgressProxy']           | Should -Be @('ProcessId', 'StartTime', 'StopFile', 'TimeoutSeconds')
+        $m['GetHostFirewallProfiles']   | Should -BeNullOrEmpty
+        $m['GetNetIPInterfaceForwarding'] | Should -Be @('InterfaceAlias')
     }
 }
 
@@ -187,6 +189,55 @@ Describe 'Host egress backend methods: the fake' {
         { & $b.GetNetNats @{} } | Should -Throw '*SimulateEgressMethodError*'
         { & $b.NewHostFirewallRule @{ Name = 'r'; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'x' } } | Should -Throw '*SimulateEgressMethodError*'
         { & $b.GetHostIPAddresses @{} } | Should -Not -Throw
+    }
+
+    It 'GetHostFirewallProfiles reports Domain, Private and Public enabled with Block by default, as an array of copies' {
+        $p = & $script:B.GetHostFirewallProfiles @{}
+        $p -is [array] | Should -BeTrue
+        @($p | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('Domain', 'Private', 'Public')
+        foreach ($row in $p) {
+            $row.Enabled | Should -BeOfType [bool]
+            $row.Enabled | Should -BeTrue
+            $row.DefaultInboundAction | Should -Be 'Block'
+        }
+        $p[0].Enabled = $false
+        (& $script:B.GetHostFirewallProfiles @{} | Where-Object { $_.Name -eq $p[0].Name }).Enabled | Should -BeTrue -Because 'a read hands out copies'
+    }
+
+    It '-SimulateFirewallProfile overrides one profile (disabled, Allow, or removed) and refuses an unknown profile name' {
+        $b = New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Public'; Enabled = $false }, @{ Name = 'Private'; DefaultInboundAction = 'Allow' })
+        $p = & $b.GetHostFirewallProfiles @{}
+        ($p | Where-Object { $_.Name -eq 'Public' }).Enabled | Should -BeFalse
+        ($p | Where-Object { $_.Name -eq 'Private' }).DefaultInboundAction | Should -Be 'Allow'
+        ($p | Where-Object { $_.Name -eq 'Domain' }).Enabled | Should -BeTrue -Because 'the untouched profile keeps its default'
+        $b2 = New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Domain'; Remove = $true })
+        @((& $b2.GetHostFirewallProfiles @{}) | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('Private', 'Public')
+        { New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Guest'; Enabled = $false }) } | Should -Throw '*unknown profile*Guest*'
+        { & (New-FakeHyperVBackend -SimulateEgressMethodError @('GetHostFirewallProfiles')).GetHostFirewallProfiles @{} } | Should -Throw '*SimulateEgressMethodError*'
+    }
+
+    It 'GetNetIPInterfaceForwarding reads Disabled for both families on a switch''s vEthernet interface, and throws for an alias the host does not have' {
+        New-EgressFakeVM -Backend $script:B
+        $f = & $script:B.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (vm1-int)' }
+        $f.IPv4 | Should -Be 'Disabled'
+        $f.IPv6 | Should -Be 'Disabled'
+        (& $script:B.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'Ethernet' }).IPv4 | Should -Be 'Disabled' -Because 'the seeded LAN interface exists too'
+        { & $script:B.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (nope-int)' } } | Should -Throw "*no host interface 'vEthernet (nope-int)'*"
+        { & $script:B.GetNetIPInterfaceForwarding @{} } | Should -Throw '*InterfaceAlias*'
+    }
+
+    It '-SimulateNetIPInterfaceForwarding sets a family''s value (Enabled or Missing) and -SimulateEgressMethodError makes the read throw' {
+        $b = New-FakeHyperVBackend -SimulateNetIPInterfaceForwarding @{ IPv4 = 'Enabled' }
+        New-EgressFakeVM -Backend $b
+        $f = & $b.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (vm1-int)' }
+        $f.IPv4 | Should -Be 'Enabled'
+        $f.IPv6 | Should -Be 'Disabled'
+        $b2 = New-FakeHyperVBackend -SimulateNetIPInterfaceForwarding @{ IPv6 = 'Missing' }
+        New-EgressFakeVM -Backend $b2
+        (& $b2.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (vm1-int)' }).IPv6 | Should -Be 'Missing'
+        $b3 = New-FakeHyperVBackend -SimulateEgressMethodError @('GetNetIPInterfaceForwarding')
+        New-EgressFakeVM -Backend $b3
+        { & $b3.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (vm1-int)' } } | Should -Throw '*SimulateEgressMethodError*'
     }
 }
 
@@ -357,6 +408,58 @@ Describe 'Host egress backend methods: the REAL bodies, executed out of process 
         $script:Cap.Nat_None.count | Should -Be 0
         $script:Cap.Nat_One.isArray | Should -BeTrue
         $script:Cap.Nat_One.first.InternalIPInterfaceAddressPrefix | Should -Be '10.231.0.0/24'
+    }
+
+    It 'GetHostFirewallProfiles reads the active store and maps each profile to a plain record with a real [bool] Enabled' {
+        $c = $script:Cap.Profiles_AllOn
+        $c.err | Should -BeNullOrEmpty
+        $c.store | Should -Be 'ActiveStore'
+        $c.isArray | Should -BeTrue
+        $c.count | Should -Be 3
+        @($c.rows | ForEach-Object { $_.Name }) | Should -Be @('Domain', 'Private', 'Public')
+        foreach ($row in $c.rows) {
+            $row.EnabledType | Should -Be 'Boolean' -Because 'the GpoBoolean enum must be compared as text, never cast'
+            $row.Enabled | Should -BeTrue
+            $row.InboundType | Should -Be 'String'
+            $row.DefaultInboundAction | Should -Be 'Block'
+        }
+    }
+
+    It 'GetHostFirewallProfiles reports a disabled profile as Enabled $false (not the truthy enum) and passes Allow through as text' {
+        $rows = $script:Cap.Profiles_Mixed.rows
+        $script:Cap.Profiles_Mixed.err | Should -BeNullOrEmpty
+        ($rows | Where-Object { $_.Name -eq 'Private' }).Enabled | Should -BeFalse -Because 'the enum False member is truthy under [bool]; the real body compares the text'
+        ($rows | Where-Object { $_.Name -eq 'Public' }).DefaultInboundAction | Should -Be 'Allow'
+        ($rows | Where-Object { $_.Name -eq 'Domain' }).Enabled | Should -BeTrue
+    }
+
+    It 'GetHostFirewallProfiles keeps a single profile an array, and THROWS when the cmdlet reports a failure' {
+        $script:Cap.Profiles_One.isArray | Should -BeTrue
+        $script:Cap.Profiles_One.count | Should -Be 1
+        $script:Cap.Profiles_Fail.err | Should -Match 'firewall profiles unreadable'
+    }
+
+    It 'GetNetIPInterfaceForwarding asks for the alias in the active store and maps both families to Disabled when their rows read Disabled' {
+        $c = $script:Cap.Fwd_Disabled
+        $c.err | Should -BeNullOrEmpty
+        $c.alias | Should -Be 'vEthernet (sbx-int)'
+        $c.store | Should -Be 'ActiveStore'
+        $c.result.IPv4 | Should -Be 'Disabled'
+        $c.result.IPv6 | Should -Be 'Disabled'
+    }
+
+    It 'GetNetIPInterfaceForwarding reports an enabled family as Enabled, a family with no row as Missing, and one enabled row among two as Enabled' {
+        $script:Cap.Fwd_V4On.result.IPv4 | Should -Be 'Enabled'
+        $script:Cap.Fwd_V4On.result.IPv6 | Should -Be 'Disabled'
+        $script:Cap.Fwd_NoV6.result.IPv4 | Should -Be 'Disabled'
+        $script:Cap.Fwd_NoV6.result.IPv6 | Should -Be 'Missing' -Because 'a family the host does not report cannot be assumed off'
+        $script:Cap.Fwd_TwoV4Rows.result.IPv4 | Should -Be 'Enabled' -Because 'one forwarding row is enough to route around the proxy'
+    }
+
+    It 'GetNetIPInterfaceForwarding THROWS for an alias the host does not know and when the cmdlet reports a failure' {
+        $script:Cap.Fwd_UnknownAlias.err | Should -Match 'No MSFT_NetIPInterface objects found'
+        $script:Cap.Fwd_UnknownAlias.isNull | Should -BeTrue
+        $script:Cap.Fwd_Fail.err | Should -Match 'IP interface unreadable'
     }
 
     It 'StartEgressProxy starts a real child, waits for its ready file and records a quoted command line without null arguments' {

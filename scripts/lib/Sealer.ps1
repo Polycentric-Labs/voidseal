@@ -711,6 +711,19 @@ function Assert-Sealed {
         throw "Assert-Sealed: REFUSING to certify — no VM named '$vmName' exists on the host. Fail closed."
     }
 
+    # --- the VM must be Off (host-verified, every tier) --------------------
+    # The gate certifies a configuration before the guest runs in it: Invoke-Voidseal starts the VM only
+    # after this gate, and a Running, Paused or Saved VM already holds guest state the seal did not cover.
+    # Until 2026-10-16 the gate never read State. Both backends expose it on the GetVM object; anything
+    # but exactly 'Off', including a value the gate cannot read, refuses.
+    $vmState = [string](Get-VMField -VM $vm -Name 'State' -Default '')
+    if ($vmState -cne 'Off') {
+        $shownState = if ([string]::IsNullOrWhiteSpace($vmState)) { '(unreadable)' } else { $vmState }
+        throw ("Assert-Sealed: REFUSING to certify '$vmName' SEALED because its State is '$shownState', not Off. " +
+               "The gate certifies a VM before it starts; a VM that is running, paused or saved already holds " +
+               "guest state the seal did not cover. Fail closed.")
+    }
+
     # --- the descriptor MUST record its network posture (fail closed, every tier) ---
     # Without the Network label the policy cannot tell a Tier-1 VM that keeps an isolated NIC from a
     # Tier-1 processor that must have none. New-SandboxVM always records it (the loader requires Network

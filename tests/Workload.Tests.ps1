@@ -484,6 +484,7 @@ Describe 'Wait-WorkloadComplete' {
         # is the only exit. -TimeoutSeconds 0 makes exactly one poll then trips the deadline.
         $b = New-FakeHyperVBackend -SimulateNeverOff
         $null = & $b.NewVM @{ Name='w2'; Generation=2 }
+        $null = & $b.StartVM @{ Name='w2' }   # the seam reports Running only once the VM has been started
         $d = New-SandboxDescriptor -Name 'w2' -Tier 0
         $r = Wait-WorkloadComplete -Descriptor $d -Backend $b -TimeoutSeconds 0 -PollDelaySeconds 0
         $r.TimedOut | Should -BeTrue
@@ -494,6 +495,7 @@ Describe 'Wait-WorkloadComplete' {
         # call the fake StopVM has flipped State back to Off (host-truth the next read would see).
         $b = New-FakeHyperVBackend -SimulateNeverOff
         $null = & $b.NewVM @{ Name='w3'; Generation=2 }
+        $null = & $b.StartVM @{ Name='w3' }
         $d = New-SandboxDescriptor -Name 'w3' -Tier 0
         $r = Wait-WorkloadComplete -Descriptor $d -Backend $b -TimeoutSeconds 0 -PollDelaySeconds 0
         $r.TimedOut | Should -BeTrue
@@ -505,10 +507,14 @@ Describe 'Wait-WorkloadComplete' {
 
 Describe 'New-FakeHyperVBackend -SimulateNeverOff' {
 
-    It 'SimulateNeverOff makes GetVM report State Running regardless (the never-power-off seam)' {
+    It 'SimulateNeverOff makes GetVM report State Running once the VM has started, even after a force-stop (the never-power-off seam)' {
         $b = New-FakeHyperVBackend -SimulateNeverOff
-        $null = & $b.NewVM @{ Name='nvo'; Generation=2 }   # would default to Off
+        $null = & $b.NewVM @{ Name='nvo'; Generation=2 }
+        (& $b.GetVM @{ Name='nvo' }).State | Should -Be 'Off' -Because 'a hung guest presupposes a started one; before StartVM the read is the recorded state, so Assert-Sealed (which requires Off) still runs before the start'
+        $null = & $b.StartVM @{ Name='nvo' }
         (& $b.GetVM @{ Name='nvo' }).State | Should -Be 'Running'
+        $null = & $b.StopVM @{ Name='nvo'; Force=$true }
+        (& $b.GetVM @{ Name='nvo' }).State | Should -Be 'Running' -Because 'the poll read stays Running regardless of the recorded state once the guest has started'
     }
 
     It 'GetVM defaults to State Off when SimulateNeverOff is NOT set (switch defaults off)' {

@@ -1721,3 +1721,65 @@ Describe 'Get-SealNicPolicy loads with Sealer.ps1 and with Provisioner.ps1, each
         $defs | Should -Be @('SealPolicy.ps1')
     }
 }
+
+# ===========================================================================
+#  Assert-Sealed reads the VM's power state: only an Off VM can be certified
+# ===========================================================================
+#  The gate runs before Invoke-Voidseal starts the VM, so a VM that is already Running, Paused or Saved
+#  at gate time holds guest state the seal did not cover. Until 2026-10-16 the gate never read State.
+Describe 'Assert-Sealed: refuses a VM that is not Off at gate time' {
+
+    It 'certifies a sealed Tier-1 VM that is Off (the normal order: seal, gate, then start)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-state-off'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        (& $sb.Backend.GetVM @{ Name = 'sbx-state-off' }).State | Should -Be 'Off' -Because 'precondition: a provisioned VM is Off'
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+
+    It 'REFUSES a Running VM, naming the state' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-state-run'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        & $sb.Backend.StartVM @{ Name = 'sbx-state-run' }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*REFUSING to certify 'sbx-state-run' SEALED because its State is 'Running', not Off*"
+    }
+
+    It 'REFUSES a Paused or Saved VM, and a VM whose state cannot be read' -ForEach @(
+        @{ State = 'Paused'; Shown = 'Paused' }
+        @{ State = 'Saved';  Shown = 'Saved' }
+        @{ State = '';       Shown = '(unreadable)' }
+    ) {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-state-other'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        # The fake's GetVM hands back the live record, so a test can put the VM in a state the engine never
+        # produces itself (a pause or a save made outside the tool).
+        (& $sb.Backend.GetVM @{ Name = 'sbx-state-other' }).State = $State
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*because its State is '$Shown', not Off*"
+    }
+
+    It 'refuses a Running VM at Tier 0 and Tier 2 too (the rule holds at every tier)' {
+        foreach ($p in @($script:Tier2)) {
+            $sb = & $script:NewTestSandbox -Profile $p -Name 'sbx-state-t2'
+            Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+            & $sb.Backend.StartVM @{ Name = 'sbx-state-t2' }
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } | Should -Throw -ExpectedMessage "*State is 'Running', not Off*"
+        }
+        $t0 = $script:Tier1.Clone()
+        $t0['Tier'] = 0
+        $t0['Description'] = 'TEST FIXTURE: Tier 0 for the power-state gate.'
+        Assert-TierProfileValid -Profile $t0 -Context 'TEST Tier-0 power-state fixture'
+        $sb0 = & $script:NewTestSandbox -Profile $t0 -Name 'sbx-state-t0'
+        Lock-Sandbox -Descriptor $sb0.Desc -Backend $sb0.Backend
+        & $sb0.Backend.StartVM @{ Name = 'sbx-state-t0' }
+        { Assert-Sealed -Descriptor $sb0.Desc -Backend $sb0.Backend } | Should -Throw -ExpectedMessage "*State is 'Running', not Off*"
+    }
+
+    It 'the power-state check comes right after the VM-exists check, before the network-posture checks' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-state-order'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        & $sb.Backend.StartVM @{ Name = 'sbx-state-order' }
+        $sb.Desc.Network = ''   # would refuse with the no-posture message if it were reached first
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } | Should -Throw -ExpectedMessage "*State is 'Running', not Off*"
+    }
+}

@@ -19,6 +19,12 @@
         (stateful) TCP from the guest address to the gateway's proxy port. It runs at the vSwitch port,
         before the host stack sees a packet, so a guest must defeat two independent controls.
 
+    The firewall rules are a control only while Windows Firewall is enforcing them, so the seal gate also
+    reads the firewall profiles (GetHostFirewallProfiles: every profile enabled, default inbound action
+    Block) and the gateway interface's IP forwarding (GetNetIPInterfaceForwarding: off for both families,
+    so the host cannot route between the VM subnet and its other interfaces). Until 2026-10-16 neither was
+    read, and "two independent controls" held only by assumption.
+
     ADDRESSING. Each VM gets a deterministic /30 inside 10.231.0.0/16: the slot is the first two bytes
     of SHA-256(lowercase VM name) modulo 16384. Gateway = network + 1, guest = network + 2. Before
     anything is created the plan is checked against every IPv4 address the host already has and every
@@ -764,7 +770,11 @@ function ConvertTo-EgressPortKey {
     3. every recorded firewall rule exists, is enabled and matches its record field for field (addresses
        and ports as parsed sets, so another rendering of the same set passes; an entry the parser cannot
        read exactly is a refusal);
-    4. the VM's adapter carries exactly the recorded ACL entries, no more and no fewer.
+    4. the VM's adapter carries exactly the recorded ACL entries, no more and no fewer;
+    5. Windows Firewall is enforcing on all three profiles (Domain, Private, Public), each with default
+       inbound action exactly Block, so the rules in 3 are in force whatever profile the interface lands in;
+    6. IP forwarding on "vEthernet (<switch>)" reads Disabled for IPv4 and IPv6, so the host cannot route
+       between the VM subnet and its other interfaces around the proxy.
     Every read that throws or returns no collection is a refusal.
 #>
 function Assert-SandboxEgressSealed {
@@ -856,5 +866,45 @@ function Assert-SandboxEgressSealed {
     $hostAclKeys = @($acls | ForEach-Object { & $aclKey $_ } | Sort-Object)
     if (($hostAclKeys -join "`n") -ne ($wantAclKeys -join "`n")) {
         throw "$head its network adapter carries $($hostAclKeys.Count) port ACL entr(ies), not exactly the $($wantAclKeys.Count) recorded. Fail closed."
+    }
+
+    # 5. Windows Firewall is enforcing on every profile, with Block as the default inbound action
+    # The rules checked in 3 are controls only while the firewall is on. All three profiles are required
+    # because the gate does not read which profile the vEthernet interface landed in (usually Public, but
+    # a domain-joined host can differ). A profile that is off, that defaults to Allow, that is missing,
+    # or that cannot be read refuses by name.
+    $profiles = $null
+    try { $profiles = & $Backend.GetHostFirewallProfiles @{} }
+    catch { throw "$head the host firewall profiles could not be read ($($_.Exception.Message)). Fail closed." }
+    if ($null -eq $profiles) { throw "$head the host firewall profile read returned no collection. Fail closed." }
+    foreach ($profileName in @('Domain', 'Private', 'Public')) {
+        $found = @($profiles | Where-Object { [string](Get-EgressPlanField $_ 'Name') -eq $profileName })
+        if ($found.Count -ne 1) {
+            throw "$head the host reports $($found.Count) firewall profile(s) named '$profileName', not exactly one. Fail closed."
+        }
+        $enabled = Get-EgressPlanField $found[0] 'Enabled'
+        if ($enabled -isnot [bool] -or -not $enabled) {
+            throw "$head Windows Firewall is not enabled on the '$profileName' profile. Fail closed."
+        }
+        $inbound = [string](Get-EgressPlanField $found[0] 'DefaultInboundAction')
+        if ($inbound -cne 'Block') {
+            throw "$head the '$profileName' firewall profile's default inbound action is '$inbound', not Block. Fail closed."
+        }
+    }
+
+    # 6. the gateway interface forwards nothing
+    # IP forwarding on "vEthernet (<switch>)" would let the host route between the VM subnet and its other
+    # interfaces, around the proxy. Both families must read exactly Disabled; a family the host does not
+    # report ('Missing'), any other value, and a failed read refuse.
+    $forwarding = $null
+    try { $forwarding = & $Backend.GetNetIPInterfaceForwarding @{ InterfaceAlias = $alias } }
+    catch { throw "$head IP forwarding on '$alias' could not be read ($($_.Exception.Message)). Fail closed." }
+    if ($null -eq $forwarding) { throw "$head the IP forwarding read for '$alias' returned nothing. Fail closed." }
+    foreach ($family in @('IPv4', 'IPv6')) {
+        $value = [string](Get-EgressPlanField $forwarding $family)
+        if ($value -cne 'Disabled') {
+            $shown = if ([string]::IsNullOrWhiteSpace($value)) { '(unreadable)' } else { $value }
+            throw "$head $family forwarding on '$alias' is '$shown', not Disabled. Fail closed."
+        }
     }
 }

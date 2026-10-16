@@ -43,6 +43,8 @@ enum StubEnabled   { True = 1; False = 2 }
 enum StubFwAction  { NotConfigured = 0; Allow = 2; Block = 4 }
 enum StubDirection { Inbound = 1; Outbound = 2 }
 enum StubAclAction { Allow = 1; Deny = 2 }
+enum StubForwarding { Disabled = 0; Enabled = 1 }
+enum StubAddressFamily { IPv4 = 2; IPv6 = 23 }
 
 function Write-StubError {
     param($Cmdlet, [string] $Message, [System.Management.Automation.ErrorCategory] $Category, $Target)
@@ -155,6 +157,36 @@ function Get-NetNat {
     param()
     if ($script:stubNatFail) { Write-StubError $PSCmdlet 'stub: WinNAT unreadable' 'ReadError' $null; return }
     foreach ($n in $script:stubNats) { $n }
+}
+
+# Firewall profiles: Enabled is the GpoBoolean enum (its False member is truthy under [bool]), the default
+# inbound action an Action enum. Three rows like a real host; a fail flag reports a non-terminating error.
+$script:stubProfiles = @()
+$script:stubProfileFail = $false
+function Get-NetFirewallProfile {
+    [CmdletBinding()]
+    param([string[]] $Name, [string] $PolicyStore)
+    $script:cap['GetProfile_PolicyStore'] = $PolicyStore
+    if ($script:stubProfileFail) { Write-StubError $PSCmdlet 'stub: firewall profiles unreadable' 'ReadError' $null; return }
+    foreach ($p in $script:stubProfiles) { $p }
+}
+
+# IP interfaces: one row per address family for the alias, with Forwarding and AddressFamily enums. An
+# alias with no rows is an ObjectNotFound error, as the real cmdlet reports an unknown interface.
+$script:stubIfRows = @()
+$script:stubIfFail = $false
+function Get-NetIPInterface {
+    [CmdletBinding()]
+    param([string[]] $InterfaceAlias, [string] $AddressFamily, [string] $PolicyStore)
+    $script:cap['GetIf_Alias'] = @($InterfaceAlias) -join ','
+    $script:cap['GetIf_PolicyStore'] = $PolicyStore
+    if ($script:stubIfFail) { Write-StubError $PSCmdlet 'stub: IP interface unreadable' 'ReadError' $InterfaceAlias; return }
+    $rows = @($script:stubIfRows | Where-Object { $_.InterfaceAlias -eq @($InterfaceAlias)[0] })
+    if ($rows.Count -eq 0) {
+        Write-StubError $PSCmdlet "No MSFT_NetIPInterface objects found with property 'InterfaceAlias' equal to '$(@($InterfaceAlias)[0])'." 'ObjectNotFound' $InterfaceAlias
+        return
+    }
+    foreach ($r in $rows) { $r }
 }
 
 . $LibPath
@@ -297,6 +329,50 @@ $script:stubNatFail = $true
 $c = Invoke-Capture { & $b.GetNetNats @{} }
 $out.Nat_Fail = [ordered]@{ err = $c.err }
 $script:stubNatFail = $false
+
+# ---- firewall profiles ----------------------------------------------------------------------------------
+function New-StubProfile {
+    param([string] $Name, [StubEnabled] $Enabled = [StubEnabled]::True, [StubFwAction] $Inbound = [StubFwAction]::Block)
+    [pscustomobject]@{ Name = $Name; Enabled = $Enabled; DefaultInboundAction = $Inbound; DefaultOutboundAction = [StubFwAction]::Allow }
+}
+$script:stubProfiles = @((New-StubProfile 'Domain'), (New-StubProfile 'Private'), (New-StubProfile 'Public'))
+$c = Invoke-Capture { & $b.GetHostFirewallProfiles @{} }
+$out.Profiles_AllOn = [ordered]@{ err = $c.err; isArray = ($c.result -is [array]); count = @($c.result).Count; store = $c.cap['GetProfile_PolicyStore']
+                                  rows = @($c.result | ForEach-Object { [ordered]@{ Name = $_.Name; Enabled = $_.Enabled; EnabledType = $_.Enabled.GetType().Name; DefaultInboundAction = $_.DefaultInboundAction; InboundType = $_.DefaultInboundAction.GetType().Name } }) }
+$script:stubProfiles = @((New-StubProfile 'Domain'), (New-StubProfile 'Private' -Enabled ([StubEnabled]::False)), (New-StubProfile 'Public' -Inbound ([StubFwAction]::Allow)))
+$c = Invoke-Capture { & $b.GetHostFirewallProfiles @{} }
+$out.Profiles_Mixed = [ordered]@{ err = $c.err; rows = @($c.result | ForEach-Object { [ordered]@{ Name = $_.Name; Enabled = $_.Enabled; DefaultInboundAction = $_.DefaultInboundAction } }) }
+$script:stubProfiles = @((New-StubProfile 'Public'))
+$c = Invoke-Capture { & $b.GetHostFirewallProfiles @{} }
+$out.Profiles_One = [ordered]@{ err = $c.err; isArray = ($c.result -is [array]); count = @($c.result).Count }
+$script:stubProfileFail = $true
+$c = Invoke-Capture { & $b.GetHostFirewallProfiles @{} }
+$out.Profiles_Fail = [ordered]@{ err = $c.err }
+$script:stubProfileFail = $false
+
+# ---- IP forwarding on the gateway interface --------------------------------------------------------------
+function New-StubIfRow {
+    param([string] $Alias, [StubAddressFamily] $Family, [StubForwarding] $Forwarding = [StubForwarding]::Disabled)
+    [pscustomobject]@{ InterfaceAlias = $Alias; AddressFamily = $Family; Forwarding = $Forwarding; InterfaceIndex = 17 }
+}
+$script:stubIfRows = @((New-StubIfRow 'vEthernet (sbx-int)' IPv4), (New-StubIfRow 'vEthernet (sbx-int)' IPv6), (New-StubIfRow 'Ethernet' IPv4 Enabled))
+$c = Invoke-Capture { & $b.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (sbx-int)' } }
+$out.Fwd_Disabled = [ordered]@{ err = $c.err; alias = $c.cap['GetIf_Alias']; store = $c.cap['GetIf_PolicyStore']; result = $c.result }
+$script:stubIfRows = @((New-StubIfRow 'vEthernet (sbx-int)' IPv4 Enabled), (New-StubIfRow 'vEthernet (sbx-int)' IPv6))
+$c = Invoke-Capture { & $b.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (sbx-int)' } }
+$out.Fwd_V4On = [ordered]@{ err = $c.err; result = $c.result }
+$script:stubIfRows = @((New-StubIfRow 'vEthernet (sbx-int)' IPv4))
+$c = Invoke-Capture { & $b.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (sbx-int)' } }
+$out.Fwd_NoV6 = [ordered]@{ err = $c.err; result = $c.result }
+$script:stubIfRows = @((New-StubIfRow 'vEthernet (sbx-int)' IPv4), (New-StubIfRow 'vEthernet (sbx-int)' IPv4 Enabled), (New-StubIfRow 'vEthernet (sbx-int)' IPv6))
+$c = Invoke-Capture { & $b.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (sbx-int)' } }
+$out.Fwd_TwoV4Rows = [ordered]@{ err = $c.err; result = $c.result }
+$c = Invoke-Capture { & $b.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (gone-int)' } }
+$out.Fwd_UnknownAlias = [ordered]@{ err = $c.err; isNull = ($null -eq $c.result) }
+$script:stubIfFail = $true
+$c = Invoke-Capture { & $b.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (sbx-int)' } }
+$out.Fwd_Fail = [ordered]@{ err = $c.err }
+$script:stubIfFail = $false
 
 # ---- the proxy process (a real child: the stub script, which opens no socket) -----------------------
 $stubScript = Join-Path $PSScriptRoot 'egress_proxy_stub.py'
