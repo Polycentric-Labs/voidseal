@@ -144,12 +144,25 @@ same two documents into an ISO for you.
 
 ## 2a. Disk-mode workload runner
 
-> **This is the `user-data` the seed builder emits for a `WorkloadMode = 'Disk'` profile**
-> (`firefox.psd1`). The canonical emitter is **`New-CidataUserData`** (`scripts/lib/SeedBuilder.ps1`,
-> dot-sourced by `scripts/Invoke-Voidseal.ps1`): it holds this runner as a template and substitutes the
+> **This is the `user-data` the seed builder emits for a LEGACY `WorkloadMode = 'Disk'` profile: one
+> that is neither an `OutboxOutput` profile nor a processor.** `firefox.psd1` is no longer such a
+> profile. It is an `OutboxOutput` profile (C1.4) and gets the **outbox runner** instead
+> (`SeedBuilder.ps1`'s `$script:CidataOutboxDiskRunnerTemplate`): that runner mounts only `LABEL=INPUT`,
+> read-only at `/mnt/in`, runs the entrypoint into `/run/staging` as the `sandbox` user whenever that
+> user exists, then hands staging to `python3 /mnt/in/run_disk_workload.py --workload-rc "$erc"
+> --transport-only`, which packs it into the outbox container and writes that to the **raw** OUTPUT
+> block device. OUTPUT carries no filesystem, is never mounted in the guest, and is read by the host in
+> user space (`Read-OutboxToGateInput` in `scripts/Invoke-Voidseal.ps1`, never `Mount-VHD`); the
+> entrypoint's exit code travels inside the outbox (`workload.json`), so there is no sentinel.
+> `Invoke-Voidseal` refuses a Disk profile of the legacy shape outright, so the runner below is
+> reachable only through `New-CidataUserData` directly; it stays documented as the contrast the outbox
+> contract replaced.
+>
+> The canonical emitter for both runners is **`New-CidataUserData`** (`scripts/lib/SeedBuilder.ps1`,
+> dot-sourced by `scripts/Invoke-Voidseal.ps1`): it holds each runner as a template and substitutes the
 > profile's `Entrypoint` for `__ENTRYPOINT__`. `Invoke-Voidseal` writes the result onto the `CIDATA`
 > data disk (`New-WorkloadSeedDisk`); `New-CidataSeed` can pack the same documents into an ISO by hand.
-> The block below is the human-readable mirror of that template
+> The block below is the human-readable mirror of the legacy template
 > (`SeedBuilder.ps1`'s `$script:CidataDiskRunnerTemplate` is the source of truth that actually ships in a
 > seed). It replaces the COM1-serial command channel with the **disk-passing model**: the host creates +
 > host-formats two exFAT data disks (label **`INPUT`**, label **`OUTPUT`**), populates `INPUT`
@@ -185,11 +198,15 @@ every run as `Failed` (missing sentinel):
 | Filesystem | exFAT (host-pre-formatted) | `New-WorkloadDisks` `FileSystem` default `exFAT` |
 
 The seed builder substitutes the token **`__ENTRYPOINT__`** in the script body below with the
-profile's `Entrypoint`. The profile's `Entrypoint` MUST therefore read its inputs from `/mnt/in`
-and write its result to `/mnt/out/result.html` (see `profiles/firefox.psd1`), so the host's
-`result.html` default finds the file. The sentinel `result.exitcode` is the guest's **last write** —
-the host treats its absence as `Failed` (the workload crashed, hung, or never reached the write),
-so it is written only *after* the result is on disk.
+profile's `Entrypoint`. Under this legacy runner the `Entrypoint` MUST therefore read its inputs from
+`/mnt/in` and write its result to `/mnt/out/result.html`, so the host's `result.html` default finds
+the file; the sentinel `result.exitcode` is the guest's **last write** (the host treats its absence as
+`Failed`: the workload crashed, hung, or never reached the write), so it is written only *after* the
+result is on disk. An **outbox profile** (`profiles/firefox.psd1`, and every processor) keeps `/mnt/in`
+and the `result.html` inner-name but writes to **`/run/staging/result.html`**: the outbox runner never
+mounts OUTPUT, the seed builder refuses an entrypoint that names `/mnt/out`, and the exit code travels
+in the outbox (`workload.json`) instead of a sentinel. The INPUT rows of the table hold for both
+runners; the OUTPUT label, mountpoint and sentinel rows apply to the legacy runner alone.
 
 ### `user-data` (the Disk-mode workload runner)
 
@@ -336,8 +353,9 @@ runcmd:
    user exists** (`[ "$OUT_SANDBOX_OWNED" = "1" ] && id -u sandbox`); in every other case — including the
    plain-mount fallback, where `/mnt/out` is root-owned and a non-root run could not write to it — it
    **falls back to a root run** (v1: the VM boundary is the containment, not the in-guest user — see RC4).
-   The entrypoint **writes its own** result to `/mnt/out/result.html` (firefox: `--out
-   /mnt/out/result.html`); the runner captures stdout/stderr to **separate** `/mnt/out/stdout.log` +
+   The entrypoint **writes its own** result to `/mnt/out/result.html` (firefox, an outbox profile, instead
+   writes `--out /run/staging/result.html` under the outbox runner); the runner captures stdout/stderr to
+   **separate** `/mnt/out/stdout.log` +
    `/mnt/out/stderr.txt` (the host ignores them) — it does **NOT** redirect stdout into `result.html`,
    which would double-write the file the entrypoint already owns and could 0-byte/corrupt the required
    Netscape-HTML.
@@ -468,7 +486,7 @@ runner above it **MUST**:
   Firefox-importable, and never touch `logins.json` / `key4.db` / `cookies.sqlite`.
 
 The host source `C:\sandbox\organizer-src\organize_bookmarks.py` (referenced by the live-acceptance
-populate step) must be a version aligned to these `/mnt/in` + `/mnt/out/result.html` paths. If the
+populate step) must be a version aligned to these `/mnt/in` + `/run/staging/result.html` paths. If the
 current copy on disk writes `bookmarks.html` or reads a different mount, the live-acceptance step
 must use an aligned copy. (Do not edit files outside the skill dir to make this true — this note is
 the requirement the live-acceptance step satisfies; the script itself lives in `C:\sandbox\`.)
