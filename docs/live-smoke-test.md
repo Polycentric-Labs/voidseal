@@ -480,7 +480,7 @@ never assumes "Off == success".
   one baked in. The outbox runner (firefox) runs the entrypoint as `sandbox` whenever that user exists
   (`SeedBuilder.ps1`, `CidataOutboxDiskRunnerTemplate`); only the legacy exFAT runner ties the choice to
   whether OUTPUT mounted sandbox-owned, falling back to root otherwise.
-- **Data-disk mount is robust now** (RC4, 2026-06-24 live): the runner tries the `uid=/gid=` mount and
+- **Data-disk mount has a fallback now** (RC4, 2026-06-24 live): the runner tries the `uid=/gid=` mount and
   **falls back to a mount without those options** if it fails, so the exFAT data disks always mount
   regardless of the filesystem driver (for firefox that is INPUT alone: the outbox runner never mounts
   the raw OUTPUT disk). INPUT's fallback keeps `ro`, so INPUT is read-only whichever arm wins. On the
@@ -786,7 +786,7 @@ Remove-VMSwitch -Name '<orphan>-int' -Force        # only if Get-VMSwitch shows 
   green-light verified isolation.
 - **No real personal data.** Synthetic/sample Firefox data only; real-profile reads need
   explicit per-task authorization (DATA-ACCESS rule).
-- **Does not validate the un-wired data path (Gap 2 / Gap 3).** Host↔guest `Mounts` and a robust
+- **Does not validate the un-wired data path (Gap 2 / Gap 3).** Host↔guest `Mounts` and a reliable
   transfer-out are **not** wired in v1 — where this smoke test uses a pre-seeded `ResultPath`,
   it certifies the *extraction boundary*, not a full guest-produced artifact round-trip. That
   wiring is a follow-up build item, not part of this smoke test.
