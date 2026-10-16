@@ -266,3 +266,40 @@ Describe 'Negative guard — the live credentials path WOULD be refused (why we 
             Should -Throw -ExpectedMessage '*secret*'
     }
 }
+
+Describe 'profiles/builder.psd1: the Tier-1 builder inherits HostProxy and is a builder by its DepsSpec' {
+
+    BeforeAll {
+        $script:BuilderPath = Join-Path $script:ProfileDir 'builder.psd1'
+        $script:Builder     = Import-WorkloadProfile -Path $script:BuilderPath -TierProfileDir $script:TierDir
+        $script:BuilderRaw  = Import-PowerShellDataFile -LiteralPath $script:BuilderPath
+    }
+
+    It 'loads through the real loader as a Tier-1 Internal+Allowlist HostProxy profile' {
+        $script:Builder.Tier       | Should -Be 1
+        $script:Builder.Network    | Should -Be 'Internal+Allowlist'
+        $script:Builder.EgressMode | Should -Be 'HostProxy'
+        $script:Builder.WorkloadMode | Should -Be 'Disk'
+    }
+
+    It 'sets no EgressMode of its own: the key is tier-owned and the file inherits tier1''s value' {
+        $script:BuilderRaw.ContainsKey('EgressMode') | Should -BeFalse -Because 'a workload file that sets EgressMode is refused at load'
+    }
+
+    It 'declares a DepsSpec of known fetchers, and the merged allowlist covers every host they need' {
+        @($script:Builder.DepsSpec.Keys | Sort-Object) | Should -Be @('Apt', 'HuggingFace', 'Pip')
+        foreach ($h in 'deb.debian.org', 'security.debian.org', 'pypi.org', 'files.pythonhosted.org', 'huggingface.co', 'cdn-lfs.huggingface.co') {
+            Test-AllowlistCoversHost -Allowlist $script:Builder.EgressAllowlist -HostName $h | Should -BeTrue -Because "the builder fetches from $h through the host proxy"
+        }
+        Test-AllowlistCoversHost -Allowlist $script:Builder.EgressAllowlist -HostName 'cas-bridge.xethub.hf.co' | Should -BeTrue -Because 'the .hf.co suffix entry covers the rotating LFS hosts'
+    }
+
+    It 'runs the dep-fetch runner from the INPUT disk into /mnt/out (the exFAT deps disk)' {
+        $script:Builder.Entrypoint | Should -Match 'fetch_deps\.py'
+        $script:Builder.Entrypoint | Should -Match '--out /mnt/out'
+    }
+
+    It 'mentions no in-guest proxy anywhere in the file' {
+        (Get-Content -LiteralPath $script:BuilderPath -Raw) | Should -Not -Match '(?i)squid'
+    }
+}

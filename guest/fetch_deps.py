@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Voidseal Tier-1 builder dep-fetch runner (in-guest). Reads a deps-spec.json, fetches each dependency
-over the builder's Squid SNI egress into /mnt/out/<fetcher>/, then writes a per-file SHA-256
-deps-manifest.json. build_commands + write_manifest are PURE (unit-tested, no network); the subprocess
-EXECUTION is live (Phase 6). --plan prints the commands and exits without executing (mock + operator preview)."""
+over the host's CONNECT proxy into /mnt/out/<fetcher>/, then writes a per-file SHA-256
+deps-manifest.json. The runner script exports the proxy variables (http_proxy, https_proxy and their
+uppercase twins) before calling this, and every fetch below inherits that environment unchanged: pip
+download, apt-get download and huggingface-cli all honor it, and apt also reads its own proxy setting.
+build_commands + write_manifest are PURE (unit-tested, no network); the subprocess EXECUTION is live
+(Phase 6). --plan prints the commands and exits without executing (mock + operator preview)."""
 import sys, json, argparse, pathlib, hashlib, subprocess
 
 def build_commands(spec, out_dir):
@@ -68,7 +71,7 @@ def main(argv=None):
         for fetcher, cmd in cmds:
             print(f"{fetcher}: {' '.join(cmd)}")
         return 0
-    for fetcher, cmd in cmds:                       # LIVE (Phase 6): execute each fetch over the Squid egress
+    for fetcher, cmd in cmds:                       # LIVE (Phase 6): each fetch inherits the proxy environment (no env= override)
         cwd = None
         if fetcher == "apt":
             cwd = str(out / "apt"); pathlib.Path(cwd).mkdir(parents=True, exist_ok=True)

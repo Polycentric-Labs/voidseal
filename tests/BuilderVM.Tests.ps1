@@ -4,8 +4,9 @@
     Pester 5 tests for scripts/lib/BuilderVM.ps1 (Invoke-BuilderVM orchestrator).
 
 .DESCRIPTION
-    Task 2.4: Tier-1 builder orchestration — provision->seed->run->detach->whole-image-hash->emit.
-    No seal (the builder keeps its NIC + Squid egress for the whole run).
+    Task 2.4: Tier-1 builder orchestration: provision->seed->seal->gate->proxy->run->detach->whole-image-hash->emit.
+    The builder seals like every run: Lock-Sandbox keeps its NIC and installs the host side of egress,
+    Assert-Sealed gates StartVM, and the host CONNECT proxy on the gateway is the guest's only way out.
     The integrity artifact is the whole-image hash (raw, no mount). The deps (OUTPUT) disk is never read by the
     host; the verdict (exit code and manifest) comes from a second, small RAW disk in the user-space outbox
     format, read before the move and the hash.
@@ -100,9 +101,9 @@ Describe 'Invoke-BuilderVM — Tier-1 builder orchestration (Phase 2.4)' {
         (@($wv) -join "`n") | Should -Match 'did not power off' -Because 'the timeout path must emit the lifecycle-abort warning'
     }
 
-    It 'a non-builder profile (EgressMode != SquidSniProxy) is refused' {
+    It 'a profile without a DepsSpec (firefox) is refused as not a builder' {
         { Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/firefox.psd1" -Backend (New-FakeHyperVBackend) } |
-            Should -Throw -ExpectedMessage '*builder*'
+            Should -Throw -ExpectedMessage '*builder profile has no DepsSpec key*'
     }
 }
 
@@ -130,34 +131,65 @@ Describe 'Invoke-BuilderVM — teardown removes the VM (no orphan), on success a
 }
 
 # ===========================================================================
-#  No seal — the builder keeps its NIC + Squid egress
+#  The seal: the builder keeps its NIC behind host-enforced egress, and the gate precedes StartVM
 # ===========================================================================
-Describe 'Invoke-BuilderVM — no seal (builder keeps NIC for the fetch)' {
+Describe 'Invoke-BuilderVM: the builder is sealed, gated and proxied before it starts' {
 
-    It 'the builder run does NOT call Lock-Sandbox (no NIC removal, no host-channel zeroing)' {
+    It 'Lock-Sandbox runs (channels off, host egress installed, NIC kept), the gate certifies, and SEALED precedes RUNNING' {
         $blob = [byte[]](1..8)
         $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateVerdictBlob $script:BuilderOkBlob -SimulateDepsImageBlob $blob
-        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-noseal' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-ns.vhdx')
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-seal' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-seal.vhdx')
         $r.Status | Should -Be 'Success'
-        # A sealed NoAdapter VM has its network adapter removed. The builder is a Tier-1 non-processor
-        # that never seals and KEEPS its NIC.
-        # The VM is torn down so we can't read it back, so assert via CallLog. Lock-Sandbox removes the
-        # adapter unless the policy is IsolatedInternalSwitch, and the builder is a Tier-1 non-processor
-        # (it keeps its NIC), so a zero count here ALONE does not prove Lock-Sandbox was never called: a
-        # regression invoking Lock-Sandbox on this VM would still log zero RemoveNetworkAdapter entries.
-        # SetHostChannel is Lock-Sandbox's UNCONDITIONAL op (every tier, every channel) and is what pins the claim.
-        $removeNicCalls = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' })
-        $removeNicCalls.Count | Should -Be 0 -Because 'a sealed NoAdapter VM would have its NIC removed; the builder is a Tier-1 non-processor that keeps its NIC, so this check alone does not discriminate Lock-Sandbox invocation'
-        $setChannelCalls = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'SetHostChannel' })
-        $setChannelCalls.Count | Should -Be 0 -Because 'SetHostChannel is Lock-Sandbox''s unconditional op across every tier — zero entries is what actually proves Lock-Sandbox was never called'
+        $r.SealVerdict | Should -BeTrue -Because 'Assert-Sealed certified the builder VM before it started'
+        @($r.States) | Should -Contain 'SEALED'
+        [array]::IndexOf(@($r.States), 'SEALED') | Should -BeLessThan ([array]::IndexOf(@($r.States), 'RUNNING'))
+        # The VM is torn down, so assert via the call log. SetHostChannel is Lock-Sandbox's unconditional
+        # op; the gateway address and the seven firewall rules are the host egress it installs for a kept
+        # NIC; RemoveNetworkAdapter must never run (the builder keeps its NIC).
+        @($fake.FakeCallLog | Where-Object { $_.Op -eq 'SetHostChannel' }).Count | Should -BeGreaterThan 0 -Because 'Lock-Sandbox turns every host channel off'
+        @($fake.FakeCallLog | Where-Object { $_.Op -eq 'AddSwitchHostIPAddress' }).Count | Should -Be 1 -Because 'the seal installs the gateway address on the builder switch'
+        @($fake.FakeCallLog | Where-Object { $_.Op -eq 'NewHostFirewallRule' }).Count | Should -Be 7 -Because 'the seal installs the seven HostProxy rules'
+        @($fake.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' }).Count | Should -Be 0 -Because 'the builder keeps its NIC; the host restricts it'
     }
 
-    It 'the builder run does NOT record a SealVerdict (SealVerdict is not a builder output)' {
+    It 'the host proxy starts after the gate and before StartVM, logs to the artifact folder, and teardown stops it' {
         $blob = [byte[]](1..8)
         $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateVerdictBlob $script:BuilderOkBlob -SimulateDepsImageBlob $blob
-        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-nosealt' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-nst.vhdx')
-        # The Invoke-BuilderVM result hashtable has no SealVerdict key (a builder output, not a seal output).
-        $r.ContainsKey('SealVerdict') | Should -BeFalse -Because 'SealVerdict is an Invoke-Voidseal concept; Invoke-BuilderVM does not produce a seal verdict'
+        $art = Join-Path $TestDrive 'art-px'
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-px' -Backend $fake -ArtifactRoot $art
+        $r.Status | Should -Be 'Success'
+        $ops = @($fake.FakeCallLog | Where-Object { $_.Op -in @('AddSwitchHostIPAddress', 'StartEgressProxy', 'StartVM', 'StopEgressProxy') } | ForEach-Object { $_.Op })
+        $ops | Should -Be @('AddSwitchHostIPAddress', 'StartEgressProxy', 'StartVM', 'StopEgressProxy') -Because 'seal, then proxy, then guest, then teardown stops the proxy'
+        $r.EgressProxyLog | Should -Be (Join-Path $art 'egress-proxy.log')
+        (& $fake.GetVM @{ Name = 'bld-px' }) | Should -BeNullOrEmpty
+        (& $fake.GetSwitch @{ Name = 'bld-px-int' }) | Should -BeNullOrEmpty -Because 'teardown removes the switch with the egress objects'
+    }
+
+    It 'a gate refusal (an unreadable host channel) fails the run before StartVM, emits no artifact, and tears down' {
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateChannelReadError -SimulateVerdictBlob $script:BuilderOkBlob -SimulateDepsImageBlob ([byte[]](1..8))
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-gatefail' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-gf.vhdx') -WarningVariable wv -WarningAction SilentlyContinue
+        $r.Status | Should -Be 'Failed'
+        $r.SealVerdict | Should -BeFalse
+        $r.DepsDiskPath | Should -BeNullOrEmpty
+        @($r.States) | Should -Not -Contain 'SEALED'
+        @($r.States) | Should -Not -Contain 'RUNNING'
+        @($fake.FakeCallLog | Where-Object { $_.Op -in @('StartVM', 'StartEgressProxy') }).Count | Should -Be 0 -Because 'nothing boots and no proxy opens on an uncertified VM'
+        # The gate lets an unreadable host read propagate as-is (an inability to check is never a pass);
+        # the orchestrator records it as the run's error and warns about the abort.
+        $r.Error | Should -Match 'host-channel read failure'
+        (@($wv) -join "`n") | Should -Match "aborting 'bld-gatefail' after a lifecycle failure"
+        (& $fake.GetVM @{ Name = 'bld-gatefail' }) | Should -BeNullOrEmpty -Because 'teardown still runs after a gate refusal'
+    }
+
+    It 'a non-true gate verdict fails closed even when Assert-Sealed does not throw' {
+        Mock Assert-Sealed { return $false }
+        $fake = New-FakeHyperVBackend -SimulateSelfPowerOff -SimulateVerdictBlob $script:BuilderOkBlob -SimulateDepsImageBlob ([byte[]](1..8))
+        $r = Invoke-BuilderVM -Profile "$script:SkillRoot/profiles/builder.psd1" -Name 'bld-verdict' -Backend $fake -DepsDiskPath (Join-Path $TestDrive 'deps-vg.vhdx') -WarningAction SilentlyContinue
+        $r.Status | Should -Be 'Failed'
+        $r.SealVerdict | Should -BeFalse
+        $r.Error | Should -Match 'seal gate did not certify'
+        @($fake.FakeCallLog | Where-Object { $_.Op -eq 'StartVM' }).Count | Should -Be 0
+        (& $fake.GetVM @{ Name = 'bld-verdict' }) | Should -BeNullOrEmpty
     }
 }
 

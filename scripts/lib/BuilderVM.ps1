@@ -5,20 +5,28 @@
 .DESCRIPTION
     Runs a DepsSpec in a net-restricted Hyper-V VM and emits a hash-verified deps.vhdx.
 
-    MIRRORS Invoke-Voidseal's INIT->PROVISION->disks->seed->start->wait->detach flow
-    (Invoke-Voidseal.ps1:242-463), MINUS THE SEAL, plus a whole-image hash + emit.
+    MIRRORS Invoke-Voidseal's INIT->PROVISION->disks->seed->seal->gate->proxy->start->wait->detach flow,
+    plus a whole-image hash + emit. The builder is a Tier-1 HostProxy run like any other: its NIC stays,
+    and the host proxy on the gateway of its own /30 is the only way out.
 
     FLOW:
-      INIT        load + validate the builder profile (must be EgressMode='SquidSniProxy').
-      PROVISION   New-SandboxVM — Tier-1 VM with NIC (the fetch needs the net).
+      INIT        load + validate the builder profile (a Tier-1 HostProxy profile with a DepsSpec; the
+                  loader's builder rule already pins that shape).
+      PROVISION   New-SandboxVM: a Tier-1 VM with its NIC (the fetch needs the net) and a HostProxy
+                  address plan on the descriptor.
       DISKS       New-WorkloadDisks - INPUT (runner+DepsSpec) + OUTPUT (deps.vhdx-to-be, exFAT, never
                   host-mounted); New-BuilderVerdictDisk - a small RAW verdict disk beside them.
-      SEED        New-WorkloadSeedDisk — CIDATA data disk carrying the Squid seed (RC6).
-      RC7         SetAutomaticCheckpoints Enabled=$false — so guest writes land in the base
+      SEED        New-WorkloadSeedDisk: the CIDATA data disk carrying the builder runner, the proxy
+                  settings, the in-guest lockdown and the network-config (RC6).
+      RC7         SetAutomaticCheckpoints Enabled=$false, so guest writes land in the base
                   .vhdx, not a differencing .avhdx, which is what the host hashes.
-      NO SEAL     The builder is Tier-1 NET-RESTRICTED — it KEEPS its NIC + Squid egress for
-                  the whole run (it must fetch deps). Do NOT call Lock-Sandbox/Assert-Sealed.
-      RUN         StartVM -> Wait-WorkloadComplete (the guest fetches deps, self-powers-off).
+      SEAL        Lock-Sandbox keeps the NIC, installs the host side of egress from the plan (gateway
+                  address, firewall rules, port ACL), detaches media and turns the host channels off;
+                  then Assert-Sealed, a HARD GATE: it reads every host object back, the egress ones
+                  included, and a verdict that is not literally $true fails the run before StartVM.
+      PROXY       Start-SandboxEgressProxy: the host CONNECT proxy on the gateway, enforcing the merged
+                  EgressAllowlist, after the gate and before the guest boots.
+      RUN         StartVM -> Wait-WorkloadComplete (the guest fetches deps over the proxy, self-powers-off).
       DETACH      RemoveHardDiskDrive the OUTPUT/deps disk AND the verdict disk BEFORE the verdict read,
                   the move and the hash (an attached disk is locked; the fake THROWS on GetVhdxImageHash
                   while attached).
@@ -33,9 +41,10 @@
       HASH        GetVhdxImageHash on the MOVED file: whole-file SHA-256 in USER-SPACE (NEVER Mount-VHD),
                   taken after the verdict read so it describes the bytes a consumer will copy.
       EMIT        Record DepsDiskPath + DepsImageHash + Status=Success.
-      TEARDOWN    Remove-Sandbox -DeleteDisks in a finally. It deletes only what the run created (the
-                  descriptor's CreatedDisks); the moved deps.vhdx is not on that list and lives outside the
-                  storage root (Resolve-BuilderDepsDestination refuses anything inside it), so it survives.
+      TEARDOWN    Remove-Sandbox -DeleteDisks in a finally. It stops the proxy and removes the host egress
+                  objects it recorded, then deletes only what the run created (the descriptor's
+                  CreatedDisks); the moved deps.vhdx is not on that list and lives outside the storage
+                  root (Resolve-BuilderDepsDestination refuses anything inside it), so it survives.
 
     DESIGN DECISIONS (resolved, do not redesign):
       * The integrity artifact is the whole-image hash (GetVhdxImageHash, raw, no mount). The deps disk is
@@ -61,8 +70,12 @@
         ExitCode       - the builder's exit code as the guest recorded it, or $null when none was read.
         Status         - 'Success' | 'FetchFailed' | 'Failed'.
         Error          - the failure message on a non-Success run, or $null.
-        States         - the lifecycle phases traversed (INIT, PROVISIONED, STAGED, RUNNING, CAPTURED,
-                         DETACHED, VERDICT, MOVED, HASHED, DESTROYED), for diagnostics.
+        SealVerdict    - $true when Assert-Sealed certified the VM; $false when the gate refused or was
+                         never reached.
+        EgressProxyLog - the host proxy's per-connection JSON log in the artifact folder, or $null when
+                         the proxy never started.
+        States         - the lifecycle phases traversed (INIT, PROVISIONED, STAGED, SEALED, RUNNING,
+                         CAPTURED, DETACHED, VERDICT, MOVED, HASHED, DESTROYED), for diagnostics.
 #>
 
 Set-StrictMode -Version Latest
@@ -327,10 +340,11 @@ function Read-BuilderVerdict {
 # --------------------------------------------------------------------------
 <#
 .SYNOPSIS
-    Run the Tier-1 builder: provision -> disks -> seed -> run (no seal) -> detach -> hash -> emit.
+    Run the Tier-1 builder: provision -> disks -> seed -> seal -> gate -> proxy -> run -> detach -> hash -> emit.
 .PARAMETER Profile
     A builder profile NAME, a .psd1 PATH, or an already-normalized profile HASHTABLE.
-    Must have EgressMode='SquidSniProxy' and a DepsSpec key.
+    Must be a Tier-1 HostProxy profile with a DepsSpec key (profiles/builder.psd1 inherits the mode from
+    tier1.psd1; the loader refuses any other shape for a DepsSpec).
 .PARAMETER Name
     (Optional) the VM name. Defaults to a unique 'bld-<rand>'.
 .PARAMETER DepsOutputDir
@@ -383,10 +397,12 @@ function Invoke-BuilderVM {
     # --- INIT: load + validate the profile (fail-closed before any backend call) ---
     $resolved = Resolve-DeployProfile -Profile $Profile -Tier 1
 
-    # Builder guard: refuse anything that isn't a SquidSniProxy-egress profile.
-    if ([string]$resolved['EgressMode'] -ne 'SquidSniProxy') {
+    # Builder guard: the fetch rides the host proxy, so the profile must be HostProxy and must carry the
+    # DepsSpec that makes it a builder. The loader's builder rule pins the same shape (Tier 1,
+    # Network 'Internal+Allowlist'); this is the orchestrator's own check on the profile it was handed.
+    if ([string]$resolved['EgressMode'] -cne 'HostProxy') {
         throw ("Invoke-BuilderVM: '$([string]$resolved['Name'])' is not a builder profile " +
-               "(EgressMode='$([string]$resolved['EgressMode'])', need 'SquidSniProxy'). " +
+               "(EgressMode='$([string]$resolved['EgressMode'])', need 'HostProxy': the builder fetches over the host proxy). " +
                "Pass a builder profile (e.g. profiles/builder.psd1). Failing closed.")
     }
     if (-not $resolved.ContainsKey('DepsSpec')) {
@@ -417,6 +433,12 @@ function Invoke-BuilderVM {
     # fetch is too long to lose to it at the end.
     $depsDestination = Resolve-BuilderDepsDestination -Name $Name -StorageBase $storageBase `
         -ArtifactRoot $ArtifactRoot -DepsOutputDir $DepsOutputDir -DepsDiskPath $DepsDiskPath
+
+    # The run's artifact folder (the host proxy logs there); the same default Resolve-BuilderDepsDestination
+    # derives the default deps folder from.
+    $effectiveArtifactRoot = if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
+        Join-Path ([System.IO.Path]::GetTempPath()) ("Voidseal\artifacts\{0}" -f $Name)
+    } else { $ArtifactRoot.Trim() }
 
     # Inject the runner + the DepsSpec into the INPUT disk at deploy time (mirrors how
     # the firefox orchestrator injects the organizer script via -Workload.Inputs).
@@ -454,6 +476,8 @@ function Invoke-BuilderVM {
         ExitCode       = $null
         Status         = 'Failed'
         Error          = $null
+        SealVerdict    = $false
+        EgressProxyLog = $null
         States         = @()
     }
 
@@ -499,8 +523,31 @@ function Invoke-BuilderVM {
         # explicit RC7 call just before StartVM.
         $null = & $Backend.SetAutomaticCheckpoints @{ VMName = $Name; Enabled = $false }
 
-        # --- NO SEAL: the builder is Tier-1 NET-RESTRICTED. It KEEPS its NIC + Squid egress
-        # for the full run (it must fetch deps). Do NOT call Lock-Sandbox / Assert-Sealed. ---
+        # --- SEALED: cut the VM to Tier-1 isolation, then the HARD GATE ---------------------------
+        # The builder keeps its NIC (Tier 1, Network 'Internal+Allowlist'), so Lock-Sandbox leaves the
+        # adapter, installs the host side of egress from the descriptor's HostProxy plan (gateway
+        # address, host firewall rules, port ACL), detaches import media and turns the host channels
+        # off. Assert-Sealed then reads every host object back, the egress ones included. It is
+        # throw-only today; the explicit verdict check below holds even if it ever returned $false
+        # instead. Either refusal lands in the outer catch, which records it and tears down, so the
+        # guest never boots on an uncertified VM.
+        Lock-Sandbox -Descriptor $descriptor -Backend $Backend
+        $sealOk = Assert-Sealed -Descriptor $descriptor -Backend $Backend
+        $result.SealVerdict = (($sealOk -is [bool]) -and $sealOk)
+        if (-not $result.SealVerdict) {
+            throw "Invoke-BuilderVM: seal gate did not certify '$Name' (Assert-Sealed returned a non-true verdict); refusing to start the builder."
+        }
+        $states.Add('SEALED')
+
+        # --- PROXY: the host CONNECT proxy, after the gate and before the guest boots -----------------
+        # The one door the host objects leave open. It enforces the merged EgressAllowlist (the Debian
+        # mirrors, PyPI and the Hugging Face hosts the DepsSpec needs), writes one JSON line per CONNECT
+        # to the artifact folder, and exits at the deadline plus a margin or with this process. Teardown
+        # (Remove-Sandbox) stops it first. A proxy that does not come up is a lifecycle failure.
+        Start-SandboxEgressProxy -Descriptor $descriptor -Allowlist @($resolved['EgressAllowlist']) `
+            -RunDirectory $effectiveArtifactRoot -MaxLifetimeSeconds ($effectiveTimeoutSeconds + 900) `
+            -PythonExe (Resolve-PythonExe) -Backend $Backend
+        $result.EgressProxyLog = [string]$descriptor.EgressProxy.LogPath
 
         # --- RUNNING: start the VM + wait for the guest to self-power-off ---
         $null = & $Backend.StartVM @{ Name = $Name }

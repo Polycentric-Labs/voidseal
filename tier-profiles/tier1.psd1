@@ -13,9 +13,11 @@
     # the merged EgressAllowlist, resolving them itself and refusing private answers. No NAT, no route,
     # no resolver in the guest. Assert-Sealed reads the host objects back before the proxy and the VM
     # start. Mock-green only: the first elevated run is the first live exercise
-    # (docs/phase-6-live-runbook.md section 2). 'InGuestSquid' (the in-guest Squid + iptables layer,
-    # defense in depth and NOT a boundary) still works for a tier file that sets it.
-    EgressMode      = 'HostProxy'                # credential-FREE. Phase-1B: 'HostEnvoy' (deferred)
+    # (docs/phase-6-live-runbook.md section 2). It is the one egress model for a VM that keeps its
+    # NIC: the loader refuses any other value on this Network label (the kept-NIC rule), and a
+    # workload file may not set EgressMode at all. Serial and Disk runs alike get the proxy settings,
+    # the network-config and the in-guest lockdown (defense in depth, not a boundary) in their seed.
+    EgressMode      = 'HostProxy'                # credential-free: no token travels through the proxy
     EgressAllowlist = @(
         'api.anthropic.com',
         'registry.npmjs.org',
@@ -35,6 +37,9 @@
     HostChannels    = @{ Clipboard = $false; Shares = $false; GuestServices = $false; EnhancedSession = $false }
     Capture         = @{ Mode = 'HostSide+ProxyLog'; Otlp = $true }   # ProxyLog = the host proxy's per-connection JSON log in the run folder
     Extraction      = 'HostReadResultDir'         # Tier 1 isn't running presumed-hostile code
-    Lifecycle       = 'SnapshotRevert'
+    # Declared, not wired: no engine code reads Lifecycle, and teardown always destroys the VM and the
+    # disks it created. 'SnapshotRevert' would need a checkpoint, which the seal refuses (Assert-Sealed
+    # fails a VM with automatic checkpoints on or any checkpoint present), so this says what happens.
+    Lifecycle       = 'Ephemeral'
     Controls        = @('NonRoot', 'ReadOnlyCodeMount', 'SecretFileExclusion', 'DeferTrust', 'SymlinkGuard', 'NativeBubblewrap')
 }

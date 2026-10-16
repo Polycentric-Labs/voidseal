@@ -1,30 +1,33 @@
 @{
     # =====================================================================
-    # Voidseal — Tier-1 net-restricted BUILDER workload profile (Phase 2).
+    # Voidseal, Tier-1 net-restricted BUILDER workload profile (Phase 2).
     # Layers onto tier1.psd1; the loader RE-VALIDATES all invariants + the
-    # builder rule (SquidSniProxy => DepsSpec + derived-per-fetcher allowlist
-    # completeness). Runs a DepsSpec in a net-restricted VM and emits a
-    # hash-verified deps.vhdx. ZERO personal data — the safest first live Tier-1.
+    # builder rule (a DepsSpec profile must be the Tier-1 'Internal+Allowlist'
+    # HostProxy shape, and its merged allowlist must cover every declared
+    # fetcher's hosts). Runs a DepsSpec in a net-restricted VM and emits a
+    # hash-verified deps.vhdx. ZERO personal data: the safest first live Tier-1.
     # =====================================================================
     BaseTier = 1
     Name     = 'builder'
 
     # Disk-mode: reuse the PROVEN firefox CIDATA disk path. The dep-fetch runner (2.2) rides the
-    # INPUT disk, fetches per DepsSpec over the Squid SNI egress, writes deps onto the OUTPUT disk
+    # INPUT disk, fetches per DepsSpec over the host proxy, writes deps onto the OUTPUT disk
     # (-> deps.vhdx) + a per-file manifest, and self-powers-off; the host (2.4) reads + hashes it.
     WorkloadMode = 'Disk'
     Inputs       = @{}
 
-    # The builder egress: transparent Squid SNI proxy (nftables CANNOT runtime-FQDN-filter —
-    # it resolves name->IP once at rule-load and CDN rotation then drops the connection). This is the
-    # FIRST live Tier-1 egress in the project; the allowlist is load-bearing. Guarded workload override
-    # (D-1): the loader accepts EgressMode here ONLY because it is exactly 'SquidSniProxy'.
-    EgressMode = 'SquidSniProxy'
+    # Egress: inherited from tier1 ('HostProxy', a tier-owned key no workload file may set). The host
+    # plans the VM's /30, the seal installs the gateway address, firewall rules and port ACL, the gate
+    # reads them back, and the host CONNECT proxy on the gateway enforces the merged allowlist below;
+    # the seed points pip, apt and the Hugging Face client at that proxy and keeps an in-guest
+    # default-DROP as defense in depth. This is the FIRST live Tier-1 egress in the project; the
+    # allowlist is load-bearing. What makes this profile the builder is its DepsSpec.
 
     # Union the apt + HF hosts tier1 lacks (tier1 already carries pypi/files.pythonhosted/github/
     # codeload/objects.githubusercontent). '.hf.co' is a domain-suffix entry covering the rotating
-    # LFS/Xet hosts (the Squid domain-ACL model); the explicit cdn-lfs/cas-bridge anchors document the
-    # representative hosts the completeness check requires. Re-confirm the exact rotating LFS set at fire.
+    # LFS/Xet hosts (the proxy admits a name and its subdomains for a leading-dot entry); the explicit
+    # cdn-lfs/cas-bridge anchors document the representative hosts the completeness check requires.
+    # Re-confirm the exact rotating LFS set at fire.
     ExtraAllowlist = @(
         'deb.debian.org', 'security.debian.org',
         'huggingface.co', 'cdn-lfs.huggingface.co', 'cas-bridge.xethub.hf.co', '.hf.co'
@@ -65,9 +68,10 @@
         }
     }
 
-    # Disk-mode entrypoint — the dep-fetch runner the seed injects (2.2 finalizes the exact call +
-    # the deps-spec.json the runner reads). Reads the DepsSpec, fetches over the Squid egress, stages
-    # deps + a per-file SHA-256 manifest under /mnt/out (-> the OUTPUT disk -> deps.vhdx).
+    # Disk-mode entrypoint: the dep-fetch runner the seed injects (2.2 finalizes the exact call +
+    # the deps-spec.json the runner reads). Reads the DepsSpec, fetches over the host proxy (pip, apt
+    # and huggingface-cli all honor the proxy environment the runner exports), stages deps + a
+    # per-file SHA-256 manifest under /mnt/out (-> the OUTPUT disk -> deps.vhdx).
     Entrypoint = 'python3 /mnt/in/fetch_deps.py --spec /mnt/in/deps-spec.json --out /mnt/out'
 
     # The cloud-init NoCloud CIDATA seed path. ci-2 NOTE: the builder never reads it. The builder is

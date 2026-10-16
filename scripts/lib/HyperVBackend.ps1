@@ -2802,7 +2802,7 @@ function New-FakeHyperVBackend {
             }
         }
         # SimulateDepsImageBlob (paired with SimulateSelfPowerOff): model the BUILDER guest fetching deps
-        # over the Squid egress, writing them onto the OUTPUT (deps) disk, then self-powering-off. SAME
+        # over the host proxy, writing them onto the OUTPUT (deps) disk, then self-powering-off. SAME
         # write-flush gate as the outbox: no clean power-off -> no flushed deps image -> a host hash of an
         # empty disk (fail-closed, not a false match). Recorded as DepsImageRegion (the stand-in for the
         # .vhdx file bytes the real GetVhdxImageHash streams). The .avhdx identity trap (RC7) DOES apply:
