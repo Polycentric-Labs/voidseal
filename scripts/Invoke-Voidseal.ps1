@@ -175,6 +175,46 @@ function Get-OutboxWorkloadExitCode {
     return [int]$code
 }
 
+<#
+.SYNOPSIS
+    Is a staged in-guest helper this checkout's guest/<Name>, once line endings and trailing whitespace
+    are set aside?
+.DESCRIPTION
+    The outbox preflight calls this for each helper the effective Inputs carry. The staged content (a
+    string, or the bytes a byte-clean Input holds) and the engine's own file are normalized the same way
+    before the comparison: CRLF and lone CR become LF, whitespace at the end of each line goes, and so do
+    a leading BOM and any trailing whitespace at the end of the text. Those are the differences a
+    Get-Content round-trip, an editor, or another checkout's line-ending setting introduces without
+    changing the Python. Anything else is a different file. THROWS when the engine's own copy is missing:
+    with nothing to compare against the run fails closed rather than trusting the staged content.
+.PARAMETER Name
+    The helper's file name (run_disk_workload.py, outbox.py, screener.py).
+.PARAMETER Content
+    The staged content from Inputs: a string, or a [byte[]] (decoded as UTF-8).
+.PARAMETER GuestDir
+    The engine's guest directory holding the reference copies.
+#>
+function Test-OutboxHelperCurrent {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [AllowNull()] [AllowEmptyString()] $Content,
+        [Parameter(Mandatory)] [string] $GuestDir
+    )
+    $enginePath = Join-Path $GuestDir $Name
+    if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
+        throw ("Invoke-Voidseal: this checkout has no '$enginePath' to compare the staged helper against (the " +
+               "engine's guest directory is incomplete). Fail closed.")
+    }
+    $staged = if ($Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($Content) } else { [string]$Content }
+    $normalize = {
+        param([string] $Text)
+        (($Text.TrimStart([char]0xFEFF) -replace "`r`n?", "`n") -replace "(?m)[ `t]+$", '').TrimEnd()
+    }
+    return ((& $normalize $staged) -ceq (& $normalize ([System.IO.File]::ReadAllText($enginePath))))
+}
+
 # --------------------------------------------------------------------------
 # Internal: resolve the -Profile argument to a normalized profile hashtable (loader output).
 # --------------------------------------------------------------------------
@@ -513,7 +553,7 @@ function Invoke-Voidseal {
                "with no NIC (Network='None'). Nothing was provisioned. Fail closed.")
     }
 
-    # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT ---
+    # --- OUTBOX preflight: the in-guest producer and outbox module must ride INPUT, as this checkout's copies ---
     # Every outbox-transport Disk run (a processor, or a transport-only OutboxOutput profile such as
     # firefox) executes `python3 /mnt/in/run_disk_workload.py` from the INPUT disk, and that script
     # imports outbox.py from its own directory. A processor also runs screener.py beside them. If any
@@ -547,6 +587,27 @@ function Invoke-Voidseal {
                    "in-guest runner executes run_disk_workload.py from the INPUT disk, and that script imports " +
                    "outbox.py beside it. Stage both from the repo's guest/ directory in Inputs (or " +
                    "-Workload.Inputs). Fail closed.")
+        }
+        # Present is not enough: the helpers must be THIS checkout's copies. The seed runner this engine
+        # builds calls the producer with this checkout's command line (SeedBuilder.ps1: --workload-rc, then
+        # --transport-only or --mode), and host/read_outbox.py reads the container guest/outbox.py writes.
+        # A copy staged from another checkout rejects a flag it never had (argparse exits 2), writes no
+        # outbox, and leaves the host with the same "outbox header missing" a missing helper gives; the
+        # producer's CLI last moved on 2026-10-03, after the only live run. The engine never injects the
+        # helpers (the operator stages their content), so compare each one with the engine's own file,
+        # setting line endings and trailing whitespace aside (Test-OutboxHelperCurrent).
+        $guestDir     = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest'
+        $staleHelpers = @($requiredHelpers | Where-Object {
+            -not (Test-OutboxHelperCurrent -Name $_ -Content $effectiveInputs[$_] -GuestDir $guestDir)
+        })
+        if ($staleHelpers.Count -gt 0) {
+            $profileKind = if ($isProcessorShape) { 'processor' } else { 'outbox profile' }
+            throw ("Invoke-Voidseal: REFUSING $profileKind '$Name': the content staged for $($staleHelpers -join ', ') in " +
+                   "Inputs is not this checkout's (compared with the files under '$guestDir', ignoring line endings and " +
+                   "trailing whitespace). The seed runner this engine builds calls the in-guest producer with this " +
+                   "checkout's command line (for example --workload-rc), so a copy from another checkout can exit " +
+                   "before any outbox is written, which the host could only report as 'outbox header missing'. Read " +
+                   "each helper from '$guestDir' (Get-Content -Raw) into Inputs or -Workload.Inputs. Fail closed.")
         }
     }
 
