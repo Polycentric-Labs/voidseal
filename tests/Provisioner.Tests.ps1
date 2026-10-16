@@ -710,6 +710,62 @@ Describe 'Reaper — Remove-Sandbox' {
         }
     }
 
+    It 'WITHOUT a descriptor, -DeleteDisks deletes only the disks under the VM''s own storage directory and reports the rest' {
+        # An operator's original, attached by hand from outside the sandbox folder, must survive.
+        & $script:B.NewVHD @{ Path = 'C:\originals\keep-me.vhdx'; SizeBytes = 1GB }
+        & $script:B.AddHardDiskDrive @{ VMName = 'sbx-rm'; Path = 'C:\originals\keep-me.vhdx' }
+        $system = $script:Desc.DiskPath
+        $warnings = @()
+        Remove-Sandbox -Name 'sbx-rm' -DeleteDisks -Backend $script:B -WarningAction SilentlyContinue -WarningVariable warnings
+        (& $script:B.GetVM @{ Name = 'sbx-rm' }) | Should -BeNullOrEmpty
+        (& $script:B.GetVHDInfo @{ Path = $system }) | Should -BeNullOrEmpty -Because 'the system disk lives under <StorageRoot>\sbx-rm'
+        (& $script:B.GetVHDInfo @{ Path = 'C:\originals\keep-me.vhdx' }) | Should -Not -BeNullOrEmpty -Because 'nothing proves this run created it'
+        @($warnings | Where-Object { $_ -match 'skips 1 attached disk' -and $_ -match 'keep-me\.vhdx' }).Count | Should -Be 1
+    }
+
+    It 'the no-descriptor fallback honors -StorageRoot: the VM''s disks under an explicit root are deleted with it and skipped without it' {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("vs-rm-root-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $b = New-FakeHyperVBackend
+        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-rooted' -StorageRoot $root -Backend $b
+        $d.DiskPath | Should -BeLike "$root*" -Because 'precondition: the disk is under the explicit root'
+        $warnings = @()
+        Remove-Sandbox -Name 'sbx-rooted' -DeleteDisks -Backend $b -WarningAction SilentlyContinue -WarningVariable warnings
+        (& $b.GetVHDInfo @{ Path = $d.DiskPath }) | Should -Not -BeNullOrEmpty -Because 'resolved against the default root, the disk is not provably this run''s'
+        @($warnings | Where-Object { $_ -match 'skips 1 attached disk' }).Count | Should -Be 1
+        $b2 = New-FakeHyperVBackend
+        $d2 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-rooted' -StorageRoot $root -Backend $b2
+        Remove-Sandbox -Name 'sbx-rooted' -DeleteDisks -StorageRoot $root -Backend $b2
+        (& $b2.GetVHDInfo @{ Path = $d2.DiskPath }) | Should -BeNullOrEmpty -Because 'with the right root the system disk is the VM''s own'
+    }
+
+    It 'turns a Paused or Saved VM OFF before removing it (a graceful stop needs a running guest)' -ForEach @(
+        @{ Suspended = 'Paused' }, @{ Suspended = 'Saved' }
+    ) {
+        $b = New-FakeHyperVBackend -SimulateStateAfterStart $Suspended
+        $null = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-susp' -Backend $b
+        & $b.StartVM @{ Name = 'sbx-susp' }
+        (& $b.GetVM @{ Name = 'sbx-susp' }).State | Should -Be $Suspended -Because 'precondition: the VM was paused or saved outside the tool'
+        { Remove-Sandbox -Name 'sbx-susp' -Backend $b } | Should -Not -Throw
+        (& $b.GetVM @{ Name = 'sbx-susp' }) | Should -BeNullOrEmpty
+        $stops = @($b.FakeCallLog | Where-Object { $_.Op -eq 'StopVM' -and $_.VMName -eq 'sbx-susp' })
+        $stops.Count | Should -Be 1
+        $stops[0].TurnOff   | Should -BeTrue -Because "a $Suspended VM has no running guest to shut down"
+        $stops[0].FromState | Should -Be $Suspended
+    }
+
+    It 'stops a Running VM gracefully (Force without TurnOff, the Shutdown-service decision) and does not stop an Off one' {
+        & $script:B.StartVM @{ Name = 'sbx-rm' }
+        Remove-Sandbox -Name 'sbx-rm' -Backend $script:B
+        $stops = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'StopVM' })
+        $stops.Count | Should -Be 1
+        $stops[0].TurnOff | Should -BeFalse
+        $stops[0].Force   | Should -BeTrue
+        $b2 = New-FakeHyperVBackend
+        $null = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-off' -Backend $b2
+        Remove-Sandbox -Name 'sbx-off' -Backend $b2
+        @($b2.FakeCallLog | Where-Object { $_.Op -eq 'StopVM' }).Count | Should -Be 0 -Because 'an Off VM needs no stop'
+    }
+
     It 'removing a NON-EXISTENT VM is a clean no-op (warns, does not throw)' {
         { Remove-Sandbox -Name 'never-existed-vm' -Backend $script:B } |
             Should -Not -Throw -Because 'idempotent teardown: removing an absent VM is a no-op, not a crash'
@@ -746,12 +802,15 @@ Describe 'Reaper — Remove-Sandbox' {
         (& $script:B.GetSwitch @{ Name = 'sbx-rm-int' }) | Should -BeNullOrEmpty -Because 'a re-run teardown must converge; the descriptor still says which switch this sandbox owns'
     }
 
-    It 'leaves a PRE-EXISTING switch the provision did not create (the same ownership rule the rollback follows)' {
+    It 'REFUSES a PRE-EXISTING switch of the VM''s name instead of reusing it, rolls the VM back and leaves the switch alone' {
         $b = New-FakeHyperVBackend
         & $b.NewSwitch @{ Name = 'sbx-shared-int'; SwitchType = 'Internal' }   # exists before the provision
-        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-shared' -Backend $b
-        Remove-Sandbox -Name 'sbx-shared' -DeleteDisks -Descriptor $d -Backend $b
-        (& $b.GetSwitch @{ Name = 'sbx-shared-int' }) | Should -Not -BeNullOrEmpty -Because 'the provision reused a switch it did not create, so teardown must not reap it'
+        { New-SandboxVM -Profile $script:Tier1 -Name 'sbx-shared' -Backend $b } |
+            Should -Throw -ExpectedMessage "New-SandboxVM: a vSwitch named 'sbx-shared-int' already exists; refusing to reuse it.*Remove-VMSwitch -Name 'sbx-shared-int'*Fail closed."
+        (& $b.GetVM @{ Name = 'sbx-shared' }) | Should -BeNullOrEmpty -Because 'the mid-provision rollback removes the VM'
+        (& $b.GetSwitch @{ Name = 'sbx-shared-int' }) | Should -Not -BeNullOrEmpty -Because 'the provision did not create the switch, so neither rollback nor teardown may reap it'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'RemoveSwitch' }).Count | Should -Be 0
+        (& $b.GetVHDInfo @{ Path = 'C:\ProgramData\Voidseal\sandboxes\sbx-shared\sbx-shared-system.vhdx' }) | Should -BeNullOrEmpty -Because 'the created system disk is rolled back too'
     }
 }
 
@@ -768,6 +827,23 @@ Describe 'New-SandboxVM — input validation' {
     It 'throws on a blank VM name' {
         $b = New-FakeHyperVBackend
         { New-SandboxVM -Profile $script:Tier1 -Name '   ' -Backend $b } | Should -Throw
+    }
+
+    It 'refuses a VM name with a wildcard, a space or a leading hyphen at the parameter, before any backend call' -ForEach @(
+        @{ Bad = 'sbx*' }, @{ Bad = 'sbx?1' }, @{ Bad = 'sbx[1]' }, @{ Bad = 'a b' }, @{ Bad = '-sbx' }, @{ Bad = 'x;reboot' }, @{ Bad = ('a' * 65) }
+    ) {
+        $b = New-FakeHyperVBackend
+        { New-SandboxVM -Profile $script:Tier1 -Name $Bad -Backend $b } |
+            Should -Throw -ExpectedMessage '*does not match*' -Because 'Get-VM -Name treats * ? [ ] as wildcards; the name also becomes a folder, a pipe and firewall rule names'
+        @($b.FakeCallLog).Count | Should -Be 0 -Because 'parameter validation refuses before the body runs'
+    }
+
+    It 'accepts a name of letters, digits, dot, underscore and hyphen up to 64 characters' {
+        $b = New-FakeHyperVBackend
+        $name = 'Sbx-1.a_b' + ('x' * 55)
+        $name.Length | Should -Be 64
+        $d = New-SandboxVM -Profile $script:Tier1 -Name $name -Backend $b
+        $d.Name | Should -Be $name
     }
 }
 

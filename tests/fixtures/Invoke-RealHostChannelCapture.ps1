@@ -24,9 +24,10 @@
 
     THE CORRECT LINUX-GUEST MODEL (what this harness now proves):
       * GuestServices = the ONE real autonomous host<->guest data channel (Copy-VMFile /
-        'Guest Service Interface'). UNCHANGED: SetHostChannel disables it via
-        Disable-VMIntegrationService; GetHostChannels reads the real `.Enabled` and FAILS
-        CLOSED (catch { throw }). It still flips with the integration-service state.
+        'Guest Service Interface'). SetHostChannel disables it via Disable-VMIntegrationService and
+        GetHostChannels reads the real `.Enabled`, both FAIL CLOSED; since 2026-10-16 it is found by
+        its component GUID (6C09BB55) with the other integration services, never by its English
+        display name, so the stub set below carries it under a German name like the rest.
       * EnhancedSession / Clipboard / Shares = ESM facets. There is NO per-VM "ESM off"
         toggle and ESM clipboard/drive-redirection needs Windows-guest components a stock
         Linux image structurally lacks — so they are NOT live autonomous channels on a Linux
@@ -116,8 +117,9 @@ function Set-VM {
     }
 }
 
-# GuestServices read stub (THE fail-closed channel read). Reports .Enabled = $script:gsiEnabled,
-# or THROWS when $script:gsiThrows (the unreadable-channel fail-closed scenario).
+# Integration-service stub. Called WITH -Name it models the by-name lookup the real body no longer makes
+# (kept so a regression back to the English-name read is visible: it returns an object whose Enabled is
+# $script:gsiEnabled, and throws when $script:gsiThrows).
 #
 # Called WITHOUT -Name it models the enumeration the integration-service reads use (design E6): it
 # returns $script:isServices, a list of objects carrying an Id ('Microsoft:<vm id>\<component GUID>'),
@@ -236,7 +238,7 @@ function Invoke-IsGetCapture {
     $script:isEnumThrows = $false
     $script:isServices   = @(New-StubServiceSet)
     $res = [ordered]@{ err = $err; keys = if ($ch) { @($ch.Keys | Sort-Object) -join ',' } else { $null } }
-    foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') {
+    foreach ($k in 'GuestServices', 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') {
         $res[$k] = if ($ch -and $ch.ContainsKey($k)) { $ch[$k] } else { $null }
     }
     return $res
@@ -249,6 +251,7 @@ function Invoke-IsSetCapture {
     $script:capIsDisable = [System.Collections.Generic.List[object]]::new()
     $script:capIsEnable  = [System.Collections.Generic.List[object]]::new()
     $script:capDisableGsi = $null
+    $script:gsiEnabled   = $true
     $err = $null
     try { & $b.SetHostChannel @{ VMName = 'sbx-seal'; Channel = $Channel; Enabled = $Enabled } | Out-Null } catch { $err = $_.Exception.Message }
     $script:isServices = @(New-StubServiceSet)
@@ -268,14 +271,24 @@ function Invoke-SetCapture {
     $script:capEnableConsole  = $null
     $script:capSetVmEsm       = $null
     $script:capDisableGsi     = $null
+    $script:capIsDisable      = [System.Collections.Generic.List[object]]::new()
+    $script:capIsEnable       = [System.Collections.Generic.List[object]]::new()
+    $script:isServices        = @(New-StubServiceSet)
     $err = $null
     try { & $Call | Out-Null } catch { $err = $_.Exception.Message }
+    # The GuestServices disable now arrives as the ID-matched Guest Service Interface object piped to
+    # Disable-VMIntegrationService (capIsDisable); the by-name shape (capDisableGsi) is kept so a
+    # regression to the English-name call would still register, and the test asserts it stays unused.
+    $gsiGuid = '6C09BB55-D683-4DA0-8931-C9BF705F6480'
+    $gsiDisabledById = [bool](@($script:capIsDisable | Where-Object { ([string]$_.Id).EndsWith($gsiGuid, [System.StringComparison]::OrdinalIgnoreCase) }).Count)
     return [ordered]@{
         err                     = $err
         disableConsoleCalled    = ($null -ne $script:capDisableConsole)
         enableConsoleCalled     = ($null -ne $script:capEnableConsole)
         consoleVMName           = [string]$script:capDisableConsole
-        disableGsiCalled        = ($null -ne $script:capDisableGsi)
+        disableGsiCalled        = (($null -ne $script:capDisableGsi) -or $gsiDisabledById)
+        disableGsiById          = $gsiDisabledById
+        disableGsiByName        = ($null -ne $script:capDisableGsi)
         setVmEsmTransportPassed = ($null -ne $script:capSetVmEsm)
         setVmEsmTransportValue  = $script:capSetVmEsm
     }
@@ -286,11 +299,16 @@ function Invoke-SetCapture {
 # at 0 (live-host reality), and optionally a throwing GSI read.
 function Invoke-GetCapture {
     param([bool] $GsiEnabled, [bool] $GsiThrows = $false)
+    # The Guest Service Interface state lives in the enumerated service set (read by GUID); the by-name
+    # stub value is set too so a regression to the English-name read would read the same state here and
+    # be caught by the AST pin in the test file rather than by a lucky value.
     $script:gsiEnabled = $GsiEnabled
     $script:gsiThrows  = $GsiThrows
+    $script:isServices = @(New-StubServiceSet -Enabled @{ GuestServices = $GsiEnabled })
     $err = $null; $ch = $null
     try { $ch = & $b.GetHostChannels @{ VMName = 'sbx-seal' } } catch { $err = $_.Exception.Message }
-    $script:gsiThrows = $false   # reset for the next scenario
+    $script:gsiThrows  = $false   # reset for the next scenario
+    $script:isServices = @(New-StubServiceSet)
     return [ordered]@{
         err             = $err
         EnhancedSession = if ($ch) { [bool]$ch.EnhancedSession } else { $null }
@@ -316,23 +334,27 @@ $out = [ordered]@{
     GetEsmFacetsAtConsoleMode0 = Invoke-GetCapture -GsiEnabled $true
     # GuestServices reads OFF when the integration service is disabled (the real channel flips independently).
     GetGsiOffAtConsoleMode0    = Invoke-GetCapture -GsiEnabled $false
-    # GuestServices read THROWS -> GetHostChannels rethrows (fail closed: the one real channel is unreadable).
+    # The Guest Service Interface is missing from the enumeration -> GetHostChannels THROWS (fail closed:
+    # the one real channel cannot be read, and nothing may coerce it to off).
     GetGsiThrows   = (& {
-        $script:gsiThrows = $true
+        $script:gsiThrows  = $true
+        $script:isServices = @(New-StubServiceSet | Where-Object { $_.Id -notlike '*6C09BB55-D683-4DA0-8931-C9BF705F6480' })
         $err = $null; $ch = $null
         try { $ch = & $b.GetHostChannels @{ VMName = 'sbx-seal' } } catch { $err = $_.Exception.Message }
-        $script:gsiThrows = $false
+        $script:gsiThrows  = $false
+        $script:isServices = @(New-StubServiceSet)
         [ordered]@{ err = $err; ch = if ($null -ne $ch) { 'non-null' } else { $null } }
     })
 
     # ---- integration services (design E6): ID-matched real reads and sets ----
     IsGetAllOn      = Invoke-IsGetCapture -Services @(New-StubServiceSet)
-    IsGetAllOff     = Invoke-IsGetCapture -Services @(New-StubServiceSet -Enabled @{ TimeSync = $false; KeyValueExchange = $false; Backup = $false; Heartbeat = $false })
+    IsGetAllOff     = Invoke-IsGetCapture -Services @(New-StubServiceSet -Enabled @{ GuestServices = $false; TimeSync = $false; KeyValueExchange = $false; Backup = $false; Heartbeat = $false })
     IsGetMixed      = Invoke-IsGetCapture -Services @(New-StubServiceSet -Enabled @{ TimeSync = $false; KeyValueExchange = $true; Backup = $false; Heartbeat = $false })
     IsGetMissingKvp = Invoke-IsGetCapture -Services @(New-StubServiceSet | Where-Object { $_.Id -notlike '*2A34B1C2-FD73-4043-8A5B-DD2159BC743F' })
     IsGetDuplicate  = Invoke-IsGetCapture -Services (@(New-StubServiceSet) + @([pscustomobject]@{ Id = $script:vmIdPrefix + '84EAAE65-2F2E-45F5-9BB5-0E857DC8EB47'; Name = 'Taktsignal'; Enabled = $false }))
     IsGetNonBool    = Invoke-IsGetCapture -Services @(New-StubServiceSet -Enabled @{ Backup = 'False' })
     IsGetEnumThrows = Invoke-IsGetCapture -Services @(New-StubServiceSet) -EnumThrows
+    IsSetGsiOff       = Invoke-IsSetCapture -Channel 'GuestServices'    -Enabled $false
     IsSetTimeSyncOff  = Invoke-IsSetCapture -Channel 'TimeSync'         -Enabled $false
     IsSetKvpOff       = Invoke-IsSetCapture -Channel 'KeyValueExchange' -Enabled $false
     IsSetBackupOff    = Invoke-IsSetCapture -Channel 'Backup'           -Enabled $false

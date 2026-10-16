@@ -317,6 +317,26 @@ Describe 'Lock-Sandbox — a Tier-1 net-restricted seal keeps the NIC but still 
         (& $script:B.GetHostChannels @{ VMName = 'sbx-seal1' }).EnhancedSession | Should -BeFalse
         $script:Desc.State | Should -Be 'Sealed'
     }
+
+    It 'guards the kept adapter: MAC address spoofing Off, DHCP guard On, router guard On (host-readable after the seal)' {
+        $before = & $script:B.GetNetworkAdapterGuards @{ VMName = 'sbx-seal1' }
+        $before.DhcpGuard | Should -Be 'Off' -Because 'precondition: a new adapter carries Hyper-V defaults, all Off'
+        Lock-Sandbox -Descriptor $script:Desc -Backend $script:B
+        $g = & $script:B.GetNetworkAdapterGuards @{ VMName = 'sbx-seal1' }
+        $g.MacAddressSpoofing | Should -Be 'Off'
+        $g.DhcpGuard          | Should -Be 'On'
+        $g.RouterGuard        | Should -Be 'On'
+        $set = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'SetNetworkAdapterGuards' })
+        $set.Count | Should -Be 1
+        $set[0].Path | Should -Be 'Off/On/On'
+    }
+
+    It 'does NOT set adapter guards for a NoAdapter VM (Tier 2 removes the adapter instead)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier2 -Name 'sbx-seal2-noguard'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'SetNetworkAdapterGuards' }).Count | Should -Be 0 -Because 'there is no adapter left to guard'
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'RemoveNetworkAdapter' }).Count | Should -Be 1
+    }
 }
 
 # ===========================================================================
@@ -1784,5 +1804,126 @@ Describe 'Lock-Sandbox + Assert-Sealed: a kept NIC is sealed only behind host-en
         Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
         @($sb.Backend.FakeCallLog | Where-Object { $_.Op -in @('AddSwitchHostIPAddress', 'NewHostFirewallRule') }).Count | Should -Be 0
         Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+}
+
+# ===========================================================================
+#  Assert-Sealed reads the VM's power state: only an Off VM can be certified
+# ===========================================================================
+#  The gate runs before Invoke-Voidseal starts the VM, so a VM that is already Running, Paused or Saved
+#  at gate time holds guest state the seal did not cover. Until 2026-10-16 the gate never read State.
+Describe 'Assert-Sealed: refuses a VM that is not Off at gate time' {
+
+    It 'certifies a sealed Tier-1 VM that is Off (the normal order: seal, gate, then start)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-state-off'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        (& $sb.Backend.GetVM @{ Name = 'sbx-state-off' }).State | Should -Be 'Off' -Because 'precondition: a provisioned VM is Off'
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+    }
+
+    It 'REFUSES a Running VM, naming the state' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-state-run'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        & $sb.Backend.StartVM @{ Name = 'sbx-state-run' }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*REFUSING to certify 'sbx-state-run' SEALED because its State is 'Running', not Off*"
+    }
+
+    It 'REFUSES a Paused or Saved VM, and a VM whose state cannot be read' -ForEach @(
+        @{ State = 'Paused'; Shown = 'Paused' }
+        @{ State = 'Saved';  Shown = 'Saved' }
+        @{ State = '';       Shown = '(unreadable)' }
+    ) {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-state-other'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        # The fake's GetVM hands back the live record, so a test can put the VM in a state the engine never
+        # produces itself (a pause or a save made outside the tool).
+        (& $sb.Backend.GetVM @{ Name = 'sbx-state-other' }).State = $State
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } |
+            Should -Throw -ExpectedMessage "*because its State is '$Shown', not Off*"
+    }
+
+    It 'refuses a Running VM at Tier 0 and Tier 2 too (the rule holds at every tier)' {
+        foreach ($p in @($script:Tier2)) {
+            $sb = & $script:NewTestSandbox -Profile $p -Name 'sbx-state-t2'
+            Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+            & $sb.Backend.StartVM @{ Name = 'sbx-state-t2' }
+            { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } | Should -Throw -ExpectedMessage "*State is 'Running', not Off*"
+        }
+        $t0 = $script:Tier1.Clone()
+        $t0['Tier'] = 0
+        $t0['Description'] = 'TEST FIXTURE: Tier 0 for the power-state gate.'
+        Assert-TierProfileValid -Profile $t0 -Context 'TEST Tier-0 power-state fixture'
+        $sb0 = & $script:NewTestSandbox -Profile $t0 -Name 'sbx-state-t0'
+        Lock-Sandbox -Descriptor $sb0.Desc -Backend $sb0.Backend
+        & $sb0.Backend.StartVM @{ Name = 'sbx-state-t0' }
+        { Assert-Sealed -Descriptor $sb0.Desc -Backend $sb0.Backend } | Should -Throw -ExpectedMessage "*State is 'Running', not Off*"
+    }
+
+    It 'the power-state check comes right after the VM-exists check, before the network-posture checks' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-state-order'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        & $sb.Backend.StartVM @{ Name = 'sbx-state-order' }
+        $sb.Desc.Network = ''   # would refuse with the no-posture message if it were reached first
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } | Should -Throw -ExpectedMessage "*State is 'Running', not Off*"
+    }
+}
+
+# ===========================================================================
+#  Assert-Sealed reads the kept adapter's guards back (IsolatedInternalSwitch only)
+# ===========================================================================
+Describe 'Assert-Sealed: the Tier-1 adapter guards are host-verified (MacAddressSpoofing Off, DhcpGuard On, RouterGuard On)' {
+
+    It 'certifies when the guards read exactly Off / On / On, and reads them through the backend' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-guard-ok'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'GetNetworkAdapterGuards' }).Count | Should -BeGreaterOrEqual 1
+    }
+
+    It 'REFUSES when the seal''s set did not take (host truth, not the seal''s own call)' {
+        $b = New-FakeHyperVBackend -SimulateAdapterGuardsStuck
+        $d = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-guard-stuck' -Backend $b
+        Lock-Sandbox -Descriptor $d -Backend $b
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'SetNetworkAdapterGuards' }).Count | Should -Be 1 -Because 'the seal did call the set'
+        { Assert-Sealed -Descriptor $d -Backend $b } |
+            Should -Throw -ExpectedMessage "*'sbx-guard-stuck' SEALED because its network adapter reports DhcpGuard='Off', not 'On'*"
+    }
+
+    It 'REFUSES each guard changed after the seal' -ForEach @(
+        @{ Guards = @{ MacAddressSpoofing = 'On';  DhcpGuard = 'On';  RouterGuard = 'On' };  Expect = "MacAddressSpoofing='On', not 'Off'" }
+        @{ Guards = @{ MacAddressSpoofing = 'Off'; DhcpGuard = 'Off'; RouterGuard = 'On' };  Expect = "DhcpGuard='Off', not 'On'" }
+        @{ Guards = @{ MacAddressSpoofing = 'Off'; DhcpGuard = 'On';  RouterGuard = 'Off' }; Expect = "RouterGuard='Off', not 'On'" }
+    ) {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-guard-changed'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $args = @{ VMName = 'sbx-guard-changed' } + $Guards
+        & $sb.Backend.SetNetworkAdapterGuards $args
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend } | Should -Throw -ExpectedMessage "*$Expect*"
+    }
+
+    It 'REFUSES when the guard read throws or returns nothing' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-guard-read'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $b2 = $sb.Backend.Clone(); $b2.GetNetworkAdapterGuards = { param($P) throw 'stub: adapter query failed' }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $b2 } |
+            Should -Throw -ExpectedMessage "*network adapter guards could not be read (stub: adapter query failed)*"
+        $b3 = $sb.Backend.Clone(); $b3.GetNetworkAdapterGuards = { param($P) $null }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $b3 } |
+            Should -Throw -ExpectedMessage '*network adapter guard read returned nothing*'
+    }
+
+    It 'REFUSES a guard value the read cannot interpret (a blank), naming it unreadable' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier1 -Name 'sbx-guard-blank'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        $b2 = $sb.Backend.Clone(); $b2.GetNetworkAdapterGuards = { param($P) @{ MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = '' } }
+        { Assert-Sealed -Descriptor $sb.Desc -Backend $b2 } | Should -Throw -ExpectedMessage "*RouterGuard='(unreadable)', not 'On'*"
+    }
+
+    It 'does not read adapter guards for a NoAdapter VM (nothing to read; the adapter is gone)' {
+        $sb = & $script:NewTestSandbox -Profile $script:Tier2 -Name 'sbx-guard-t2'
+        Lock-Sandbox -Descriptor $sb.Desc -Backend $sb.Backend
+        Assert-Sealed -Descriptor $sb.Desc -Backend $sb.Backend | Should -BeTrue
+        @($sb.Backend.FakeCallLog | Where-Object { $_.Op -eq 'GetNetworkAdapterGuards' }).Count | Should -Be 0
     }
 }

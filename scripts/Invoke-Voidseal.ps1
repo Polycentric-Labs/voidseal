@@ -379,7 +379,10 @@ function Get-WorkloadField {
         WorkloadMode='Disk'). The ResultInnerName/SentinelInnerName default to the cloud-init runner's
         emitted names (result.html / result.exitcode).
 .PARAMETER Name
-    (Optional) the VM name. Defaults to a unique 'sbx-<tier>-<rand>'.
+    (Optional) the VM name. Defaults to a unique 'sbx-<tier>-<rand>'. A supplied name must start with a
+    letter or digit and contain only letters, digits, '.', '_' and '-', 64 characters at most: it names
+    the VM, its switch, its storage folder, its COM1 pipe and its firewall rules, and Get-VM -Name treats
+    * ? [ ] as wildcards.
 .PARAMETER ArtifactRoot
     (Optional) host-side dir for the Runner's capture artifact. Defaults under the system temp path.
 .PARAMETER Destination
@@ -446,7 +449,7 @@ function Invoke-Voidseal {
         [Parameter(Mandatory)] [int] $Tier,
         [Parameter(Mandatory)] [AllowNull()] $Profile,
         $Workload,
-        [string] $Name,
+        [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')] [string] $Name,
         [string] $ArtifactRoot,
         [string] $Destination,
         [string] $ParentDiskPath,
@@ -906,13 +909,20 @@ function Invoke-Voidseal {
         # it THROWS, we do NOT catch-and-continue — we let it propagate to the outer catch, which
         # records the seal failure and runs teardown. The workload-run state is unreachable on failure.
         $sealOk = Assert-Sealed -Descriptor $descriptor -Backend $Backend
-        $report.SealVerdict = [bool]$sealOk
+        # Only the literal $true certifies. A [bool] cast would accept any truthy value (a non-empty array,
+        # a string, a number), so the verdict is recorded and tested as "a [bool] that is true".
+        $report.SealVerdict = ($sealOk -is [bool] -and $sealOk)
         # Belt-and-braces (defense-in-depth): today Assert-Sealed is throw-only, so reaching here means
-        # the gate certified. But if a FUTURE refactor ever made it RETURN $false instead of throwing,
-        # this explicit verdict gate ensures the workload still cannot run on an uncertified VM. We throw
-        # into the same outer catch (records the failure + tears down), exactly as a thrown gate would.
+        # the gate certified. But if a FUTURE refactor ever made it RETURN $false, or return something that
+        # is not a boolean at all (an array that happens to hold $true, an object, nothing), this explicit
+        # verdict gate still keeps the workload off an uncertified VM. We throw into the same outer catch
+        # (records the failure + tears down), exactly as a thrown gate would.
+        if ($sealOk -isnot [bool]) {
+            $verdictKind = if ($null -eq $sealOk) { 'null' } else { $sealOk.GetType().Name }
+            throw "Invoke-Voidseal: seal gate did not certify '$Name' (Assert-Sealed returned a non-boolean verdict of type $verdictKind instead of exactly `$true); refusing to run the workload."
+        }
         if (-not $sealOk) {
-            throw "Invoke-Voidseal: seal gate did not certify '$Name' (Assert-Sealed returned a non-true verdict); refusing to run the workload."
+            throw "Invoke-Voidseal: seal gate did not certify '$Name' (Assert-Sealed returned `$false); refusing to run the workload."
         }
         $states.Add('SEALED')
 

@@ -193,8 +193,11 @@ function Clear-SparseFlag {
 }
 
 function Convert-QcowToVhdx {
-    <# LIVE: confined qemu-img convert qcow2 -> vhdx, atomic move into place, clear the sparse flag.
-       Returns OutputPath. #>
+    <# LIVE: qemu-img convert qcow2 -> vhdx through the Invoke-ConfinedQemu seam (a pass-through today:
+       the seam exists so a confinement mechanism can be wired in one place at Phase 6, but no confinement
+       runs yet), atomic move into place, clear the sparse flag. Returns OutputPath. A sparse flag that will
+       not clear removes the converted file again: left in place, Test-GoldenImagePresent would skip the
+       fetch next run and hand Hyper-V the sparse parent it refuses. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string] $QcowPath,
@@ -206,7 +209,7 @@ function Convert-QcowToVhdx {
     # Temp beside the target (same volume) so the final Move-Item is an atomic rename — the host
     # never sees a half-written golden disk at $OutputPath.
     $tmp = "$OutputPath.partial-$PID"
-    Write-Host "Converting qcow2 -> vhdx (confined qemu-img) ..."
+    Write-Host "Converting qcow2 -> vhdx (qemu-img through the Invoke-ConfinedQemu seam, a pass-through today) ..."
     $null = Invoke-ConfinedQemu -QemuPath $QemuPath -Arguments @('convert', '-f', 'qcow2', '-O', 'vhdx', '--', $QcowPath, $tmp)
     if ($LASTEXITCODE -ne 0) {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -214,7 +217,13 @@ function Convert-QcowToVhdx {
     }
     Move-Item -LiteralPath $tmp -Destination $OutputPath -Force
     # Hyper-V rejects a sparse differencing parent; qemu-img's output is sparse on NTFS (see Clear-SparseFlag).
-    Clear-SparseFlag -Path $OutputPath
+    try { Clear-SparseFlag -Path $OutputPath }
+    catch {
+        $why = $_.Exception.Message
+        Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue
+        throw ("$why The converted file was removed from '$OutputPath' so the next run fetches and converts " +
+               "again instead of skipping the fetch and reusing a sparse image.")
+    }
     return $OutputPath
 }
 

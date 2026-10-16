@@ -1106,3 +1106,14 @@ Describe 'MoveVhdxFile backend method' {
         }
     }
 }
+
+Describe 'Invoke-BuilderVM: -Name is refused at the parameter when it could act as a wildcard (the Invoke-Voidseal rule)' {
+
+    It 'refuses a wildcard, a space or an over-long name before the profile is even resolved' -ForEach @(
+        @{ Bad = 'bld*' }, @{ Bad = 'bld ?' }, @{ Bad = 'bld[1]' }, @{ Bad = ('b' * 65) }
+    ) {
+        $b = New-FakeHyperVBackend
+        { Invoke-BuilderVM -Profile $null -Name $Bad -Backend $b } | Should -Throw -ExpectedMessage '*does not match*'
+        @($b.FakeCallLog).Count | Should -Be 0
+    }
+}

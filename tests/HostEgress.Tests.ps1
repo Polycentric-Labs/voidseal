@@ -216,6 +216,8 @@ Describe 'HostEgress: the proxy allowlist and arguments' {
         $argv = Get-EgressProxyArguments -Plan $p -Allowlist @('api.example.com', '*.x.example.org') -LogPath 'C:\r\l.log' -StopFile 'C:\r\s' -ReadyFile 'C:\r\r.json' -MaxLifetimeSeconds 1500 -ParentPid 4242
         $i = [array]::IndexOf($argv, '--listen-host'); $argv[$i + 1] | Should -Be $p.GatewayIP
         $i = [array]::IndexOf($argv, '--listen-port'); $argv[$i + 1] | Should -Be '13128'
+        $i = [array]::IndexOf($argv, '--client'); $i | Should -BeGreaterOrEqual 0 -Because 'the proxy serves the guest address only'
+        $argv[$i + 1] | Should -Be $p.GuestIP
         $i = [array]::IndexOf($argv, '--max-lifetime-seconds'); $argv[$i + 1] | Should -Be '1500'
         $i = [array]::IndexOf($argv, '--parent-pid'); $argv[$i + 1] | Should -Be '4242'
         ($argv -join ' ') | Should -BeLike '*--allow api.example.com --allow `*.x.example.org*'
@@ -612,6 +614,60 @@ Describe 'HostEgress: Assert-Sealed refusals for a Tier-1 HostProxy VM (each mes
         { Assert-Sealed -Descriptor $script:D -Backend $b3 } | Should -Throw "$($script:Head) its port ACL read returned no collection. Fail closed."
     }
 
+    It 'reads the firewall profiles and the gateway forwarding state as part of certifying (both default clean on the fake)' {
+        Assert-Sealed -Descriptor $script:D -Backend $script:B | Should -BeTrue
+        @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'GetHostFirewallProfiles' }).Count | Should -BeGreaterOrEqual 1
+        $fwdReads = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'GetNetIPInterfaceForwarding' })
+        $fwdReads.Count | Should -BeGreaterOrEqual 1 -Because 'the gate must read forwarding on the gateway interface'
+        $fwdReads[0].Path | Should -Be 'vEthernet (sbx-g-int)'
+    }
+
+    It 'refuses when Windows Firewall is disabled on a profile' {
+        $b = New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Public'; Enabled = $false })
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-g'
+        { Assert-Sealed -Descriptor $d -Backend $b } | Should -Throw "$($script:Head) Windows Firewall is not enabled on the 'Public' profile. Fail closed."
+    }
+
+    It 'refuses when a profile''s default inbound action is not Block' {
+        $b = New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Private'; DefaultInboundAction = 'Allow' })
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-g'
+        { Assert-Sealed -Descriptor $d -Backend $b } | Should -Throw "$($script:Head) the 'Private' firewall profile's default inbound action is 'Allow', not Block. Fail closed."
+    }
+
+    It 'refuses when a firewall profile is missing from the read' {
+        $b = New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Domain'; Remove = $true })
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-g'
+        { Assert-Sealed -Descriptor $d -Backend $b } | Should -Throw "$($script:Head) the host reports 0 firewall profile(s) named 'Domain', not exactly one. Fail closed."
+    }
+
+    It 'refuses when the firewall profiles cannot be read, or the read returns no collection' {
+        $b = New-FakeHyperVBackend -SimulateEgressMethodError @('GetHostFirewallProfiles')
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-g'
+        { Assert-Sealed -Descriptor $d -Backend $b } | Should -Throw "$($script:Head) the host firewall profiles could not be read (*SimulateEgressMethodError*). Fail closed."
+        $b2 = $script:B.Clone(); $b2.GetHostFirewallProfiles = { param($P) $null }
+        { Assert-Sealed -Descriptor $script:D -Backend $b2 } | Should -Throw "$($script:Head) the host firewall profile read returned no collection. Fail closed."
+    }
+
+    It 'refuses when IP forwarding is enabled on the gateway interface, for either family' {
+        $b = New-FakeHyperVBackend -SimulateNetIPInterfaceForwarding @{ IPv4 = 'Enabled' }
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-g'
+        { Assert-Sealed -Descriptor $d -Backend $b } | Should -Throw "$($script:Head) IPv4 forwarding on 'vEthernet (sbx-g-int)' is 'Enabled', not Disabled. Fail closed."
+        $b6 = New-FakeHyperVBackend -SimulateNetIPInterfaceForwarding @{ IPv6 = 'Enabled' }
+        $d6 = script:New-SealedHPVM -Backend $b6 -Name 'sbx-g'
+        { Assert-Sealed -Descriptor $d6 -Backend $b6 } | Should -Throw "$($script:Head) IPv6 forwarding on 'vEthernet (sbx-g-int)' is 'Enabled', not Disabled. Fail closed."
+    }
+
+    It 'refuses when a family is missing from the forwarding read, or the read fails or returns nothing' {
+        $b = New-FakeHyperVBackend -SimulateNetIPInterfaceForwarding @{ IPv6 = 'Missing' }
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-g'
+        { Assert-Sealed -Descriptor $d -Backend $b } | Should -Throw "$($script:Head) IPv6 forwarding on 'vEthernet (sbx-g-int)' is 'Missing', not Disabled. Fail closed."
+        $bf = New-FakeHyperVBackend -SimulateEgressMethodError @('GetNetIPInterfaceForwarding')
+        $df = script:New-SealedHPVM -Backend $bf -Name 'sbx-g'
+        { Assert-Sealed -Descriptor $df -Backend $bf } | Should -Throw "$($script:Head) IP forwarding on 'vEthernet (sbx-g-int)' could not be read (*SimulateEgressMethodError*). Fail closed."
+        $b2 = $script:B.Clone(); $b2.GetNetIPInterfaceForwarding = { param($P) $null }
+        { Assert-Sealed -Descriptor $script:D -Backend $b2 } | Should -Throw "$($script:Head) the IP forwarding read for 'vEthernet (sbx-g-int)' returned nothing. Fail closed."
+    }
+
     It 'still applies the switch checks first (the egress checks are added, not instead)' {
         & $script:B.NewSwitch @{ Name = 'other-int'; SwitchType = 'Internal' }
         & $script:B.ConnectNetworkAdapter @{ VMName = 'sbx-g'; SwitchName = 'other-int' }
@@ -648,6 +704,22 @@ Describe 'HostEgress: teardown removes exactly what was recorded' {
         $d.EgressGatewayAddress | Should -BeNullOrEmpty
         $order = @($b.FakeCallLog | Where-Object { $_.Op -in @('StopEgressProxy', 'RemoveNetworkAdapterAcl', 'RemoveHostFirewallRule', 'RemoveSwitchHostIPAddress') } | ForEach-Object { $_.Op } | Select-Object -Unique)
         $order | Should -Be @('StopEgressProxy', 'RemoveNetworkAdapterAcl', 'RemoveHostFirewallRule', 'RemoveSwitchHostIPAddress')
+    }
+
+    It 'a proxy that survives its kill (Stopped=$false) is a teardown failure: the record stays, the rest of teardown runs, Remove-Sandbox names the pid' {
+        $b = New-FakeHyperVBackend -SimulateEgressProxyUnkillable
+        $d = script:New-SealedHPVM -Backend $b -Name 'sbx-td3'
+        Start-SandboxEgressProxy -Descriptor $d -Allowlist @('api.example.com') -RunDirectory (Join-Path $script:TmpRoot 'run-td3') -MaxLifetimeSeconds 600 -PythonExe 'C:\py\python.exe' -Backend $b
+        $procId = $d.EgressProxy.ProcessId
+        { Remove-Sandbox -Name 'sbx-td3' -DeleteDisks -Descriptor $d -Backend $b } |
+            Should -Throw "Remove-Sandbox: host egress teardown for 'sbx-td3' could not remove: egress proxy pid ${procId}: the process did not exit after the stop file and a kill (Stopped=False); it stays recorded"
+        $d.EgressProxy | Should -Not -BeNullOrEmpty -Because 'a proxy the host could not end stays recorded for the operator'
+        $d.EgressProxy.ProcessId | Should -Be $procId
+        $b.FakeEgressProcesses[$procId].Running | Should -BeTrue
+        & $b.GetVM @{ Name = 'sbx-td3' } | Should -BeNullOrEmpty -Because 'the rest of teardown still ran'
+        @($b.FakeFirewallRules.Keys).Count | Should -Be 0
+        @($d.EgressFirewallRules).Count | Should -Be 0
+        $d.EgressGatewayAddress | Should -BeNullOrEmpty
     }
 
     It 'a removal that fails still runs the rest of teardown, keeps the record, and Remove-Sandbox throws naming it' {

@@ -346,7 +346,10 @@ function Read-BuilderVerdict {
     Must be a Tier-1 HostProxy profile with a DepsSpec key (profiles/builder.psd1 inherits the mode from
     tier1.psd1; the loader refuses any other shape for a DepsSpec).
 .PARAMETER Name
-    (Optional) the VM name. Defaults to a unique 'bld-<rand>'.
+    (Optional) the VM name. Defaults to a unique 'bld-<rand>'. A supplied name must start with a letter or
+    digit and contain only letters, digits, '.', '_' and '-', 64 characters at most (the same rule as
+    Invoke-Voidseal -Name: it names the VM, its disks and its deps file, and Get-VM -Name treats
+    * ? [ ] as wildcards).
 .PARAMETER DepsOutputDir
     (Optional) the host directory the finished deps.vhdx is moved into, as 'deps-<Name>.vhdx'. Defaults to
     '<ArtifactRoot>\deps'. Must be an absolute local path and must not be inside the sandbox storage root
@@ -383,6 +386,7 @@ function Invoke-BuilderVM {
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory)] [AllowNull()] $Profile,
+        [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
         [string]    $Name,
         [string]    $DepsDiskPath,
         [string]    $DepsOutputDir,

@@ -383,7 +383,9 @@ function New-SandboxDescriptor {
     Tier, Substrate, GuestImage, Memory, Cpu, NestedVirt, SecureBootTemplate,
     ManagementChannel, Network, etc.
 .PARAMETER Name
-    The VM name (also the sandbox id + storage subdir).
+    The VM name (also the sandbox id + storage subdir). Must start with a letter or digit and contain only
+    letters, digits, '.', '_' and '-', 64 characters at most: Get-VM -Name and Get-VMSwitch -Name treat
+    * ? [ ] as wildcards, and the name also becomes a folder, a pipe name and firewall rule names.
 .PARAMETER ParentDiskPath
     (Optional) A base/golden image .vhdx. When supplied, the system disk is a DIFFERENCING
     disk off this parent (fast, copy-on-write). When omitted, a fresh dynamic disk is created.
@@ -411,7 +413,7 @@ function New-SandboxVM {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)] [AllowNull()] $Profile,
-        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Name,
+        [Parameter(Mandatory)] [AllowEmptyString()] [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')] [string] $Name,
         [string] $ParentDiskPath,
         [long]   $SystemDiskSizeBytes = 40GB,
         [string] $StorageRoot,
@@ -643,14 +645,21 @@ function New-SandboxVM {
         # vSwitch and a connected NIC. A NoAdapter VM (Tier 0, Tier >= 2, any processor) gets NO switch:
         # the default adapter real New-VM creates stays unconnected until Lock-Sandbox removes it.
         # Create the switch FIRST (the backend rejects connecting a NIC to a non-existent switch, as
-        # real Hyper-V does).
+        # real Hyper-V does). A switch of that name that already exists is REFUSED, not reused (until
+        # 2026-10-16 the provision connected to it): another run or something outside the tool owns it,
+        # and the gate's isolation checks assume the switch is the one this provision built. The throw
+        # lands in the rollback below, which removes the VM and leaves the foreign switch alone (it was
+        # never added to $createdSwitches).
         if ($Profile['Substrate'] -eq 'HyperV-Gen2' -and $nicPolicy -eq 'IsolatedInternalSwitch') {
             $switchType = 'Internal'
             $switchName = "{0}-int" -f $Name
-            if ($null -eq (& $Backend.GetSwitch @{ Name = $switchName })) {
-                $null = & $Backend.NewSwitch @{ Name = $switchName; SwitchType = $switchType }
-                $createdSwitches.Add($switchName)   # only track switches WE created (don't reap a pre-existing one)
+            if ($null -ne (& $Backend.GetSwitch @{ Name = $switchName })) {
+                throw ("New-SandboxVM: a vSwitch named '$switchName' already exists; refusing to reuse it. Another run or " +
+                       "something outside the tool owns it, and a switch this provision did not build cannot be assumed " +
+                       "isolated. Remove it (Remove-VMSwitch -Name '$switchName') or choose another sandbox name. Fail closed.")
             }
+            $null = & $Backend.NewSwitch @{ Name = $switchName; SwitchType = $switchType }
+            $createdSwitches.Add($switchName)   # the switch this provision built; rollback and teardown reap exactly these
             $null = & $Backend.ConnectNetworkAdapter @{ VMName = $Name; SwitchName = $switchName }
         }
 
@@ -719,8 +728,8 @@ function New-SandboxVM {
             catch { Write-Warning "New-SandboxVM rollback: failed to delete created disks: $($_.Exception.Message)" }
         }
 
-        # Remove every switch THIS provision created (a pre-existing switch was NOT tracked,
-        # so a shared switch is never reaped). RemoveSwitch is idempotent + best-effort.
+        # Remove every switch THIS provision created (a pre-existing switch of the same name is refused
+        # before anything is built, and is never tracked here). RemoveSwitch is idempotent + best-effort.
         foreach ($sw in @($createdSwitches)) {
             try { $null = & $Backend.RemoveSwitch @{ Name = $sw } }
             catch { Write-Warning "New-SandboxVM rollback: failed to remove switch '$sw': $($_.Exception.Message)" }
@@ -784,7 +793,11 @@ function Restore-Sandbox {
 
     -DeleteDisks targets the disks recorded on the sandbox descriptor's CreatedDisks if a
     -Descriptor is supplied; otherwise it falls back to this VM's currently-attached disks
-    (read from the VM before removal) so a caller without the descriptor can still clean up.
+    (read from the VM before removal), but only those under the VM's own storage directory
+    (<StorageRoot>\<Name>, the folder every provision writes its disks into). An attached disk from
+    anywhere else, an operator's original or a disk attached by hand, is skipped and reported with a
+    warning: without the descriptor nothing proves this run created it. Until 2026-10-16 the fallback
+    deleted whatever was attached.
 
     HOST EGRESS: with a -Descriptor that records HostProxy objects (EgressProxy, EgressAcls,
     EgressFirewallRules, EgressGatewayAddress), they are removed after the VM is stopped and before it is
@@ -795,8 +808,9 @@ function Restore-Sandbox {
     SWITCHES: with a -Descriptor, the per-VM switches recorded on its CreatedSwitches are removed
     after the VM is gone, whether or not -DeleteDisks is set (a disk can be worth keeping for
     inspection; a switch whose only VM is gone serves nothing). Only switches New-SandboxVM itself
-    created are listed there, so a pre-existing or shared switch it reused is never reaped. Without
-    a -Descriptor no switch is touched, because ownership cannot be established from a name alone.
+    created are listed there (it refuses a pre-existing switch of its name rather than reuse it), so a
+    switch another run or the operator owns is never reaped. Without a -Descriptor no switch is
+    touched, because ownership cannot be established from a name alone.
 .PARAMETER Name
     The VM name.
 .PARAMETER DeleteDisks
@@ -805,6 +819,10 @@ function Restore-Sandbox {
     (Optional) The New-SandboxVM descriptor; its CreatedDisks list is the authoritative
     set of disks to delete under -DeleteDisks, and its CreatedSwitches list is the set of
     switches to remove.
+.PARAMETER StorageRoot
+    (Optional) the storage root the VM was provisioned under, so the no-descriptor -DeleteDisks
+    fallback can tell the VM's own disks from anything else attached. Resolved like New-SandboxVM's:
+    -StorageRoot, then VOIDSEAL_STORAGE_ROOT, then the %ProgramData%\Voidseal\sandboxes default.
 .PARAMETER Backend
     The Hyper-V backend.
 #>
@@ -814,6 +832,7 @@ function Remove-Sandbox {
         [Parameter(Mandatory)] [string] $Name,
         [switch] $DeleteDisks,
         [pscustomobject] $Descriptor,
+        [string] $StorageRoot,
         [hashtable] $Backend = (New-RealHyperVBackend)
     )
 
@@ -852,22 +871,47 @@ function Remove-Sandbox {
             $disksToDelete = @($Descriptor.CreatedDisks)
         }
         else {
-            # Fallback (no descriptor kept): delete whatever is attached. The fake records
-            # HardDrives as path STRINGS; the real backend as HardDiskDrive objects with a
-            # .Path — normalize both to strings.
+            # Fallback (no descriptor kept): only the attached disks under this VM's own storage directory
+            # (<StorageRoot>\<Name>, where every provision writes its disks). Anything attached from
+            # elsewhere (an operator's original, a disk attached by hand) is skipped and reported: without
+            # the descriptor nothing proves this run created it. The fake records HardDrives as path
+            # STRINGS; the real backend as HardDiskDrive objects with a .Path; normalize both to strings.
+            $vmStorageDir = Join-Path (Resolve-SandboxStorageBase -StorageRoot $StorageRoot) $Name
+            $ownPrefix = [System.IO.Path]::GetFullPath($vmStorageDir).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
             $hd = Get-VMField -VM $vm -Name 'HardDrives' -Default @()
-            $disksToDelete = @($hd | ForEach-Object {
+            $attached = @($hd | ForEach-Object {
                 if ($_ -is [string]) { $_ }
                 elseif ($null -ne $_ -and $null -ne $_.PSObject.Properties['Path']) { [string]$_.Path }
             } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $own     = [System.Collections.Generic.List[string]]::new()
+            $skipped = [System.Collections.Generic.List[string]]::new()
+            foreach ($p in $attached) {
+                $full = $null
+                try { $full = [System.IO.Path]::GetFullPath($p) } catch { $full = $null }
+                if ($null -ne $full -and $full.StartsWith($ownPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { $own.Add($p) }
+                else { $skipped.Add($p) }
+            }
+            if ($skipped.Count -gt 0) {
+                Write-Warning ("Remove-Sandbox: -DeleteDisks without a descriptor skips $($skipped.Count) attached disk(s) outside " +
+                               "'$vmStorageDir', which this run is not known to have created: $($skipped -join ', '). " +
+                               "Delete them by hand if they are disposable.")
+            }
+            $disksToDelete = $own.ToArray()
         }
     }
 
-    # Stop the VM first if it's running (Remove-VM on a running VM is an error / surprise).
+    # Stop the VM first unless it is Off (Remove-VM refuses a VM that is not Off). A Running VM gets the
+    # graceful stop (StopVM -Force, no TurnOff: the guest shuts down through its Shutdown integration
+    # service, the decision docs/threat-model.md records). Any other state (Paused, Saved, a transition
+    # such as Starting or Stopping) has no running guest to shut down, so it is turned off; until
+    # 2026-10-16 only a Running VM was stopped and a Paused or Saved one reached Remove-VM as it was.
     # Effect-only calls are suppressed ($null = ...) so a real-backend emission can't leak.
     $state = [string](Get-VMField -VM $vm -Name 'State' -Default 'Off')
     if ($state -eq 'Running') {
         $null = & $Backend.StopVM @{ Name = $Name; Force = $true }
+    }
+    elseif ($state -ne 'Off') {
+        $null = & $Backend.StopVM @{ Name = $Name; TurnOff = $true; Force = $true }
     }
 
     # HostProxy egress (HostEgress.ps1): with the VM stopped, stop its proxy and remove exactly the port

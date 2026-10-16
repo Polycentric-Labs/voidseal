@@ -137,6 +137,8 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
             'NewVHD', 'NewOutputVhdx', 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'ReadVhdxRawRegion', 'GetVhdxImageHash', 'GetVHDInfo', 'RemoveVHD', 'AddHardDiskDrive', 'RemoveHardDiskDrive', 'SetDvdDrive', 'RemoveDvdDrive', 'GetDvdDrives'
             # switch / network
             'NewSwitch', 'GetSwitch', 'RemoveSwitch', 'ConnectNetworkAdapter', 'RemoveNetworkAdapter', 'GetNetworkAdapter'
+            # adapter guards (the Tier-1 seal sets them, the gate reads them back)
+            'SetNetworkAdapterGuards', 'GetNetworkAdapterGuards'
             # passthrough devices (the seal gate's passthrough refusal)
             'GetGpuPartitionAdapters', 'GetAssignableDevices'
             # checkpoint
@@ -147,13 +149,13 @@ Describe 'HyperVBackend — method manifest (the contract surface)' {
         }
     }
 
-    It 'documents a non-empty arg-key list for every method that takes args (only TestAvailable, GetHostMemory, GetHostIPAddresses and GetNetNats are arg-less)' {
+    It 'documents a non-empty arg-key list for every method that takes args (only TestAvailable, GetHostMemory, GetHostIPAddresses, GetNetNats and GetHostFirewallProfiles are arg-less)' {
         # Arg-key drift guard: if a method silently grew/lost args, this catches the
         # manifest going stale. TestAvailable (the capability probe) and GetHostMemory (a whole-host
         # read) are the documented arg-less methods (@()).
         foreach ($name in $script:ExpectedMethods.Keys) {
             $argKeys = @($script:ExpectedMethods[$name])
-            if ($name -in @('TestAvailable', 'GetHostMemory', 'GetHostIPAddresses', 'GetNetNats')) {
+            if ($name -in @('TestAvailable', 'GetHostMemory', 'GetHostIPAddresses', 'GetNetNats', 'GetHostFirewallProfiles')) {
                 $argKeys.Count | Should -Be 0 -Because "$name takes no named args"
             }
             else {
@@ -227,6 +229,41 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
         }
     }
 
+    It 'BOTH factories name every documented arg key inside the method body (a key a body never names is silently dropped; AST-pinned)' {
+        # Until 2026-10-16 the fake accepted and dropped NewVM Path/NoVHD, StopVM TurnOff/Force, RemoveVM
+        # Force, SetMemory MinimumBytes/MaximumBytes, SetFirmware BootOrder, NewVHD Dynamic, NewSwitch
+        # NetAdapterName, StartEgressProxy ReadyTimeoutSeconds and StopEgressProxy StopFile/TimeoutSeconds.
+        $fakeFactoryAst = $script:RealFactoryAst.Parent.Parent.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'New-FakeHyperVBackend'
+        }, $true) | Select-Object -First 1
+        $fakeFactoryAst | Should -Not -BeNullOrEmpty
+        foreach ($factory in @(@{ Label = 'real'; Ast = $script:RealFactoryAst }, @{ Label = 'fake'; Ast = $fakeFactoryAst })) {
+            foreach ($name in $script:ExpectedMethods.Keys) {
+                $assign = $factory.Ast.FindAll({
+                    param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$b.' + $name)
+                }, $true) | Select-Object -First 1
+                $assign | Should -Not -BeNullOrEmpty -Because "the $($factory.Label) factory must define $name"
+                $literals = @($assign.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+                foreach ($key in @($script:ExpectedMethods[$name])) {
+                    $literals | Should -Contain $key -Because "the $($factory.Label) $name must read its documented arg '$key' (as `$GetArg/`$AssertArg/`$P lookups name it)"
+                }
+            }
+        }
+    }
+
+    It 'the FAKE records every passed key per call (Op=Call), and a call carrying the full manifest key set records exactly that set' {
+        $fake = New-FakeHyperVBackend
+        foreach ($name in $script:ExpectedMethods.Keys) {
+            $keys = @($script:ExpectedMethods[$name])
+            $allArgs = @{}
+            foreach ($k in $keys) { $allArgs[$k] = 'x' }
+            try { $null = & $fake[$name] $allArgs } catch { }   # the call may refuse the dummy values; the record precedes the body
+            $entry = @($fake.FakeCallLog | Where-Object { $_.Op -eq 'Call' -and $_.Method -eq $name }) | Select-Object -Last 1
+            $entry | Should -Not -BeNullOrEmpty -Because "every $name call is recorded"
+            (@($entry.Keys) -join ',') | Should -Be (@($keys | Sort-Object) -join ',') -Because "$name recorded exactly the keys it was passed"
+        }
+    }
+
     It 'the FAKE actually consumes each method''s documented primary-identifier arg key (omitting it throws)' {
         # Arg-key drift guard with teeth: for every method, the manifest documents a
         # primary identifier ('Name' for VM/switch/VHD lifecycle, 'VMName' for ops on an
@@ -248,10 +285,12 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
             AddHardDiskDrive = 'VMName'; RemoveHardDiskDrive = 'VMName'; SetDvdDrive = 'VMName'; RemoveDvdDrive = 'VMName'; GetDvdDrives = 'VMName'
             NewSwitch = 'Name'; GetSwitch = 'Name'; RemoveSwitch = 'Name'
             ConnectNetworkAdapter = 'VMName'; RemoveNetworkAdapter = 'VMName'; GetNetworkAdapter = 'VMName'
+            SetNetworkAdapterGuards = 'VMName'; GetNetworkAdapterGuards = 'VMName'
             GetGpuPartitionAdapters = 'VMName'; GetAssignableDevices = 'VMName'
             AddSwitchHostIPAddress = 'SwitchName'; RemoveSwitchHostIPAddress = 'SwitchName'
             NewHostFirewallRule = 'Name'; GetHostFirewallRule = 'Name'; RemoveHostFirewallRule = 'Name'; GetHostFirewallRuleNames = 'NamePrefix'
             AddNetworkAdapterAcl = 'VMName'; GetNetworkAdapterAcls = 'VMName'; RemoveNetworkAdapterAcl = 'VMName'
+            GetNetIPInterfaceForwarding = 'InterfaceAlias'
             StartEgressProxy = 'PythonExe'; StopEgressProxy = 'ProcessId'
             Checkpoint = 'VMName'; RestoreCheckpoint = 'VMName'; GetCheckpoint = 'VMName'; RemoveCheckpoint = 'VMName'
         }
@@ -260,7 +299,7 @@ Describe 'HyperVBackend — interface parity (fake matches real)' {
         # method added to the manifest forces this map, and thus the contract, to update).
         # TestAvailable and GetHostMemory are arg-less, so they have no primary key to drop.
         $covered  = @($primaryKey.Keys | Sort-Object)
-        $expected = @($script:ExpectedMethods.Keys | Where-Object { $_ -notin @('TestAvailable', 'GetHostMemory', 'GetHostIPAddresses', 'GetNetNats') } | Sort-Object)
+        $expected = @($script:ExpectedMethods.Keys | Where-Object { $_ -notin @('TestAvailable', 'GetHostMemory', 'GetHostIPAddresses', 'GetNetNats', 'GetHostFirewallProfiles') } | Sort-Object)
         ($covered -join ',') | Should -Be ($expected -join ',') -Because 'every arg-taking manifest method must be in the primary-key drift map'
 
         foreach ($name in $primaryKey.Keys) {
@@ -351,6 +390,34 @@ Describe 'Fake backend — VM lifecycle' {
         (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Running'
         & $script:B.StopVM @{ Name = 'vm1' }
         (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
+    }
+
+    It 'StopVM ends in Off with or without TurnOff, and logs both flags and the state it stopped from' {
+        & $script:B.NewVM @{ Name = 'vm1'; Generation = 2 }
+        & $script:B.StartVM @{ Name = 'vm1' }
+        & $script:B.StopVM @{ Name = 'vm1'; Force = $true }
+        (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
+        & $script:B.StartVM @{ Name = 'vm1' }
+        & $script:B.StopVM @{ Name = 'vm1'; TurnOff = $true; Force = $true }
+        (& $script:B.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
+        $stops = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'StopVM' })
+        $stops.Count | Should -Be 2
+        $stops[0].TurnOff | Should -BeFalse
+        $stops[0].Force   | Should -BeTrue
+        $stops[1].TurnOff | Should -BeTrue
+        $stops[1].FromState | Should -Be 'Running'
+    }
+
+    It '-SimulateStateAfterStart leaves a started VM Paused or Saved (a pause or save made outside the tool)' {
+        foreach ($s in 'Paused', 'Saved') {
+            $b = New-FakeHyperVBackend -SimulateStateAfterStart $s
+            & $b.NewVM @{ Name = 'vm1'; Generation = 2 }
+            & $b.StartVM @{ Name = 'vm1' }
+            (& $b.GetVM @{ Name = 'vm1' }).State | Should -Be $s
+            & $b.StopVM @{ Name = 'vm1'; TurnOff = $true }
+            (& $b.GetVM @{ Name = 'vm1' }).State | Should -Be 'Off'
+        }
+        { New-FakeHyperVBackend -SimulateStateAfterStart 'Hibernated' } | Should -Throw
     }
 
     It 'StartVM logs exactly one Op=StartVM CallLog entry for the started VM (positive control — pins the invocation-was-reached instrumentation used by the I2b lifecycle-abort tests'' zero-StartVM-entries assertions)' {
@@ -770,11 +837,6 @@ Describe 'Real backend — GetHostChannels rethrows the unreadable REAL channel 
         }, $true) | Select-Object -First 1
         $script:RealFnAst | Should -Not -BeNullOrEmpty -Because 'the real backend factory must exist'
 
-        # The GuestServices read try/catch inside the real GetHostChannels op (the ONE real channel).
-        $allTry = $script:RealFnAst.FindAll({
-            param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)
-        $script:GsiTry = $allTry | Where-Object { $_.Body.Extent.Text -match 'Guest Service Interface' } | Select-Object -First 1
-
         # Locate the `$b.GetHostChannels = { ... }` assignment body so we can scan the whole method.
         $script:RealChanAssign = $script:RealFnAst.FindAll({
             param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
@@ -782,21 +844,28 @@ Describe 'Real backend — GetHostChannels rethrows the unreadable REAL channel 
         }, $true) | Select-Object -First 1
     }
 
-    It 'the Guest Service Interface (GuestServices) read catch RETHROWS — never coerces to off (THE fix)' {
-        $script:GsiTry | Should -Not -BeNullOrEmpty -Because 'the GSI channel read must be wrapped in a try/catch'
-        $catch = @($script:GsiTry.CatchClauses)[0]
-        $catch | Should -Not -BeNullOrEmpty
-
-        $hasThrow = $null -ne ($catch.Body.FindAll({
-            param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true) | Select-Object -First 1)
-        $hasThrow | Should -BeTrue -Because 'an unreadable GuestServices channel MUST propagate so Assert-Sealed fails closed'
-
-        # The fail-OPEN signature the review caught: `catch { $gsiOn = $false }`. It must be gone.
-        $hasFailOpenAssign = $null -ne ($catch.Body.FindAll({
-            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-                      $n.Left.Extent.Text -eq '$gsiOn'
-        }, $true) | Select-Object -First 1)
-        $hasFailOpenAssign | Should -BeFalse -Because 'coercing an unreadable GuestServices channel to $false (off) is the fail-OPEN bug; the catch must rethrow, not assign'
+    It 'the Guest Service Interface (GuestServices) is read by component GUID in the fail-closed loop: no by-name lookup, no fail-open shape, every catch rethrows' {
+        $script:RealChanAssign | Should -Not -BeNullOrEmpty -Because 'the real factory must define GetHostChannels'
+        # No Get-VMIntegrationService -Name call remains (the English display name is not what a localized
+        # host reports; the GUID read covers GuestServices with the other four services).
+        $byName = @($script:RealChanAssign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                      $n.GetCommandName() -eq 'Get-VMIntegrationService' -and
+                      @($n.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Name' }).Count -gt 0
+        }, $true))
+        $byName.Count | Should -Be 0 -Because 'GuestServices must be found by its component GUID, never by the localized display name'
+        # The fail-OPEN signature the review once caught, `catch { $gsiOn = $false }`, must not come back
+        # in any form: no $gsiOn variable at all, and every catch in the method rethrows.
+        $gsiAssign = @($script:RealChanAssign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$gsiOn' }, $true))
+        $gsiAssign.Count | Should -Be 0
+        $catches = @($script:RealChanAssign.FindAll({ param($n) $n -is [System.Management.Automation.Language.CatchClauseAst] }, $true))
+        foreach ($c in $catches) {
+            $rethrows = $null -ne ($c.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true) | Select-Object -First 1)
+            $rethrows | Should -BeTrue -Because 'an unreadable channel MUST propagate so Assert-Sealed fails closed; a catch that swallows is the fail-open bug'
+        }
+        # And GuestServices is produced by the GUID table, which carries it.
+        $script:IntegrationServiceIds.Contains('GuestServices') | Should -BeTrue
     }
 
     It 'the ESM facets are NOT read from a host property (no Get-CimInstance / ConsoleMode member access gates the seal)' {
@@ -934,28 +1003,33 @@ Describe 'Real backend — Linux-guest host-channel seal model (invalid-enum SET
         $script:ChCap.GetGsiOffAtConsoleMode0.EnhancedSession | Should -BeFalse
     }
 
-    It 'GetHostChannels RETHROWS when the GuestServices read fails (the one real channel is unreadable => fail closed)' {
-        # The fail-closed guard, behaviorally: if the host cannot read the Guest Service Interface state,
-        # GetHostChannels must propagate the error (never coerce to off) so Assert-Sealed refuses.
-        $script:ChCap.GetGsiThrows.err | Should -Not -BeNullOrEmpty -Because 'an unreadable GuestServices channel must propagate so the gate fails closed'
-        $script:ChCap.GetGsiThrows.ch  | Should -BeNullOrEmpty -Because 'no channel hashtable should be returned when the real channel read throws'
+    It 'GetHostChannels THROWS when the Guest Service Interface is missing from the enumeration (the one real channel is unreadable => fail closed)' {
+        # The fail-closed guard, behaviorally: if the host cannot report the Guest Service Interface,
+        # GetHostChannels must throw (never coerce to off) so Assert-Sealed refuses.
+        $script:ChCap.GetGsiThrows.err | Should -BeLike "*could not identify the 'GuestServices' integration service*0 matching*"
+        $script:ChCap.GetGsiThrows.ch  | Should -BeNullOrEmpty -Because 'no channel hashtable should be returned when the real channel cannot be read'
+    }
+
+    It 'SetHostChannel GuestServices-disable pipes the GUID-matched Guest Service Interface object, never a -Name' {
+        $script:ChCap.SetGsiDisable.disableGsiById   | Should -BeTrue -Because 'the Guest Service Interface is found by its component GUID (a German-named stub here)'
+        $script:ChCap.SetGsiDisable.disableGsiByName | Should -BeFalse -Because 'the English display name is not what a localized host reports'
     }
 
     # ---- integration services (design E6): REAL reads by stable component GUID ------------------
     # The harness stubs return services with GERMAN display names, so these pass only if the real body
     # matches on the Id's trailing component GUID. Shutdown and Guest Service Interface are in the stub
     # set too, so a match that grabbed the wrong service would read the wrong value.
-    It 'GetHostChannels reads the four integration services from the host (all ON) and returns all eight keys' {
+    It 'GetHostChannels reads the five integration services from the host (all ON) and returns all eight keys' {
         $c = $script:ChCap.IsGetAllOn
         $c.err  | Should -BeNullOrEmpty
         $c.keys | Should -Be 'Backup,Clipboard,EnhancedSession,GuestServices,Heartbeat,KeyValueExchange,Shares,TimeSync'
-        foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeTrue -Because "$k is enabled on the host" }
+        foreach ($k in 'GuestServices', 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeTrue -Because "$k is enabled on the host" }
     }
 
     It 'GetHostChannels reads them OFF when the host reports them disabled (a real read, not a constant)' {
         $c = $script:ChCap.IsGetAllOff
         $c.err | Should -BeNullOrEmpty
-        foreach ($k in 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeFalse -Because "$k is disabled on the host" }
+        foreach ($k in 'GuestServices', 'TimeSync', 'KeyValueExchange', 'Backup', 'Heartbeat') { $c.$k | Should -BeFalse -Because "$k is disabled on the host" }
     }
 
     It 'GetHostChannels maps each value to its own service (mixed states, localized names)' {
@@ -987,6 +1061,7 @@ Describe 'Real backend — Linux-guest host-channel seal model (invalid-enum SET
 
     It 'SetHostChannel disables each integration service by piping the ID-matched object, never by -Name' {
         $expect = @{
+            IsSetGsiOff       = '6C09BB55-D683-4DA0-8931-C9BF705F6480'
             IsSetTimeSyncOff  = '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
             IsSetKvpOff       = '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
             IsSetBackupOff    = '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
@@ -1069,8 +1144,9 @@ Describe 'Real backend — never binds the nonexistent EnhancedSessionTransportT
 # ===========================================================================
 Describe 'Integration-service seal: matched by stable component GUID, never by localized name (AST-pinned real)' {
 
-    It 'the component GUID table names exactly the four sealed services with their Hyper-V component ids' {
-        $script:IntegrationServiceIds.Keys -join ',' | Should -Be 'TimeSync,KeyValueExchange,Backup,Heartbeat'
+    It 'the component GUID table names exactly the five sealed services with their Hyper-V component ids' {
+        $script:IntegrationServiceIds.Keys -join ',' | Should -Be 'GuestServices,TimeSync,KeyValueExchange,Backup,Heartbeat'
+        $script:IntegrationServiceIds.GuestServices    | Should -Be '6C09BB55-D683-4DA0-8931-C9BF705F6480' -Because 'the Guest Service Interface is matched by GUID like the rest since 2026-10-16'
         $script:IntegrationServiceIds.TimeSync         | Should -Be '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
         $script:IntegrationServiceIds.KeyValueExchange | Should -Be '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
         $script:IntegrationServiceIds.Backup           | Should -Be '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
@@ -1079,7 +1155,7 @@ Describe 'Integration-service seal: matched by stable component GUID, never by l
     }
 
     It 'neither real SetHostChannel nor real GetHostChannels passes an English integration-service name to a cmdlet' {
-        $english = @('Time Synchronization', 'Key-Value Pair Exchange', 'Backup (volume shadow copy)', 'Heartbeat', 'Shutdown')
+        $english = @('Time Synchronization', 'Key-Value Pair Exchange', 'Backup (volume shadow copy)', 'Heartbeat', 'Shutdown', 'Guest Service Interface')
         foreach ($method in 'SetHostChannel', 'GetHostChannels') {
             $assign = & $script:GetRealBackendAssign $method
             $assign | Should -Not -BeNullOrEmpty
@@ -1337,10 +1413,20 @@ Describe 'Fake backend — disk operations' {
         { & $b.NewOutputVhdx @{ Path='C:\t\x.vhdx'; Label='OUTPUT'; FileSystem='ext4'; SizeBytes=64MB } } |
             Should -Throw -ExpectedMessage '*FileSystem*'
     }
-    It 'NewOutputVhdx (fake) rejects an over-length exFAT label (>15)' {
+    It 'NewOutputVhdx (fake) rejects an over-length exFAT label (>11, the real exFAT volume-label limit)' {
         $b = New-FakeHyperVBackend
-        { & $b.NewOutputVhdx @{ Path='C:\t\y.vhdx'; Label='THIS_LABEL_IS_WAY_TOO_LONG'; FileSystem='exFAT'; SizeBytes=64MB } } |
-            Should -Throw -ExpectedMessage '*abel*'
+        { & $b.NewOutputVhdx @{ Path='C:\t\y.vhdx'; Label='TWELVE_CHARS'; FileSystem='exFAT'; SizeBytes=64MB } } |
+            Should -Throw -ExpectedMessage '*Label*12 chars*exFAT maximum of 11*' -Because 'exFAT labels are 11 characters; the 15 the table once carried would pass a label live Format-Volume rejects'
+    }
+    It 'NewOutputVhdx (fake) accepts an 11-character exFAT label: VSD plus an 8-character data-disk name' {
+        $b = New-FakeHyperVBackend
+        $label = 'VSD' + 'abcdefgh'
+        $label.Length | Should -Be 11
+        { & $b.NewOutputVhdx @{ Path='C:\t\vsd.vhdx'; Label=$label; FileSystem='exFAT'; SizeBytes=64MB } } | Should -Not -Throw
+        (& $b.GetVHDInfo @{ Path='C:\t\vsd.vhdx' }).Label | Should -Be $label
+        foreach ($shipped in 'INPUT', 'OUTPUT', 'CIDATA', 'VERDICT') {
+            (& $script:SbValidateVhdxFormat 'exFAT' $shipped) | Should -Be 'exFAT' -Because "the shipped label $shipped must still fit"
+        }
     }
     It 'NewOutputVhdx (fake) accepts a valid lowercase exfat (normalized)' {
         $b = New-FakeHyperVBackend
@@ -1578,6 +1664,25 @@ Describe 'Fake backend — disk operations' {
         @($vm.HardDrives) | Should -Not -Contain 'C:\vhd\d.vhdx'
     }
 
+    It 'RemoveHardDiskDrive THROWS when no attached drive has the path (never a silent success), leaving the other disks attached' {
+        & $script:B.NewVHD @{ Path = 'C:\vhd\d1.vhdx'; SizeBytes = 40GB }
+        & $script:B.AddHardDiskDrive @{ VMName = 'vm1'; Path = 'C:\vhd\d1.vhdx' }
+        { & $script:B.RemoveHardDiskDrive @{ VMName = 'vm1'; Path = 'C:\vhd\never-attached.vhdx' } } |
+            Should -Throw -ExpectedMessage "*no hard disk drive on 'vm1' has the path 'C:\vhd\never-attached.vhdx'; nothing was detached*"
+        @((& $script:B.GetVM @{ Name = 'vm1' }).HardDrives) | Should -Be @('C:\vhd\d1.vhdx')
+        # A second detach of the same path is the same refusal: the first one already took it off the VM.
+        & $script:B.RemoveHardDiskDrive @{ VMName = 'vm1'; Path = 'C:\vhd\d1.vhdx' }
+        { & $script:B.RemoveHardDiskDrive @{ VMName = 'vm1'; Path = 'C:\vhd\d1.vhdx' } } | Should -Throw -ExpectedMessage '*nothing was detached*'
+        @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'RemoveHardDiskDrive' }).Count | Should -Be 3 -Because 'every attempt is logged, refused ones included'
+    }
+
+    It 'NewVHD on a path that already exists THROWS (real New-VHD refuses to overwrite) and leaves the existing record as it was' {
+        & $script:B.NewVHD @{ Path = 'C:\vhd\once.vhdx'; SizeBytes = 40GB }
+        { & $script:B.NewVHD @{ Path = 'C:\vhd\once.vhdx'; SizeBytes = 1GB } } |
+            Should -Throw -ExpectedMessage "*'C:\vhd\once.vhdx' already exists*"
+        (& $script:B.GetVHDInfo @{ Path = 'C:\vhd\once.vhdx' }).SizeBytes | Should -Be 40GB
+    }
+
     It 'AddHardDiskDrive on a VHD that was NEVER created throws (real Add-VMHardDiskDrive requires the file to exist)' {
         # Fake≠real fidelity: real Hyper-V errors if the .vhdx path does not exist. The fake
         # must mirror that — otherwise the consumers attach a phantom disk and tests go false-green.
@@ -1773,10 +1878,33 @@ namespace Microsoft.HyperV.PowerShell {
         (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
     }
 
-    It 'still classifies generic permission phrasing from any exception layer as unavailable (existing behavior preserved)' {
+    It 'still classifies generic permission phrasing that names Hyper-V as unavailable (existing behavior preserved)' {
         $ex = New-Object System.Exception('Access is denied. Run as Administrator or join Hyper-V Administrators.')
         $errorRecord = New-Object System.Management.Automation.ErrorRecord($ex, 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
         (& $script:SbIsUnavailableError $errorRecord) | Should -BeTrue
+    }
+
+    It 'classifies "Access is denied" from a Hyper-V-shaped cmdlet as unavailable, but NOT the same words from a plain file operation' {
+        function Get-VMDeniedZz9 {
+            [CmdletBinding()] param()
+            $PSCmdlet.ThrowTerminatingError([System.Management.Automation.ErrorRecord]::new(
+                [System.UnauthorizedAccessException]::new('Access is denied.'), 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null))
+        }
+        function Copy-ThingZz9 {
+            [CmdletBinding()] param()
+            $PSCmdlet.ThrowTerminatingError([System.Management.Automation.ErrorRecord]::new(
+                [System.UnauthorizedAccessException]::new("Access to the path 'C:\s\deps.vhdx' is denied."), 'X', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null))
+        }
+        $fromHyperV = $null; $fromFileOp = $null
+        try { Get-VMDeniedZz9 } catch { $fromHyperV = $_ }
+        try { Copy-ThingZz9 } catch { $fromFileOp = $_ }
+        $fromHyperV.InvocationInfo.MyCommand.Name | Should -Be 'Get-VMDeniedZz9'
+        (& $script:SbIsUnavailableError $fromHyperV) | Should -BeTrue -Because 'a Hyper-V cmdlet refusing for permissions is the elevation / Hyper-V Administrators case'
+        (& $script:SbIsUnavailableError $fromFileOp) | Should -BeFalse -Because 'an ACL problem on a file must keep its own message, not become the "run elevated or join Hyper-V Administrators" advice'
+        # A plain string throw (no command behind it) with the same words is not rebranded either.
+        $plain = $null
+        try { throw 'GetVhdxImageHash: access denied ("Access to the path is denied."). Failing closed.' } catch { $plain = $_ }
+        (& $script:SbIsUnavailableError $plain) | Should -BeFalse
     }
 
     It 'still returns $false for an arbitrary unrelated exception (existing behavior preserved)' {
@@ -1811,6 +1939,35 @@ Describe 'Fake backend — switch + network adapter' {
         # Capture outside Should -Not -Throw (child-scope assignment caveat).
         $sw = & $script:B.GetSwitch @{ Name = 'ghost' }
         $sw | Should -BeNullOrEmpty
+    }
+
+    It 'NewSwitch External REQUIRES NetAdapterName like the real body, and records it; Internal does not need one' {
+        { & $script:B.NewSwitch @{ Name = 'ext-none'; SwitchType = 'External' } } |
+            Should -Throw -ExpectedMessage "*NewSwitch(External): required argument 'NetAdapterName' is missing*"
+        (& $script:B.GetSwitch @{ Name = 'ext-none' }) | Should -BeNullOrEmpty -Because 'the refused switch was not recorded'
+        & $script:B.NewSwitch @{ Name = 'ext-ok'; SwitchType = 'External'; NetAdapterName = 'Ethernet' }
+        (& $script:B.GetSwitch @{ Name = 'ext-ok' }).NetAdapterName | Should -Be 'Ethernet'
+        & $script:B.NewSwitch @{ Name = 'int-ok'; SwitchType = 'Internal' }
+        (& $script:B.GetSwitch @{ Name = 'int-ok' }).NetAdapterName | Should -BeNullOrEmpty
+    }
+
+    It 'the fake records the keys the other once-dropped args arrive with: NewVM Path/NoVHD, SetMemory bounds, SetFirmware BootOrder, NewVHD Dynamic, StopEgressProxy StopFile/TimeoutSeconds' {
+        & $script:B.NewVM @{ Name = 'vm2'; Generation = 2; Path = 'C:\vms'; NoVHD = $true }
+        $vm2 = & $script:B.GetVM @{ Name = 'vm2' }
+        $vm2.Path  | Should -Be 'C:\vms'
+        $vm2.NoVHD | Should -BeTrue
+        & $script:B.SetMemory @{ VMName = 'vm2'; StartupBytes = 2GB; DynamicMemoryEnabled = $true; MinimumBytes = 1GB; MaximumBytes = 4GB }
+        $vm2.MemoryMinimumBytes | Should -Be 1GB
+        $vm2.MemoryMaximumBytes | Should -Be 4GB
+        & $script:B.SetFirmware @{ VMName = 'vm2'; EnableSecureBoot = $true; BootOrder = @('disk', 'net') }
+        @($vm2.BootOrder) | Should -Be @('disk', 'net')
+        & $script:B.NewVHD @{ Path = 'C:\vhd\fixed.vhdx'; SizeBytes = 1GB; Dynamic = $false }
+        $rec = & $script:B.GetVHDInfo @{ Path = 'C:\vhd\fixed.vhdx' }
+        $rec | Should -Not -BeNullOrEmpty
+        $removed = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'Call' -and $_.Method -eq 'NewVHD' })
+        $removed[-1].Keys | Should -Contain 'Dynamic'
+        & $script:B.RemoveVM @{ Name = 'vm2'; Force = $false }
+        (@($script:B.FakeCallLog | Where-Object { $_.Op -eq 'RemoveVM' })[-1]).Force | Should -BeFalse
     }
 
     It 'NewVM without a SwitchName still creates ONE unconnected adapter (real New-VM always does)' {
@@ -1909,6 +2066,55 @@ Describe 'Fake backend — switch + network adapter' {
 
         & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
         (& $script:B.GetNetworkAdapter @{ VMName = 'vm1' }).Count | Should -Be 0 -Because 'sealing a Tier2/3 VM removes all NICs; Assert-Sealed verifies this from the host'
+    }
+
+    # ---- adapter guards (SetNetworkAdapterGuards / GetNetworkAdapterGuards) ----
+    It 'a new VM''s adapter carries Hyper-V''s guard defaults: MacAddressSpoofing, DhcpGuard and RouterGuard all Off' {
+        $g = & $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' }
+        $g.MacAddressSpoofing | Should -Be 'Off'
+        $g.DhcpGuard          | Should -Be 'Off'
+        $g.RouterGuard        | Should -Be 'Off'
+    }
+
+    It 'SetNetworkAdapterGuards records the three values and GetNetworkAdapterGuards reads them back' {
+        & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = 'On' }
+        $g = & $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' }
+        $g.MacAddressSpoofing | Should -Be 'Off'
+        $g.DhcpGuard          | Should -Be 'On'
+        $g.RouterGuard        | Should -Be 'On'
+        # An adapter added by hand (no guard keys) reads the defaults, like a real adapter added outside the tool.
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        (& $script:B.GetVM @{ Name = 'vm1' }).NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter' })
+        (& $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' }).DhcpGuard | Should -Be 'Off'
+    }
+
+    It 'SetNetworkAdapterGuards rejects anything but ''On'' / ''Off'' (what the OnOffState enum accepts), leaving the adapter untouched, and requires all three' {
+        { & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'Off'; DhcpGuard = 'Yes'; RouterGuard = 'On' } } |
+            Should -Throw -ExpectedMessage "*DhcpGuard must be 'On' or 'Off' (got 'Yes')*"
+        { & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'off'; DhcpGuard = 'On'; RouterGuard = 'On' } } |
+            Should -Throw -ExpectedMessage "*MacAddressSpoofing must be 'On' or 'Off'*" -Because 'the compare is exact; the enum renders On and Off'
+        (& $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' }).RouterGuard | Should -Be 'Off' -Because 'a rejected call changes nothing'
+        { & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'Off'; DhcpGuard = 'On' } } |
+            Should -Throw -ExpectedMessage "*required argument 'RouterGuard'*"
+    }
+
+    It 'GetNetworkAdapterGuards THROWS when the VM has zero or two adapters (the gate must never pick one)' {
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        { & $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' } } | Should -Throw -ExpectedMessage '*expected exactly one network adapter*found 0*'
+        $vm = & $script:B.GetVM @{ Name = 'vm1' }
+        $vm.NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter' })
+        $vm.NetworkAdapters.Add(@{ SwitchName = $null; Name = 'Network Adapter 2' })
+        { & $script:B.GetNetworkAdapterGuards @{ VMName = 'vm1' } } | Should -Throw -ExpectedMessage '*found 2*'
+    }
+
+    It 'SetNetworkAdapterGuards on a VM with no adapter is a no-op (nothing to set), and -SimulateAdapterGuardsStuck leaves the values as they were' {
+        & $script:B.RemoveNetworkAdapter @{ VMName = 'vm1' }
+        { & $script:B.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = 'On' } } | Should -Not -Throw
+        $stuck = New-FakeHyperVBackend -SimulateAdapterGuardsStuck
+        & $stuck.NewVM @{ Name = 'vm2'; Generation = 2 }
+        & $stuck.SetNetworkAdapterGuards @{ VMName = 'vm2'; MacAddressSpoofing = 'Off'; DhcpGuard = 'On'; RouterGuard = 'On' }
+        (& $stuck.GetNetworkAdapterGuards @{ VMName = 'vm2' }).DhcpGuard | Should -Be 'Off' -Because 'the set did not take'
+        @($stuck.FakeCallLog | Where-Object { $_.Op -eq 'SetNetworkAdapterGuards' }).Count | Should -Be 1 -Because 'the attempt is still logged'
     }
 }
 
@@ -2164,9 +2370,48 @@ Describe 'Seal-device methods: the REAL bodies, executed out of process against 
         $script:SealDevCap.CpList_Fail.err     | Should -Match 'simulated Get-VMSnapshot failure' -Because 'an unreadable checkpoint list must not read as empty'
     }
 
-    It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal)' {
+    It 'a failing passthrough cmdlet propagates as a throw (the gate turns it into a refusal), for the GPU and the DDA read alike' {
         $script:SealDevCap.Gpu_Throw.err | Should -Match 'simulated Get-VMGpuPartitionAdapter failure'
         $script:SealDevCap.Gpu_Throw.queriedVM | Should -Be 'vm1' -Because 'the throwing cmdlet was still asked about the right VM'
+        $script:SealDevCap.Dda_Throw.err | Should -Match 'simulated Get-VMAssignableDevice failure'
+        $script:SealDevCap.Dda_Throw.queriedVM | Should -Be 'vm1'
+        $script:SealDevCap.Dda_Throw.isArray | Should -BeFalse -Because 'a throw returns nothing, so no array can be read as "no devices"'
+    }
+
+    It 'RemoveHardDiskDrive detaches exactly the drive with the path, and THROWS when no attached drive has it' {
+        $script:SealDevCap.Detach_Match.err | Should -BeNullOrEmpty
+        @($script:SealDevCap.Detach_Match.removed) | Should -Be @('C:\s\b.vhdx')
+        $script:SealDevCap.Detach_NoMatch.err | Should -BeLike "*no hard disk drive on 'vm1' has the path 'C:\s\c.vhdx'; nothing was detached*"
+        @($script:SealDevCap.Detach_NoMatch.removed).Count | Should -Be 0
+        $script:SealDevCap.Detach_None.err | Should -BeLike '*nothing was detached*' -Because 'a VM with no drives at all is the same refusal'
+    }
+
+    It 'SetNetworkAdapterGuards passes the VM name and the three values through to Set-VMNetworkAdapter, and refuses a value the enum would reject before calling it' {
+        $c = $script:SealDevCap.Guards_Set
+        $c.err | Should -BeNullOrEmpty
+        $c.call.VMName             | Should -Be 'vm1'
+        $c.call.MacAddressSpoofing | Should -Be 'Off'
+        $c.call.DhcpGuard          | Should -Be 'On'
+        $c.call.RouterGuard        | Should -Be 'On'
+        $script:SealDevCap.Guards_SetBad.err    | Should -Match "RouterGuard must be 'On' or 'Off'"
+        $script:SealDevCap.Guards_SetBad.called | Should -BeFalse -Because 'the value is refused before the cmdlet runs'
+    }
+
+    It 'GetNetworkAdapterGuards reads the one adapter''s guards as On/Off text off the enum properties' {
+        $c = $script:SealDevCap.Guards_GetOne
+        $c.err | Should -BeNullOrEmpty
+        $c.queriedVM | Should -Be 'vm1'
+        $c.result.MacAddressSpoofing | Should -Be 'Off'
+        $c.result.DhcpGuard          | Should -Be 'On'
+        $c.result.RouterGuard        | Should -Be 'On'
+        $c.types | Should -Be 'String,String,String' -Because 'the enum values are rendered as text for the gate to compare exactly'
+    }
+
+    It 'GetNetworkAdapterGuards THROWS for zero or two adapters, for an adapter without a guard property, and for a failing enumeration' {
+        $script:SealDevCap.Guards_GetNone.err   | Should -BeLike '*expected exactly one network adapter*found 0*'
+        $script:SealDevCap.Guards_GetTwo.err    | Should -BeLike '*expected exactly one network adapter*found 2*'
+        $script:SealDevCap.Guards_GetNoProp.err | Should -BeLike '*reports no RouterGuard value*'
+        $script:SealDevCap.Guards_GetFail.err   | Should -Match 'simulated Get-VMNetworkAdapter failure'
     }
 }
 
@@ -2495,6 +2740,41 @@ Describe 'Real backend — ReadVhdxRawRegion rides out a transient detach settle
         { & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 5 -DelayMilliseconds 1 } |
             Should -Throw -ExpectedMessage '*malformed image*'
         $script:lockCalls | Should -Be 1 -Because 'a malformed-image error is not transient; retrying would mask the real cause'
+    }
+
+    It 'does NOT retry an access-denied error: it fails at once with a permissions message, never "still locked"' -ForEach @(
+        @{ Msg = 'Access to the path ''C:\s\out.vhdx'' is denied.' }
+        @{ Msg = 'qemu-img: Could not open ''C:\s\out.vhdx'': Permission denied' }
+        @{ Msg = 'Access is denied.' }
+    ) {
+        $script:lockCalls = 0
+        $script:deniedMsg = $Msg   # script-scoped: a closure would carry its own module scope for $script: (the I5a lesson)
+        $op = { $script:lockCalls++; throw $script:deniedMsg }
+        $err = $null
+        try { & $script:SbInvokeWithLockRetry -Operation $op -MaxAttempts 5 -DelayMilliseconds 1 -Context 'GetVhdxImageHash' } catch { $err = $_.Exception.Message }
+        $script:lockCalls | Should -Be 1 -Because 'an ACL problem does not clear with time; five retries would only delay the real cause'
+        $err | Should -Match '^GetVhdxImageHash: access denied'
+        $err | Should -Match 'not a transient lock'
+        $err | Should -Not -Match 'still locked'
+    }
+
+    It 'the five Mount-VHD sites ride the lock-retry too (WriteVhdxFile, ReadVhdxFile, WriteVhdxFileBytes, ReadVhdxFileBytes, CopyDirectoryToVhdx; AST-pinned)' {
+        foreach ($method in 'WriteVhdxFile', 'ReadVhdxFile', 'WriteVhdxFileBytes', 'ReadVhdxFileBytes', 'CopyDirectoryToVhdx') {
+            $assign = & $script:GetRealBackendAssign $method
+            $assign | Should -Not -BeNullOrEmpty
+            $mounts = @(& $script:PinFindCommand $assign 'Mount-VHD')
+            $mounts.Count | Should -Be 1 -Because "$method mounts the VHDX exactly once"
+            # Walk up from the Mount-VHD call: an ancestor must be `& $LockRetry ... -Operation { ... }`.
+            $node = $mounts[0].Parent
+            $wrapped = $false
+            while ($null -ne $node) {
+                if ($node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                    $node.CommandElements[0].VariablePath.UserPath -eq 'LockRetry') { $wrapped = $true; break }
+                $node = $node.Parent
+            }
+            $wrapped | Should -BeTrue -Because "$method's first Mount-VHD after a detach can hit the RC8 settle-lag sharing violation like the copies and the hash do"
+        }
     }
 }
 
@@ -3096,6 +3376,29 @@ Describe 'Resolve-QemuImg (I5 version-floor + SHA-256 pin)' {
         Resolve-QemuImg -MinVersion '8.2.0' | Should -Be 'C:\qemu\qemu-img.exe'
         Should -Invoke Get-FileSha256 -Times 0
     }
+    It 'refuses a .cmd or .bat shim on PATH without running it (a shim runs through cmd.exe and can rewrite the arguments)' -ForEach @(
+        @{ Shim = 'C:\tools\qemu-img.cmd' }, @{ Shim = 'C:\tools\qemu-img.bat' }, @{ Shim = 'C:\tools\qemu-img.ps1' }
+    ) {
+        Mock Get-QemuImgPath    { $Shim }.GetNewClosure()
+        Mock Get-QemuImgVersion { throw 'the shim must not be executed' }
+        Mock Get-FileSha256     { 'a' * 64 }
+        { Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a' * 64) } | Should -Throw -ExpectedMessage '*script shim rather than a binary*'
+        Should -Invoke Get-QemuImgVersion -Times 0
+    }
+    It 'compares the pin BEFORE running --version: a mismatched binary is never executed' {
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256     { 'deadbeef' }
+        Mock Get-QemuImgVersion { throw 'an unpinned binary must not run, not even for --version' }
+        { Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a' * 64) } | Should -Throw -ExpectedMessage '*hash mismatch*'
+        Should -Invoke Get-QemuImgVersion -Times 0
+        Should -Invoke Get-FileSha256 -Times 1 -Exactly
+    }
+    It 'with a matching pin the version floor is still enforced afterwards' {
+        Mock Get-QemuImgPath    { 'C:\qemu\qemu-img.exe' }
+        Mock Get-FileSha256     { 'a' * 64 }
+        Mock Get-QemuImgVersion { '1.7.0' }
+        { Resolve-QemuImg -MinVersion '8.2.0' -PinnedSha256 ('a' * 64) } | Should -Throw -ExpectedMessage '*below the required floor*'
+    }
 }
 
 # ===========================================================================
@@ -3186,5 +3489,58 @@ Describe 'Real backend - SetProcessor caps and GetHostMemory (out-of-process cap
 
     It 'GetHostMemory throws when the CIM instance carries no usable memory figures' {
         $script:Cap2.GetHostMemory_Empty.err | Should -Match 'HyperVBackend\.GetHostMemory'
+    }
+}
+
+# ===========================================================================
+#  REAL GetVM / GetSwitch: exact-name selection out of a wildcard by-name read
+# ===========================================================================
+#  Get-VM -Name and Get-VMSwitch -Name treat * ? [ ] as wildcards and Hyper-V allows duplicate VM names,
+#  so the by-name read can return objects the caller never named, or several of the one it did. The real
+#  bodies route the result through $script:SbSelectExactName; the helper is unit-tested here and the two
+#  bodies are pinned to call it.
+Describe '$script:SbSelectExactName: the exact-name pick behind the real GetVM and GetSwitch' {
+
+    It 'returns $null for no exact match (including a wildcard hit on another name) and the one object for a single exact match' {
+        (& $script:SbSelectExactName @() 'vm1' 'GetVM') | Should -BeNullOrEmpty
+        $other = [pscustomobject]@{ Name = 'vm10'; State = 'Off' }
+        (& $script:SbSelectExactName @($other) 'vm1' 'GetVM') | Should -BeNullOrEmpty -Because 'Get-VM -Name vm1* would return vm10; it is not vm1'
+        $one = [pscustomobject]@{ Name = 'vm1'; State = 'Off' }
+        $picked = & $script:SbSelectExactName @($other, $one) 'vm1' 'GetVM'
+        $picked.Name | Should -Be 'vm1'
+        $picked.State | Should -Be 'Off'
+    }
+
+    It 'compares case-sensitively and ignores an object without a Name' {
+        (& $script:SbSelectExactName @([pscustomobject]@{ Name = 'VM1' }) 'vm1' 'GetVM') | Should -BeNullOrEmpty
+        (& $script:SbSelectExactName @([pscustomobject]@{ VMName = 'vm1' }) 'vm1' 'GetVM') | Should -BeNullOrEmpty
+    }
+
+    It 'THROWS when more than one object carries exactly the name (a duplicate VM name is never resolved by picking the first)' {
+        $dup = @([pscustomobject]@{ Name = 'vm1' }, [pscustomobject]@{ Name = 'vm1' })
+        { & $script:SbSelectExactName $dup 'vm1' 'GetVM' } |
+            Should -Throw -ExpectedMessage "HyperVBackend.GetVM: 2 objects are named exactly 'vm1'; refusing to pick one. Fail closed."
+    }
+
+    It 'the real GetVM and GetSwitch route their by-name read through the helper (AST-pinned)' {
+        foreach ($method in 'GetVM', 'GetSwitch') {
+            $assign = & $script:GetRealBackendAssign $method
+            $assign | Should -Not -BeNullOrEmpty
+            $calls = @($assign.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                          $n.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                          $n.CommandElements[0].VariablePath.UserPath -eq 'SelectExact'
+            }, $true))
+            $calls.Count | Should -Be 1 -Because "$method must hand the by-name read to the exact-name pick"
+            # The by-name read is collected into an array first, so a single object is never unrolled away.
+            $byName = @($assign.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                          $n.GetCommandName() -in @('Get-VM', 'Get-VMSwitch') -and
+                          @($n.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Name' }).Count -gt 0
+            }, $true))
+            $byName.Count | Should -Be 1
+            # @( Get-VM ... ) parses as ArrayExpression > StatementBlock > Pipeline > Command.
+            $byName[0].Parent.Parent.Parent | Should -BeOfType [System.Management.Automation.Language.ArrayExpressionAst] -Because "$method wraps the by-name read in @()"
+        }
     }
 }

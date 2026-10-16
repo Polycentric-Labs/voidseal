@@ -39,14 +39,41 @@ Set-StrictMode -Version Latest
 # --- Recording stubs (top-level script scope, defined BEFORE the dot-source so the closures resolve
 #     their cmdlet calls to these) --------------------------------------------------------------
 $script:stubNics    = @()
+$script:stubNicFail = $false
 $script:capGetNicVM = $null
 $script:capRemove   = [System.Collections.Generic.List[object]]::new()
+
+# The OnOffState enum the real adapter object carries for MacAddressSpoofing, DhcpGuard and RouterGuard.
+enum StubOnOff { Off = 0; On = 1 }
 
 function Get-VMNetworkAdapter {
     [CmdletBinding()]
     param([string[]] $VMName)
     $script:capGetNicVM = $VMName
+    if ($script:stubNicFail) { throw 'stub: simulated Get-VMNetworkAdapter failure' }
     foreach ($n in $script:stubNics) { $n }
+}
+
+# Hard disk drive stubs for RemoveHardDiskDrive: the attached drives and what the removal received.
+$script:stubDrives     = @()
+$script:capRemoveDrive = [System.Collections.Generic.List[string]]::new()
+function Get-VMHardDiskDrive {
+    [CmdletBinding()]
+    param([string[]] $VMName)
+    foreach ($d in $script:stubDrives) { $d }
+}
+function Remove-VMHardDiskDrive {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline)] $VMHardDiskDrive)
+    process { $script:capRemoveDrive.Add([string]$VMHardDiskDrive.Path) }
+}
+
+# Set-VMNetworkAdapter stub for SetNetworkAdapterGuards: records the parameters it received.
+$script:capSetNic = $null
+function Set-VMNetworkAdapter {
+    [CmdletBinding()]
+    param([string[]] $VMName, [string] $MacAddressSpoofing, [string] $DhcpGuard, [string] $RouterGuard)
+    $script:capSetNic = [ordered]@{ VMName = (@($VMName) -join ','); MacAddressSpoofing = $MacAddressSpoofing; DhcpGuard = $DhcpGuard; RouterGuard = $RouterGuard }
 }
 
 function Remove-VMNetworkAdapter {
@@ -82,6 +109,7 @@ function Add-VMNetworkAdapter {
 $script:stubGpu      = @()
 $script:stubDda      = @()
 $script:stubGpuThrow = $false
+$script:stubDdaThrow = $false
 $script:capReadVM    = $null
 
 function Get-VMGpuPartitionAdapter {
@@ -96,6 +124,7 @@ function Get-VMAssignableDevice {
     [CmdletBinding()]
     param([string[]] $VMName)
     $script:capReadVM = $VMName
+    if ($script:stubDdaThrow) { throw 'stub: simulated Get-VMAssignableDevice failure' }
     foreach ($d in $script:stubDda) { $d }
 }
 
@@ -156,8 +185,52 @@ function Get-VMSnapshot {
 $b = New-RealHyperVBackend
 
 function New-StubAdapter {
-    param([string] $Id)
-    [pscustomobject]@{ Id = $Id; Name = 'Network Adapter'; SwitchName = $null }
+    param([string] $Id, [switch] $Guarded, [switch] $NoRouterGuard)
+    $nic = [ordered]@{ Id = $Id; Name = 'Network Adapter'; SwitchName = $null }
+    if ($Guarded) {
+        $nic.MacAddressSpoofing = [StubOnOff]::Off
+        $nic.DhcpGuard          = [StubOnOff]::On
+        if (-not $NoRouterGuard) { $nic.RouterGuard = [StubOnOff]::On }
+    }
+    [pscustomobject]$nic
+}
+
+# Run the real RemoveHardDiskDrive against the given attached drive paths; report the error and the paths
+# the removal cmdlet received.
+function Invoke-DetachScenario {
+    param([string[]] $Attached, [string] $Path)
+    $script:stubDrives     = @($Attached | ForEach-Object { [pscustomobject]@{ Path = $_; ControllerNumber = 0; ControllerLocation = 1 } })
+    $script:capRemoveDrive = [System.Collections.Generic.List[string]]::new()
+    $err = $null
+    try { & $b.RemoveHardDiskDrive @{ VMName = 'vm1'; Path = $Path } | Out-Null } catch { $err = $_.Exception.Message }
+    return [ordered]@{ err = $err; removed = @($script:capRemoveDrive) }
+}
+
+# Run the real SetNetworkAdapterGuards; report the error and what Set-VMNetworkAdapter received.
+function Invoke-GuardSetScenario {
+    param([string] $Spoof, [string] $Dhcp, [string] $Router)
+    $script:capSetNic = $null
+    $err = $null
+    try { & $b.SetNetworkAdapterGuards @{ VMName = 'vm1'; MacAddressSpoofing = $Spoof; DhcpGuard = $Dhcp; RouterGuard = $Router } | Out-Null }
+    catch { $err = $_.Exception.Message }
+    return [ordered]@{ err = $err; called = ($null -ne $script:capSetNic); call = $script:capSetNic }
+}
+
+# Run the real GetNetworkAdapterGuards against the given stub adapters; report the record (and its value
+# types) or the error.
+function Invoke-GuardGetScenario {
+    param([object[]] $Adapters, [switch] $Fail)
+    $script:stubNics    = $Adapters
+    $script:stubNicFail = $Fail.IsPresent
+    $script:capGetNicVM = $null
+    $err = $null; $r = $null
+    try { $r = & $b.GetNetworkAdapterGuards @{ VMName = 'vm1' } } catch { $err = $_.Exception.Message }
+    $script:stubNicFail = $false
+    $types = $null
+    if ($r -is [System.Collections.IDictionary]) {
+        $types = @('MacAddressSpoofing', 'DhcpGuard', 'RouterGuard' | ForEach-Object { $r[$_].GetType().Name }) -join ','
+    }
+    return [ordered]@{ err = $err; queriedVM = (@($script:capGetNicVM) -join ','); result = $r; types = $types }
 }
 
 # Run the real RemoveNetworkAdapter with the given stub adapters; report the error, which VM the
@@ -199,7 +272,9 @@ function Invoke-ReadScenario {
     param([string] $Method, [object[]] $Items, [switch] $Throw)
     $script:stubGpu      = @()
     $script:stubDda      = @()
-    $script:stubGpuThrow = $Throw.IsPresent
+    # -Throw makes the cmdlet behind the method under test fail (the GPU read or the DDA read).
+    $script:stubGpuThrow = $Throw.IsPresent -and ($Method -eq 'GetGpuPartitionAdapters')
+    $script:stubDdaThrow = $Throw.IsPresent -and ($Method -eq 'GetAssignableDevices')
     $script:capReadVM    = $null
     if ($Method -eq 'GetGpuPartitionAdapters') { $script:stubGpu = $Items } else { $script:stubDda = $Items }
     $err = $null; $r = $null
@@ -260,8 +335,19 @@ $out = [ordered]@{
     Gpu_One   = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @([pscustomobject]@{ Id = 'gpu-p-0' })
     Gpu_Two   = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @([pscustomobject]@{ Id = 'gpu-p-0' }, [pscustomobject]@{ Id = 'gpu-p-1' })
     Gpu_Throw = Invoke-ReadScenario -Method 'GetGpuPartitionAdapters' -Items @() -Throw
+    Detach_Match     = Invoke-DetachScenario -Attached @('C:\s\a.vhdx', 'C:\s\b.vhdx') -Path 'C:\s\b.vhdx'
+    Detach_NoMatch   = Invoke-DetachScenario -Attached @('C:\s\a.vhdx', 'C:\s\b.vhdx') -Path 'C:\s\c.vhdx'
+    Detach_None      = Invoke-DetachScenario -Attached @() -Path 'C:\s\a.vhdx'
+    Guards_Set       = Invoke-GuardSetScenario -Spoof 'Off' -Dhcp 'On' -Router 'On'
+    Guards_SetBad    = Invoke-GuardSetScenario -Spoof 'Off' -Dhcp 'On' -Router 'Maybe'
+    Guards_GetOne    = Invoke-GuardGetScenario -Adapters @((New-StubAdapter 'nic-0' -Guarded))
+    Guards_GetNone   = Invoke-GuardGetScenario -Adapters @()
+    Guards_GetTwo    = Invoke-GuardGetScenario -Adapters @((New-StubAdapter 'nic-0' -Guarded), (New-StubAdapter 'nic-1' -Guarded))
+    Guards_GetNoProp = Invoke-GuardGetScenario -Adapters @((New-StubAdapter 'nic-0' -Guarded -NoRouterGuard))
+    Guards_GetFail   = Invoke-GuardGetScenario -Adapters @() -Fail
     Dda_None  = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @()
     Dda_One   = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @([pscustomobject]@{ LocationPath = 'PCIROOT(0)#PCI(0300)' })
+    Dda_Throw = Invoke-ReadScenario -Method 'GetAssignableDevices' -Items @() -Throw
     Com2_Empty = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '' }
     Com2_Path  = Invoke-ComScenario -Number 2 -Paths @{ 1 = '\\.\pipe\vm1-com1'; 2 = '\\.\pipe\extra' }
     Com2_Fail  = Invoke-ComScenario -Number 2 -Fail

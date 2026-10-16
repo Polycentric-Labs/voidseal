@@ -191,7 +191,8 @@ function Get-VM {
         return $null   # bare availability probe — emit nothing, do not throw
     }
     if ($script:CreatedVMs.Contains($Name)) {
-        return [pscustomobject]@{ __Stub = 'VM'; VMName = $Name; State = 'Off' }
+        # Name is what the real VM object carries and what GetVM's exact-name filter compares.
+        return [pscustomobject]@{ __Stub = 'VM'; Name = $Name; VMName = $Name; State = 'Off' }
     }
     return $null
 }

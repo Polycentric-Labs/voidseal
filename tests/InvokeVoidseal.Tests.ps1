@@ -328,6 +328,19 @@ Describe 'Invoke-Voidseal — SealVerdict guard: a non-throwing FALSE verdict st
         $report.Error     | Should -Not -BeNullOrEmpty -Because 'the guard records why it refused to run'
     }
 
+    It 'does NOT reach RUNNING when Assert-Sealed returns a non-boolean that a [bool] cast would call true (an array holding $true)' {
+        Mock Assert-Sealed { return @('leak', $true) }
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
+            -Name 'sbx-verdictarray' -ArtifactRoot $script:Art -Destination $script:Dest -Backend $script:B -ErrorAction SilentlyContinue
+        @($report.States) | Should -Not -Contain 'RUNNING' -Because 'only a [bool] $true certifies; a truthy non-boolean is refused'
+        @($report.States) | Should -Not -Contain 'SEALED'
+        $report.SealVerdict | Should -BeFalse -Because 'the recorded verdict is not a [bool] cast of whatever came back'
+        $report.Error | Should -Match 'non-boolean verdict of type Object\[\]'
+        $report.RunResult | Should -BeNullOrEmpty
+        (& $script:B.GetVM @{ Name = 'sbx-verdictarray' }) | Should -BeNullOrEmpty -Because 'teardown still runs'
+        $report.TeardownStatus | Should -BeLike 'OK*'
+    }
+
     It 'tears down the VM when the verdict guard refuses (no orphan)' {
         Mock Assert-Sealed { return $false }
         Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Workload $script:Workload `
@@ -2872,5 +2885,82 @@ Describe 'Invoke-Voidseal: unknown profile keys and ResultInnerName layering' {
         { Invoke-Voidseal -Tier 0 -Profile $script:RinProfile -Workload @{ WorkloadMode = 'Disk'; ResultInnerName = '..\escape.html' } `
             -Name 'sbx-rin-bad' -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b } |
             Should -Throw -ExpectedMessage '*ResultInnerName*'
+    }
+}
+
+# ===========================================================================
+#  -Name is validated at the parameter: wildcards, spaces and over-long names never reach the backend
+# ===========================================================================
+Describe 'Invoke-Voidseal: -Name is refused at the parameter when it could act as a wildcard or an unsafe path or rule name' {
+
+    It 'refuses a name with a wildcard character, a space or a leading hyphen before any backend call' -ForEach @(
+        @{ Bad = 'sbx*' }, @{ Bad = 'sbx?' }, @{ Bad = 'sbx[0]' }, @{ Bad = 'sbx run' }, @{ Bad = '-sbx' }, @{ Bad = ('s' * 65) }
+    ) {
+        $b = New-FakeHyperVBackend
+        { Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name $Bad -Backend $b } |
+            Should -Throw -ExpectedMessage '*does not match*' -Because 'Get-VM -Name treats * ? [ ] as wildcards and the name becomes a folder, a pipe and firewall rule names'
+        @($b.FakeCallLog).Count | Should -Be 0 -Because 'parameter validation refuses before the body runs, so nothing is provisioned and nothing torn down'
+    }
+
+    It 'still accepts a well-formed name and still generates one when -Name is omitted' {
+        $b = New-FakeHyperVBackend
+        $report = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Name 'Sbx-1.ok_name' -Backend $b `
+            -ArtifactRoot (Join-Path $script:TmpRoot ("art-name-{0}" -f ([guid]::NewGuid().ToString('N'))))
+        $report.Error | Should -BeNullOrEmpty
+        $report.Descriptor.Name | Should -Be 'Sbx-1.ok_name'
+        $b2 = New-FakeHyperVBackend
+        $report2 = Invoke-Voidseal -Tier 1 -Profile $script:Tier1 -Backend $b2 `
+            -ArtifactRoot (Join-Path $script:TmpRoot ("art-name-{0}" -f ([guid]::NewGuid().ToString('N'))))
+        $report2.Error | Should -BeNullOrEmpty
+        $report2.Descriptor.Name | Should -Match '^sbx-1-[0-9a-f]{8}$'
+    }
+}
+
+# ===========================================================================
+#  A data disk that is no longer attached when the orchestrator detaches it is a host-side detach failure
+# ===========================================================================
+#  RemoveHardDiskDrive throws when no attached drive has the path (both backends). The orchestrator's
+#  existing detach catch turns that into the documented Failed run: the host read is skipped, nothing is
+#  extracted, and teardown still runs.
+Describe 'Invoke-Voidseal: an OUTPUT disk gone from the VM before the detach is a Failed run with the detach reason, never a read of an unattached disk' {
+
+    BeforeAll {
+        $script:GoneDisk = Import-TierProfile -Path (Join-Path $script:TierDir 'tier0.psd1')
+        $script:GoneDisk = @{} + $script:GoneDisk
+        $script:GoneDisk['Name']         = 'firefox-gone'
+        $script:GoneDisk['WorkloadMode'] = 'Disk'
+        $script:GoneDisk['Inputs']       = script:New-OutboxHelperInputs
+        $script:GoneDisk['FileSystem']   = 'exFAT'
+        $script:GoneDisk['OutboxOutput'] = $true
+        Assert-TierProfileValid -Profile $script:GoneDisk -Context 'TEST Tier-0 Disk-mode fixture (disk gone before detach)'
+    }
+
+    It 'records a Failed run naming the missing drive, skips the host read, and still tears down' {
+        $b = New-FakeHyperVBackend -SimulateSelfPowerOff
+        $origStart  = $b.StartVM
+        $origDetach = $b.RemoveHardDiskDrive
+        # While the guest runs, its OUTPUT disk is detached from the VM outside the tool (a hot-detach
+        # by an operator or another process): the orchestrator's own detach then finds nothing to remove.
+        $b.StartVM = {
+            param($P)
+            & $origStart $P
+            $vm = & $b.GetVM @{ Name = $P.Name }
+            foreach ($hd in @($vm.HardDrives)) {
+                $info = & $b.GetVHDInfo @{ Path = $hd }
+                if ($null -ne $info -and [string]$info.Label -eq 'OUTPUT') { & $origDetach @{ VMName = $P.Name; Path = $hd } }
+            }
+        }.GetNewClosure()
+        $art  = Join-Path $script:TmpRoot ("art-gone-{0}"  -f ([guid]::NewGuid().ToString('N')))
+        $dest = Join-Path $script:TmpRoot ("dest-gone-{0}" -f ([guid]::NewGuid().ToString('N')))
+        $report = Invoke-Voidseal -Tier 0 -Profile $script:GoneDisk -Workload @{ WorkloadMode = 'Disk' } `
+            -Name 'sbx-disk-gone' -ArtifactRoot $art -Destination $dest -WorkloadTimeoutSeconds 0 -BootPollDelaySeconds 0 -Backend $b
+        $report.Error            | Should -BeNullOrEmpty -Because 'a detach failure is a reported run outcome, not a lifecycle abort'
+        $report.RunResult.Status | Should -Be 'Failed'
+        $report.RunResult.Reason | Should -Match 'data-disk detach failed'
+        $report.RunResult.Reason | Should -Match 'no hard disk drive on .sbx-disk-gone. has the path' -Because 'the refusal names the host-side cause'
+        @($report.States)        | Should -Not -Contain 'EXTRACTED'
+        @($b.FakeCallLog | Where-Object { $_.Op -eq 'ReadVhdxRawRegion' }).Count | Should -Be 0 -Because 'the host never reads a disk it could not detach itself'
+        @($report.States)        | Should -Contain 'DESTROYED'
+        (& $b.GetVM @{ Name = 'sbx-disk-gone' }) | Should -BeNullOrEmpty
     }
 }

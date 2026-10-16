@@ -39,6 +39,8 @@ Describe 'Host egress backend methods: the manifest' {
         $m['RemoveNetworkAdapterAcl']   | Should -Be @('VMName', 'Action', 'Direction', 'Weight')
         $m['StartEgressProxy']          | Should -Be @('PythonExe', 'ScriptPath', 'Arguments', 'ReadyFile', 'ReadyTimeoutSeconds')
         $m['StopEgressProxy']           | Should -Be @('ProcessId', 'StartTime', 'StopFile', 'TimeoutSeconds')
+        $m['GetHostFirewallProfiles']   | Should -BeNullOrEmpty
+        $m['GetNetIPInterfaceForwarding'] | Should -Be @('InterfaceAlias')
     }
 }
 
@@ -167,15 +169,32 @@ Describe 'Host egress backend methods: the fake' {
     }
 
     It 'StartEgressProxy records a running process without starting Python, and StopEgressProxy stops exactly it' {
-        $r = & $script:B.StartEgressProxy @{ PythonExe = 'C:\py\python.exe'; ScriptPath = $script:ProxyScript; Arguments = @('--listen-host', '10.231.0.1', $null); ReadyFile = 'C:\x\ready.json' }
+        $r = & $script:B.StartEgressProxy @{ PythonExe = 'C:\py\python.exe'; ScriptPath = $script:ProxyScript; Arguments = @('--listen-host', '10.231.0.1', $null); ReadyFile = 'C:\x\ready.json'; ReadyTimeoutSeconds = 7 }
         $r.ProcessId | Should -BeGreaterThan 0
         $r.CommandLine | Should -Be ('"C:\py\python.exe" "' + $script:ProxyScript + '" "--listen-host" "10.231.0.1"')
         $script:B.FakeEgressProcesses[$r.ProcessId].Running | Should -BeTrue
+        $script:B.FakeEgressProcesses[$r.ProcessId].ReadyTimeoutSeconds | Should -Be 7 -Because 'the fake reads the ready timeout like the real body'
+        $null = & $script:B.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = 'not-it'; StopFile = 'C:\x\stop'; TimeoutSeconds = 3 }
+        $stopEntry = @($script:B.FakeCallLog | Where-Object { $_.Op -eq 'StopEgressProxy' })[-1]
+        $stopEntry.StopFile       | Should -Be 'C:\x\stop'
+        $stopEntry.TimeoutSeconds | Should -Be 3
         (& $script:B.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = 'not-it' }).AlreadyGone | Should -BeTrue
         $script:B.FakeEgressProcesses[$r.ProcessId].Running | Should -BeTrue -Because 'a start-time mismatch means the id is not ours'
         (& $script:B.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = $r.StartTime }).AlreadyGone | Should -BeFalse
         $script:B.FakeEgressProcesses[$r.ProcessId].Running | Should -BeFalse
         (& $script:B.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = $r.StartTime }).AlreadyGone | Should -BeTrue
+    }
+
+    It '-SimulateEgressProxyUnkillable makes StopEgressProxy report Stopped=$false with Killed=$true and leaves the process running' {
+        $b = New-FakeHyperVBackend -SimulateEgressProxyUnkillable
+        $r = & $b.StartEgressProxy @{ PythonExe = 'C:\py\python.exe'; ScriptPath = $script:ProxyScript; Arguments = @(); ReadyFile = 'C:\x\ready.json' }
+        $s = & $b.StopEgressProxy @{ ProcessId = $r.ProcessId; StartTime = $r.StartTime; StopFile = 'C:\x\stop'; TimeoutSeconds = 1 }
+        $s.Stopped     | Should -BeOfType [bool]
+        $s.Stopped     | Should -BeFalse
+        $s.Killed      | Should -BeTrue
+        $s.AlreadyGone | Should -BeFalse
+        $b.FakeEgressProcesses[$r.ProcessId].Running | Should -BeTrue -Because 'the process survived the kill'
+        (& $script:B.StopEgressProxy @{ ProcessId = 1; StartTime = 'x' }).Stopped | Should -BeTrue -Because 'an unknown pid is already gone, which is a stopped state'
     }
 
     It 'StartEgressProxy refuses a proxy script that does not exist, like the real body' {
@@ -187,6 +206,55 @@ Describe 'Host egress backend methods: the fake' {
         { & $b.GetNetNats @{} } | Should -Throw '*SimulateEgressMethodError*'
         { & $b.NewHostFirewallRule @{ Name = 'r'; Direction = 'Inbound'; Action = 'Block'; Protocol = 'UDP'; InterfaceAlias = 'x' } } | Should -Throw '*SimulateEgressMethodError*'
         { & $b.GetHostIPAddresses @{} } | Should -Not -Throw
+    }
+
+    It 'GetHostFirewallProfiles reports Domain, Private and Public enabled with Block by default, as an array of copies' {
+        $p = & $script:B.GetHostFirewallProfiles @{}
+        $p -is [array] | Should -BeTrue
+        @($p | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('Domain', 'Private', 'Public')
+        foreach ($row in $p) {
+            $row.Enabled | Should -BeOfType [bool]
+            $row.Enabled | Should -BeTrue
+            $row.DefaultInboundAction | Should -Be 'Block'
+        }
+        $p[0].Enabled = $false
+        (& $script:B.GetHostFirewallProfiles @{} | Where-Object { $_.Name -eq $p[0].Name }).Enabled | Should -BeTrue -Because 'a read hands out copies'
+    }
+
+    It '-SimulateFirewallProfile overrides one profile (disabled, Allow, or removed) and refuses an unknown profile name' {
+        $b = New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Public'; Enabled = $false }, @{ Name = 'Private'; DefaultInboundAction = 'Allow' })
+        $p = & $b.GetHostFirewallProfiles @{}
+        ($p | Where-Object { $_.Name -eq 'Public' }).Enabled | Should -BeFalse
+        ($p | Where-Object { $_.Name -eq 'Private' }).DefaultInboundAction | Should -Be 'Allow'
+        ($p | Where-Object { $_.Name -eq 'Domain' }).Enabled | Should -BeTrue -Because 'the untouched profile keeps its default'
+        $b2 = New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Domain'; Remove = $true })
+        @((& $b2.GetHostFirewallProfiles @{}) | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('Private', 'Public')
+        { New-FakeHyperVBackend -SimulateFirewallProfile @(@{ Name = 'Guest'; Enabled = $false }) } | Should -Throw '*unknown profile*Guest*'
+        { & (New-FakeHyperVBackend -SimulateEgressMethodError @('GetHostFirewallProfiles')).GetHostFirewallProfiles @{} } | Should -Throw '*SimulateEgressMethodError*'
+    }
+
+    It 'GetNetIPInterfaceForwarding reads Disabled for both families on a switch''s vEthernet interface, and throws for an alias the host does not have' {
+        New-EgressFakeVM -Backend $script:B
+        $f = & $script:B.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (vm1-int)' }
+        $f.IPv4 | Should -Be 'Disabled'
+        $f.IPv6 | Should -Be 'Disabled'
+        (& $script:B.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'Ethernet' }).IPv4 | Should -Be 'Disabled' -Because 'the seeded LAN interface exists too'
+        { & $script:B.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (nope-int)' } } | Should -Throw "*no host interface 'vEthernet (nope-int)'*"
+        { & $script:B.GetNetIPInterfaceForwarding @{} } | Should -Throw '*InterfaceAlias*'
+    }
+
+    It '-SimulateNetIPInterfaceForwarding sets a family''s value (Enabled or Missing) and -SimulateEgressMethodError makes the read throw' {
+        $b = New-FakeHyperVBackend -SimulateNetIPInterfaceForwarding @{ IPv4 = 'Enabled' }
+        New-EgressFakeVM -Backend $b
+        $f = & $b.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (vm1-int)' }
+        $f.IPv4 | Should -Be 'Enabled'
+        $f.IPv6 | Should -Be 'Disabled'
+        $b2 = New-FakeHyperVBackend -SimulateNetIPInterfaceForwarding @{ IPv6 = 'Missing' }
+        New-EgressFakeVM -Backend $b2
+        (& $b2.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (vm1-int)' }).IPv6 | Should -Be 'Missing'
+        $b3 = New-FakeHyperVBackend -SimulateEgressMethodError @('GetNetIPInterfaceForwarding')
+        New-EgressFakeVM -Backend $b3
+        { & $b3.GetNetIPInterfaceForwarding @{ InterfaceAlias = 'vEthernet (vm1-int)' } } | Should -Throw '*SimulateEgressMethodError*'
     }
 }
 
@@ -359,6 +427,58 @@ Describe 'Host egress backend methods: the REAL bodies, executed out of process 
         $script:Cap.Nat_One.first.InternalIPInterfaceAddressPrefix | Should -Be '10.231.0.0/24'
     }
 
+    It 'GetHostFirewallProfiles reads the active store and maps each profile to a plain record with a real [bool] Enabled' {
+        $c = $script:Cap.Profiles_AllOn
+        $c.err | Should -BeNullOrEmpty
+        $c.store | Should -Be 'ActiveStore'
+        $c.isArray | Should -BeTrue
+        $c.count | Should -Be 3
+        @($c.rows | ForEach-Object { $_.Name }) | Should -Be @('Domain', 'Private', 'Public')
+        foreach ($row in $c.rows) {
+            $row.EnabledType | Should -Be 'Boolean' -Because 'the GpoBoolean enum must be compared as text, never cast'
+            $row.Enabled | Should -BeTrue
+            $row.InboundType | Should -Be 'String'
+            $row.DefaultInboundAction | Should -Be 'Block'
+        }
+    }
+
+    It 'GetHostFirewallProfiles reports a disabled profile as Enabled $false (not the truthy enum) and passes Allow through as text' {
+        $rows = $script:Cap.Profiles_Mixed.rows
+        $script:Cap.Profiles_Mixed.err | Should -BeNullOrEmpty
+        ($rows | Where-Object { $_.Name -eq 'Private' }).Enabled | Should -BeFalse -Because 'the enum False member is truthy under [bool]; the real body compares the text'
+        ($rows | Where-Object { $_.Name -eq 'Public' }).DefaultInboundAction | Should -Be 'Allow'
+        ($rows | Where-Object { $_.Name -eq 'Domain' }).Enabled | Should -BeTrue
+    }
+
+    It 'GetHostFirewallProfiles keeps a single profile an array, and THROWS when the cmdlet reports a failure' {
+        $script:Cap.Profiles_One.isArray | Should -BeTrue
+        $script:Cap.Profiles_One.count | Should -Be 1
+        $script:Cap.Profiles_Fail.err | Should -Match 'firewall profiles unreadable'
+    }
+
+    It 'GetNetIPInterfaceForwarding asks for the alias in the active store and maps both families to Disabled when their rows read Disabled' {
+        $c = $script:Cap.Fwd_Disabled
+        $c.err | Should -BeNullOrEmpty
+        $c.alias | Should -Be 'vEthernet (sbx-int)'
+        $c.store | Should -Be 'ActiveStore'
+        $c.result.IPv4 | Should -Be 'Disabled'
+        $c.result.IPv6 | Should -Be 'Disabled'
+    }
+
+    It 'GetNetIPInterfaceForwarding reports an enabled family as Enabled, a family with no row as Missing, and one enabled row among two as Enabled' {
+        $script:Cap.Fwd_V4On.result.IPv4 | Should -Be 'Enabled'
+        $script:Cap.Fwd_V4On.result.IPv6 | Should -Be 'Disabled'
+        $script:Cap.Fwd_NoV6.result.IPv4 | Should -Be 'Disabled'
+        $script:Cap.Fwd_NoV6.result.IPv6 | Should -Be 'Missing' -Because 'a family the host does not report cannot be assumed off'
+        $script:Cap.Fwd_TwoV4Rows.result.IPv4 | Should -Be 'Enabled' -Because 'one forwarding row is enough to route around the proxy'
+    }
+
+    It 'GetNetIPInterfaceForwarding THROWS for an alias the host does not know and when the cmdlet reports a failure' {
+        $script:Cap.Fwd_UnknownAlias.err | Should -Match 'No MSFT_NetIPInterface objects found'
+        $script:Cap.Fwd_UnknownAlias.isNull | Should -BeTrue
+        $script:Cap.Fwd_Fail.err | Should -Match 'IP interface unreadable'
+    }
+
     It 'StartEgressProxy starts a real child, waits for its ready file and records a quoted command line without null arguments' {
         $s = $script:Cap.Start_Ok
         $s.err | Should -BeNullOrEmpty
@@ -378,9 +498,36 @@ Describe 'Host egress backend methods: the REAL bodies, executed out of process 
         $script:Cap.Stop_Again.result.AlreadyGone | Should -BeTrue
     }
 
-    It 'StopEgressProxy kills a proxy that ignores the stop file' {
+    It 'StopEgressProxy kills a proxy that ignores the stop file, and reports Stopped=$true only because the kill ended it' {
         $script:Cap.Stop_Kill.result.Killed | Should -BeTrue
+        $script:Cap.Stop_Kill.result.Stopped | Should -BeTrue
         $script:Cap.Stop_Kill.alive | Should -BeFalse
+    }
+
+    It 'the REAL StopEgressProxy derives Stopped from the post-kill WaitForExit instead of asserting $true (AST-pinned; an unkillable process cannot be driven here)' {
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:LibPath, [ref]$tokens, [ref]$errors)
+        $assign = $ast.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                      $n.Left.Extent.Text -eq '$b.StopEgressProxy' -and
+                      $n.Right.Extent.Text -match 'GetProcessById'
+        }, $true) | Select-Object -First 1
+        $assign | Should -Not -BeNullOrEmpty -Because 'the real factory must define StopEgressProxy'
+        # The post-kill WaitForExit result must be captured into a plain variable other than $null (the
+        # outer `$b.StopEgressProxy = {...}` assignment is excluded: its Left is a member expression).
+        $captured = @($assign.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                      $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                      $n.Left.Extent.Text -ne '$null' -and
+                      $n.Right.Extent.Text -match 'WaitForExit\(5000\)'
+        }, $true))
+        $captured.Count | Should -Be 1 -Because 'the result of the post-kill wait decides Stopped'
+        $stoppedVar = $captured[0].Left.Extent.Text
+        # And the final return's Stopped field reads that variable, not a constant.
+        $returns = @($assign.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] }, $true) |
+            Where-Object { $_.Extent.Text -match 'AlreadyGone = \$false' })
+        $returns.Count | Should -Be 1
+        $returns[0].Extent.Text | Should -Match ('Stopped = \[bool\]' + [regex]::Escape($stoppedVar))
     }
 
     It 'StartEgressProxy THROWS for an early exit, a ready timeout, a ready file naming another pid and a missing script' {

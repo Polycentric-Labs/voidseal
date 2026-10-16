@@ -84,8 +84,10 @@ $script:HostChannelNames = @(
 # Time Synchronization 2497F4DE, Key-Value Pair Exchange 2A34B1C2, VSS 5CED1297, Guest Service Interface
 # 6C09BB55). LIVE-UNVERIFIED: no run has yet read these Ids off a real VM. A mismatch fails CLOSED (no
 # match throws), so the worst case is a seal that refuses, never one that certifies a service it did not
-# read. GuestServices keeps its older by-name read (see GetHostChannels).
+# read. Since 2026-10-16 GuestServices (the Guest Service Interface) is matched the same way; until then
+# it alone was looked up by its English display name, which a localized host does not report.
 $script:IntegrationServiceIds = [ordered]@{
+    GuestServices    = '6C09BB55-D683-4DA0-8931-C9BF705F6480'
     TimeSync         = '2497F4DE-E9FA-4204-80E4-4B75C46419C0'
     KeyValueExchange = '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'
     Backup           = '5CED1297-4598-4915-A5FC-AD21BB4D02A4'
@@ -318,6 +320,15 @@ function Get-HyperVBackendMethodManifest {
         ConnectNetworkAdapter= @('VMName', 'SwitchName')
         RemoveNetworkAdapter = @('VMName')                         # the SEAL operation
         GetNetworkAdapter    = @('VMName')                         # -> @() of NIC records
+        # Guards on the kept adapter (2026-10-16): Set-VMNetworkAdapter -MacAddressSpoofing / -DhcpGuard /
+        # -RouterGuard. Lock-Sandbox sets Off / On / On for an IsolatedInternalSwitch VM and Assert-Sealed
+        # reads them back, so the guest cannot change its source MAC, answer DHCP or advertise routes on
+        # the switch (defense in depth under the host egress enforcement). Values are the strings 'On'
+        # and 'Off', as the cmdlet's OnOffState enum renders; both factories reject anything else. The
+        # read throws unless the VM has exactly one adapter, so the gate never certifies an ambiguous
+        # read. Both real bodies are pinned out of process by Invoke-RealSealDeviceCapture.ps1.
+        SetNetworkAdapterGuards = @('VMName', 'MacAddressSpoofing', 'DhcpGuard', 'RouterGuard')
+        GetNetworkAdapterGuards = @('VMName')                      # -> @{ MacAddressSpoofing; DhcpGuard; RouterGuard } ('On'|'Off')
 
         # ---- passthrough devices (SEAL/GATE surface) ----
         # Host-TRUTH reads of devices that bypass the virtual NIC entirely: GPU partition adapters
@@ -350,8 +361,14 @@ function Get-HyperVBackendMethodManifest {
         GetNetworkAdapterAcls   = @('VMName')                      # -> @() of normalized extended-ACL records
         RemoveNetworkAdapterAcl = @('VMName', 'Action', 'Direction', 'Weight')   # idempotent; a VM that is gone is a no-op
         GetNetNats              = @()                              # -> @() of @{ Name; InternalIPInterfaceAddressPrefix }
+        # Two more host reads behind the seal gate (2026-10-16). The rules above are a control only while
+        # Windows Firewall is enforcing them, and the gateway's vEthernet interface must not forward between
+        # the VM subnet and the host's other interfaces. Plain hashtables with string fields, like the other
+        # reads; neither has run on a live host. Both are pinned out of process by the egress capture fixture.
+        GetHostFirewallProfiles = @()                              # -> @() of @{ Name; Enabled = [bool]; DefaultInboundAction = [string] }
+        GetNetIPInterfaceForwarding = @('InterfaceAlias')          # -> @{ IPv4 = 'Enabled'|'Disabled'|'Missing'; IPv6 = the same }
         StartEgressProxy        = @('PythonExe', 'ScriptPath', 'Arguments', 'ReadyFile', 'ReadyTimeoutSeconds')   # -> @{ ProcessId; StartTime; CommandLine }
-        StopEgressProxy         = @('ProcessId', 'StartTime', 'StopFile', 'TimeoutSeconds')                   # -> @{ Stopped; Killed; AlreadyGone }
+        StopEgressProxy         = @('ProcessId', 'StartTime', 'StopFile', 'TimeoutSeconds')                   # -> @{ Stopped; Killed; AlreadyGone }; Stopped=$false when the process survived the kill
 
         # ---- checkpoint ----
         Checkpoint           = @('VMName', 'SnapshotName')
@@ -454,9 +471,21 @@ $script:SbIsUnavailableError = {
         $ex -is [System.Management.Automation.CommandNotFoundException] -and
         $ex.CommandName -match '^\w+-(VM|VHD)') { return $true }
 
-    # Generic permission / elevation phrasing from any layer.
+    # Generic permission / elevation phrasing. Rebranded as "Hyper-V unavailable or insufficient privilege"
+    # only when it names Hyper-V or came from a Hyper-V-shaped cmdlet (Get-VM, New-VHD, Mount-VHD, ...).
+    # The same words from a plain file operation inside a real method (Copy-Item, Remove-Item, a .NET
+    # FileStream open) are an ACL problem on that file: until 2026-10-16 they were rebranded too, and the
+    # operator was told to run elevated when the fix was a folder permission. They now keep their own message.
     if ($msg -match '(?i)(do not have the required permission|requires elevation|access is denied|run as administrator|Hyper-V Administrators)') {
-        return $true
+        if ($msg -match '(?i)Hyper-V') { return $true }
+        $commandName = ''
+        try {
+            if ($null -ne $ErrorRecord.InvocationInfo -and $null -ne $ErrorRecord.InvocationInfo.MyCommand) {
+                $commandName = [string]$ErrorRecord.InvocationInfo.MyCommand.Name
+            }
+        }
+        catch { $commandName = '' }
+        if ($commandName -match '^\w+-(VM|VHD)') { return $true }
     }
 
     return $false
@@ -547,13 +576,23 @@ $script:SbInvokeWithLockRetry = {
         [string] $Context = 'ReadVhdxRawRegion'   # method name for the fail-closed message (backward-compat default)
     )
     # Lock-class signatures (case-insensitive). These are the Windows + qemu-img phrasings for a file that
-    # is still open by another handle (the unreleased Hyper-V worker-process handle, here).
+    # is still open by another handle (the unreleased Hyper-V worker-process handle, here). The Windows
+    # qemu-img build reports a CreateFile failure with the Win32 text, so a sharing violation reads "being
+    # used by another process" there too; 'Failed to get shared lock' is qemu's own lock message.
     $lockPatterns = @(
         'sharing violation',
         'used by another process',
         'being used by another',
-        'Failed to get shared lock',
-        'Permission denied'
+        'Failed to get shared lock'
+    )
+    # Access-denied signatures (case-insensitive): an ACL or read-only problem on the file or its folder.
+    # Until 2026-10-16 'Permission denied' sat in the lock set, so an ACL problem was retried five times and
+    # then reported as a lock that never released. It is not transient; it fails at once with its own cause.
+    $deniedPatterns = @(
+        'Permission denied',
+        'Access is denied',
+        'Access to the path',
+        'UnauthorizedAccess'
     )
     if ($MaxAttempts -lt 1) { $MaxAttempts = 1 }
     $attempt = 0
@@ -565,6 +604,13 @@ $script:SbInvokeWithLockRetry = {
         catch {
             $caught = $_
             $message = if ($caught -and $caught.Exception) { [string]$caught.Exception.Message } else { [string]$caught }
+            $isDenied = $false
+            foreach ($pat in $deniedPatterns) { if ($message -match ('(?i)' + [regex]::Escape($pat))) { $isDenied = $true; break } }
+            if ($isDenied) {
+                throw ("${Context}: access denied (`"$message`"). This is a permissions or read-only problem on the file or " +
+                       "its folder, not a transient lock, so it was not retried. Check the ACL and the read-only flag " +
+                       "on the VHDX and its directory. Failing closed.")
+            }
             $isLock = $false
             foreach ($pat in $lockPatterns) { if ($message -match ('(?i)' + [regex]::Escape($pat))) { $isLock = $true; break } }
             # Not a lock-class error -> a real failure (e.g. malformed image); rethrow unchanged (do NOT retry).
@@ -578,6 +624,37 @@ $script:SbInvokeWithLockRetry = {
             }
             if ($DelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $DelayMilliseconds }
             # loop and retry
+        }
+    }
+}
+
+# Pick the ONE object whose Name is exactly $Name out of what Get-VM -Name or Get-VMSwitch -Name
+# returned. Both cmdlets treat * ? [ ] in -Name as wildcards, and Hyper-V allows several VMs with the
+# same name, so a by-name read can hand back objects the caller never asked for, or several of the one it
+# did. The compare is exact and case-sensitive. Zero exact matches is $null (no such object), one is the
+# object, more than one THROWS: the caller must never act on an ambiguous name (Remove-Sandbox would stop
+# and unregister whichever came first). The fake resolves exact dictionary keys and needs no filter.
+$script:SbSelectExactName = {
+    param([object[]] $Items, [string] $Name, [string] $Method)
+    $exact = @($Items | Where-Object {
+        $null -ne $_ -and $null -ne $_.PSObject.Properties['Name'] -and ([string]$_.Name) -ceq $Name
+    })
+    if ($exact.Count -gt 1) {
+        throw "HyperVBackend.${Method}: $($exact.Count) objects are named exactly '$Name'; refusing to pick one. Fail closed."
+    }
+    if ($exact.Count -eq 0) { return $null }
+    return $exact[0]
+}
+
+# Validate the three adapter-guard values EARLY and IDENTICALLY in BOTH factories: real
+# Set-VMNetworkAdapter binds them to its OnOffState enum, which accepts exactly 'On' and 'Off', so a
+# fake that recorded any other text would pass a value the live cmdlet rejects.
+$script:SbAssertGuardValues = {
+    param([System.Collections.IDictionary] $Values, [string] $Method)
+    foreach ($guard in 'MacAddressSpoofing', 'DhcpGuard', 'RouterGuard') {
+        $v = [string]$Values[$guard]
+        if ($v -cne 'On' -and $v -cne 'Off') {
+            throw "${Method}: $guard must be 'On' or 'Off' (got '$v'); real Set-VMNetworkAdapter accepts nothing else."
         }
     }
 }
@@ -602,8 +679,11 @@ $script:SbValidateVhdxFormat = {
     # Raw = create-without-format: no Format-Volume, so no real label limit applies.
     # The Label on a Raw disk is a mock-internal discovery tag only — see NewOutputVhdx.
     if ($normalized -eq 'Raw') { return 'Raw' }
-    # Max volume-label length per filesystem (real Format-Volume limits).
-    $maxLabel = @{ exFAT = 15; FAT32 = 11; NTFS = 32; FAT = 11 }[$normalized]
+    # Max volume-label length per filesystem (real Format-Volume limits). exFAT's volume label is 11
+    # characters, like FAT and FAT32 (the 15 this table carried until 2026-10-16 would have passed a label
+    # the live Format-Volume rejects); the shipped labels (INPUT, OUTPUT, CIDATA, VERDICT, VSD plus an
+    # 8-character data-disk name) all fit.
+    $maxLabel = @{ exFAT = 11; FAT32 = 11; NTFS = 32; FAT = 11 }[$normalized]
     $labelLen = if ($null -ne $Label) { ([string]$Label).Length } else { 0 }
     if ($labelLen -gt $maxLabel) {
         throw ("NewOutputVhdx: Label '$Label' is $labelLen chars, exceeding the " +
@@ -736,9 +816,10 @@ function Get-FileSha256 {
 
 .DESCRIPTION
     Used by the REAL ReadVhdxRawRegion before it parses an untrusted guest VHDX. Fails closed
-    (throws) if: qemu-img is not found on PATH; its reported version is below -MinVersion (a
-    patch-currency floor — see the file-level comment above this function, NOT a CVE-derived
-    gate); or -PinnedSha256 is supplied and the resolved binary's SHA-256 does not match it.
+    (throws) if: qemu-img is not found on PATH; it resolves to a .cmd/.bat shim instead of a binary;
+    -PinnedSha256 is supplied and the resolved binary's SHA-256 does not match it (checked before the
+    binary is run at all); or its reported version is below -MinVersion (a patch-currency floor, see
+    the file-level comment above this function, NOT a CVE-derived gate).
     Returns the resolved qemu-img path on success.
 #>
 function Resolve-QemuImg {
@@ -749,17 +830,27 @@ function Resolve-QemuImg {
     )
     $path = Get-QemuImgPath
     if (-not $path) {
-        throw "Resolve-QemuImg: qemu-img not found on PATH — the user-space read needs qemu-img (host attach of an untrusted disk is FORBIDDEN). Failing closed."
+        throw "Resolve-QemuImg: qemu-img not found on PATH, the user-space read needs qemu-img (host attach of an untrusted disk is FORBIDDEN). Failing closed."
     }
-    $ver = Get-QemuImgVersion -Path $path
-    if ([version]$ver -lt [version]$MinVersion) {
-        throw "Resolve-QemuImg: qemu-img $ver is below the required floor $MinVersion (patch-currency: run a currently-patched qemu-img, re-resolved at ship time — not a specific-CVE gate). Failing closed."
+    # Only a real binary is accepted (the rule Resolve-PythonExe applies): a .cmd/.bat shim runs through
+    # cmd.exe, which re-parses the arguments, including the path of the untrusted disk; on Windows the
+    # extension must be .exe, elsewhere an extensionless executable is the norm.
+    $ext = [System.IO.Path]::GetExtension([string]$path)
+    $isRealBinary = ($ext -ieq '.exe') -or (-not $IsWindows -and [string]::IsNullOrEmpty($ext))
+    if (-not $isRealBinary) {
+        throw "Resolve-QemuImg: qemu-img resolved to '$path', a script shim rather than a binary (a shim runs through cmd.exe and can rewrite its arguments); put the real qemu-img executable on PATH. Failing closed."
     }
+    # The pin is compared BEFORE the binary runs: `--version` executes the file, and an unpinned or
+    # substituted binary must not run at all, not even to report its version.
     if ($PinnedSha256) {
         $actual = Get-FileSha256 -Path $path
         if ($actual -ne $PinnedSha256.ToLowerInvariant()) {
-            throw "Resolve-QemuImg: qemu-img SHA-256 hash mismatch (got $actual, pinned $PinnedSha256) — refusing an unpinned/substituted parser binary. Failing closed."
+            throw "Resolve-QemuImg: qemu-img SHA-256 hash mismatch (got $actual, pinned $PinnedSha256), refusing an unpinned/substituted parser binary. Failing closed."
         }
+    }
+    $ver = Get-QemuImgVersion -Path $path
+    if ([version]$ver -lt [version]$MinVersion) {
+        throw "Resolve-QemuImg: qemu-img $ver is below the required floor $MinVersion (patch-currency: run a currently-patched qemu-img, re-resolved at ship time, not a specific-CVE gate). Failing closed."
     }
     return $path
 }
@@ -836,6 +927,8 @@ function New-RealHyperVBackend {
     $ResolveVol    = $script:SbResolveVolumeLetter
     $FirmwareRetry = $script:SbInvokeFirmwareWithRetry   # RC5: Secure-Boot template-enumeration retry
     $LockRetry     = $script:SbInvokeWithLockRetry       # RC8: detach settle-lag sharing-violation retry
+    $GuardValues   = $script:SbAssertGuardValues         # adapter guards: 'On' / 'Off' only, in both factories
+    $SelectExact   = $script:SbSelectExactName           # exact-name pick for the by-name Get-VM / Get-VMSwitch reads
     $unavailPrefix = $script:HyperVUnavailablePrefix
     # I5a fix: same closure-capture rule as every other value here — a $script: READ inside a
     # .GetNewClosure()'d body does NOT resolve to the top-level script scope (it comes back empty/
@@ -907,7 +1000,11 @@ function New-RealHyperVBackend {
             # A missing VM is NOT an error to us: return $null. But we must distinguish
             # "no such VM" (fine) from "can't talk to Hyper-V" (fail closed). Probe first.
             Get-VM -ErrorAction Stop | Out-Null            # raises the permission/availability error if unreachable
-            Get-VM -Name $name -ErrorAction SilentlyContinue
+            # Get-VM -Name treats * ? [ ] as wildcards and Hyper-V allows duplicate VM names, so the by-name
+            # read can return objects other than the one asked for, or several of it. Keep the exact name
+            # only; two or more exact matches throw ($script:SbSelectExactName).
+            $found = @(Get-VM -Name $name -ErrorAction SilentlyContinue)
+            & $SelectExact $found $name 'GetVM'
         }
     }.GetNewClosure()
 
@@ -1160,11 +1257,12 @@ function New-RealHyperVBackend {
     # Toggle ONE host<->guest channel on/off. The four logical channels split into TWO classes on a
     # Linux guest (the deployer's target — stock Debian/Ubuntu/etc. cloud images):
     #
-    #   GuestServices  = the ONE REAL autonomous host<->guest DATA channel. Maps to
-    #                    Enable/Disable-VMIntegrationService 'Guest Service Interface' (the
-    #                    Copy-VMFile / file-copy VMBus channel). This is the channel the seal MUST
-    #                    close and Assert-Sealed MUST host-verify (its GET reads the real .Enabled,
-    #                    fail-closed). Kept exactly as-is — DO NOT weaken.
+    #   GuestServices  = the ONE REAL autonomous host<->guest DATA channel: the Guest Service Interface
+    #                    integration service (the Copy-VMFile / file-copy VMBus channel), found by its
+    #                    component GUID 6C09BB55 like the other four (until 2026-10-16 it alone was looked
+    #                    up by its English display name, which a localized host does not report). This is
+    #                    the channel the seal MUST close and Assert-Sealed MUST host-verify (its GET reads
+    #                    the real .Enabled, fail-closed). DO NOT weaken.
     #
     #   EnhancedSession / Clipboard / Shares = ESM facets. On Hyper-V there is NO per-facet cmdlet
     #                    and — critically — NO per-VM "ESM off" toggle at all. ESM clipboard / drive-
@@ -1190,11 +1288,11 @@ function New-RealHyperVBackend {
     # facets ON forever and Assert-Sealed could NEVER certify a real Linux VM. The fix reports the
     # ESM facets OFF BY CONSTRUCTION (see GetHostChannels). The SET path here is unchanged.
     #
-    # TimeSync / KeyValueExchange / Backup / Heartbeat (design E6, 2026-10-03) are integration services
-    # like GuestServices, but are found by their stable component GUID ($script:IntegrationServiceIds)
-    # rather than by the localized display name. The SET enumerates the VM's services, picks the one
-    # matching object (zero or several matches throw, fail closed) and pipes it to
-    # Enable/Disable-VMIntegrationService, so no localized -Name is ever passed.
+    # GuestServices, TimeSync, KeyValueExchange, Backup and Heartbeat are integration services found by
+    # their stable component GUID ($script:IntegrationServiceIds) rather than by the localized display
+    # name (design E6, 2026-10-03, extended to GuestServices on 2026-10-16). The SET enumerates the VM's
+    # services, picks the one matching object (zero or several matches throw, fail closed) and pipes it
+    # to Enable/Disable-VMIntegrationService, so no localized -Name is ever passed.
     $channelNames = $script:HostChannelNames
     $isIds        = $script:IntegrationServiceIds
     $FindIS       = $script:SbFindIntegrationService
@@ -1215,10 +1313,6 @@ function New-RealHyperVBackend {
                 return
             }
             switch ($channel) {
-                'GuestServices' {
-                    if ($enabled) { Enable-VMIntegrationService  -VMName $vm -Name 'Guest Service Interface' -ErrorAction Stop }
-                    else          { Disable-VMIntegrationService -VMName $vm -Name 'Guest Service Interface' -ErrorAction Stop }
-                }
                 'EnhancedSession' {
                     # Per-VM Enhanced Session / console channel. Disable = the seal (KVM off, no
                     # clipboard / drive redirection). NEVER Set-VM -EnhancedSessionTransportType
@@ -1242,21 +1336,15 @@ function New-RealHyperVBackend {
         param([System.Collections.IDictionary] $P)
         $vm = & $AssertArg $P 'VMName' 'GetHostChannels'
         & $InvokeOp {
-            # Host-side read of the host<->guest channels — the authoritative seal check.
+            # Host-side read of the host<->guest channels, the authoritative seal check.
             #
-            # GuestServices = the ONE channel the host can read as TRUE per-VM state: the Guest
-            # Service Interface integration service (the Copy-VMFile / file-copy VMBus channel — the
-            # one REAL autonomous host<->guest data channel). This read is FAIL-CLOSED: the catch
-            # RETHROWS. If it fails, the host cannot know whether the bidirectional Copy-VMFile
-            # channel is live, so the seal gate (Assert-Sealed) MUST fail closed. Swallowing the
-            # error to $gsiOn=$false would report GuestServices OFF while actually ON and let
-            # Assert-Sealed certify SEALED with the worst channel live — a fail-OPEN. DO NOT weaken.
-            $gsiOn = $false
-            try {
-                $gsi = Get-VMIntegrationService -VMName $vm -Name 'Guest Service Interface' -ErrorAction Stop
-                $gsiOn = [bool]$gsi.Enabled
-            }
-            catch { throw }   # SECURITY: an unreadable REAL channel MUST propagate — never coerce to off.
+            # GuestServices = the Guest Service Interface integration service (the Copy-VMFile / file-copy
+            # VMBus channel, the one REAL autonomous host<->guest data channel). Since 2026-10-16 it is read
+            # in the GUID loop below with the other four services, so a localized host reads it correctly.
+            # The loop is FAIL-CLOSED on every path (an enumeration that throws, a missing or duplicated
+            # service and a non-boolean Enabled all throw). Nothing may coerce an unreadable channel to off:
+            # that would report GuestServices OFF while actually ON and let Assert-Sealed certify SEALED
+            # with the worst channel live, a fail-OPEN. DO NOT weaken.
 
             # EnhancedSession / Clipboard / Shares = ESM facets, reported OFF BY CONSTRUCTION.
             #
@@ -1284,15 +1372,14 @@ function New-RealHyperVBackend {
             $out = @{
                 Clipboard       = $false
                 Shares          = $false
-                GuestServices   = $gsiOn
                 EnhancedSession = $false
             }
 
-            # TimeSync / KeyValueExchange / Backup / Heartbeat: REAL per-VM reads, never constants. One
-            # enumeration of the VM's integration services, then each service is picked by its stable
-            # component GUID (not the localized Name) and its .Enabled is read. FAIL-CLOSED on every
-            # path: the enumeration throws through $InvokeOp, a missing or duplicated service throws in
-            # $FindIS, and an .Enabled that is not a real [bool] throws here. None of these may degrade
+            # GuestServices / TimeSync / KeyValueExchange / Backup / Heartbeat: REAL per-VM reads, never
+            # constants. One enumeration of the VM's integration services, then each service is picked by
+            # its stable component GUID (not the localized Name) and its .Enabled is read. FAIL-CLOSED on
+            # every path: the enumeration throws through $InvokeOp, a missing or duplicated service throws
+            # in $FindIS, and an .Enabled that is not a real [bool] throws here. None of these may degrade
             # to "off".
             $all = @(Get-VMIntegrationService -VMName $vm -ErrorAction Stop)
             foreach ($name in $isIds.Keys) {
@@ -1421,7 +1508,9 @@ function New-RealHyperVBackend {
         $inner = & $AssertArg $P 'InnerPath' 'WriteVhdxFile'
         $content = & $AssertArg $P 'Content' 'WriteVhdxFile'
         & $InvokeOp {
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            # RC8: the first Mount-VHD after a detach can hit the settle-lag sharing violation too, so the
+            # mount rides the same lock-retry as the file copies and the hash (added 2026-10-16).
+            $img = & $LockRetry -Context 'WriteVhdxFile' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'WriteVhdxFile'
                 Set-Content -LiteralPath ("{0}:\{1}" -f $letter, $inner) -Value $content -NoNewline -Encoding utf8 -ErrorAction Stop
@@ -1457,7 +1546,7 @@ function New-RealHyperVBackend {
             }
             $srcArg = [System.IO.Path]::GetFullPath($src).TrimEnd('\', '/')
             if ($srcArg -match '^[A-Za-z]:$') { $srcArg = "$srcArg\." }
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            $img = & $LockRetry -Context 'CopyDirectoryToVhdx' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'CopyDirectoryToVhdx'
                 $dest = "{0}:\" -f $letter
@@ -1569,7 +1658,7 @@ function New-RealHyperVBackend {
         $path = & $AssertArg $P 'Path' 'ReadVhdxFile'
         $inner = & $AssertArg $P 'InnerPath' 'ReadVhdxFile'
         & $InvokeOp {
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            $img = & $LockRetry -Context 'ReadVhdxFile' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'ReadVhdxFile'
                 $fp = "{0}:\{1}" -f $letter, $inner
@@ -1596,7 +1685,7 @@ function New-RealHyperVBackend {
         $inner = & $AssertArg $P 'InnerPath' 'WriteVhdxFileBytes'
         $bytes = [byte[]](& $AssertArg $P 'Bytes' 'WriteVhdxFileBytes')
         & $InvokeOp {
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            $img = & $LockRetry -Context 'WriteVhdxFileBytes' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'WriteVhdxFileBytes'
                 [System.IO.File]::WriteAllBytes(("{0}:\{1}" -f $letter, $inner), $bytes)   # raw bytes, NO utf8 recode
@@ -1624,7 +1713,7 @@ function New-RealHyperVBackend {
         $path  = & $AssertArg $P 'Path' 'ReadVhdxFileBytes'
         $inner = & $AssertArg $P 'InnerPath' 'ReadVhdxFileBytes'
         & $InvokeOp {
-            $img = Mount-VHD -Path $path -Passthru -ErrorAction Stop
+            $img = & $LockRetry -Context 'ReadVhdxFileBytes' -Operation { Mount-VHD -Path $path -Passthru -ErrorAction Stop }
             try {
                 $letter = & $ResolveVol $img 'ReadVhdxFileBytes'
                 $fp = "{0}:\{1}" -f $letter, $inner
@@ -1642,7 +1731,10 @@ function New-RealHyperVBackend {
     # VHDX -> logical-block translation (so a logical Offset == the byte offset in the flat raw output);
     # we then seek/read the requested slice. NEVER Mount-VHD: even -ReadOnly host-attach runs partmgr.sys
     # + FS-recognizer parses on attacker bytes (Pass-5, verified). REQUIRES the VHDX DETACHED + the VM Off
-    # (qemu-img cannot open a Hyper-V-locked file) — the orchestrator's $detachOk guard enforces that.
+    # (qemu-img cannot open a Hyper-V-locked file). The orchestrator reads only after Wait-WorkloadComplete
+    # saw the VM Off (or force-stopped it) and after RemoveHardDiskDrive returned for the disk; a detach
+    # that throws, including one for a disk no longer attached, skips the read ($detachOk). The lock-retry
+    # below is the backstop for a handle that is still releasing.
     # LIVE-ONLY-UNPROVEN until Phase 6 (the mock never runs this); re-resolve the exact qemu-img
     # invocation at fire. Fails closed with a clear message if qemu-img is absent or the file is locked.
     # Hoist every $P read into locals BEFORE $InvokeOp (see NewVHD note).
@@ -1725,15 +1817,17 @@ function New-RealHyperVBackend {
         }
     }.GetNewClosure()
 
-    # Whole-.vhdx-file SHA-256 in USER-SPACE — the supply-chain artifact fingerprint Phase 3 verifies
+    # Whole-.vhdx-file SHA-256 in USER-SPACE, the supply-chain artifact fingerprint Phase 3 verifies
     # before AddHardDiskDrive. NEVER Mount-VHD / attach: an integrity fingerprint needs no FS parse, so
-    # the host kernel never touches attacker bytes (Pass-5). NO qemu (D-3) — we stream the file as-is.
-    # REQUIRES the .vhdx DETACHED + the VM Off (an attached disk is locked) — the orchestrator's
-    # $detachOk guard enforces that. RC8: the FIRST OpenRead after a detach can hit a transient sharing
-    # violation while the Hyper-V worker handle releases; route open+hash through the shared $LockRetry
-    # (a lock-class error rides out, a real failure — e.g. a missing file — rethrows at once, a
-    # persistent lock fails closed clearly with Context='GetVhdxImageHash'). LIVE-ONLY-UNPROVEN until
-    # Phase 6 (the mock never runs this).
+    # the host kernel never touches attacker bytes (Pass-5). NO qemu (D-3), we stream the file as-is.
+    # REQUIRES the .vhdx DETACHED + the VM Off (an attached disk is locked). Its callers hash a disk no
+    # live VM holds: Invoke-Voidseal and the data-disk check hash a working copy before AddHardDiskDrive,
+    # and the builder hashes its deps disk after its own RemoveHardDiskDrive (which throws, rather than
+    # succeeding silently, when the disk is not attached). RC8: the FIRST OpenRead after a detach can hit
+    # a transient sharing violation while the Hyper-V worker handle releases; route open+hash through the
+    # shared $LockRetry (a lock-class error rides out, a real failure, e.g. a missing file, rethrows at
+    # once, a persistent lock fails closed clearly with Context='GetVhdxImageHash'). LIVE-ONLY-UNPROVEN
+    # until Phase 6 (the mock never runs this).
     $b.GetVhdxImageHash = {
         param([System.Collections.IDictionary] $P)
         $path = & $AssertArg $P 'Path' 'GetVhdxImageHash'
@@ -1829,11 +1923,18 @@ function New-RealHyperVBackend {
         $vm   = & $AssertArg $P 'VMName' 'RemoveHardDiskDrive'
         $path = & $AssertArg $P 'Path'   'RemoveHardDiskDrive'
         & $InvokeOp {
-            # Find the controller slot holding this path, then detach (Remove-VMHardDiskDrive
-            # takes controller coords, not a path). Detach only — the VHDX file is left on disk.
+            # Find the controller slot holding this path, then detach (Remove-VMHardDiskDrive takes
+            # controller coords, not a path). Detach only: the VHDX file is left on disk. No attached drive
+            # with that path is a THROW (since 2026-10-16), never a silent success: the orchestrator reads
+            # a data disk only after this returns, so a disk that was never attached, or that something
+            # else detached, must not pass as "detached by us". The orchestrator's catch records it as a
+            # Failed run with the host-side detach reason.
             $drive = Get-VMHardDiskDrive -VMName $vm -ErrorAction Stop |
                      Where-Object { $_.Path -eq $path } | Select-Object -First 1
-            if ($null -ne $drive) { $drive | Remove-VMHardDiskDrive -ErrorAction Stop }
+            if ($null -eq $drive) {
+                throw "HyperVBackend.RemoveHardDiskDrive: no hard disk drive on '$vm' has the path '$path'; nothing was detached. Fail closed."
+            }
+            $drive | Remove-VMHardDiskDrive -ErrorAction Stop
         }
     }.GetNewClosure()
 
@@ -1899,7 +2000,9 @@ function New-RealHyperVBackend {
         $name = & $AssertArg $P 'Name' 'GetSwitch'
         & $InvokeOp {
             Get-VMSwitch -ErrorAction Stop | Out-Null     # availability probe
-            Get-VMSwitch -Name $name -ErrorAction SilentlyContinue
+            # Same wildcard and duplicate hazard as GetVM: keep the exact name only (see SbSelectExactName).
+            $found = @(Get-VMSwitch -Name $name -ErrorAction SilentlyContinue)
+            & $SelectExact $found $name 'GetSwitch'
         }
     }.GetNewClosure()
 
@@ -1950,6 +2053,44 @@ function New-RealHyperVBackend {
         # MUST be here, not inside the op: $InvokeOp's `return (& $op)` re-enumerates and
         # would strip an inner comma, re-unrolling a single element to a bare object.
         return ,@(& $InvokeOp { Get-VMNetworkAdapter -VMName $vm -ErrorAction Stop })
+    }.GetNewClosure()
+
+    # Guards on the VM's adapter(s): Set-VMNetworkAdapter -VMName applies to every adapter the VM has
+    # (production has exactly one). The three values are validated here, before the cmdlet, with the same
+    # rule the fake applies, so a value the OnOffState enum would reject fails identically on both.
+    $b.SetNetworkAdapterGuards = {
+        param([System.Collections.IDictionary] $P)
+        $vm    = & $AssertArg $P 'VMName'             'SetNetworkAdapterGuards'
+        $spoof = [string](& $AssertArg $P 'MacAddressSpoofing' 'SetNetworkAdapterGuards')
+        $dhcp  = [string](& $AssertArg $P 'DhcpGuard'          'SetNetworkAdapterGuards')
+        $rtr   = [string](& $AssertArg $P 'RouterGuard'        'SetNetworkAdapterGuards')
+        & $GuardValues @{ MacAddressSpoofing = $spoof; DhcpGuard = $dhcp; RouterGuard = $rtr } 'HyperVBackend.SetNetworkAdapterGuards'
+        & $InvokeOp {
+            Set-VMNetworkAdapter -VMName $vm -MacAddressSpoofing $spoof -DhcpGuard $dhcp -RouterGuard $rtr -ErrorAction Stop
+        }
+    }.GetNewClosure()
+
+    # Host-truth read of the guards for the seal gate. FAIL-CLOSED: an adapter count other than one throws
+    # (the gate must not pick one of several), and a guard the adapter does not report, or reports blank,
+    # throws rather than reading as Off. Each value is the OnOffState enum rendered as text ('On' / 'Off').
+    $b.GetNetworkAdapterGuards = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $AssertArg $P 'VMName' 'GetNetworkAdapterGuards'
+        & $InvokeOp {
+            $nics = @(Get-VMNetworkAdapter -VMName $vm -ErrorAction Stop)
+            if ($nics.Count -ne 1) {
+                throw "HyperVBackend.GetNetworkAdapterGuards: expected exactly one network adapter on '$vm', found $($nics.Count). Fail closed."
+            }
+            $out = @{}
+            foreach ($guard in 'MacAddressSpoofing', 'DhcpGuard', 'RouterGuard') {
+                $prop = $nics[0].PSObject.Properties[$guard]
+                if ($null -eq $prop -or [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+                    throw "HyperVBackend.GetNetworkAdapterGuards: the adapter on '$vm' reports no $guard value. Fail closed."
+                }
+                $out[$guard] = [string]$prop.Value
+            }
+            $out
+        }
     }.GetNewClosure()
 
     # ---- passthrough devices (SEAL/GATE surface) -------------------------
@@ -2182,6 +2323,44 @@ function New-RealHyperVBackend {
         })
     }.GetNewClosure()
 
+    # Windows Firewall enforcement per profile, from the active store. Enabled is a GpoBoolean enum whose
+    # 'False' member is truthy under a [bool] cast (the same CIM trap as GetHostFirewallRule), so the text
+    # is compared; DefaultInboundAction is passed through as text for the gate to compare exactly.
+    $b.GetHostFirewallProfiles = {
+        param([System.Collections.IDictionary] $P)
+        return ,@(& $InvokeOp {
+            Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop | ForEach-Object {
+                @{
+                    Name                 = [string]$_.Name
+                    Enabled              = ([string]$_.Enabled -eq 'True')
+                    DefaultInboundAction = [string]$_.DefaultInboundAction
+                }
+            }
+        })
+    }.GetNewClosure()
+
+    # IP forwarding on one host interface, per address family. A family with no row reads 'Missing'; a
+    # family whose rows all read Disabled reads 'Disabled'; any other value is passed through as the text
+    # Windows gave (an empty one as 'Unknown'), so the gate refuses it by name. An alias Windows does not
+    # know is an ObjectNotFound error from the cmdlet, which propagates as a throw.
+    $b.GetNetIPInterfaceForwarding = {
+        param([System.Collections.IDictionary] $P)
+        $alias = & $AssertArg $P 'InterfaceAlias' 'GetNetIPInterfaceForwarding'
+        & $InvokeOp {
+            $rows = @(Get-NetIPInterface -InterfaceAlias $alias -PolicyStore ActiveStore -ErrorAction Stop)
+            $out = @{}
+            foreach ($family in 'IPv4', 'IPv6') {
+                $values = @($rows | Where-Object { [string]$_.AddressFamily -eq $family } | ForEach-Object { [string]$_.Forwarding })
+                if ($values.Count -eq 0) { $out[$family] = 'Missing'; continue }
+                $other = @($values | Where-Object { $_ -ne 'Disabled' })
+                if ($other.Count -eq 0)                                  { $out[$family] = 'Disabled' }
+                elseif ([string]::IsNullOrWhiteSpace([string]$other[0])) { $out[$family] = 'Unknown' }
+                else                                                     { $out[$family] = [string]$other[0] }
+            }
+            $out
+        }
+    }.GetNewClosure()
+
     # Start the proxy as a plain child process (no shell, so no argument re-parsing) and wait for the
     # ready file it writes once it is listening. A process that exits first, or a ready file that never
     # appears, is a throw (the process is killed first), never a half-started proxy.
@@ -2223,7 +2402,9 @@ function New-RealHyperVBackend {
     }.GetNewClosure()
 
     # Stop asks first (the stop file), then kills after the timeout. The recorded StartTime guards against
-    # PID reuse: a process with that id but another start time is not ours and is left alone.
+    # PID reuse: a process with that id but another start time is not ours and is left alone. Stopped is
+    # $true only when the process has exited: a process that survives Kill (a stuck kernel wait) is
+    # reported as Stopped=$false, and Remove-SandboxEgress keeps it recorded as a teardown failure.
     $b.StopEgressProxy = {
         param([System.Collections.IDictionary] $P)
         $procId  = [int](& $AssertArg $P 'ProcessId' 'StopEgressProxy')
@@ -2240,13 +2421,14 @@ function New-RealHyperVBackend {
             if ($actual -ne $start) { return @{ Stopped = $true; Killed = $false; AlreadyGone = $true } }
         }
         if (-not [string]::IsNullOrWhiteSpace($stop)) { Set-Content -LiteralPath $stop -Value 'stop' -ErrorAction Stop }
-        $killed = $false
+        $killed  = $false
+        $stopped = $true
         if (-not $proc.WaitForExit($timeout * 1000)) {
             $proc.Kill()
-            $null = $proc.WaitForExit(5000)
-            $killed = $true
+            $killed  = $true
+            $stopped = $proc.WaitForExit(5000)   # $false when the process is still there after the kill
         }
-        return @{ Stopped = $true; Killed = $killed; AlreadyGone = $false }
+        return @{ Stopped = [bool]$stopped; Killed = $killed; AlreadyGone = $false }
     }.GetNewClosure()
 
     # ---- checkpoint ------------------------------------------------------
@@ -2345,6 +2527,11 @@ $script:SbCopyFakeVM = {
     A named-pipe path NewVM records on every new VM's COM2, modeling a second serial channel wired
     outside the tool. Default: none, matching real Hyper-V, where a new Gen2 VM's COM2 has an empty path
     (GetComPort then returns $null).
+.PARAMETER SimulateAdapterGuardsStuck
+    Make SetNetworkAdapterGuards a no-op: the adapter keeps the guard values it had (Hyper-V's defaults
+    on a new adapter are MacAddressSpoofing Off, DhcpGuard Off, RouterGuard Off), so GetNetworkAdapterGuards
+    still reads them after Lock-Sandbox. Models a Set-VMNetworkAdapter that failed quietly or was undone
+    outside the tool, so a test can prove Assert-Sealed reads host truth instead of trusting the seal's call.
 .PARAMETER SimulateAutomaticCheckpointsStuckOn
     Make SetAutomaticCheckpoints with Enabled=$false a no-op, so the Hyper-V default (ON) survives the
     Provisioner's RC7 call and GetAutomaticCheckpoints still reads $true. Models a setting that did not
@@ -2372,11 +2559,14 @@ $script:SbCopyFakeVM = {
     orchestrator's teardown-on-mid-flow-failure path: the VM provisions + seals + passes the gate,
     then the workload-launch (StartVM) throws, so the orchestrator must reap the VM (no orphan).
 .PARAMETER SimulateNeverOff
-    Make GetVM report State='Running' regardless of the VM's recorded state (simulating a guest
-    workload that never powers itself off — a hung guest). The completion model has no live
-    channel: the guest runs at boot then powers ITSELF off, and Wait-WorkloadComplete polls VM
-    State until Off (or a timeout). This seam models the timeout branch — a VM that never reaches
-    Off so the deadline is the only exit, exercising Wait-WorkloadComplete's force-stop teardown.
+    Make GetVM report State='Running' regardless of the VM's recorded state once StartVM has been
+    called on it (simulating a guest workload that never powers itself off, a hung guest). The
+    completion model has no live channel: the guest runs at boot then powers ITSELF off, and
+    Wait-WorkloadComplete polls VM State until Off (or a timeout). This seam models the timeout
+    branch, a VM that never reaches Off so the deadline is the only exit, exercising
+    Wait-WorkloadComplete's force-stop teardown. Before its first StartVM the VM reads its recorded
+    state (Off), because a hung guest presupposes a started one and Assert-Sealed refuses any VM
+    that is not Off (the gate runs before the start).
 .PARAMETER SimulateSelfPowerOff
     Make StartVM leave the VM in State='Off' (instead of 'Running') — modelling a guest that boots,
     runs its boot workload, and SELF-POWERS-OFF before the host's first completion poll. This is the
@@ -2384,6 +2574,11 @@ $script:SbCopyFakeVM = {
     Wait-WorkloadComplete 'Off' (not-timed-out) branch and the subsequent Read-WorkloadResult host-
     read, so the orchestrator's detach+read+classify wiring is exercisable against the fake (the fake
     guest writes no sentinel, so Read-WorkloadResult honestly classifies Failed — the wiring still runs).
+.PARAMETER SimulateStateAfterStart
+    The State StartVM leaves the VM in when -SimulateSelfPowerOff is not set: 'Running' (the default),
+    'Paused' or 'Saved'. The engine never pauses or saves a VM; the two other values model a pause or a
+    save made outside the tool, so a test can prove teardown turns such a VM off before Remove-VM (a
+    graceful shutdown needs a running guest, and Remove-VM refuses a VM that is not Off).
 .PARAMETER SimulateSecondNewOutputVhdxError
     Make the SECOND NewOutputVhdx call THROW (the first succeeds; the second raises). New-WorkloadDisks
     creates the INPUT disk first (NewOutputVhdx #1) then the OUTPUT disk (NewOutputVhdx #2), so this
@@ -2465,11 +2660,27 @@ $script:SbCopyFakeVM = {
     the HostProxy range to drive the provisioner's address-collision refusal.
 .PARAMETER SimulateNetNat
     NAT networks GetNetNats reports, each @{ Name; InternalIPInterfaceAddressPrefix }. Default: none.
+.PARAMETER SimulateFirewallProfile
+    Overrides for the Windows Firewall profiles GetHostFirewallProfiles reports. The default is the
+    three profiles (Domain, Private, Public) all Enabled with DefaultInboundAction 'Block'. Each entry
+    names a profile and changes the keys it carries, for example @{ Name = 'Public'; Enabled = $false } or
+    @{ Name = 'Private'; DefaultInboundAction = 'Allow' }; @{ Name = 'Domain'; Remove = $true } drops the
+    profile from the read, modeling a host whose firewall service reports it missing. An unknown Name
+    throws at construction.
+.PARAMETER SimulateNetIPInterfaceForwarding
+    The forwarding state GetNetIPInterfaceForwarding reports for every host interface, as
+    @{ IPv4 = <text>; IPv6 = <text> }. The default is Disabled for both; pass 'Enabled' or 'Missing' for a
+    family to drive the gate's refusals.
+.PARAMETER SimulateEgressProxyUnkillable
+    Make StopEgressProxy report Stopped=$false with Killed=$true and leave the process recorded as
+    Running, modeling a proxy that ignored its stop file and then survived the kill (the real body's
+    post-kill WaitForExit returning $false). Remove-SandboxEgress must treat that as a removal failure.
 .PARAMETER SimulateEgressMethodError
     Names of host egress methods (GetHostIPAddresses, AddSwitchHostIPAddress, NewHostFirewallRule,
-    GetHostFirewallRule, GetHostFirewallRuleNames, AddNetworkAdapterAcl, GetNetworkAdapterAcls, GetNetNats, StartEgressProxy,
-    StopEgressProxy and the Remove* methods) that THROW when called, modeling the host cmdlet failing,
-    so a test can drive each fail-closed and rollback path. Default: none.
+    GetHostFirewallRule, GetHostFirewallRuleNames, GetHostFirewallProfiles, GetNetIPInterfaceForwarding,
+    AddNetworkAdapterAcl, GetNetworkAdapterAcls, GetNetNats, StartEgressProxy, StopEgressProxy and the
+    Remove* methods) that THROW when called, modeling the host cmdlet failing, so a test can drive each
+    fail-closed and rollback path. Default: none.
 #>
 function New-FakeHyperVBackend {
     [CmdletBinding()]
@@ -2479,12 +2690,14 @@ function New-FakeHyperVBackend {
         [switch] $SimulateChannelReadError,
         [string[]] $SimulateChannelStuckOn = @(),
         [string] $SimulateCom2Path,
+        [switch] $SimulateAdapterGuardsStuck,
         [switch] $SimulateAutomaticCheckpointsStuckOn,
         [switch] $SimulateCheckpointPresent,
         [switch] $SimulateGuestCommandFailure,
         [switch] $SimulateGuestCommandTimeout,
         [switch] $SimulateStartVMError,
         [switch] $SimulateNeverOff,
+        [ValidateSet('Running', 'Paused', 'Saved')] [string] $SimulateStateAfterStart = 'Running',
         [switch] $SimulateSelfPowerOff,
         [switch] $SimulateSecondNewOutputVhdxError,
         [hashtable] $SimulateWorkloadOutput,
@@ -2503,6 +2716,9 @@ function New-FakeHyperVBackend {
         [string[]] $SimulateGuestDiskWrite = @(),
         [hashtable[]] $SimulateHostIPAddresses = @(@{ IPAddress = '192.168.1.20'; PrefixLength = 24; InterfaceAlias = 'Ethernet' }),
         [hashtable[]] $SimulateNetNat = @(),
+        [hashtable[]] $SimulateFirewallProfile = @(),
+        [hashtable] $SimulateNetIPInterfaceForwarding,
+        [switch] $SimulateEgressProxyUnkillable,
         [string[]] $SimulateEgressMethodError = @()
     )
 
@@ -2518,7 +2734,15 @@ function New-FakeHyperVBackend {
     $AssertArg    = $script:SbAssertArg
     $CopyVM       = $script:SbCopyFakeVM
     $ValidateFmt  = $script:SbValidateVhdxFormat
+    $GuardValues  = $script:SbAssertGuardValues
     $channelNames = $script:HostChannelNames
+    # Captured by the SetNetworkAdapterGuards closure: the set does not take (see param help).
+    $guardsStuck  = $SimulateAdapterGuardsStuck.IsPresent
+    # Hyper-V's defaults for a new adapter's guards; every adapter record the fake creates starts here.
+    $newAdapter = {
+        param([string] $SwitchName)
+        return @{ SwitchName = $SwitchName; Name = 'Network Adapter'; MacAddressSpoofing = 'Off'; DhcpGuard = 'Off'; RouterGuard = 'Off' }
+    }
     # Captured by the GetHostChannels closure to simulate an unreadable channel (see param help).
     $channelReadThrows = $SimulateChannelReadError.IsPresent
     # Captured by the SetHostChannel closure: channels whose disable does not take (see param help).
@@ -2543,6 +2767,8 @@ function New-FakeHyperVBackend {
     # Captured by the StartVM closure: model a guest that boots, runs, and self-powers-off before the
     # first host poll (the happy completion branch of the Disk-mode model — leaves State Off).
     $selfPowerOff      = $SimulateSelfPowerOff.IsPresent
+    # Captured by the StartVM closure: the state a started VM lands in when it does not self-power-off.
+    $stateAfterStart   = $SimulateStateAfterStart
     # Captured by the NewOutputVhdx closure: throw on the 2nd NewOutputVhdx call (the OUTPUT disk),
     # exercising New-WorkloadDisks's incremental-record orphan-window fix. A mutable single-element
     # array is the counter (a closure can mutate an array element but not rebind a captured [int]).
@@ -2598,9 +2824,32 @@ function New-FakeHyperVBackend {
     foreach ($natRec in @($SimulateNetNat)) {
         $state.NetNats.Add(@{ Name = [string]$natRec['Name']; InternalIPInterfaceAddressPrefix = [string]$natRec['InternalIPInterfaceAddressPrefix'] })
     }
+    # Windows Firewall profiles (GetHostFirewallProfiles): the three profiles, enforcing with Block as the
+    # default inbound action, then the per-profile overrides of -SimulateFirewallProfile.
+    $state.FirewallProfiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($pn in 'Domain', 'Private', 'Public') {
+        $state.FirewallProfiles.Add(@{ Name = $pn; Enabled = $true; DefaultInboundAction = 'Block' })
+    }
+    foreach ($ovr in @($SimulateFirewallProfile)) {
+        $pn = [string]$ovr['Name']
+        $target = @($state.FirewallProfiles | Where-Object { $_.Name -eq $pn })
+        if ($target.Count -ne 1) {
+            throw "New-FakeHyperVBackend: -SimulateFirewallProfile names unknown profile '$pn' (expected Domain, Private or Public)."
+        }
+        if ($ovr.Contains('Remove') -and [bool]$ovr['Remove']) { [void]$state.FirewallProfiles.Remove($target[0]); continue }
+        if ($ovr.Contains('Enabled'))              { $target[0].Enabled = [bool]$ovr['Enabled'] }
+        if ($ovr.Contains('DefaultInboundAction')) { $target[0].DefaultInboundAction = [string]$ovr['DefaultInboundAction'] }
+    }
+    # IP forwarding per address family (GetNetIPInterfaceForwarding), the same on every host interface.
+    $state.HostForwarding = @{ IPv4 = 'Disabled'; IPv6 = 'Disabled' }
+    if ($null -ne $SimulateNetIPInterfaceForwarding) {
+        foreach ($fam in @($SimulateNetIPInterfaceForwarding.Keys)) { $state.HostForwarding[[string]$fam] = [string]$SimulateNetIPInterfaceForwarding[$fam] }
+    }
     # Captured by the egress methods: the named methods throw (a host cmdlet failing), so a test can drive
     # every fail-closed and rollback path.
     $egressErrors = @($SimulateEgressMethodError)
+    # Captured by the StopEgressProxy closure: the process survives the kill (see param help).
+    $proxyUnkillable = $SimulateEgressProxyUnkillable.IsPresent
     $egressFail = {
         param([string] $Method)
         if ($egressErrors -contains $Method) {
@@ -2670,6 +2919,10 @@ function New-FakeHyperVBackend {
             Generation                     = (& $GetArg $P 'Generation' 2)
             State                          = 'Off'
             MemoryStartupBytes             = (& $GetArg $P 'MemoryStartupBytes')
+            # New-VM -Path (the configuration folder) and -NoVHD, recorded so the fake reads every key the
+            # manifest documents (a key a factory never reads is silently dropped; the parity test checks).
+            Path                           = (& $GetArg $P 'Path')
+            NoVHD                          = [bool](& $GetArg $P 'NoVHD' $false)
             DynamicMemoryEnabled           = $false
             ProcessorCount                 = 1
             ExposeVirtualizationExtensions = $false
@@ -2709,7 +2962,7 @@ function New-FakeHyperVBackend {
         # adapter without a SwitchName, so a Tier-0 VM had zero NICs here and one on real Hyper-V, and every
         # no-NIC seal check passed on the fake alone.
         $sw = & $GetArg $P 'SwitchName'
-        $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
+        $vm.NetworkAdapters.Add((& $newAdapter $sw))
         if (-not [string]::IsNullOrWhiteSpace($com2Seed)) { $vm.ComPorts[2] = $com2Seed }
         if ($seedCheckpoint) { $vm.Checkpoints.Add(@{ Name = 'external-checkpoint'; Snapshot = (& $CopyVM $vm) }) }
         $state.VMs[$name] = $vm
@@ -2724,7 +2977,7 @@ function New-FakeHyperVBackend {
             # self-powers-off). Return a shallow CLONE with State overridden so the underlying
             # record is untouched — StopVM's timeout force-stop can still flip the real record to
             # Off (the force-stop is host-truth; the poll read is what stays "Running").
-            if ($neverOff) {
+            if ($neverOff -and $vm.ContainsKey('_started') -and [bool]$vm['_started']) {
                 $clone = @{}
                 foreach ($k in @($vm.Keys)) { $clone[$k] = $vm[$k] }
                 $clone['State'] = 'Running'
@@ -2835,22 +3088,34 @@ function New-FakeHyperVBackend {
             }
         }
         # SimulateSelfPowerOff: the guest booted, ran its boot workload, and powered itself off before
-        # the host's first completion poll — leave State Off so Wait-WorkloadComplete reads the happy
-        # (not-timed-out) completion branch on its first poll. Default: the VM is now Running.
-        $vm.State = if ($selfPowerOff) { 'Off' } else { 'Running' }
+        # the host's first completion poll. Leave State Off so Wait-WorkloadComplete reads the happy
+        # (not-timed-out) completion branch on its first poll. Default: the VM is now Running (or the
+        # Paused / Saved state -SimulateStateAfterStart asks for).
+        $vm.State = if ($selfPowerOff) { 'Off' } else { $stateAfterStart }
+        # The VM has been started at least once: from here on -SimulateNeverOff may override the read.
+        $vm['_started'] = $true
     }.GetNewClosure()
 
     $b.StopVM = {
         param([System.Collections.IDictionary] $P)
-        $name = & $AssertArg $P 'Name' 'StopVM'
-        (& $requireVM $name 'StopVM').State = 'Off'
+        $name    = & $AssertArg $P 'Name' 'StopVM'
+        $vm      = & $requireVM $name 'StopVM'
+        $turnOff = [bool](& $GetArg $P 'TurnOff' $false)
+        $force   = [bool](& $GetArg $P 'Force' $false)
+        # Logged with both flags so a test can prove HOW a VM was stopped (teardown turns a Paused or Saved
+        # VM off; a Running one gets the graceful stop the Shutdown integration service serves).
+        $state.CallLog.Add(@{ Op = 'StopVM'; Path = $null; VMName = $name; TurnOff = $turnOff; Force = $force; FromState = [string]$vm.State })
+        # Real Stop-VM ends in Off with or without -TurnOff (the guest shuts down, or is turned off).
+        $vm.State = 'Off'
     }.GetNewClosure()
 
     $b.RemoveVM = {
         param([System.Collections.IDictionary] $P)
-        $name = & $AssertArg $P 'Name' 'RemoveVM'
+        $name  = & $AssertArg $P 'Name' 'RemoveVM'
+        $force = [bool](& $GetArg $P 'Force' $true)
         [void](& $requireVM $name 'RemoveVM')
-        # Unregister the VM only. Its VHDX records persist in $state.VHDs — mirroring
+        $state.CallLog.Add(@{ Op = 'RemoveVM'; Path = $null; VMName = $name; Force = $force })
+        # Unregister the VM only. Its VHDX records persist in $state.VHDs, mirroring
         # Hyper-V (Remove-VM leaves disks); explicit cleanup is the caller's step.
         $state.VMs.Remove($name) | Out-Null
     }.GetNewClosure()
@@ -2883,6 +3148,9 @@ function New-FakeHyperVBackend {
         $vm = & $requireVM (& $GetArg $P 'VMName') 'SetMemory'
         $s = & $GetArg $P 'StartupBytes'; if ($null -ne $s) { $vm.MemoryStartupBytes = $s }
         $d = & $GetArg $P 'DynamicMemoryEnabled'; if ($null -ne $d) { $vm.DynamicMemoryEnabled = [bool]$d }
+        # The dynamic-memory bounds, recorded like the real Set-VMMemory -MinimumBytes / -MaximumBytes.
+        $mn = & $GetArg $P 'MinimumBytes'; if ($null -ne $mn) { $vm['MemoryMinimumBytes'] = $mn }
+        $mx = & $GetArg $P 'MaximumBytes'; if ($null -ne $mx) { $vm['MemoryMaximumBytes'] = $mx }
     }.GetNewClosure()
 
     $b.SetFirmware = {
@@ -2890,6 +3158,9 @@ function New-FakeHyperVBackend {
         $vm = & $requireVM (& $GetArg $P 'VMName') 'SetFirmware'
         $sb = & $GetArg $P 'EnableSecureBoot'; if ($null -ne $sb) { $vm.SecureBootEnabled = [bool]$sb }
         $tmpl = & $GetArg $P 'SecureBootTemplate'; if ($null -ne $tmpl) { $vm.SecureBootTemplate = $tmpl }
+        # BootOrder is array-typed, so it is read off $P directly (not through $GetArg, whose single
+        # `&` boundary unrolls an array; see the F2 note on $script:SbGetArg) and stored as an array.
+        if ($P.Contains('BootOrder') -and $null -ne $P['BootOrder']) { $vm['BootOrder'] = @($P['BootOrder']) }
     }.GetNewClosure()
 
     # RC7: the fake's analogue of Set-VM -AutomaticCheckpointsEnabled — flip the recorded flag on the VM
@@ -3008,12 +3279,19 @@ function New-FakeHyperVBackend {
     $b.NewVHD = {
         param([System.Collections.IDictionary] $P)
         $path = & $AssertArg $P 'Path' 'NewVHD'
+        # Real New-VHD refuses an existing file; until 2026-10-16 the fake overwrote the record, so a test
+        # could create the same path twice where the live run would have failed.
+        if ($state.VHDs.ContainsKey($path)) {
+            throw "HyperVBackend(fake).NewVHD: '$path' already exists (real New-VHD refuses to overwrite a file). Fail closed."
+        }
         $diff = [bool](& $GetArg $P 'Differencing' $false)
         $rec  = @{
             Path         = $path
             SizeBytes    = (& $GetArg $P 'SizeBytes')
             Differencing = $diff
             ParentPath   = (& $GetArg $P 'ParentPath')
+            # Dynamic (the default) or fixed, as the real New-VHD -Dynamic / -Fixed choice records.
+            Dynamic      = [bool](& $GetArg $P 'Dynamic' $true)
         }
         if ($diff -and [string]::IsNullOrWhiteSpace([string]$rec.ParentPath)) {
             throw "HyperVBackend(fake).NewVHD: -Differencing requires a ParentPath."
@@ -3480,9 +3758,14 @@ function New-FakeHyperVBackend {
         # SimulateDetachError: model a transient real-Hyper-V detach failure (throw AFTER logging, so the
         # test can still see the attempt). Exercises the orchestrator's detach try/catch.
         if ($detachThrows) {
-            throw "HyperVBackend(fake).RemoveHardDiskDrive: simulated detach failure for '$path' on '$vmName' (SimulateDetachError) — a transient Remove-VMHardDiskDrive failure right after force-stop."
+            throw "HyperVBackend(fake).RemoveHardDiskDrive: simulated detach failure for '$path' on '$vmName' (SimulateDetachError): a transient Remove-VMHardDiskDrive failure right after force-stop."
         }
-        # Detach only — the VHD record in $state.VHDs is untouched (disk file stays on disk).
+        # No such attached drive is a THROW, as on the real backend: a silent success here would let a disk
+        # that was never attached, or that something else detached, read as "detached by us".
+        if (-not (@($vm.HardDrives) -contains $path)) {
+            throw "HyperVBackend(fake).RemoveHardDiskDrive: no hard disk drive on '$vmName' has the path '$path'; nothing was detached. Fail closed."
+        }
+        # Detach only: the VHD record in $state.VHDs is untouched (disk file stays on disk).
         $kept = [System.Collections.Generic.List[object]]::new()
         foreach ($d in $vm.HardDrives) { if ($d -ne $path) { $kept.Add($d) } }
         $vm.HardDrives = $kept
@@ -3518,7 +3801,13 @@ function New-FakeHyperVBackend {
         if (@('Internal', 'Private', 'External') -notcontains $type) {
             throw "HyperVBackend(fake).NewSwitch: SwitchType '$type' must be Internal, Private, or External."
         }
-        $state.Switches[$name] = @{ Name = $name; SwitchType = $type }
+        # An External switch binds a host adapter: real New-VMSwitch requires -NetAdapterName for it, and the
+        # real body asserts the key before the cmdlet. Mirror that (until 2026-10-16 the fake accepted an
+        # External switch without one), and record the adapter on the switch.
+        $adapter = $null
+        if ($type -eq 'External') { $adapter = & $AssertArg $P 'NetAdapterName' 'NewSwitch(External)' }
+        else { $adapter = & $GetArg $P 'NetAdapterName' }
+        $state.Switches[$name] = @{ Name = $name; SwitchType = $type; NetAdapterName = $adapter }
     }.GetNewClosure()
 
     $b.GetSwitch = {
@@ -3560,7 +3849,7 @@ function New-FakeHyperVBackend {
             foreach ($nic in $vm.NetworkAdapters) { $nic['SwitchName'] = $sw }
         }
         else {
-            $vm.NetworkAdapters.Add(@{ SwitchName = $sw; Name = 'Network Adapter' })
+            $vm.NetworkAdapters.Add((& $newAdapter $sw))
         }
     }.GetNewClosure()
 
@@ -3586,6 +3875,42 @@ function New-FakeHyperVBackend {
         # VM has exactly one NIC (and to $null when empty), so an unwrapped caller's `.Count`
         # would read the hashtable's key-count (or fail on $null). `,@(...)` keeps it an array.
         return ,@($vm.NetworkAdapters)
+    }.GetNewClosure()
+
+    # Guards on every adapter of the VM (real Set-VMNetworkAdapter -VMName does the same). Validated with
+    # the shared helper BEFORE any record changes, so a rejected call leaves the adapters untouched; a VM
+    # with no adapter is a no-op, as the real cmdlet has nothing to set. -SimulateAdapterGuardsStuck
+    # leaves the recorded values alone, so the gate's host-truth read can be proven to catch it.
+    $b.SetNetworkAdapterGuards = {
+        param([System.Collections.IDictionary] $P)
+        $vm    = & $requireVM (& $GetArg $P 'VMName') 'SetNetworkAdapterGuards'
+        $spoof = [string](& $AssertArg $P 'MacAddressSpoofing' 'SetNetworkAdapterGuards')
+        $dhcp  = [string](& $AssertArg $P 'DhcpGuard'          'SetNetworkAdapterGuards')
+        $rtr   = [string](& $AssertArg $P 'RouterGuard'        'SetNetworkAdapterGuards')
+        & $GuardValues @{ MacAddressSpoofing = $spoof; DhcpGuard = $dhcp; RouterGuard = $rtr } 'HyperVBackend(fake).SetNetworkAdapterGuards'
+        $state.CallLog.Add(@{ Op = 'SetNetworkAdapterGuards'; Path = "$spoof/$dhcp/$rtr"; VMName = $vm.Name })
+        if ($guardsStuck) { return }
+        foreach ($nic in $vm.NetworkAdapters) {
+            $nic['MacAddressSpoofing'] = $spoof; $nic['DhcpGuard'] = $dhcp; $nic['RouterGuard'] = $rtr
+        }
+    }.GetNewClosure()
+
+    # The guards of the VM's one adapter, as the real read returns them. An adapter a test added by hand
+    # (without guard keys) reads Hyper-V's defaults, Off for all three, exactly as a real adapter added
+    # outside the tool would. Zero or several adapters throw, like the real body.
+    $b.GetNetworkAdapterGuards = {
+        param([System.Collections.IDictionary] $P)
+        $vm = & $requireVM (& $GetArg $P 'VMName') 'GetNetworkAdapterGuards'
+        $state.CallLog.Add(@{ Op = 'GetNetworkAdapterGuards'; Path = $null; VMName = $vm.Name })
+        if ($vm.NetworkAdapters.Count -ne 1) {
+            throw "HyperVBackend(fake).GetNetworkAdapterGuards: expected exactly one network adapter on '$($vm.Name)', found $($vm.NetworkAdapters.Count). Fail closed."
+        }
+        $nic = $vm.NetworkAdapters[0]
+        $out = @{}
+        foreach ($guard in 'MacAddressSpoofing', 'DhcpGuard', 'RouterGuard') {
+            $out[$guard] = if ($nic.Contains($guard)) { [string]$nic[$guard] } else { 'Off' }
+        }
+        return $out
     }.GetNewClosure()
 
     # ---- passthrough devices (SEAL/GATE surface) ----
@@ -3771,6 +4096,27 @@ function New-FakeHyperVBackend {
         return ,@($state.NetNats | ForEach-Object { @{ Name = $_.Name; InternalIPInterfaceAddressPrefix = $_.InternalIPInterfaceAddressPrefix } })
     }.GetNewClosure()
 
+    # The firewall profiles as seeded (and overridden by -SimulateFirewallProfile); copies, like every read.
+    $b.GetHostFirewallProfiles = {
+        param([System.Collections.IDictionary] $P)
+        $state.CallLog.Add(@{ Op = 'GetHostFirewallProfiles'; Path = $null; VMName = $null })
+        & $egressFail 'GetHostFirewallProfiles'
+        return ,@($state.FirewallProfiles | ForEach-Object { @{ Name = $_.Name; Enabled = [bool]$_.Enabled; DefaultInboundAction = [string]$_.DefaultInboundAction } })
+    }.GetNewClosure()
+
+    # Forwarding on one host interface. Mirrors the real refusal for an alias the host does not have
+    # (Get-NetIPInterface reports ObjectNotFound); the values come from -SimulateNetIPInterfaceForwarding.
+    $b.GetNetIPInterfaceForwarding = {
+        param([System.Collections.IDictionary] $P)
+        $alias = [string](& $AssertArg $P 'InterfaceAlias' 'GetNetIPInterfaceForwarding')
+        $state.CallLog.Add(@{ Op = 'GetNetIPInterfaceForwarding'; Path = $alias; VMName = $null })
+        & $egressFail 'GetNetIPInterfaceForwarding'
+        if ((& $hostAliases) -notcontains $alias) {
+            throw "HyperVBackend(fake).GetNetIPInterfaceForwarding: no host interface '$alias' (real Get-NetIPInterface finds no MSFT_NetIPInterface for an unknown alias)."
+        }
+        return @{ IPv4 = [string]$state.HostForwarding['IPv4']; IPv6 = [string]$state.HostForwarding['IPv6'] }
+    }.GetNewClosure()
+
     # The fake never starts Python. It checks what the real body checks before launching (the script
     # exists), records the process as running, and builds the command line the same way.
     $b.StartEgressProxy = {
@@ -3779,6 +4125,7 @@ function New-FakeHyperVBackend {
         $script = [string](& $AssertArg $P 'ScriptPath' 'StartEgressProxy')
         $ready  = [string](& $AssertArg $P 'ReadyFile' 'StartEgressProxy')
         $argv   = @(@(& $GetArg $P 'Arguments' @()) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        $readyTimeout = [double](& $GetArg $P 'ReadyTimeoutSeconds' 30)
         $state.CallLog.Add(@{ Op = 'StartEgressProxy'; Path = $script; VMName = $null })
         & $egressFail 'StartEgressProxy'
         if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
@@ -3788,15 +4135,18 @@ function New-FakeHyperVBackend {
         $state.NextProcId[0] = $procId + 1
         $start = [datetime]::new(2026, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc).AddSeconds($procId).ToString('o')
         $cmd = (@($py, $script) + $argv | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
-        $state.EgressProcs[$procId] = @{ ProcessId = $procId; StartTime = $start; Arguments = $argv; ReadyFile = $ready; Running = $true }
+        $state.EgressProcs[$procId] = @{ ProcessId = $procId; StartTime = $start; Arguments = $argv; ReadyFile = $ready; ReadyTimeoutSeconds = $readyTimeout; Running = $true }
         return @{ ProcessId = $procId; StartTime = $start; CommandLine = $cmd }
     }.GetNewClosure()
 
     $b.StopEgressProxy = {
         param([System.Collections.IDictionary] $P)
-        $procId = [int](& $AssertArg $P 'ProcessId' 'StopEgressProxy')
-        $start  = [string](& $GetArg $P 'StartTime')
-        $state.CallLog.Add(@{ Op = 'StopEgressProxy'; Path = [string]$procId; VMName = $null })
+        $procId  = [int](& $AssertArg $P 'ProcessId' 'StopEgressProxy')
+        $start   = [string](& $GetArg $P 'StartTime')
+        # The stop file and the timeout the real body uses, recorded on the process for a test to read.
+        $stop    = [string](& $GetArg $P 'StopFile')
+        $timeout = [int](& $GetArg $P 'TimeoutSeconds' 10)
+        $state.CallLog.Add(@{ Op = 'StopEgressProxy'; Path = [string]$procId; VMName = $null; StopFile = $stop; TimeoutSeconds = $timeout })
         & $egressFail 'StopEgressProxy'
         if (-not $state.EgressProcs.ContainsKey($procId) -or -not $state.EgressProcs[$procId].Running) {
             return @{ Stopped = $true; Killed = $false; AlreadyGone = $true }
@@ -3804,6 +4154,8 @@ function New-FakeHyperVBackend {
         if (-not [string]::IsNullOrWhiteSpace($start) -and $state.EgressProcs[$procId].StartTime -ne $start) {
             return @{ Stopped = $true; Killed = $false; AlreadyGone = $true }
         }
+        # SimulateEgressProxyUnkillable: the stop file was ignored and the kill did not end the process.
+        if ($proxyUnkillable) { return @{ Stopped = $false; Killed = $true; AlreadyGone = $false } }
         $state.EgressProcs[$procId].Running = $false
         return @{ Stopped = $true; Killed = $false; AlreadyGone = $false }
     }.GetNewClosure()
@@ -3850,6 +4202,26 @@ function New-FakeHyperVBackend {
         foreach ($c in $vm.Checkpoints) { if ($c.Name -ne $snap) { $kept.Add($c) } }
         $vm.Checkpoints = $kept
     }.GetNewClosure()
+
+    # Every method call is also recorded with the argument keys it received (Op='Call', with Method,
+    # Keys and Args), so the parity test can prove the fake was handed exactly the manifest's keys and a
+    # consumer test can see what was passed. The wrapper keeps every return shape intact: it captures
+    # the inner result and re-wraps it once, because crossing its own `&` boundary unrolls one level
+    # (the same trap the single-comma returns above guard), and it emits nothing when the method emitted
+    # nothing, so an effect-only call still leaves the output stream clean.
+    foreach ($methodName in @($b.Keys)) {
+        if ($b[$methodName] -isnot [scriptblock]) { continue }
+        $inner = $b[$methodName]
+        $b[$methodName] = {
+            param([System.Collections.IDictionary] $P)
+            $keys = @()
+            if ($null -ne $P) { $keys = @($P.Keys | ForEach-Object { [string]$_ } | Sort-Object) }
+            # Path and VMName are present (null) like every other entry, so a filter on them stays StrictMode-safe.
+            $state.CallLog.Add(@{ Op = 'Call'; Method = $methodName; Keys = $keys; Args = $P; Path = $null; VMName = $null })
+            $r = & $inner $P
+            if ($null -ne $r) { return ,$r }
+        }.GetNewClosure()
+    }
 
     # TEST-ONLY introspection seam (NOT a backend method): expose the cross-cutting CALL LOG as a
     # NON-scriptblock key so the interface-parity test (which compares only scriptblock-valued keys)
