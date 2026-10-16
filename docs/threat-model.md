@@ -308,7 +308,7 @@ The table above answers *"if this happened, would it be a Voidseal bug?"* — a 
 below answers a different question, *"has this actually been exercised?"* — a maturity question. Don't
 blend them: something can be correctly scoped as IN SCOPE and still be unproven live.
 
-- **Tier 0/1 provisioning + seal:** mock-proven against a fake Hyper-V backend (1517 passed, 0 failed, 2 skipped, no
+- **Tier 0/1 provisioning + seal:** mock-proven against a fake Hyper-V backend (1651 passed, 0 failed, 2 skipped, no
   elevation, no real VM). The Tier-0 `firefox` disk round-trip ran end-to-end on real Hyper-V on
   2026-06-25, and again with the user-space outbox transport on 2026-07-21; Tier 1 has not had a live run,
   which remains the operator's own elevated step.

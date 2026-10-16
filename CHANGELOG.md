@@ -4,7 +4,7 @@
 
 Every Hyper-V call goes through one seam with a real factory and a fake factory that share a
 manifest-enforced method set, so the whole engine is unit-tested with no elevation and no real VM
-(1519 Pester tests (1517 passed, 2 skipped), plus 185 pytest tests for the guest and host helpers). The recurring failure mode
+(1653 Pester tests (1651 passed, 2 skipped), plus 194 pytest tests for the guest and host helpers). The recurring failure mode
 that design guards against, a fake that accepts what real Hyper-V rejects, is treated as the first
 bug class to rule out.
 
@@ -197,11 +197,46 @@ places where a check is an argument rather than a measurement.
   the removal command. New backend read `GetHostFirewallRuleNames` (manifest, real, fake, parity). Not yet
   run live: the first elevated run must confirm the cmdlet accepts the store
   (`docs/phase-6-live-runbook.md` section 2).
-- A Disk-mode workload on a VM that keeps its NIC under `EgressMode='HostProxy'` is now refused by an
-  `Invoke-Voidseal` preflight, before anything is created. Previously only the seed builder refused it,
-  after the system, INPUT and OUTPUT disks had been created and copied; that check stays as a backstop.
 - The seal gate now compares each host firewall rule with its record as parsed address and port sets
   (single addresses, ranges, prefixes, IPv6 in any form, any list order, split or merged ranges), not as
   text, since how Windows renders them was unproven. An address or port the parser cannot read exactly
   (for example `LocalSubnet`, a scope id, or `RPC`) refuses the seal, naming the rule. Added to the
   Phase-6 live checks: readback equals record for all seven rules.
+- One egress model for every VM that keeps its network adapter: `EgressMode` is now `HostProxy` or
+  `None`; the loader requires `HostProxy` for a kept NIC and refuses the key in a workload file;
+  `Lock-Sandbox` installs the host side of egress for every kept-NIC VM and `Assert-Sealed` refuses to
+  certify one without the host rules, port ACL and address plan in place. Disk-mode seeds now carry the
+  host proxy settings (environment, apt drop-in, and one shared in-guest lockdown block with diagnostic
+  markers), so a Disk-mode workload may run on a Tier-1 VM; the earlier preflight refusal of that
+  combination is gone. The `builder` profile moves onto HostProxy and passes through the seal and gate
+  before it starts; the in-guest Squid variants (`InGuestSquid`, `SquidSniProxy`) are removed.
+  `tier1.psd1` drops the unwired `SnapshotRevert` lifecycle (the seal refuses checkpoints). Not yet run
+  live.
+- The gate also reads the three Windows Firewall profiles (enabled, inbound default Block), the vEthernet
+  interface's IPv4 and IPv6 forwarding (both off), the VM's power state (Off at gate time) and, for the
+  kept Tier-1 adapter, MAC address spoofing (off), DHCP guard and router guard (on), which `Lock-Sandbox`
+  sets; any other value, or an answer the host cannot give, refuses the seal. The host proxy accepts
+  connections only from the guest's own address, and a proxy process that survives its kill is reported
+  as a teardown failure. The Guest Service Interface is matched by component GUID like the other
+  integration services, and the seal verdict must be a boolean true, not merely truthy.
+- Provisioning and teardown: VM names are validated (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`); the real
+  backend resolves a VM or switch by exact name and refuses duplicates; a pre-existing switch with the
+  run's name is refused rather than reused; teardown stops a VM in any state other than Off; a detach
+  that matches no attached drive throws instead of passing silently; `Remove-Sandbox` without a
+  descriptor deletes only disks under the run's own storage directory. The fake backend refuses to
+  overwrite an existing VHDX, accepts and records every manifest key, and the parity test compares full
+  parameter sets. The exFAT label limit is 11 characters, every `Mount-VHD` site retries on a sharing
+  violation, `qemu-img` resolution refuses `.cmd` and `.bat` shims and compares the pin before running
+  the binary, a failed sparse-flag clear removes the half-made golden image, and access-denied errors are
+  reported as such instead of retried or rebranded as a Hyper-V failure.
+- Disk-mode results: a staged in-guest helper (`run_disk_workload.py`, `outbox.py`, `screener.py`) whose
+  content differs from the engine's own `guest/` copy is refused before provisioning; an outbox run that
+  is not a success releases nothing on disk (a non-zero exit code, a missing exit-code record and an
+  empty result file each report a failure and remove the staged files, keeping `workload.json` and
+  `verdicts.json` for diagnosis). The live docs and the `firefox` profile read the helpers from the
+  engine checkout rather than an operator staging folder.
+- Documentation aligned with the code: Tier 0 is live-proven and Tier 1 and the builder are mock-proven;
+  the Tier-1 token path is declared, not wired; the gate reads one of the four host channels and treats
+  the other three as off by construction; CI runs on pushes to main and pull requests to main; the Tier-1
+  description names only generic workloads, and private design-record names are gone from public
+  comments.
