@@ -869,7 +869,7 @@ function Resolve-QemuImg {
 # real mechanism is a restricted-token / Job-Object native shim for Tier-0/1 (drop privileges + cap
 # resources on the child qemu-img process) or a Windows Sandbox (.wsb) for Tier-2/3 (full OS-level
 # confinement for the disposable/detonation tiers). Design notes are internal and not published;
-# the design record holds the full mechanism comparison. That mechanism is built and LIVE-TESTED at
+# the design record holds the full mechanism comparison. That mechanism will be built and live-tested in
 # Phase 6, Allen's explicit choice (ship the seam now; wire the real confinement then) — do not silently
 # "upgrade" this function without a live test proving the confined child still produces correct output.
 #
