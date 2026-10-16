@@ -2,7 +2,7 @@
     # Voidseal — Tier 1 isolation contract (net-restricted Hyper-V VM).
     # Declarative; consumed by the profile loader (Import-TierProfile).
     Tier            = 1
-    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress is host-enforced: the guest has no route, NAT or resolver and reaches only a host CONNECT allowlist proxy on its own switch, behind host firewall rules and a port ACL that the seal gate verifies. An in-guest default-DROP is defense in depth. Default: no credentials. For agent loops (Ralph), organizers, Immich steady-state.'
+    Description     = 'Network-restricted Hyper-V Gen2 VM. Egress is host-enforced: the guest has no route, NAT or resolver and reaches only a host CONNECT allowlist proxy on its own switch, behind host firewall rules and a port ACL that the seal gate verifies. An in-guest default-DROP is defense in depth. Default: no credentials. For agent loops (Ralph), organizers and similar maintenance tasks.'
     Substrate       = 'HyperV-Gen2'
     Network         = 'Internal+Allowlist'      # per-VM Internal vSwitch; the host holds the gateway address of the VM's /30
     # EgressMode (2026-10-03): 'HostProxy', the host-enforced design (scripts/lib/HostEgress.ps1).
