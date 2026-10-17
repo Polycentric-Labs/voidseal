@@ -32,7 +32,8 @@ places where a check is an argument rather than a measurement.
   zero adapters, host-verified. The processor check previously read a descriptor field production never
   wrote, so it could not fire, and a Tier-1 processor was certified with a connected NIC. The gate also
   refuses any GPU partition adapter or Discrete Device Assignment device at every tier, and the fake
-  backend now models the default adapter real `New-VM` creates. Not yet exercised live.
+  backend now models the default adapter real `New-VM` creates. Exercised live at Tier 0 on 2026-10-17
+  (zero adapters); the Tier-1 branch is mock-proven only.
 - Seal coverage: `Lock-Sandbox` now also turns off the Time Synchronization, Key-Value Pair Exchange,
   Backup (VSS) and Heartbeat integration services, and `Assert-Sealed` reads each back from the host,
   matched by component GUID rather than the localized display name, refusing when one is on or
@@ -40,7 +41,8 @@ places where a check is an argument rather than a measurement.
   it, and disabling Time Synchronization does not stop the guest reading the host-paced reference TSC
   page. The gate also refuses a pipe path on COM2, automatic checkpoints, and any existing checkpoint;
   the new `GetAutomaticCheckpoints` read backs the last two, and `GetComPort` now throws on a failed read
-  instead of returning "no port". Not yet exercised live.
+  instead of returning "no port". Exercised live at Tier 0 on 2026-10-17: the guest booted with the four
+  services off and completed its workload.
 - Seal fixes from a review of the network-adapter policy: a Tier-1 NIC must now be the VM's only NIC and
   sit on the switch `New-SandboxVM` recorded for it, so a NIC re-pointed at another Internal switch no
   longer certifies; a network-adapter read that returns nothing refuses instead of certifying at Tier 1;

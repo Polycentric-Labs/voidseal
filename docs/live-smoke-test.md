@@ -305,7 +305,9 @@ $report.TeardownStatus      # 'OK (VM removed, created disks deleted)'
   the VM is still torn down.
 - First boot with the integration services off (section 5.3): cloud-init still reaches `done` and the
   guest clock is sane. The seal turns off Time Synchronization, Key-Value Pair Exchange, Backup and
-  Heartbeat, and no live run has booted a guest that way yet.
+  Heartbeat. The first live boot in that state was the Tier-0 run of 2026-10-17, which completed its
+  workload and powered off cleanly; its cloud-init status and clock were not captured, so read them on
+  the next run.
 
 ### 3.5 Manual cleanup if it fails mid-flow
 
@@ -447,8 +449,11 @@ never assumes "Off == success".
 > **Live result for the outbox contract (2026-07-21).** A firefox run on real Hyper-V returned
 > `SealVerdict=True`, `RunResult.Status=Success` and an empty `Error`, then tore down cleanly. Its
 > `result.html` was produced inside the sealed guest: a Netscape-format file whose three entries came
-> from the four-entry synthetic sample after deduplication. Changes made since then, such as the
-> read-only INPUT fallback (2026-10-03), have run only against the mock backend.
+> from the four-entry synthetic sample after deduplication. A second live run on 2026-10-17, at the
+> head of the 2026-10-16 review round, passed the same way (SealVerdict True, Success, exit code 0,
+> three of four entries, clean teardown) in 156 seconds, and was the first live exercise of the
+> zero-adapter seal, the four integration services off, the passthrough reads and the power-state
+> read. Tier 1, the builder and host egress remain mock-proven.
 
 ### 4A.1 Preconditions (mostly reuse Milestone-1 groundwork)
 
