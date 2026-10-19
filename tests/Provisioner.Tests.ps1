@@ -1212,9 +1212,12 @@ Describe 'Get-SandboxStorageRoot - precedence and validation (E2)' {
         Get-SandboxStorageRoot -Name 'vm-a' | Should -Be (Join-Path 'D:\vs-env' 'vm-a')
     }
 
+    # Join-Path resolves the drive, so every path here must sit on a drive every Windows host has (C:, or the
+    # D: that GitHub's runners and the existing cases use). Nothing is created at these paths; only the
+    # precedence is under test. E: was used until 2026-10-19 and failed on CI, which has no E: drive.
     It 'an explicit -StorageRoot beats the environment variable' {
         $env:VOIDSEAL_STORAGE_ROOT = 'D:\vs-env'
-        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot 'E:\vs-param' | Should -Be (Join-Path 'E:\vs-param' 'vm-a')
+        Get-SandboxStorageRoot -Name 'vm-a' -StorageRoot 'C:\vs-param' | Should -Be (Join-Path 'C:\vs-param' 'vm-a')
     }
 
     It 'ignores a blank environment variable and a blank -StorageRoot (treated as unset)' {
@@ -1281,8 +1284,8 @@ Describe 'New-SandboxVM - honors the storage root (E2)' {
         $b = script:New-PathRecordingBackend
         $d1 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root2' -Backend $b
         $d1.DiskPath | Should -Be (Join-Path (Join-Path 'D:\vs-env' 'sbx-root2') 'sbx-root2-system.vhdx')
-        $d2 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root3' -StorageRoot 'E:\vs-param' -Backend $b
-        $d2.DiskPath | Should -Be (Join-Path (Join-Path 'E:\vs-param' 'sbx-root3') 'sbx-root3-system.vhdx')
+        $d2 = New-SandboxVM -Profile $script:Tier1 -Name 'sbx-root3' -StorageRoot 'C:\vs-param' -Backend $b
+        $d2.DiskPath | Should -Be (Join-Path (Join-Path 'C:\vs-param' 'sbx-root3') 'sbx-root3-system.vhdx')
     }
 
     It 'keeps the old default when neither is set' {
